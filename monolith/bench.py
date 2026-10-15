@@ -101,6 +101,6 @@ def check_against_oracle(y: np.ndarray, y_ref: np.ndarray) -> OracleCheck:
                        float((err / ulps).max()))
 
 
-def profile_for_device(gpu_cores: int, apple_family: int, chip: Optional[str] = None) -> Optional[Profile]:
-    """Compatibility wrapper; runtime callers also supply the exact chip name."""
+def profile_for_device(gpu_cores: int, apple_family: int, chip: str) -> Optional[Profile]:
+    """Compatibility wrapper of ``config_for_device``: core count and family alone never identify a chip."""
     return config_for_device(gpu_cores, apple_family, chip)

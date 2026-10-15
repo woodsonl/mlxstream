@@ -65,14 +65,25 @@ def test_m3_max_40c_is_its_own_device():
     with pytest.raises(ValueError, match='40 GPU cores'):
         get_backend(config.backend).validate_device(config,
             SimpleNamespace(name='Apple M3 Max', gpu_cores=30, apple_family=9))
+    # a 512-row exact pass with the DSpark drafter resident ran out of GPU memory on the measured 48 GB machine
+    assert get_backend('m3_max_40c').serving_prefill_chunk({}) == 128
 
 
-def test_m3_max_draft_context_is_capped_and_other_chips_are_not():
+def test_40_core_max_configs_reject_the_other_chip():
+    configs = load_configs()
+    for config, other in ((configs['apple-m3-max-40c'], 'Apple M4 Max'), (configs['apple-m4-max-40c'], 'Apple M3 Max')):
+        with pytest.raises(ValueError, match=f'requires {config.chip} with 40 GPU cores'):
+            get_backend(config.backend).validate_device(config, SimpleNamespace(name=other, gpu_cores=40, apple_family=9))
+    for chip in (None, '', ' '):
+        with pytest.raises(ValueError, match='chip name is required'):
+            config_for_device(40, 9, chip)
+
+
+def test_m3_max_30c_draft_context_is_capped_and_other_chips_are_not():
     assert get_backend('m3_max_30c').serving_context_limit(drafter=True) == 20480
     assert get_backend('m3_max_30c').serving_context_limit(drafter=False) is None
-    assert get_backend('m3_max_40c').serving_context_limit(drafter=True) == 20480
-    assert get_backend('m3_max_40c').serving_context_limit(drafter=False) is None
     assert get_backend('m5_max_40c').serving_context_limit(drafter=True) is None
+    assert get_backend('m3_max_40c').serving_context_limit(drafter=True) is None
     assert get_backend('common').serving_context_limit(drafter=True) is None
 
 
@@ -281,7 +292,7 @@ def test_kernel_choices_look_up_the_tuners_keys_without_timing():
 
 
 
-@pytest.mark.parametrize('name', ['apple-m3-ultra-60c', 'apple-m4-pro-20c'])
+@pytest.mark.parametrize('name', sorted(n for n, c in load_configs().items() if c.raw.get('kernel_choices')))
 def test_shipped_kernel_choices_are_valid_geometries(name, tmp_path):
     from monolith.backends.metal.config import kernel_choices, load_configs
     configs = load_configs()
@@ -297,6 +308,11 @@ def test_shipped_kernel_choices_are_valid_geometries(name, tmp_path):
             assert split in kernels.gemv_rsplits(rows, rg, 'silu_mul' if 'silu_mul' in fields else None), key
         elif kind == 'gemm3':
             assert c['grid_mode'] in ('crew', 'crew2') or kernels.gemm_ksplit(c['grid_mode']) > 1, key
+        elif kind == 'gdn':                    # raises on a geometry the GDN kernel cannot build
+            dk, dv = map(int, fields[2].split('x'))
+            kernels.gdn_macros(dk, dv, conv_width=int(fields[3][2:]), t=int(fields[4][1:]),
+                               slice_cols=int(c['macros']['SL'].rstrip('u')),
+                               slices_per_block=int(c['macros']['SPB'].rstrip('u')))
         assert 0 < c['ms'] <= c['default_ms'], key
     assert kernel_choices(configs['apple-m5-max-40c']) == {}
     # choices resolve beside the file a configuration was loaded from, under any name
@@ -307,3 +323,64 @@ def test_shipped_kernel_choices_are_valid_geometries(name, tmp_path):
     assert list(kernel_choices(load_config(tmp_path / 'custom.json'))) == ['k']
     # the sidecar beside a configuration is not one
     assert set(load_configs(config_path(name).parent)) == {n for n, p in CONFIG_PATHS.items() if p.parent == config_path(name).parent}
+
+
+@pytest.mark.parametrize('name', sorted(n for n, c in load_configs().items() if c.accelerator == 'on'))
+def test_tile_rows_cost_no_more_than_the_shader_passes_they_replace(name):
+    # verify_costs prices each T at or above accelerator_min_t at the tile's row; a row above the shader pass it
+    # replaces (the writer's, timed without the K-split) makes the cost rule decline drafts the tile verifies cheaply
+    from monolith.backends.metal.calibration import NOISE
+    from monolith.compiler.emit import gemm_tm
+    config = load_configs()[name]
+    for row in (r for r in config.cost_t if r.startswith('accelerator_')):
+        fmt = row.removeprefix('accelerator_')
+        min_t = config.accelerator_min_t.get(fmt, 2)                       # verify_costs' start for a format without one
+        for t, shader in config.cost_t.get(fmt, {}).items():
+            if t >= min_t:
+                assert config.cost(row, gemm_tm(t)) <= shader * (1 + NOISE), (fmt, t)
+
+
+def test_m3_max_40c_keeps_its_hand_set_values():
+    # set by hand from paired A/Bs and the K-split tile's timing (config.json's note); tools/profile_writer.py times the
+    # tile without its K-split and attention at 32 query heads, so a refresh resets them (the October 15 writer run,
+    # 9ce1de5, gives attention v2) and fails here until they are measured again
+    config = load_configs()['apple-m3-max-40c']
+    assert config.attention == 'auto'
+    assert {fmt: config.accelerator_min_t[fmt] for fmt in ('nvfp4', 'fp8', 'bf16')} == {'nvfp4': 2, 'fp8': 4, 'bf16': 2}
+    assert {fmt: config.cost_t[f'accelerator_{fmt}'] for fmt in ('nvfp4', 'fp8', 'int4_affine', 'bf16')} == {
+        'nvfp4': {8: 0.89, 16: 1.428, 32: 2.766}, 'fp8': {8: 1.01, 16: 1.096, 32: 2.063},
+        'int4_affine': {8: 1.515, 16: 2.078, 32: 3.538}, 'bf16': {8: 1.046, 16: 1.109, 32: 1.249}}
+
+
+@pytest.mark.parametrize('family', [None, 9, 10])   # the host's GPU family: no Metal module (hosted CI), Apple9, Apple10
+def test_shipped_kernel_choices_match_their_configs_chip_and_keys(monkeypatch, family):
+    # gemv and gemm3 keys carry the pack's layout and the tile's default shape, and a miss returns no choice: a change to
+    # the config's lane_order or scale_placement, or to a key function, would drop shipped choices without an error, so
+    # each key must be the one the tuner builds for its shape under its config, on any host
+    monkeypatch.setattr(kernels, '_FAMILY', [family])
+    import dataclasses
+    import numpy as np
+    from monolith.bench import pack_spec, random_spec
+    from monolith.compiler.autotune import gdn_key, gemm_key, gemv_key
+    from monolith.formats import PackLayout
+    shipped = {n: c for n, c in load_configs().items() if c.raw.get('kernel_choices')}
+    # pinned: a config that loses its kernel_choices field drops out of these tests and runs on the default geometry
+    assert set(shipped) >= {'apple-m3-max-40c', 'apple-m3-ultra-60c', 'apple-m4-pro-20c'}
+    for name, config in shipped.items():
+        doc = json.loads((config_path(name).parent / config.raw['kernel_choices']).read_text())
+        assert (doc.get('chip'), doc.get('cores')) == (config.chip, config.gpu_cores), name
+        layout = PackLayout(lane_order=config.lane_order, scale_placement=config.scale_placement)
+        with using_backend(config.backend):   # as in compile_program: the backend's GPU family sets the tile's layout
+            for key in doc['choices']:
+                f = key.split('|')
+                if f[0] == 'gdn':   # gdn_key takes the value heads first and prints the key heads first
+                    hk, hv, dk, dv = map(int, f[1].split('x') + f[2].split('x'))
+                    assert gdn_key(hv, hk, dk, dv, int(f[3][2:]), int(f[4][1:])) == key, (name, key)
+                    continue
+                n, k = map(int, f[2].split('x'))
+                _, info, _ = pack_spec(random_spec(f[1], layout.rows, k, np.random.default_rng(0)), layout)
+                info = dataclasses.replace(info, n=n, n_blocks=-(-n // info.rows))
+                epilogue, parts = None if f[7] == 'plain' else f[7], next((int(x[1:]) for x in f if x.startswith('P')), None)
+                built = (gemv_key(info, int(f[6][1:]), epilogue, 'norm' in f, parts or 64) if f[0] == 'gemv' else
+                         gemm_key(info, int(f[6][2:]), epilogue, permute='perm' in f, norm_fed='norm' in f, stat_parts=parts or 1))
+                assert built == key, (name, key, built)
