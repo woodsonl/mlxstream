@@ -1,10 +1,14 @@
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #import <Metal/Metal.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <algorithm>
+#include <deque>
+#include <mutex>
 #include <stdexcept>
 #include "metal_core.h"
 
@@ -209,15 +213,8 @@ std::vector<std::pair<double, double>> Queue::profile(const std::vector<Dispatch
   }
 }
 
-}  // namespace monolith
-
 // ---------------------------------------------------------------------------------------------------------------
 // ICB replay and the host pump
-#include <mach/mach.h>
-#include <deque>
-#include <mutex>
-
-namespace monolith {
 
 struct IcbImpl { id<MTLIndirectCommandBuffer> icb; size_t count = 0; };
 
