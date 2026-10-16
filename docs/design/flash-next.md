@@ -428,7 +428,7 @@ and `iogpu.wired_limit_mb` is at its default of 0, with the GPU's wired-memory c
 (`iogpu.disable_wired_collector` 0, `iogpu.dynamic_lwm` 1). A fresh Metal process reports a `currentAllocatedSize` of
 81,920 bytes: the figure counts that process's allocations only. With no engine running, other processes held
 2,102,771,712 to 2,434,203,648 bytes of GPU memory (IOAccelerator's "In use system memory", readings on 2026-10-15
-and 2026-10-16), 5.72 to 6.54 GB of RAM was wired, and 3.5 to 3.9 GB of swap was in use.
+and 2026-10-16), 5.72 to 6.59 GB of RAM was wired, and 3.5 to 3.9 GB of swap was in use.
 
 **Mode.** Basalt's low-RAM resident mode, `--resident-experts` (`src/program/generate.cpp:872-876`; the flags it sets,
 `:1608-1611`). The experts section stays memory-mapped. The experts no GPU slot holds are copied into RAM once, and so
@@ -520,7 +520,7 @@ other processes take more than 8,926,534,395 bytes (8.31 GiB) less the RAM tier:
 READY, the n-gram cache, the serving growth and the margin. Metal's own host memory comes out of the same bytes.
 
 How much macOS and other processes take on this Mac, at load and while serving, has not been measured [H]. With no
-engine running, 5.72 to 6.54 GB was already wired, against the 7,410,173,047 bytes the largest session leaves for
+engine running, 5.72 to 6.59 GB was already wired, against the 7,410,173,047 bytes the largest session leaves for
 macOS, other processes and the RAM tier. A lent slot whose expert the RAM tier lacks is refilled from the file after
 the prompt (`src/core/expert_source.cpp:947-951`). The quality gate's 256-token prompts take a 262,852,352-byte loan,
 the last 191 slots (264,038,400 bytes of blobs), which the RAM tier holds first. Basalt also sets aside spare places
