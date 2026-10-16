@@ -9,10 +9,12 @@ workstream `flash-next-port`):
 
 - **D-002, an exact port.** "We will run it on this mac once you have performed an exact 1:1 port from the existing
   code to Metal 4. Your Metal 4 implementation must be 100% exact to the original design."
-- **D-005, basalt's own correctness bar.** Every ported kernel passes basalt's parity test against its CPU reference
-  within basalt's tolerance. Greedy tokens are identical between plain decoding and 7-token speculative windows.
-  Wikitext-2 perplexity lands within 0.01 of basalt's published 2.971; the 0.01 threshold is agent-set.
-- **D-006, the Q2_0 pack.** The model file is basalt's official Q2_0 pack.
+- **D-005, basalt's own correctness bar.** The selected option reads: "Basalt's own bar. Every Metal kernel passes
+  basalt's parity test against its CPU reference within basalt's tolerance. Greedy tokens are identical between
+  --spec 0 and --spec 7 on this Mac. Wikitext-2 perplexity (20 chunks, basalt's harness) lands within 0.01 of the
+  README figure for the pack". The figure is 2.971; the 0.01 threshold is agent-set.
+- **D-006, the Q2_0 pack.** The selected option reads: "The Q2_0 pack, 64.90 GiB with 31.6 GiB of experts and
+  perplexity 2.971."
 
 The machine is an Apple M3 Max with 40 GPU cores (Apple family 9) and 48 GiB of unified memory, on macOS 27.0.1.
 
@@ -20,7 +22,7 @@ The machine is an Apple M3 Max with 40 GPU cores (Apple family 9) and 48 GiB of 
 [`b4c63b5`](https://github.com/jesdga95/basalt/tree/b4c63b55754637f4c72ad53a0f791d425f71eb36), and `path:a-b` means
 lines a to b at that commit. `precision.md` is basalt's `docs/precision.md`. That page was measured at an older
 commit, and several of its line references no longer point at the code they describe, so the rules below cite the
-current code wherever the two differ.
+current code wherever the two differ. Paths under `runtime/` are this repository's.
 
 ## Numerics contract
 
@@ -45,9 +47,10 @@ current code wherever the two differ.
 | Greedy pick | fp32 argmax; the lowest index wins a tie | `src/kernels/cuda/sampler.cu:88-90` |
 | Sampling | Philox, counter-based on (seed, absolute position) | `include/basalt/kernels/sampler.hpp:25`; `src/core/verify.cpp:2652-2654` |
 | Weights | the GGUF blocks as shipped. The int8 hyper-connection copies are the only requantization | `precision.md:17-18` |
-| CPU expert tier | ggml's `vec_dot_type` of the weight type, not q8_1, so it rounds differently from the GPU tier | `src/kernels/cpu/native_expert.cpp:54-55`; `precision.md:68` |
+| CPU expert tier (decode misses, the prompt path's CPU share) | For this pack's Q2_0 experts: the fp32 FFN input, and the fp32 SwiGLU before down, quantized per 32 values to int8 with an fp32 scale `amax / 127`, codes `trunc(x * (1 / scale) ± 0.5)` clamped to ±127; products on `q2_0_gguf_rows_multi`. The GPU's q8_1 has an fp16 scale, so the two tiers round differently. The AVX-512 kernel and its AVX2 fallback sum in different orders; the port transcribes the AVX-512 one, which basalt runs wherever AVX-512 is present (agent-set) | `src/kernels/cpu/expert.cpp:336-398`, `:503-556`; `src/kernels/cpu/expert_layout.cpp:124-133`; `src/core/expert_source.cpp:1592-1593`; `src/kernels/cpu/pool.cpp:423-444`, `:559`; `src/kernels/cpu/q2_avx2.cpp:37-62` |
 | Prompt path | a different computation (fp16/BF16 GEMMs, llama.cpp MMQ for the routed experts, fp16 hi/lo attention, 3xTF32 indexer scores) that writes the same KV and state formats. Quality is scored through decode | `precision.md:23-24`, `:94-108` |
 | MTP drafter | Q8_0 and BF16 dense weights, Q2_0 experts. Its precision changes drafts, never output | `precision.md:47-52` |
+| Compiler arithmetic | The kernels adapted from llama.cpp's arithmetic (`native_*.cu`, `qsa_dec_fused.cu`, `q5k_head.cu`, `q6k_head.cu`) and the prompt path's MMQ build with `--use_fast_math`: approximate `expf`, division and square root, denormals flushed. Every other kernel builds with nvcc's IEEE defaults, which still contract a multiply and an add into an FMA | `CMakeLists.txt:185-202`, `:728` |
 
 ### Exactness invariants
 
@@ -57,17 +60,25 @@ current code wherever the two differ.
    kernel's test to check that a token's output does not depend on the window width or its position in it
    (`CONTRIBUTING.md:14`). A Metal kernel whose threadgroup partition or reduction order changes with the window width
    or with a row's column breaks speculative decoding.
-2. **One kernel per projection.** The kernel for a projection is chosen per projection, never per window width
-   (`src/core/verify.cpp:209-219`).
+2. **Kernel choice.** A quantized projection's kernel is chosen per projection, never per window width
+   (`src/core/verify.cpp:209-219`). Where basalt does switch on the width, its multi-row kernel gives every row the
+   one-row kernel's bits: the BF16 projections run `bf16_gemv_fp32_mmvf` for one row and `bf16_gemv_fp32_mmvf_multi`
+   for more (`src/core/verify.cpp:1349`, `:1440-1442`, `:1508`; `src/kernels/cuda/shared_expert.cu:196-201`), "each
+   output bitwise its one-row call" (`src/kernels/cuda/native_bf16.cu:193-202`).
 3. **State commit.** A window reads the GDN state and never writes it. The commit replays the kept tokens from inputs
    the window stored, restores the indexer tail from a snapshot, re-appends the kept keys and restores the n-gram
    history (`include/basalt/core/verify.hpp:13-18`).
 4. **Per-step values are data.** Tokens, positions, step records and commit counts live in buffers, never in baked
    kernel arguments (`include/basalt/core/graph.hpp:14-17`).
-5. **Basalt's rounding sequence.** The default arithmetic is the forced `native_*` set
-   (`src/program/generate.cpp:1889-1893`), including its rounding sequence. Where a basalt kernel keeps a multiply
-   unfused (`__fmul_rn`, `__fadd_rn`, as in `src/kernels/cuda/native_ple_postops.cu:41-50`), the Metal kernel must not
-   contract it into an FMA.
+5. **Basalt's rounding sequence, Metal's arithmetic.** The default arithmetic is the forced `native_*` set
+   (`src/program/generate.cpp:1889-1893`), including its rounding sequence. The Metal kernels build in
+   `MTLMathModeSafe`, this repository's default (`runtime/src/metal_core.mm:103`). An FMA appears where the basalt
+   source writes one, and a multiply basalt rounds on its own (`__fmul_rn`, as in
+   `src/kernels/cuda/native_ple_postops.cu:41-50`; the embedding gather that
+   `src/kernels/elementwise_parity.cpp:358-362` checks) is never contracted into one. Where nvcc contracts
+   implicitly, or a `--use_fast_math` file approximates, the Metal result can differ from CUDA's last bits. D-005's
+   tolerances accept that, and invariant 1 still holds, because each Metal kernel rounds the same way at every window
+   width.
 
 ### How this departs from the repository-wide contract
 
@@ -83,7 +94,7 @@ unchanged.
 | FP32 accumulators and recurrent state | The same, except that integer block dots are exact int32 and the hyper-connection up projection multiplies fp16 high and low halves into fp32 accumulators |
 | Reference: the HF model run on the dequantized weights | Basalt's own kernels and their CPU references (`AGENTS.md:17`); quality against llama.cpp's Q8_0 base |
 | Gates: leaf ops within 2 ULP, layers at cosine above 0.999 | Basalt's per-kernel criteria: bitwise, `1e-6` to `1e-4` against double-precision references, and quantization-level bounds from `1e-3` to `5e-2` (the table below) |
-| Greedy tokens equal to the golden; repeated runs bit-identical | Greedy tokens identical between plain decoding and 7-token windows; perplexity within 0.01 of 2.971. Runs are bit-identical only with expert placement pinned (`precision.md:227-228`) |
+| Greedy tokens equal to the golden; repeated runs bit-identical | Greedy tokens identical between `--spec 0` and `--spec 7`; perplexity within 0.01 of 2.971. Runs are bit-identical only with expert placement pinned (`precision.md:227-228`) |
 
 ### How basalt's test tiers carry over to Metal
 
@@ -96,12 +107,12 @@ Basalt's parity programs check three kinds of results:
 
 Basalt builds for CUDA compute capability 12.0 only (`CMakeLists.txt:25-30`), so none of its tests runs on this Mac;
 the port re-implements each one against its Metal kernel. Tiers 2 and 3 keep basalt's references and tolerances
-unchanged. In tier 1 the invariance checks stay bitwise. A comparison against "the kernel it replaces" has no CUDA
-kernel to run here, so the Metal kernel is compared bitwise against its own single-token or single-column
-arrangement, and against the CPU reference within basalt's tolerance. The hardware preconditions in basalt's tests
-(thread-block clusters, int8 tensor cores, AVX-512) describe CUDA and x86 code paths; the arithmetic they specify still
-applies. Several basalt gates fold errors with `std::max`, which drops a NaN, so the ported tests also count
-non-finite outputs.
+unchanged. In tier 1 the invariance checks stay bitwise. A comparison against the CUDA kernel that a kernel replaced
+cannot run here, so the ported test compares the Metal kernel bitwise against its own one-token or one-column calls,
+which is what those comparisons establish, and the kernel's accuracy rests on the tier 2 and 3 tests of the same
+operation. The hardware preconditions in basalt's tests (thread-block clusters, int8 tensor cores, AVX-512) describe
+CUDA and x86 code paths; the arithmetic they specify still applies. Several basalt gates fold errors with `std::max`,
+which drops a NaN, so the ported tests also count non-finite outputs.
 
 ## Acceptance setup
 
@@ -129,6 +140,8 @@ What the pack holds, from its header and tables:
   33,973,862,400 bytes in all.
 - The head `output.weight` is Q5_K and the token embedding Q3_K. The n-gram table `per_layer_token_embd.weight` is
   IQ4_NL, 28,800,138,240 bytes.
+- The 301 natively served matrices use ten GGUF types: IQ4_XS, Q2_0, Q3_K, Q4_K, Q5_K and Q6_K, plus IQ4_NL, Q4_0,
+  Q5_0 and Q8_0 in the shared experts' down projections.
 - The drafter's vocabulary (`mtp/draft_vocab`) holds 106,299 ids, of which 40,525 are base rows. It was read from the
   pack with an HTTP range request; its sha256 `b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91`
   equals that of the revision's `convert/draft_vocab.bin`.
@@ -144,7 +157,7 @@ as follows.
    `ggml-org/ci` at revision `927b3642933080f1b0e811e2f916e14c292992f9` (4,721,645 bytes, LFS sha256
    `ef7edb566e3e2b2d31b29c1fdb0c89a4cc683597484c3dc2517919c615435a11`). `wiki.test.raw` is 1,290,590 bytes with
    sha256 `173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08`.
-2. **Chunks.** The gate does not tokenize. It reads its chunks from a llama.cpp KL-divergence base made by
+2. **Chunks.** Basalt's gate does not tokenize. It reads its chunks from a llama.cpp KL-divergence base made by
    `llama-perplexity -m MODEL-Q8_0-00001-of-0000N.gguf -f wikitext-2-raw/wiki.test.raw --kl-divergence-base
    flashnext-q8-base.kld -c 512 -b 2048 -ngl 99 --n-cpu-moe 99 -t 16` (`precision.md:399-404`). The base holds
    `n_ctx = 512`, every chunk's 512 tokens, and the Q8_0 model's log-probabilities for positions 256 to 510
@@ -161,29 +174,43 @@ as follows.
    (`src/program/bench_main.cpp:1086-1093`; T = 3 is the bench default, `:391`). The engine checks the prompt against
    the base's chunk (`include/basalt/program/ppl_gate.hpp:40-54`) and forces greedy decoding
    (`src/program/generate.cpp:7313`). Tokens 0 to 255 go through the batched prompt path, because 256 tokens exceed
-   the default `--short-read 64` (`src/program/generate.cpp:583-586`, `:7739-7745`). Positions 256 to 510 are
-   teacher-forced through verify windows of exactly 3 rows, filled with the reference tokens instead of drafts
-   (`src/program/generate.cpp:8379-8382`, `:8400-8401`). Every row is scored and committed (`:8470-8480`), and relaxed
-   drafting is off under the gate (`:8184`).
-5. **Score.** For each row, `nll = lse - logit[target]`, with the log-sum-exp taken in double
-   (`include/basalt/program/ppl_gate.hpp:125-145`). PPL is `exp(mean nll)` over the 20 x 255 = 5,100 rows
-   (`src/program/bench_main.cpp:768-806`).
-6. **Pass.** `|PPL - 2.971| <= 0.01`. KLD and top-1 agreement are reported when the base is present; they are not
-   part of the bar.
+   the default `--short-read 64` (`src/program/generate.cpp:583-586`, `:7739-7745`, `:8233-8268`). A chunk below
+   1,024 tokens hands a measured share of its non-resident experts with a RAM copy (here, the lent slots' experts) to
+   the CPU tier, so this half is not bit-reproducible run to run (`src/prefill/prefill.cpp:1868-1895`;
+   `precision.md:116-119`). Positions 256 to 510 are teacher-forced through verify windows of exactly 3 rows, filled
+   with the reference tokens instead of drafts (`src/program/generate.cpp:8379-8382`, `:8400-8401`). Every row is
+   scored and committed (`:8470-8480`), and relaxed drafting is off under the gate (`:8184`).
+5. **Score.** For each row, `nll = lse - logit[target]`, with the exponentials summed in double and the log-sum-exp
+   rounded to fp32 (`include/basalt/program/ppl_gate.hpp:125-145`). PPL is `exp(mean nll)` over the 20 x 255 = 5,100
+   rows (`src/program/bench_main.cpp:768-806`).
+6. **Pass.** `|PPL - 2.971| <= 0.01`. KLD and top-1 agreement need the base; they are not part of the bar.
 
-Two inputs of this setup are not available from any source. First, the base file is not published (the pinned
-revision has no `.kld` file), and making it needs llama.cpp on the 178.3 GiB Q8_0 model (`README.md:272`), which this
-Mac cannot hold. PPL itself needs only the base's tokens. Second, basalt does not record the engine flags behind
-2.971. The bench passes extra engine flags through unchanged, and `precision.md`'s reproduction command uses
-`--kv int8` (`precision.md:416-418`) while the engine default is fp16. Every run of the gate records its full engine
-command line.
+**What the port supplies itself.** No base is published (the pinned revision has no `.kld` file), and making one needs
+llama.cpp on the 178.3 GiB Q8_0 model (`README.md:272`), which this Mac cannot hold. Basalt's engine reads a base row
+for every row it scores (`include/basalt/program/ppl_gate.hpp:125-158`), so the port's gate differs from basalt's
+harness in two ways:
 
-### Greedy identity: plain decoding against 7-token windows
+- It builds the 20 chunks as `llama-perplexity` builds a base: the whole file tokenized once with special tokens on,
+  no BOS (`tokenizer.ggml.add_bos_token` is false), then cut into consecutive 512-token chunks (llama.cpp
+  [`436f6f89e`](https://github.com/ggml-org/llama.cpp/blob/436f6f89e1e581249900b37a5b8a12a36a6d0912/tools/perplexity/perplexity.cpp),
+  `tools/perplexity/perplexity.cpp:473`, `:491`, `:523`; `precision.md:336` names that commit). The vocabulary is
+  the pack's: every `tokenizer.*` key of its meta equals that of the Q8_0 GGUF's first shard
+  (`unsloth/Qwen3.8-Flash-Next-GGUF` at `766911a6b7369840a91dbcd95f9f997acaab6cd6`, read 2026-10-15). That these
+  tokens are the base's own is [H] until a base made elsewhere is compared.
+- It scores the `nll` of step 5 only, and reports neither KLD nor top-1 agreement.
+
+Basalt also does not record the engine flags behind 2.971. The bench passes extra engine flags through unchanged, and
+`precision.md`'s reproduction command uses `--kv int8` (`precision.md:416-418`) while the engine default is fp16.
+Every run of the gate records its full engine command line.
+
+### Greedy identity: `--spec 0` against `--spec 7`
 
 This is basalt's own MTP on/off check (`precision.md:183-205`, `:422-437`), with expert placement pinned.
 
 1. Two `--serve` sessions. The first runs `--spec 0`: every step is a one-token window through the verify path, and
-   no drafter is loaded (`src/program/generate.cpp:1860-1867`). The second runs `--spec 7 --spec-min-p 0.5`.
+   no drafter is loaded (`src/program/generate.cpp:1860-1867`). The second runs `--spec 7 --spec-min-p 0.5`. Its
+   drafts come from the MTP layer in windows of up to 7 rows, and the default prompt-lookup drafter raises the cap to
+   8, so its windows run 1 to 8 rows (`src/program/generate.cpp:1868-1874`).
 2. Both sessions take `--prefill auto --resident-experts --max-context 8192 --adapt-swaps 0 --peer-adapt-swaps 0
    --pcie-frac 0 --expert-cache 24576 --short-read 8192 --exp concur9_logit_hash=1`, with KV left at fp16.
 3. Both sessions receive the same prompts in the same order, each as `GEN 256 temperature=0` followed by the ids.
@@ -206,10 +233,11 @@ decode has no CPU tier in either session. The peer-GPU flags of basalt's command
 **The one agent-set addition: `--short-read 8192`.** For chunks below 1,024 tokens, basalt's prompt path hands a
 measured share of the non-resident experts to the CPU, so a prompt read twice is not bit-reproducible
 (`precision.md:116-119`; `src/prefill/prefill.cpp:1868-1895`). With every expert resident, the only non-resident
-experts during a prompt are the coldest slots the prompt path borrows. Those have a RAM copy (the RAM tier below),
-which makes them CPU candidates (`src/prefill/prefill.cpp:1881`). With `--short-read` at least as long as the prompt,
+experts during a prompt are the coldest slots the prompt path borrows, and those with a RAM copy (the RAM tier below)
+are CPU candidates (`src/prefill/prefill.cpp:1881`). With `--short-read` at least as long as the prompt,
 every prompt is read through the verify windows instead (`src/program/generate.cpp:7739-7760`). No slots are lent,
-window rows do not depend on the window width, and both sessions start decoding from the same state.
+window rows do not depend on the window width, and both sessions start decoding from the same state. Of the three
+prompts only `struct.ids` exceeds the default 64.
 
 ### Per-kernel parity tests
 
@@ -222,13 +250,12 @@ line of the test's own source (`src/kernels/<test>.cpp`, or `tests/cuda/<test>.c
 |---|---|---|---|
 | `mmvq_multi_parity` | `native_mmvq`, T columns against T one-column calls; Q8_0 against a float64 dot | `if (exact && diff != 0) ++bad;` (`:215`); `const bool ok = diff == 0 && worst <= 1e-4 * (scale + 1e-30);` (`:461`) | decode |
 | `dense_tc_parity` | `dense_tc` and `dense_tc_pair`: each column of a T-column call against the 8-column call; RMS error against `native_mmvq` | `const bool ok = bits == 0 && nonfinite == 0 && rms < 1e-3;` (`:137`); `const bool k = bits == 0 && rms < 1e-3;` (`:201`) | decode |
-| `iq_parity` | dequantizers against gguf-py; `native_mmvq` for Q2_0, Q3_K, IQ4_XS and others, 1 to 8 columns | `const bool ok = dq_err < 1e-6 && mm_err < 2e-2 && multi_bad == 0;` (`:112`) | decode |
+| `iq_parity` | dequantizers against gguf-py (the Q3_K token embedding's gather shares them: `src/kernels/cuda/iq_kernels.cu:2217-2220`, `:2478-2483`); `native_mmvq` for Q2_0, Q3_K, IQ4_XS and others, 1 to 8 columns | `const bool ok = dq_err < 1e-6 && mm_err < 2e-2 && multi_bad == 0;` (`:112`) | decode |
 | `iq_multi_parity` | `native_expert_grouped` on Q2_0 gate/up and down at 2560/640; the q8_1 quantizers' overflow clamping | `const bool ok = diff == 0 && finite;` (`:329`); `bool near = path == 1 && gs == os && std::abs((int) gd - (int) od) <= 1;` (`:465`) | decode |
 | `native_grouped_parity` | `native_expert_grouped` across grid shapes and stale scratch, Q2_0 pairs at 2560/640 | `for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];` (`:234`); `if (written == 0) { std::printf("  nothing was written: the check checked nothing  FAIL\n"); ++bad; }` (`:246`) | decode |
-| `bf16_gemv_parity` | BF16 GEMVs against a double reference over the same bits | `if (!(rn <= 1e-5 && rw <= 1e-5 && rs <= 1e-5))` (`:116`) | decode |
-| `quantize_act_parity` | Q8_0 and Q8_K quantizers and fp16 conversion, byte for byte | `if (g_blocks[i] != r_blocks[i]) ++byte_bad;` (`:100`); `if (std::memcmp(&a, &b, sizeof(float)) != 0) ++val_bad;` (`:105`) | decode, CPU share |
-| `dequant_s2_parity` | the GPU Q2_0 dequantizer against the CPU's, bitwise | `if (std::memcmp(&cpu[i], &gpu[i], sizeof(float)) != 0) {` (`:98`) | prompt |
+| `quantize_act_parity` | the GPU Q8_0 and Q8_K quantizers and fp16 conversion, byte for byte; Q8_0 feeds the drafter's Q2_0 experts (`src/kernels/cuda/s2_expert_grouped.cu:597`) | `if (g_blocks[i] != r_blocks[i]) ++byte_bad;` (`:100`); `if (std::memcmp(&a, &b, sizeof(float)) != 0) ++val_bad;` (`:105`) | drafter |
 | `shared_expert_parity` | the shared expert, its BF16 scalar gate, the combine | `if (!(worst <= 1e-2)) {` (`:298`); `const bool correct = std::isfinite(rel) && rel < 2e-6 && visible > 1e-5 && refused_missing;` (`:372`); `if (!(rel_k <= 1e-6))` (`:462`) | decode |
+| `route_window_parity`, its projection half | the BF16 multi-row GEMV (`bf16_gemv_fp32_mmvf_cols`, which runs `bf16_gemv_fp32_mmvf_multi`) against per-row `bf16_gemv_fp32_mmvf` at 2560 to 256 and 2560 to 1, T = 2, 3, 4, 6. The engine runs that kernel for the indexer projections and the shared expert's gate (invariant 2) | `const bool same = std::memcmp(y1.data(), yn.data(), y1.size() * 4) == 0;` (`:48`) | decode |
 | `dec_gdn_parity` | the decode GDN kernel for T = 1 to 8 against the 8-token window; the window leaves the state untouched; segments against a double reference | `ok = ok && d == 0 && inv == 0 && st_ok;` (`:301`); `ok = ok && d == 0 && ec < 1e-4 && ey < 1e-3 && es < 1e-3;` (`:551`) | decode |
 | `dec_commit_parity` | the GDN commit across grid sizes and the indexer commit, byte for byte | `if (ra != rb) {` (`:177`); `if (qa != qb) {` (`:189`) | decode |
 | `gdn_parity` | the GDN step, conv and norms against transcriptions of the Python reference; wrong readings must differ | `if (!(rel_o <= 1e-5))` (`:200`); `if (!(rel_out <= 1e-6)) {` (`:297`); `if (!(rel <= 1e-6)) ++bad;` (`:339`); `if (!(rel > 0.05)) ++bad;` (`:143`) | decode |
@@ -237,7 +264,6 @@ line of the test's own source (`src/kernels/<test>.cpp`, or `tests/cuda/<test>.c
 | `gr_parity` | the hyper-connection read and write against a CPU reference; 8-token read against 8 single-token reads | `const bool ok = rm <= 1e-4 && ri <= 1e-4;` (`:566`, `:752`); `if (!same(multi, single)) {` (`:367`) | decode |
 | `hc_fused_parity` (not registered with ctest) | the fused hyper-connection read with the 512-expert router, on the int8 copies | `if (u0 != u1 \|\| u1 != u2) {` (`:306`); with `--tol`: `if (std::memcmp(&by_t[T][ot + i], &by_t[t_hi][oh + i], 4) != 0) ++bad;` (`:328`) | decode |
 | `ple_parity` | the n-gram hash vectors, the table reader, the n-gram block, the native key and value paths | `if (got[i] != hc.rows[i]) ++diff;` (`:324`); `if (last && !le(rel, 1e-2)) ++bad;` (`:782`); `const bool correct = le(rel, 2e-6) && nf == 0 && gt(separation, 1e-5);` (`:815`) | decode |
-| `ple_win_parity` | the n-gram window kernel for T = 1 to 8 and random segmentations, bitwise | `for (size_t i = 0; i < a.size(); ++i) c += std::memcmp(&a[i], &b[i], 4) != 0;` (`:40`); `fail += d0 + d1 + d2 != 0;` (`:109`) | decode |
 | `qsa_parity` | KV append and gather, indexer append, block scores, top-k, attention, gate, RoPE table | `require("  kv_gather is BIT-EXACT at page_size " + std::to_string(c.page_size), gm == 0,` (`:531`); `if (!(num / den <= 1e-5))` (`:1117`); `for (size_t i = 0; i < pa.size(); ++i) bad += std::memcmp(&pa[i], &pb[i], 4) != 0;` (`:1437`) | decode |
 | `qsa_scores_parity` | block scores and top-k, per row against per segment | `const bool ok = same && max_rel < 1e-5;` (`:123`) | decode |
 | `qsa_topk_parity` | the block top-k with continuous, tied and equal scores | `const bool ok = same_cont == nq && same_tied == nq && same_equal == nq;` (`:98`) | decode |
@@ -259,10 +285,10 @@ line of the test's own source (`src/kernels/<test>.cpp`, or `tests/cuda/<test>.c
 
 These basalt tests do not run on this pack's path:
 
-- `route_window_parity`: its batched router branch is skipped for 512 experts and top-10 with the native router
-  (`src/core/layer.cpp:354`).
+- The top-10 half of `route_window_parity` (`:51-67`): its batched router branch is skipped for 512 experts and
+  top-10 with the native router (`src/core/layer.cpp:354`).
 - `router_top10_parity`: the generic router for packs with other than 512 experts (`precision.md:87`). The 512-expert
-  router is checked inside `hc_fused_parity`.
+  native router runs only inside `hc_fused_parity` (see below).
 - `ple_q5_parity`, `q5_projection_parity`: a Q5_0 n-gram table and Q5_1 projections, neither in this pack.
 - `q6k_head_parity`, `q6k_vhead_parity`: a Q6_K head; this pack's head is Q5_K.
 - `kv_q8_parity`, `kv_q4_parity`, `kv_hybrid_parity`, `kv_stream_parity`: KV formats and KV streaming outside the
@@ -271,6 +297,12 @@ These basalt tests do not run on this pack's path:
 - `cvec_parity`: control vectors, which are off.
 - `s2_gemv_parity`, `s2_gemv_q8_parity`, `s_gemv_parity`, `s_gemv_q8k_parity`: older S-format GEMVs that the forced
   native path does not call.
+- `bf16_gemv_parity`: the GEMVs on BF16-rounded activations. With the native BF16 projections forced on, the engine
+  runs `bf16_gemv_fp32_mmvf` instead (`src/core/layer.cpp:84-90`).
+- `dequant_s2_parity`: the naive S2 decode kernel, which no engine path calls (`src/kernels/cuda/dequant_s2.cu:1`).
+- `ple_win_parity`: the n-gram window kernel runs only with a BF16 n-gram key (`src/core/verify.cpp:1058-1066`). This
+  pack's key is Q2_0 (`src/program/generate.cpp:2538-2554`), so each window row runs `ple_block`
+  (`src/core/verify.cpp:1105-1124`), which `ple_parity` covers.
 - `expert_parity`, `expert_multi_test`, `pool_test`: the older S2 AVX-512 CPU kernels, reached only for packs that are
   not native (`src/core/expert_source.cpp:1652-1653`).
 - `router_dot_parity`: an AVX1 BF16 dot product that is not on the expert path.
@@ -279,18 +311,32 @@ These basalt tests do not run on this pack's path:
   `prefill_mmq_kq_test`: formats this pack does not use.
 - `prefill_fused_moe_test`: the fused int8 prompt experts run only for a layout that is not native, and every layout
   is native (`src/kernels/cpu/expert_layout.cpp:145`). Q2_0 gate/up is not among the fused native kernels' formats
-  (`src/prefill/moe_fused_iq.cpp:933-936`), so this pack's prompt experts always run on llama.cpp's MMQ
+  (`src/prefill/moe_fused_iq.cu:933-936`), so this pack's prompt experts always run on llama.cpp's MMQ
   (`src/prefill/prefill.cpp:1716-1723`).
 - `dec_moe_parity`: the device-planned MoE tail, which is off when every expert is resident
   (`src/core/verify.cpp:313`).
 - `vision_cpu_parity`, `vision_cuda_parity`: vision is off.
 
-Two kernels on this pack's path have no basalt parity test. The CPU Q2_0 gate/up kernel (`q2_0_gguf_rows_multi`) is
-reached through the CPU share, and `prefill_cpu_share_test` uses Q2_0 only as a down type
-(`tests/cuda/prefill_cpu_share_test.cpp:392-395`). MMQ on Q2_0 is measured only as `prefill_fused_moe_test`'s
-yardstick. The port adds a test for each against a double-precision reference, with the bound of the nearest basalt
-test: `prefill_cpu_share_test`'s for the CPU kernel, and `const double lim_rms = outliers ? 3e-2 : 2e-2, lim_worst =
-outliers ? 0.15 : 0.1;` (`tests/cuda/prefill_mmq_kq_test.cpp:375`) for MMQ.
+Four kernels on this pack's path have no gated basalt parity test against a reference:
+
+- The CPU Q2_0 gate/up kernel (`q2_0_gguf_rows_multi`), reached through the CPU share. `prefill_cpu_share_test` uses
+  Q2_0 only as a down type (`tests/cuda/prefill_cpu_share_test.cpp:392-395`).
+- MMQ on Q2_0, the prompt path's experts, which basalt measures only as `prefill_fused_moe_test`'s yardstick.
+- `native_mmvq` on Q5_0, the shared-expert down projection of seven layers (`src/kernels/cuda/shared_expert.cu:195`;
+  `src/kernels/cuda/native_mmvq.cu:1897`). `mmvq_multi_parity` covers Q4_0, Q8_0, Q4_K, Q5_K, Q6_K and IQ4_XS
+  (`src/kernels/mmvq_multi_parity.cpp:69-77`), and `iq_parity` the i-quants, Q2_0 and Q3_K
+  (`src/kernels/iq_parity.cpp:29`).
+- The native 512-expert router's softmax and top-10 (`src/kernels/cuda/native_router.cu:46-100`). `hc_fused_parity`,
+  the only test that runs it, takes it as its own reference (`src/kernels/hc_fused_parity.cpp:185-187`), so its
+  picks are checked for repeatability and window invariance only.
+
+The port adds a test for each, against a double-precision reference with the bound of the nearest basalt test:
+`prefill_cpu_share_test`'s for the CPU kernel; `const double lim_rms = outliers ? 3e-2 : 2e-2, lim_worst = outliers ?
+0.15 : 0.1;` (`tests/cuda/prefill_mmq_kq_test.cpp:375`) for MMQ; `mmvq_multi_parity`'s Q8_0 rule, `const bool ok =
+diff == 0 && worst <= 1e-4 * (scale + 1e-30);` (`src/kernels/mmvq_multi_parity.cpp:461`), for Q5_0; and
+`router_top10_parity`'s for the router, ids exact (`if (h_ids[i] != r_ids[i]) ++id_bad;`,
+`src/kernels/router_top10_parity.cpp:86`) and weights within `1e-5` (`:90`, `:129`). The ported
+`route_window_parity` also runs the shapes this path uses, 2560 to 128 and 2560 to 512.
 
 ## Memory budget on this Mac
 
@@ -307,10 +353,13 @@ are the experts of the cache slots the prompt path may borrow, as far as RAM all
 Linux's MemAvailable. The port reads the GPU figure as `recommendedMaxWorkingSetSize - currentAllocatedSize` and the
 RAM figure as macOS's available memory. Every GPU buffer and every host allocation come out of the same 48 GiB.
 
-**Context.** 8192 cells, the identity check's `--max-context`, which also covers the quality gate's 4096. The verify
-buffers are sized for 8 rows (`kVerifyMaxT`, `include/basalt/kernels/verify_kernels.hpp:21`). KV, indexer keys and the
-RoPE table cost 26,384 bytes per cell over the 12 attention layers at fp16, and the drafter's own KV costs 2,177 bytes
-per cell; basalt rounds the sum to "29 KB per token" (`include/basalt/kernels/kv_q8.hpp:3-4`).
+**Session.** The tables below are for the identity check's `--spec 7` session, the largest of the acceptance
+sessions: 8192 cells, which also covers the quality gate's 4096, and verify buffers for 8 rows (`--spec 7` with the
+lookup's eighth row, `src/program/generate.cpp:1868-1874`; `kVerifyMaxT`,
+`include/basalt/kernels/verify_kernels.hpp:21`). Each cell costs 26,380 bytes over the 12 attention layers at fp16:
+per layer 2,048 of K and V, 128 of pooled indexer keys and 1 of page table, plus one 256-byte RoPE row; the drafter's
+own K/V costs 2,177 more (`src/core/layer.cpp:498-533`). Basalt's own figure is about 29 KB per token
+(`include/basalt/kernels/kv_q8.hpp:3-4`).
 
 **Labels.** *Exact*: the pack's tables put through basalt's allocation code. *Estimate*: a small buffer counted
 approximately. *Allowance*: a constant basalt reserves rather than allocates. *[H]*: a CUDA figure assumed to carry
@@ -322,54 +371,57 @@ over to Metal.
 |---|---:|---|---|
 | Dense pool: routers, norms, BF16 projections, inject matrices | 214,208,000 | exact | `dense.index` rows less the natively served, head, embedding and hyper-connection down/up rows, 64-byte aligned (`src/program/generate.cpp:2200-2248`; `src/core/weights.cpp:98-127`) |
 | int8 hyper-connection copies | 691,527,680 | exact | 96 down, 96 up, 96 inject and 2 output matrices, each `rows * cols + rows * srow * 2` with `srow = (cols / 32 + 7) & ~7` (`src/kernels/cuda/hc_fused.cu:1210-1216`; `src/core/verify.cpp:566-581`) |
-| Native projections | 1,443,058,432 | exact | every attention, GDN and shared-expert matrix and the Q2_0 n-gram key, GGUF bytes as shipped (`src/core/native_dense.cpp:26-38`, `:66-92`) |
+| Native projections | 1,443,058,432 | exact | every attention, GDN and shared-expert matrix and the Q2_0 n-gram key, GGUF bytes as shipped, and a 6,912-byte q8_1 scratch (`src/core/native_dense.cpp:26-38`, `:213-233`) |
 | Output head, Q5_K | 437,043,200 | exact | no two-stage copy for a Q5_K head (`src/core/native_head.cpp:23-40`) |
 | Token embedding, Q3_K | 273,152,000 | exact | mapped host memory in basalt; the GPU reads it, so on Metal it is a working-set buffer (`src/core/native_head.cpp:174-200`) |
-| MTP drafter | 833,647,616 | exact; buffers estimated | dense weights without the hyper-connection matrices 76,777,472; 512 Q2_0 experts 707,788,800; int8 copies 21,345,280; KV 17,837,568; buffers 9,898,496 (`src/core/mtp.cpp:220-234`, `:298-327`, `:333-401`, `:403-453`, `:488-503`) |
-| Session at 8192 cells | 343,227,392 | exact; layer buffers estimated | 36 GDN states 117,669,888; 12 attention states with indexer keys and RoPE table 216,147,968 (`src/core/session.cpp:56-75`; `src/core/layer.cpp:515-533`) |
-| Logits and small buffers | 1,058,816 | estimate | |
-| **Allocated before the cache** | **4,236,923,136** | | |
-| Reserve kept free (`--vram-reserve-mib 700`) | 734,003,200 | allowance [H] | `src/program/generate.cpp:476`, `:3339` |
+| MTP drafter | 831,970,992 | exact | dense weights without the hyper-connection matrices 76,777,472; 512 Q2_0 experts 707,788,800; int8 copies 21,345,280; K/V 17,837,520; buffers 8,219,648 and mapped staging 2,272 (`src/core/mtp.cpp:220-234`, `:298-327`, `:333-401`, `:403-453`, `:488-503`) |
+| Session at 8192 cells | 343,102,976 | exact | 36 GDN states 117,669,888; 12 attention states with indexer keys and one RoPE table 216,147,392; per-layer buffers 9,285,696 (`src/core/session.cpp:56-75`; `src/core/layer.cpp:147-179`, `:297-315`, `:515-533`, `:796-808`, `:1153-1165`) |
+| Logits and small buffers | 1,372,912 | estimate | logits 993,280 (`src/program/generate.cpp:3194`), n-gram scratch 264,112 and embedding row 10,240 (`:2581-2582`), expert parts 102,400 (`:2630`), head q8_1 scratch 2,880 (`src/core/native_head.cpp:75`); kernels' own scratch, such as the fused hyper-connection read's (`src/kernels/cuda/hc_fused.cu:1150-1152`), not counted |
+| **Allocated before the cache** | **4,235,436,192** | | |
+| Reserve kept free (`--vram-reserve-mib 700`) | 734,003,200 | allowance [H] | for the graphs, the hit scratch and other small tables (`src/program/generate.cpp:474-476`, `:3339`) |
 | Draft head, bound after the cache | 229,259,012 | exact | logits for 8 rows 7,946,240; 106,811 gathered head rows 187,987,360; 2-bit copy of the 41,037 leading rows and its scratch 32,896,120; id maps 429,292 (`src/core/mtp.cpp:524-549`) |
 | Verify windows and the deferred checkpoint copy | 218,333,184 | allowance [H] | 96 MiB of windows and one GDN state, 117,669,888 (`src/program/generate.cpp:2841`, `:3313-3319`) |
-| **Expert cache** | **33,973,862,400** | exact | `min(24576, (40,200,896,512 - 4,236,923,136 - 1,181,595,396) / 1,382,400)` = 24,576 slots: every expert (`src/program/generate.cpp:3299-3343`) |
-| Allocated after the cache | 419,223,404 | exact | verifier arena 71,303,936 and staging 990,568 (`src/core/verify.cpp:733-816`), the draft head 229,259,012 and the deferred GDN copy 117,669,888, all out of the reserve terms above |
-| **Used at READY** | **38,630,008,940** | | 35.98 of 37.44 GiB |
-| Left | 1,570,887,572 | | includes the 700 MiB reserve |
+| **Expert cache** | **33,973,862,400** | exact | `min(24576, (40,200,896,512 - 4,235,436,192 - 1,181,595,396) / 1,382,400)` = 24,576 slots: every expert (`src/program/generate.cpp:3299-3343`) |
+| Allocated after the cache | 417,798,252 | exact | verifier arena 69,878,784 and mapped staging 990,568 (`src/core/verify.cpp:733-821`), the draft head 229,259,012 and the deferred GDN copy 117,669,888, all out of the reserve terms above |
+| **Used at READY** | **38,627,096,844** | | 35.97 of 37.44 GiB |
+| Left | 1,573,799,668 | | includes the 700 MiB reserve |
+
+Loading also stages the BF16 hyper-connection down and up matrices, 1,271,398,400 bytes, to quantize their copies,
+and frees them before the cache is sized (`src/program/generate.cpp:2334-2358`).
 
 ### RAM
 
 | Allocation | Bytes | Label | Basis |
 |---|---:|---|---|
-| GPU buffers allocated before the RAM copy is sized | 38,210,785,536 | exact | the table above, through the expert cache |
+| GPU buffers allocated before the RAM copy is sized | 38,209,298,592 | exact | the table above, through the expert cache |
 | n-gram row cache and reader slab | 100,794,368 | exact | 1,048,576 rows of 90 bytes in 8-way sets with 4-byte keys, and 256 two-page read slots (`src/ngram/ple_reader.cpp:35-50`, `:350`; `src/program/generate.cpp:369-370`) |
 | n-gram table | 0 | design | the 28,800,138,240-byte table stays on the SSD and is read unbuffered (`--ple-io direct`, `src/program/generate.cpp:368`; `include/basalt/platform/direct_file.hpp:3-5`) |
-| Engine memory taken after the copy | 2,147,483,648 | allowance | `kLateHostBytes` (`include/basalt/platform/memory.hpp:33-35`). On this Mac it also holds the 419,223,404 bytes of GPU buffers allocated after the cache |
+| Engine memory taken after the copy | 2,147,483,648 | allowance | `kLateHostBytes` (`include/basalt/platform/memory.hpp:33-35`). On this Mac it also holds the 417,798,252 bytes of GPU buffers allocated after the cache |
 | Serving growth | 1,094,877,520 | exact; one allowance | 7 conversation checkpoints of 118,063,152 bytes (`--prompt-cache 6` plus one) and one request's 256 MiB (`src/program/generate.cpp:1175-1192`; `src/core/conversation_state.cpp:106-128`) |
 | RAM margin | 2,576,980,377 | allowance | the larger of 2 GiB and 5 % of the RAM (`src/platform/memory.cpp:51-53`) |
 | File-cache floor for the OS | 0 | rule | kept only while an expert is read from the file, then 5,173,673,984: the larger of 4 GiB and 3.5 GiB plus two layers' experts (`include/basalt/platform/memory.hpp:41-62`; `src/program/generate.cpp:4665-4691`). Here every expert has a GPU slot |
-| **Subtotal** | **44,130,921,449** | | 41.10 GiB |
-| **Left for macOS, other processes and the RAM tier** | **7,408,686,103** | | 6.90 GiB |
+| **Subtotal** | **44,129,434,505** | | 41.10 GiB |
+| **Left for macOS, other processes and the RAM tier** | **7,410,173,047** | | 6.90 GiB |
 
 **The RAM tier.** Basalt's resident copy holds the complement (the experts no GPU slot holds), which is empty here.
 What remains is the lend region: the experts of the slots the prompt path may borrow, copied from the last slot
 downward while they fit (`src/core/expert_source.cpp:138-158`, `:728-744`). The planned loan is for the largest
 `--prefill auto` chunk, 8192 tokens (`src/program/generate.cpp:4553-4591`): `Prefill::bytes_needed(8192)` is
-3,732,376,064 bytes, or 2,700 slots (`src/prefill/prefill.cpp:1141-1177`). The copy keeps 5,819,341,545 bytes free
+3,732,376,320 bytes, or 2,700 slots (`src/prefill/prefill.cpp:1141-1177`). The copy keeps 5,819,341,545 bytes free
 (the margin, `kLateHostBytes` and the serving growth; `src/program/generate.cpp:4660-4662`). The RAM tier is
-therefore `min(3,732,480,000, 7,408,686,103 - macOS and other processes)`, in whole 1,382,400-byte blobs:
+therefore `min(3,732,480,000, 7,410,173,047 - macOS and other processes)`, in whole 1,382,400-byte blobs:
 
 | macOS and other processes | RAM tier |
 |---|---|
 | 3 GiB | 3,732,480,000 bytes, the whole loan (2,700 slots) |
-| 4 GiB | 3,113,164,800 bytes (2,252 slots) |
-| 5 GiB | 2,039,040,000 bytes (1,475 slots) |
-| 6 GiB | 964,915,200 bytes (698 slots) |
+| 4 GiB | 3,114,547,200 bytes (2,253 slots) |
+| 5 GiB | 2,040,422,400 bytes (1,476 slots) |
+| 6 GiB | 967,680,000 bytes (700 slots) |
 | 6.90 GiB or more | 0 |
 
 How much macOS and other processes take on this Mac has not been measured [H]. A lent slot whose expert the RAM tier
 lacks is refilled from the file after the prompt (`src/core/expert_source.cpp:947-951`); the quality gate's 256-token
-prompts borrow only the last 191 slots (262,852,096 bytes), which the RAM tier holds first. Basalt also sets aside
+prompts borrow only the last 191 slots (262,852,352 bytes), which the RAM tier holds first. Basalt also sets aside
 spare places for adaptive swaps, 96 blobs or 132,710,400 bytes (`src/core/expert_source.cpp:711-726`), only when
 adaptation is on. Both acceptance runs pin it off, and with every expert resident no swap would have a candidate.
 
@@ -379,25 +431,31 @@ adaptation is on. Both acceptance runs pin it off, and with every expert residen
   zero-doorbell window, planned on the device with no host service and no CPU tier (`src/core/verify.cpp:876-882`),
   and the device-planned MoE tail is off (`src/core/verify.cpp:313`).
 - **RAM tier: 0 to 3,732,480,000 bytes**, set by what macOS leaves when the copy is built.
-- At 4096 cells (the quality gate) the working set is 38,511,274,092 bytes and the room for macOS and the RAM tier
-  7,527,388,183 bytes.
-- A context backed in full at startup keeps every expert GPU-resident up to about 36,000 cells of fp16 KV; past that,
-  basalt's own sizing hands the coldest experts to the CPU tier. A server whose `--max-context` exceeds 32,768 cells
-  backs only 32,768 at startup (elastic KV) and lends the cache's last slots to the KV cache when a request needs more
-  cells; those slots' experts then run on the CPU tier from their RAM copies (`src/program/generate.cpp:2970-2977`,
-  `:6291-6324`).
+- Every acceptance session holds every expert:
+
+  | Session | Working set at READY | Left of the working set | Room for macOS and the RAM tier |
+  |---|---:|---:|---:|
+  | Identity, `--spec 7`, 8192 cells (the tables above) | 38,627,096,844 | 1,573,799,668 | 7,410,173,047 |
+  | Identity, `--spec 0`, 8192 cells: no drafter, verify buffers for 2 rows | 37,529,321,424 | 2,671,575,088 | 8,242,144,039 |
+  | Quality gate, `--spec 5`, 4096 cells: verify buffers for 7 rows | 38,500,684,212 | 1,700,212,300 | 7,529,473,635 |
+
+- Longer contexts: each cell backed at startup costs about 28,980 bytes of the working set (the 26,380 above, the
+  drafter's 2,177 and its per-cell scratch), so the 810,002,524 bytes of slack at 8192 cells keep every expert
+  GPU-resident up to about 36,000 backed cells. A server backs at most 32,768 cells at startup (elastic KV,
+  `src/program/generate.cpp:2970-2977`); a request that needs more borrows the cache's last slots for its K/V, and
+  those slots' experts then run on the CPU tier from their RAM copies (`src/program/generate.cpp:6291-6324`).
 
 ### Constraints for the Metal port
 
 1. **The cache needs at least two buffers.** At 33,973,862,400 bytes it exceeds `maxBufferLength` (30,150,672,384).
    Basalt's segmented arena (`src/core/expert_cache.cpp:146-264`) is the precedent; slot addressing must survive the
    split.
-2. **The RAM tier stays outside Metal buffers.** As a Metal buffer it would count against the working set: 38.6 GB in
-   use plus a 3.7 GB tier exceeds 40.2 GB. The prompt path copies a lent expert into GPU memory the way basalt's
+2. **The RAM tier stays outside Metal buffers.** As a Metal buffer it would count against the working set [H]: 38.6 GB
+   in use plus a 3.7 GB tier exceeds 40.2 GB. The prompt path copies a lent expert into GPU memory the way basalt's
    `Stager` copies blobs that are not pinned (`src/prefill/prefill.cpp:121-271`).
 3. **Basalt's CUDA allowances need measuring on Metal [H].** These are the 700 MiB reserve, the 96 MiB window
    allowance and the host-mapping probe (`src/program/generate.cpp:3321-3338`), which costs nothing on unified memory.
-   The 1,570,887,572 bytes left in the working set must absorb Metal's own allocations (pipelines, command buffers);
+   The 1,573,799,668 bytes left in the working set must absorb Metal's own allocations (pipelines, command buffers);
    measure them at the first load.
 4. **Available RAM needs a macOS reading [H].** MemAvailable has no macOS equivalent, and the port's reading of
    available memory decides the RAM tier.
