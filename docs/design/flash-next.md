@@ -47,7 +47,7 @@ current code wherever the two differ. Paths under `runtime/` are this repository
 | Greedy pick | fp32 argmax; the lowest index wins a tie | `src/kernels/cuda/sampler.cu:88-90` |
 | Sampling | Philox, counter-based on (seed, absolute position) | `include/basalt/kernels/sampler.hpp:25`; `src/core/verify.cpp:2652-2654` |
 | Weights | the GGUF blocks as shipped. Two copies are requantized: the int8 hyper-connection copies, and the drafter's 2-bit copy of its draft head's leading rows, which scores drafts only | `precision.md:17-18`, `:49`; `src/core/mtp.cpp:532-539` |
-| CPU expert tier (decode misses, the prompt path's CPU share) | For this pack's Q2_0 experts: the fp32 FFN input, and the fp32 SwiGLU before down, quantized per 32 values to int8 with an fp32 scale `amax / 127`, codes `trunc(x * (1 / scale) ± 0.5)` clamped to ±127; products on `q2_0_gguf_rows_multi`. The GPU's q8_1 has an fp16 scale, so the two tiers round differently. The AVX-512 kernel and its AVX2 fallback sum in different orders; the port transcribes the AVX-512 one, which basalt runs wherever AVX-512 is present (agent-set) | `src/kernels/cpu/expert.cpp:336-398`, `:503-556`; `src/kernels/cpu/expert_layout.cpp:124-133`; `src/core/expert_source.cpp:1592-1593`; `src/kernels/cpu/pool.cpp:423-444`, `:559`; `src/kernels/cpu/q2_avx2.cpp:37-62` |
+| CPU expert tier (decode misses, the prompt path's CPU share) | For this pack's Q2_0 experts: the fp32 FFN input, and the fp32 SwiGLU before down, quantized per 32 values to int8 with an fp32 scale `amax / 127` (0 for an all-zero block, whose inverse scale is 0 as well: `src/kernels/cpu/expert.cpp:353-354`), codes `trunc(x * (1 / scale) ± 0.5)` clamped to ±127; products on `q2_0_gguf_rows_multi`. The GPU's q8_1 has an fp16 scale, so the two tiers round differently. The AVX-512 kernel and its AVX2 fallback sum in different orders; the port transcribes the AVX-512 one, which basalt runs wherever AVX-512 is present (agent-set) | `src/kernels/cpu/expert.cpp:336-398`, `:503-556`; `src/kernels/cpu/expert_layout.cpp:124-133`; `src/core/expert_source.cpp:1592-1593`; `src/kernels/cpu/pool.cpp:423-444`, `:559`; `src/kernels/cpu/q2_avx2.cpp:37-62` |
 | Prompt path | a different computation (fp16/BF16 GEMMs, llama.cpp MMQ for the routed experts, fp16 hi/lo attention, 3xTF32 indexer scores) that writes the same KV and state formats. Quality is scored through decode | `precision.md:23-24`, `:94-108` |
 | MTP drafter | Q8_0 and BF16 dense weights, Q2_0 experts. Its precision changes drafts, never output | `precision.md:47-52` |
 | Compiler arithmetic | The kernels adapted from llama.cpp's arithmetic (`native_*.cu`, `qsa_dec_fused.cu`, `q5k_head.cu`, `q6k_head.cu`) and the prompt path's MMQ build with `--use_fast_math`: approximate `expf`, division and square root, denormals flushed. Every other kernel builds with nvcc's IEEE defaults, which still contract a multiply and an add into an FMA. Several of those IEEE-built kernels write approximate or flush-to-zero operations by hand, most of them to give a fast-math kernel's bits (the list below) | `CMakeLists.txt:185-202`, `:728`; `src/kernels/cuda/hc_fused.cu:1-5`; `src/kernels/cuda/dec_gdn_rec.cu:4-5` |
@@ -217,12 +217,13 @@ as follows.
    (`src/program/bench_main.cpp:900-912`, `:1066-1076`). Serving refuses to start without `--prefill`
    (`src/program/generate.cpp:4805-4810`) and the bench does not set it, so the contract adds `--prefill auto`, the
    value of basalt's sample configuration and of its reproduction command (`README.md:92`; `precision.md:418`). The
-   expert cache stays on auto. On this Mac auto resolves to every expert only while other processes hold at most
-   930,296,392 bytes of GPU memory (see the memory budget). The run records IOAccelerator's "In use system memory"
-   before it starts, and stops unless the engine's `INFO` line reports `expert_slots=24576`
-   (`src/program/generate.cpp:5965-5984`). If closing programs that use the GPU does not bring other processes under
-   the ceiling, the agent-set fallback keeps auto and records the slot count instead, which puts the remaining experts
-   on the CPU tier as auto sizing does on any GPU that holds fewer. KV stays fp16.
+   expert cache stays on auto, as `basalt-bench` leaves it. On this Mac auto resolves to every expert only while other
+   processes hold at most 930,296,392 bytes of GPU memory (see the memory budget); above that, auto puts the remaining
+   experts on the CPU tier, as it does on any GPU that holds fewer. Basalt's own gate ran on its default placement,
+   with about 0.8% of routed experts computed on the CPU for its IQ3_XXS pack (`precision.md:229-231`), so the gate
+   is valid at any slot count. The run records IOAccelerator's "In use system memory" before it starts and the
+   `expert_slots` count of the engine's `INFO` line (`src/program/generate.cpp:5965-5984`). Closing programs that use
+   the GPU first, so that every expert sits on the GPU tier, is preferred (agent-set). KV stays fp16.
 4. **Per chunk k.** The request is `GEN 255 ppl=k ppl_t=3` followed by the chunk's first 257 tokens
    (`src/program/bench_main.cpp:1086-1093`; T = 3 is the bench default, `:391`). The engine checks the prompt against
    the base's chunk (`include/basalt/program/ppl_gate.hpp:40-54`) and forces greedy decoding
