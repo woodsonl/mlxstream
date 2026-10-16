@@ -53,8 +53,8 @@ current code wherever the two differ. Paths under `runtime/` are this repository
 | Compiler arithmetic | The kernels adapted from llama.cpp's arithmetic (`native_*.cu`, `qsa_dec_fused.cu`, `q5k_head.cu`, `q6k_head.cu`) and the prompt path's MMQ build with `--use_fast_math`: approximate `expf`, division and square root, denormals flushed. Every other kernel builds with nvcc's IEEE defaults, which still contract a multiply and an add into an FMA. Several of those IEEE-built kernels write approximate or flush-to-zero operations by hand, most of them to give a fast-math kernel's bits (the list below) | `CMakeLists.txt:185-202`, `:728`; `src/kernels/cuda/hc_fused.cu:1-5`; `src/kernels/cuda/dec_gdn_rec.cu:4-5` |
 
 **Approximate operations in IEEE-built kernels.** These decode and drafter kernels compute some operations with
-approximate or flush-to-zero instructions although their files build without `--use_fast_math`, and one calls a CUDA
-math library function that is not correctly rounded (`log1pf`):
+approximate or flush-to-zero instructions although their files build without `--use_fast_math`, and two of them call
+CUDA math library functions that are not correctly rounded (`log1pf`, and the library `expf`):
 
 - `src/kernels/cuda/hc_fused.cu`, the fused hyper-connection read (decode and drafter): the router's GEMV and top-10
   as the fast-math build's flush-to-zero PTX, `fma`, `add`, `sub`, `mul` and `max` with `.ftz`, `ex2.approx.ftz.f32`
@@ -75,6 +75,11 @@ math library function that is not correctly rounded (`log1pf`):
   `__expf` (`src/kernels/cuda/s2_expert_grouped.cu:170`).
 - `src/kernels/cuda/sampler.cu:311`: `__expf` in the probability of the drafter's greedy pick
   (`src/core/mtp.cpp:1036`).
+- `src/kernels/cuda/hc8_gr.cu`, the 8-bit hyper-connection read the drafter's prompt catch-up runs once per verify
+  window: `MtpDrafter::prefill_cur` (`src/core/mtp.cpp:1393-1402`) records the forward without the fused read, which
+  calls `gr_read` or `fused_gr_read_multi` (`:819-823`), and both run `hc8_gr_read_multi` because `hc8_enabled()` is
+  always true (`src/kernels/cuda/hc_fused.cu:1248`). It computes `rsqrtf` in the norm (`:78`) and the library `expf`
+  in the SiLU (`:165`) and the sigmoid (`:233`).
 
 The prompt path's own kernels, `src/prefill/kernels.cu`, build the same way (`CMakeLists.txt:285`) and write `__expf`,
 `rsqrtf` and `log1pf` too (for example `src/prefill/kernels.cu:39`, `:74`, `:214`); the prompt path's port lists the
@@ -109,8 +114,9 @@ ones this pack runs.
    IEEE-built kernel writes it (the list above), maps to the `metal::fast::` function of the same operation:
    `fast::exp2` of the product with log2(e) that `__expf` or basalt's PTX forms, `fast::divide` for an approximate
    division or reciprocal (MSL has no `fast::recip`), `fast::rsqrt` for `rsqrtf` (Table 8.2). MSL has no `log1p`, so
-   `log1pf` gets a helper of its own. One helper serves each operation at every site, so kernels that basalt checks
-   bitwise against each other (`hc_fused_parity`, `qsa_dec_attn_parity`, `dec_gdn_parity`) stay bitwise equal on
+   `log1pf` gets a helper of its own, and the library `expf` maps to `metal::precise::exp` (agent-set). One helper
+   serves each operation at every site, so kernels that basalt checks bitwise against each other
+   (`qsa_dec_attn_parity`, `dec_gdn_parity`, and `hc_fused_parity`'s window checks) stay bitwise equal on
    Metal. MSL leaves subnormals and the rounding mode to the GPU: subnormal inputs and results "may be flushed to
    zero" (section 8.1), and round to nearest even or toward zero "may be supported" (section 8.2). Whether Apple family
    9 flushes subnormals under `MTLMathModeSafe`, as basalt's `.ftz` instructions do, and rounds to nearest even, as
@@ -313,8 +319,10 @@ The port carries over each of these basalt tests and passes it with basalt's cri
 last column says where the kernel runs for this pack: **decode** (the verify window), **prompt** (the batched prompt
 path), **drafter**, or **CPU share** (the prompt path's CPU experts). Unless another file is named, a bare `:N` is a
 line of the test's own source (`src/kernels/<test>.cpp`, or `tests/cuda/<test>.cpp` for the `prefill_*` tests). The
-criterion column quotes the gating lines of the listed checks. A test's other gates carry over with it: non-finite
-outputs counted as failures, negative controls that must find a difference, launch counters that must move.
+criterion column quotes each listed check's main gating lines. Every other gate of each test carries over with it
+unchanged, for example non-finite outputs counted as failures, negative controls that must find a difference, launch
+counters that must move, repeats that must be bitwise identical (`qsa_dec_attn_parity.cpp:292-295`), and
+`ple_parity`'s table-reader, key-row and host-reference checks (`ple_parity.cpp:491`, `:636`, `:1119`).
 
 | Test | What it checks | Pass criterion | Q2_0 path |
 |---|---|---|---|
@@ -329,9 +337,8 @@ outputs counted as failures, negative controls that must find a difference, laun
 | `dec_gdn_parity` | the decode GDN kernel for T = 1 to 8 against the 8-token window; the window leaves the state untouched; segments against a double reference | `ok = ok && d == 0 && inv == 0 && st_ok;` (`:301`); `ok = ok && d == 0 && ec < 1e-4 && ey < 1e-3 && es < 1e-3;` (`:551`) | decode |
 | `dec_commit_parity` | the GDN commit across grid sizes and the indexer commit, byte for byte | `if (ra != rb) {` (`:177`); `if (qa != qb) {` (`:189`) | decode |
 | `gdn_rec_parity` | the prompt path's GDN recurrence kernels | `const bool ok = std::isfinite(co.rms) && std::isfinite(cs.rms) && co.rms < 1e-5 && co.worst < 1e-4 &&` / `cs.rms < 1e-5 && cs.worst < 1e-4;` (`src/prefill/gdn_rec_parity.cu:585-586`) | prompt |
-| `hc8_parity` | the read on the int8 hyper-connection copies against the BF16 matrices and the dequantized copies; token-count and column independence; the prompt path's product on a copy against BF16 and the copy in double | `expect(e[1][k].rel() < 2e-3, "the 8-bit read against the dequantized copy");` (`:173`); `expect(e[0][k].rel() < 5e-2, "the 8-bit read against bf16");` (`:174`); `expect(same, "token count / column independence");` (`:190`); `expect(ex.rel() < 5e-3, "the product against the copy in double");` (`:269`); `expect(eb.rel() < 5e-2, "the product against bf16");` (`:270`); `const bool sliced = es.rel() < 1e-5;` (`:266`) | decode, prompt |
-| `gr_parity` | the hyper-connection read and write against a CPU reference; 8-token read against 8 single-token reads | `const bool ok = rm <= 1e-4 && ri <= 1e-4;` (`:566`, `:752`); `const bool plain = worst_plain < 1e-6;` (`:645`); `const bool streams_ok = worst_stream < 1e-6;` (`:689`); `if (!same(multi, single)) {` (`:367`) | decode |
-| `hc_fused_parity` (not registered with ctest) | the fused hyper-connection read with the 512-expert router, on the int8 copies: bitwise against `fused_gr_read_multi`, the MMVF router GEMV and `native_router_top10_multi`, and against its own repeats; with `--tol`, each token against the widest window | `if (u0 != u1 \|\| u1 != u2) {` (`:306`); with `--tol`: `if (std::memcmp(&by_t[T][ot + i], &by_t[t_hi][oh + i], 4) != 0) ++bad;` (`:328`) | decode, drafter |
+| `hc8_parity` | `hc8_gr_read_multi`, the read on the int8 hyper-connection copies that the drafter's prompt catch-up runs, against the BF16 matrices and the dequantized copies; token-count and column independence; `Gemm::bf16_w`, the prompt path's product on a copy, against BF16 and the copy in double (`src/kernels/hc8_parity.cpp:1-10`) | `expect(e[1][k].rel() < 2e-3, "the 8-bit read against the dequantized copy");` (`:173`); `expect(e[0][k].rel() < 5e-2, "the 8-bit read against bf16");` (`:174`); `expect(same, "token count / column independence");` (`:190`); `expect(ex.rel() < 5e-3, "the product against the copy in double");` (`:269`); `expect(eb.rel() < 5e-2, "the product against bf16");` (`:270`); `const bool sliced = es.rel() < 1e-5;` (`:266`) | drafter, prompt |
+| `hc_fused_parity` (not registered with ctest) | the fused hyper-connection read with the 512-expert router, on the int8 copies, run with `--tol` as its header requires for the 8-bit path (`:1-4`, `:236`): its comparison with `fused_gr_read_multi` (which runs `hc8_gr_read_multi`), the MMVF router GEMV and `native_router_top10_multi` is printed, not gated (`:262-296`); gated are each token against the widest window and the widest window with its tokens reversed | `if (std::memcmp(&by_t[T][ot + i], &by_t[t_hi][oh + i], 4) != 0) ++bad;` (`:328`); `badc += std::memcmp(&vr[off + (size_t) (TH - 1 - k) * per[pt]], &by_t[TH][off + (size_t) k * per[pt]],` (`:356`), `failures += badc ? 1 : 0;` (`:361`) | decode, drafter |
 | `ple_parity` | the n-gram hash vectors, the table reader, the n-gram block, the native key and value paths | `if (got[i] != hc.rows[i]) ++diff;` (`:324`); `if (last && !le(rel, 1e-2)) ++bad;` (`:782`); `const bool correct = le(rel, 2e-6) && nf == 0 && gt(separation, 1e-5);` (`:815`) | decode |
 | `qsa_parity` | the fp16 KV append (`kv_append`, which runs `kv_append_step`: `src/kernels/cuda/qsa.cu:714-718`) through a reversed page table, bit for bit; the native indexer append one cell at a time against the prompt path's batched append, bitwise. Its other checks run kernels this path does not: `kv_gather`, the table indexer (`indexer_key_append`, `qsa_index`, `topk_512`), `qsa_attend` and the fp16 `qsa_gate_apply` | `require("kv_append at page_size " + std::to_string(c.page_size) + ": the pool is BIT-EXACT",` (`:504`); `for (size_t i = 0; i < pa.size(); ++i) bad += std::memcmp(&pa[i], &pb[i], 4) != 0;` (`:1437`) | decode |
 | `qsa_scores_parity` | block scores and top-k, per row against per segment | `const bool ok = same && max_rel < 1e-5;` (`:123`) | decode |
@@ -361,6 +368,12 @@ These basalt tests do not run on this pack's path:
   `gdn_out_norm`), which only the single-token layer calls (`src/core/layer.cpp:218-287`), through `block_layer` and
   `session_token`, which nothing in `src/program/` calls. The verify window runs `dec_gdn_rec`
   (`src/core/verify.cpp:1205-1297`), which `dec_gdn_parity` checks against a double reference.
+- `gr_parity`: its read checks (`:367`, `:566`, `:752`) run `gr_read` and `fused_gr_read` on BF16 matrices without
+  an 8-bit copy, and this pack always reads through the copies (`src/kernels/cuda/hc_fused.cu:1248`). Its write
+  checks (`:645`, `:689`) run `gr_write_kernel`, because `native_mmvf` defaults to false
+  (`src/kernels/cuda/gr.cu:43`) and the test switches modes only at its end (`:763`). Decode folds the write into
+  `hc_fused` or runs `native_gr_post` (`src/kernels/cuda/gr.cu:394-395`, with `gr_native_mmvf` forced at
+  `src/program/generate.cpp:1890`, `:2383`); both are in the table of kernels without a reference test below.
 - `elementwise_parity`: `gdn_gate`, `silu_inplace`, `rms_norm_weighted`, the S-form `embedding_gather` and
   `f32_to_bf16_bulk`. Under the forced native flags neither verify nor the drafter calls them
   (`src/core/verify.cpp:1341-1342`, `:1715-1717`; `src/core/mtp.cpp:946`), and the Q3_K embedding runs
@@ -412,7 +425,9 @@ same rule holds for any other ported kernel whose basalt tests end in a comparis
 | `native_mmvq` on Q4_0, Q4_K, Q5_0, Q5_K and Q6_K: the shared experts' matrices (`src/kernels/cuda/shared_expert.cu:186-195`) and the attention's K and V projections, which `dense_tc_mask()` leaves on `native_mmvq` (`src/kernels/cuda/dense_tc.cu:1155`; `src/core/verify.cpp:209-219`, `:1444-1445`) | `mmvq_multi_parity` checks column invariance, with a float64 reference for Q8_0 only (`src/kernels/mmvq_multi_parity.cpp:97-176`, `:403-461`). `dense_tc_parity`, `q5k_head_parity` and `dec_gdn_parity` use `native_mmvq` as their reference; `iq_parity` covers the i-quants, Q2_0 and Q3_K (`src/kernels/iq_parity.cpp:29`) | `mmvq_multi_parity`'s Q8_0 rule on the same q8_1 bytes: `const bool ok = diff == 0 && worst <= 1e-4 * (scale + 1e-30);` (`src/kernels/mmvq_multi_parity.cpp:461`) |
 | `q5k_head_mmvq`, the decode head (`src/core/verify.cpp:1935-1936`) | bitwise against `native_mmvq` on Q5_K only (`src/kernels/q5k_head_parity.cpp:67-74`, `:91`) | the same rule at the head's shape, 2560 to 248,320; the bitwise check carries over |
 | The q8_1 rows the fused read writes for the projections (`src/core/verify.cpp:1151-1159`), in place of `native_quantize_q8_1` (`:1439`) | no test sets `HcFusedArgs::xq` (`src/kernels/hc_fused_parity.cpp:190-196`) | the host formula with `iq_multi_parity`'s rule for `native_quantize_q8_1`, whose arithmetic the rows copy (`src/kernels/cuda/hc_fused.cu:80-101`): `bool near = path == 1 && gs == os && std::abs((int) gd - (int) od) <= 1;` (`src/kernels/iq_multi_parity.cpp:465`) |
-| The router's softmax and top-10: `hc_top10` in the fused read (`src/kernels/cuda/hc_fused.cu:811-916`), and `route` (`src/kernels/cuda/native_router.cu:46-100`) where the fused read does not run | `hc_fused_parity`, which is not registered, compares the fused picks bitwise with `native_router_top10_multi` (`src/kernels/hc_fused_parity.cpp:185-187`, `:306`); neither meets a host reference | `router_top10_parity`'s rule: ids exact, `if (h_ids[i] != r_ids[i]) ++id_bad;` (`src/kernels/router_top10_parity.cpp:86`), and weights `if (!(rel <= tol)) ++w_bad;` (`:90`) with `tol` 1e-5 (`:129`, `:134`, `:141`, `:146`) |
+| The router's softmax and top-10: `hc_top10` in the fused read (`src/kernels/cuda/hc_fused.cu:811-916`), and `route` (`src/kernels/cuda/native_router.cu:46-100`) where the fused read does not run | `hc_fused_parity`, which is not registered, prints its comparison of the fused picks with `native_router_top10_multi` under `--tol` and gates only window invariance (`src/kernels/hc_fused_parity.cpp:185-187`, `:262-296`, `:328`); neither meets a host reference | `router_top10_parity`'s rule: ids exact, `if (h_ids[i] != r_ids[i]) ++id_bad;` (`src/kernels/router_top10_parity.cpp:86`), and weights `if (!(rel <= tol)) ++w_bad;` (`:90`) with `tol` 1e-5 (`:129`, `:134`, `:141`, `:146`) |
+| The hyper-connection outputs of `hc_fused_read` on the int8 copies (`R_out`, `rs`, `lo`, `inject_out`, `mixed`), decode and drafter (`src/core/verify.cpp:1611-1617`; `src/core/mtp.cpp:814-818`) | `hc_fused_parity` gates only window invariance on them (`src/kernels/hc_fused_parity.cpp:328`, `:356-361`); `hc8_parity` checks `hc8_gr_read_multi` and `gr_parity` the BF16 reads, neither of which decode runs | each output against a double-precision read on the dequantized copies, with `hc8_parity`'s bound for the 8-bit read against the dequantized copy: `expect(e[1][k].rel() < 2e-3, "the 8-bit read against the dequantized copy");` (`src/kernels/hc8_parity.cpp:173`) |
+| `native_gr_post`, the hyper-connection write when decode does not fold it into `hc_fused` (`src/kernels/cuda/gr.cu:394-395`) | its only test, `ple_win_parity`, runs it as the reference side (`src/kernels/ple_win_parity.cpp:74`) | against a double-precision write with `gr_parity`'s write rule: `const bool plain = worst_plain < 1e-6;` (`src/kernels/gr_parity.cpp:645`) |
 | `native_expert_grouped` on Q2_0/Q2_0 at 2560/640, the routed experts (`src/core/verify.cpp:1759-1765`) | new kernels against old ones, bitwise (`src/kernels/iq_multi_parity.cpp:302-329`; `src/kernels/native_grouped_parity.cpp:1-12`); only the Q2_0 dot product meets a reference (`src/kernels/iq_parity.cpp:112`; `src/kernels/iq_multi_parity.cpp:162`), and `native_expert_parity`'s pairs include no Q2_0 (`CMakeLists.txt:771`) | the whole expert (gate/up, SwiGLU, the q8_1 of H, down) against a double-precision expert on fp32 activations, with Q2_0 dequantized by `tools/gguf_writer.py`'s codec as `iq_parity`'s fixtures are (`src/kernels/iq_parity.cpp:5-7`): `const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);` (`src/kernels/native_expert_parity.cpp:368`) |
 | `shared_expert_multi` with `native_swiglu_quantize_q8_1` (decode, `src/core/verify.cpp:1720`), and the drafter's one-row native `shared_expert` (`src/core/mtp.cpp:947-949`) | `shared_expert_parity` runs the S-form expert (`src/kernels/shared_expert_parity.cpp:241-242`, `:343-344`); `shared_expert_multi` runs only in a bench (`src/kernels/pk_moe_bench.cpp:244`) | the expert against a double-precision expert on fp32 activations with `native_expert_parity`'s rule (`src/kernels/native_expert_parity.cpp:368`); the scalar gate keeps `shared_expert_parity`'s rule (`src/kernels/shared_expert_parity.cpp:372`) |
 | `native_moe_combine` and `native_moe_combine_multi` (decode, `src/core/verify.cpp:1850-1852`, `src/core/layer.cpp:415`; drafter, `src/core/mtp.cpp:952`, `:962`) | `shared_expert_parity` checks the legacy `moe_combine` (`src/kernels/shared_expert_parity.cpp:445`, `:462`); `native_moe_combine_multi` runs only in `dec_moe_parity` (`src/kernels/dec_moe_parity.cpp:692`), which is not registered | the legacy combine's rule against a double reference, `if (!(rel_k <= 1e-6))` (`src/kernels/shared_expert_parity.cpp:462`); each row of a multi-row call bitwise its one-row call |
@@ -431,8 +446,8 @@ GPU working set (`recommendedMaxWorkingSetSize`) is 40,200,896,512 bytes, `maxBu
 and `iogpu.wired_limit_mb` is at its default of 0, with the GPU's wired-memory collector on
 (`iogpu.disable_wired_collector` 0, `iogpu.dynamic_lwm` 1). A fresh Metal process reports a `currentAllocatedSize` of
 81,920 bytes: the figure counts that process's allocations only. With no engine running, other processes held
-2,102,771,712 to 2,434,203,648 bytes of GPU memory (IOAccelerator's "In use system memory", readings on 2026-10-15
-and 2026-10-16), 5.72 to 6.59 GB of RAM was wired, and 3.5 to 3.9 GB of swap was in use.
+962,134,016 to 2,434,203,648 bytes of GPU memory (IOAccelerator's "In use system memory", readings on 2026-10-15
+and 2026-10-16), 5.24 to 6.59 GB of RAM was wired, and 3.1 to 3.9 GB of swap was in use.
 
 **Mode.** Basalt's low-RAM resident mode, `--resident-experts` (`src/program/generate.cpp:872-876`; the flags it sets,
 `:1608-1611`). The experts section stays memory-mapped. The experts no GPU slot holds are copied into RAM once, and so
@@ -478,7 +493,7 @@ over to Metal.
 | Reserve kept free (`--vram-reserve-mib 700`) | 734,003,200 | allowance [H] | for the graphs, the hit scratch and other small tables (`src/program/generate.cpp:474-476`, `:3339`); the only term an explicit cache keeps free (`:3440-3441`) |
 | Draft head, bound after the cache | 229,259,012 | exact | logits for 8 rows 7,946,240; 106,811 gathered head rows 187,987,360; 2-bit copy of the 41,037 leading rows and its scratch 32,896,120; id maps 429,292 (`src/core/mtp.cpp:524-549`); auto sizing keeps it free as well (`src/program/generate.cpp:3309-3311`) |
 | Verify windows and the deferred checkpoint copy | 218,333,184 | allowance [H] | 96 MiB of windows and one GDN state, 117,669,888; auto sizing keeps them free as well (`src/program/generate.cpp:2841`, `:3313-3319`) |
-| Other processes' GPU memory | 2,102,771,712 to 2,434,203,648 | measured | IOAccelerator's "In use system memory" with no engine running; not in the sums of this table. It comes out of the free figure the cache is sized from (the next row) |
+| Other processes' GPU memory | 962,134,016 to 2,434,203,648 | measured | IOAccelerator's "In use system memory" with no engine running; not in the sums of this table. It comes out of the free figure the cache is sized from (the next row) |
 | **Expert cache** | **33,973,862,400** | exact | the identity sessions' explicit `--expert-cache 24576`, capped at the free figure less the 734,003,200-byte reserve (`src/program/generate.cpp:3434-3449`): 24,576 slots, every expert, while other processes hold at most `40,200,896,512 - 4,235,436,192 - 734,003,200 - 33,973,862,400` = 1,257,594,720 bytes, and one slot fewer for each further 1,382,400 bytes |
 | Allocated after the cache | 631,122,300 | exact | verifier arena 69,878,784 and mapped staging 990,568 (`src/core/verify.cpp:733-821`), the draft head 229,259,012, the deferred GDN copy 117,669,888; the prompt path's mapped grouping table 987,408, and the pinned PLE double buffer 167,772,160 and `Stager` ring 44,236,800 its copies read (`src/prefill/prefill.cpp:153-166`, `:725-750`, set up from `src/program/generate.cpp:5016`); slot offsets 196,608 and the penalty history 131,072 (`src/core/verify.cpp:901-904`; `src/program/generate.cpp:5109-5114`); all allocated once the cache is sized. MMQ's buffer pool fills at the first prompt and is not counted (`src/prefill/mmq/mmq_host.cu:47-58`) |
 | **Used at READY** | **38,840,420,892** | | 36.17 of 37.44 GiB |
@@ -524,7 +539,7 @@ other processes take more than 8,926,534,395 bytes (8.31 GiB) less the RAM tier:
 READY, the n-gram cache, the serving growth and the margin. Metal's own host memory comes out of the same bytes.
 
 How much macOS and other processes take on this Mac, at load and while serving, has not been measured [H]. With no
-engine running, 5.72 to 6.59 GB was already wired, against the 7,410,173,047 bytes the largest session leaves for
+engine running, 5.24 to 6.59 GB was already wired, against the 7,410,173,047 bytes the largest session leaves for
 macOS, other processes and the RAM tier. A lent slot whose expert the RAM tier lacks is refilled from the file after
 the prompt (`src/core/expert_source.cpp:947-951`). The quality gate's 256-token prompts take a 262,852,352-byte loan,
 the last 191 slots (264,038,400 bytes of blobs), which the RAM tier holds first. Basalt also sets aside spare places
@@ -540,14 +555,16 @@ Both acceptance runs pin it off, and with every expert resident no swap would ha
 - **RAM tier: 0 to 3,732,480,000 bytes**, set by what macOS leaves when the copy is built.
 - Each acceptance session holds every expert only while other processes hold at most its ceiling of GPU memory: the
   identity sessions through the explicit cache's cap (`src/program/generate.cpp:3434-3449`), the quality gate through
-  auto sizing (`:3299-3343`). Even the least that other processes were measured to hold, 2,102,771,712 bytes, exceeds
-  all three ceilings, so other programs must release GPU memory first, or the acceptance setup's fallbacks apply.
+  auto sizing (`:3299-3343`). Other processes were measured holding 962,134,016 to 2,434,203,648 bytes. At the low
+  end both identity sessions hold every expert and the quality gate is 24 slots short; at the high end all three
+  ceilings are exceeded. Each session therefore checks its slot count before it runs, and other programs release GPU
+  memory first, or the acceptance setup's fallbacks apply.
 
-  | Session | Working set at READY | Left of the working set | Ceiling for other processes' GPU memory | Slots with 2,102,771,712 to 2,434,203,648 held | Room for macOS and the RAM tier |
+  | Session | Working set at READY | Left of the working set | Ceiling for other processes' GPU memory | Slots with 962,134,016 to 2,434,203,648 held | Room for macOS and the RAM tier |
   |---|---:|---:|---:|---:|---:|
-  | Identity, `--spec 7`, 8192 cells (the tables above) | 38,840,420,892 | 1,360,475,620 | 1,257,594,720 | 23,724 to 23,964 | 7,410,173,047 |
-  | Identity, `--spec 0`, 8192 cells: no drafter, verify buffers for 2 rows | 37,742,645,472 | 2,458,251,040 | 2,089,565,712 | 24,326 to 24,566 | 8,242,144,039 |
-  | Quality gate, `--spec 5`, 4096 cells: verify buffers for 7 rows | 38,714,008,260 | 1,486,888,252 | 930,296,392 | 23,488 to 23,727 | 7,529,473,635 |
+  | Identity, `--spec 7`, 8192 cells (the tables above) | 38,840,420,892 | 1,360,475,620 | 1,257,594,720 | 23,724 to 24,576 | 7,410,173,047 |
+  | Identity, `--spec 0`, 8192 cells: no drafter, verify buffers for 2 rows | 37,742,645,472 | 2,458,251,040 | 2,089,565,712 | 24,326 to 24,576 | 8,242,144,039 |
+  | Quality gate, `--spec 5`, 4096 cells: verify buffers for 7 rows | 38,714,008,260 | 1,486,888,252 | 930,296,392 | 23,488 to 24,552 | 7,529,473,635 |
 
 - Longer contexts: each cell backed at startup costs about 28,980 bytes of the working set (the 26,380 above, the
   drafter's 2,177 and its per-cell scratch). Under auto sizing, the 810,002,524 bytes of slack at 8192 cells keep
@@ -573,7 +590,8 @@ Both acceptance runs pin it off, and with every expert resident no swap would ha
    700 MiB reserve, the 96 MiB window allowance and the host-mapping probe (`src/program/generate.cpp:3321-3338`),
    which costs nothing on unified memory. The 1,360,475,620 bytes left in the working set must absorb Metal's own
    allocations (pipelines, command buffers) and, under the port's device-wide free figure, other processes' GPU
-   memory, which as measured already exceeds every session's ceiling. Measure both at the first load.
+   memory, which as measured ranges from under both identity ceilings to over every session's. Measure both at the
+   first load.
 4. **Available RAM needs a macOS reading [H].** MemAvailable has no macOS equivalent, and the port's reading of
    available memory decides the RAM tier and when serving stops a request. Measure what macOS and other processes
    take at the first load and while serving: above 7,410,173,047 bytes the largest session's RAM tier is 0, and above
