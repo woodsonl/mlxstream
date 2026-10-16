@@ -121,8 +121,9 @@ ones this pack runs.
    zero" (section 8.1), and round to nearest even or toward zero "may be supported" (section 8.2). Whether Apple family
    9 flushes subnormals under `MTLMathModeSafe`, as basalt's `.ftz` instructions do, and rounds to nearest even, as
    CUDA does, is [H], for a probe to measure. Where nvcc contracts implicitly, where basalt approximates or calls
-   `log1pf` or the library `expf`, and on subnormal values, the Metal result can therefore differ from CUDA's last bits. D-005's tolerances
-   accept that, and invariant 1 still holds, because each Metal kernel rounds the same way at every window width.
+   `log1pf` or the library `expf`, and on subnormal values, the Metal result can therefore differ from CUDA's last
+   bits. D-005's tolerances accept that, and invariant 1 still holds, because each Metal kernel rounds the same way at
+   every window width.
 
 ### How this departs from the repository-wide contract
 
@@ -371,8 +372,8 @@ These basalt tests do not run on this pack's path:
 - `gr_parity`: its read checks (`:367`, `:566`, `:752`) run `gr_read` and `fused_gr_read` on BF16 matrices without
   an 8-bit copy, and this pack always reads through the copies (`src/kernels/cuda/hc_fused.cu:1248`). Its write
   checks (`:645`, `:689`) run `gr_write_kernel`, because `native_mmvf` defaults to false
-  (`src/kernels/cuda/gr.cu:43`) and the test switches modes only after them (`:741`, `:763`). Decode folds the write into
-  `hc_fused` or runs `native_gr_post` (`src/kernels/cuda/gr.cu:394-395`, with `gr_native_mmvf` forced at
+  (`src/kernels/cuda/gr.cu:43`) and the test switches modes only after them (`:741`, `:763`). Decode folds the
+  write into `hc_fused` or runs `native_gr_post` (`src/kernels/cuda/gr.cu:394-395`, with `gr_native_mmvf` forced at
   `src/program/generate.cpp:1890`, `:2383`); both are in the table of kernels without a reference test below.
 - `elementwise_parity`: `gdn_gate`, `silu_inplace`, `rms_norm_weighted`, the S-form `embedding_gather` and
   `f32_to_bf16_bulk`. Under the forced native flags neither verify nor the drafter calls them
