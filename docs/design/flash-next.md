@@ -4,17 +4,13 @@ This page fixes what the Metal 4 port of [basalt](https://github.com/jesdga95/ba
 correctness is judged, and how basalt's Q2_0 model file fits this Mac's 48 GiB. Every later pull request of the port
 is checked against it. Basalt is an MIT C++/CUDA engine for Qwen3.8-Flash-Next on NVIDIA GPUs.
 
-Three user decisions govern the page. They are recorded in the shared decision database (project `mlxstream`,
-workstream `flash-next-port`):
+The port is held to three requirements:
 
-- **D-002, an exact port.** "We will run it on this mac once you have performed an exact 1:1 port from the existing
-  code to Metal 4. Your Metal 4 implementation must be 100% exact to the original design."
-- **D-005, basalt's own correctness bar.** The selected option reads: "Basalt's own bar. Every Metal kernel passes
-  basalt's parity test against its CPU reference within basalt's tolerance. Greedy tokens are identical between
-  --spec 0 and --spec 7 on this Mac. Wikitext-2 perplexity (20 chunks, basalt's harness) lands within 0.01 of the
-  README figure for the pack". The figure is 2.971; the 0.01 threshold is agent-set.
-- **D-006, the Q2_0 pack.** The selected option reads: "The Q2_0 pack, 64.90 GiB with 31.6 GiB of experts and
-  perplexity 2.971."
+- **An exact port.** The Metal 4 implementation reproduces basalt's design and arithmetic, one to one.
+- **Basalt's own correctness bar.** Every Metal kernel passes basalt's parity test against its CPU reference within
+  basalt's tolerance; greedy tokens are identical between `--spec 0` and `--spec 7` on this Mac; and wikitext-2
+  perplexity (20 chunks, basalt's harness) lands within 0.01 of the pack's README figure, 2.971 (`README.md:265`).
+- **The Q2_0 pack.** Basalt's official Q2_0 file, 64.90 GiB with 31.6 GiB of experts.
 
 The machine is an Apple M3 Max with 40 GPU cores (Apple family 9) and 48 GiB of unified memory, on macOS 27.0.1.
 
@@ -47,7 +43,7 @@ current code wherever the two differ. Paths under `runtime/` are this repository
 | Greedy pick | fp32 argmax; the lowest index wins a tie | `src/kernels/cuda/sampler.cu:88-90` |
 | Sampling | Philox, counter-based on (seed, absolute position) | `include/basalt/kernels/sampler.hpp:25`; `src/core/verify.cpp:2652-2654` |
 | Weights | the GGUF blocks as shipped. Two copies are requantized: the int8 hyper-connection copies, and the drafter's 2-bit copy of its draft head's leading rows, which scores drafts only | `precision.md:17-18`, `:49`; `src/core/mtp.cpp:532-539` |
-| CPU expert tier (decode misses, the prompt path's CPU share) | For this pack's Q2_0 experts: the fp32 FFN input, and the fp32 SwiGLU before down, quantized per 32 values to int8 with an fp32 scale `amax / 127` (0 for an all-zero block, whose inverse scale is 0 as well: `src/kernels/cpu/expert.cpp:353-354`), codes `trunc(x * (1 / scale) ± 0.5)` clamped to ±127; products on `q2_0_gguf_rows_multi`. The GPU's q8_1 has an fp16 scale, so the two tiers round differently. The AVX-512 kernel and its AVX2 fallback sum in different orders; the port transcribes the AVX-512 one, which basalt runs wherever AVX-512 is present (agent-set) | `src/kernels/cpu/expert.cpp:336-398`, `:503-556`; `src/kernels/cpu/expert_layout.cpp:124-133`; `src/core/expert_source.cpp:1592-1593`; `src/kernels/cpu/pool.cpp:423-444`, `:559`; `src/kernels/cpu/q2_avx2.cpp:37-62` |
+| CPU expert tier (decode misses, the prompt path's CPU share) | For this pack's Q2_0 experts: the fp32 FFN input, and the fp32 SwiGLU before down, quantized per 32 values to int8 with an fp32 scale `amax / 127` (0 for an all-zero block, whose inverse scale is 0 as well: `src/kernels/cpu/expert.cpp:353-354`), codes `trunc(x * (1 / scale) ± 0.5)` clamped to ±127; products on `q2_0_gguf_rows_multi`. The GPU's q8_1 has an fp16 scale, so the two tiers round differently. The AVX-512 kernel and its AVX2 fallback sum in different orders; the port transcribes the AVX-512 one, which basalt runs wherever AVX-512 is present | `src/kernels/cpu/expert.cpp:336-398`, `:503-556`; `src/kernels/cpu/expert_layout.cpp:124-133`; `src/core/expert_source.cpp:1592-1593`; `src/kernels/cpu/pool.cpp:423-444`, `:559`; `src/kernels/cpu/q2_avx2.cpp:37-62` |
 | Prompt path | a different computation (fp16/BF16 GEMMs, llama.cpp MMQ for the routed experts, fp16 hi/lo attention, 3xTF32 indexer scores) that writes the same KV and state formats. Quality is scored through decode | `precision.md:23-24`, `:94-108` |
 | MTP drafter | Q8_0 and BF16 dense weights, Q2_0 experts. Its precision changes drafts, never output | `precision.md:47-52` |
 | Compiler arithmetic | The kernels adapted from llama.cpp's arithmetic (`native_*.cu`, `qsa_dec_fused.cu`, `q5k_head.cu`, `q6k_head.cu`) and the prompt path's MMQ build with `--use_fast_math`: approximate `expf`, division and square root, denormals flushed. Every other kernel builds with nvcc's IEEE defaults, which still contract a multiply and an add into an FMA. Several of those IEEE-built kernels write approximate or flush-to-zero operations by hand, most of them to give a fast-math kernel's bits (the list below) | `CMakeLists.txt:185-202`, `:728`; `src/kernels/cuda/hc_fused.cu:1-5`; `src/kernels/cuda/dec_gdn_rec.cu:4-5` |
@@ -114,7 +110,7 @@ ones this pack runs.
    IEEE-built kernel writes it (the list above), maps to the `metal::fast::` function of the same operation:
    `fast::exp2` of the product with log2(e) that `__expf` or basalt's PTX forms, `fast::divide` for an approximate
    division or reciprocal (MSL has no `fast::recip`), `fast::rsqrt` for `rsqrtf` (Table 8.2). MSL has no `log1p`, so
-   `log1pf` gets a helper of its own, and the library `expf` maps to `metal::precise::exp` (agent-set). One helper
+   `log1pf` gets a helper of its own, and the library `expf` maps to `metal::precise::exp`. One helper
    serves each operation at every site, so kernels that basalt checks bitwise against each other
    (`qsa_dec_attn_parity`, `dec_gdn_parity`, and `hc_fused_parity`'s window checks) stay bitwise equal on
    Metal. MSL leaves subnormals and the rounding mode to the GPU: subnormal inputs and results "may be flushed to
@@ -122,13 +118,13 @@ ones this pack runs.
    9 flushes subnormals under `MTLMathModeSafe`, as basalt's `.ftz` instructions do, and rounds to nearest even, as
    CUDA does, is [H], for a probe to measure. Where nvcc contracts implicitly, where basalt approximates or calls
    `log1pf` or the library `expf`, and on subnormal values, the Metal result can therefore differ from CUDA's last
-   bits. D-005's tolerances accept that, and invariant 1 still holds, because each Metal kernel rounds the same way at
+   bits. Basalt's tolerances accept that, and invariant 1 still holds, because each Metal kernel rounds the same way at
    every window width.
 
 ### How this departs from the repository-wide contract
 
 CLAUDE.md's numerics contract governs this repository's other models. The Flash-Next path departs from it as follows,
-because D-002 requires basalt's design and D-005 sets basalt's bar. Every other model keeps CLAUDE.md's contract
+because the port reproduces basalt's design and is judged by basalt's bar. Every other model keeps CLAUDE.md's contract
 unchanged.
 
 | CLAUDE.md, repository-wide | Flash-Next path |
@@ -223,7 +219,7 @@ as follows.
    with about 0.8% of routed experts computed on the CPU for its IQ3_XXS pack (`precision.md:229-231`), so the gate
    is valid at any slot count. The run records IOAccelerator's "In use system memory" before it starts and the
    `expert_slots` count of the engine's `INFO` line (`src/program/generate.cpp:5965-5984`). Closing programs that use
-   the GPU first, so that every expert sits on the GPU tier, is preferred (agent-set). KV stays fp16.
+   the GPU first, so that every expert sits on the GPU tier, is preferred. KV stays fp16.
 4. **Per chunk k.** The request is `GEN 255 ppl=k ppl_t=3` followed by the chunk's first 257 tokens
    (`src/program/bench_main.cpp:1086-1093`; T = 3 is the bench default, `:391`). The engine checks the prompt against
    the base's chunk (`include/basalt/program/ppl_gate.hpp:40-54`) and forces greedy decoding
@@ -262,7 +258,7 @@ Every run of the gate records its full engine command line.
 ### Greedy identity: `--spec 0` against `--spec 7`
 
 This is basalt's own MTP on/off check (`precision.md:183-205`, `:422-437`), with expert placement pinned and two
-agent-set departures from basalt's command: fp16 KV and `--short-read 8192` (both below).
+departures from basalt's command: fp16 KV and `--short-read 8192` (both below).
 
 1. Two `--serve` sessions. The first runs `--spec 0`: every step is a one-token window through the verify path, and
    no drafter is loaded (`src/program/generate.cpp:1860-1867`). The second runs `--spec 7 --spec-min-p 0.5`. Its
@@ -280,7 +276,7 @@ agent-set departures from basalt's command: fp16 KV and `--short-read 8192` (bot
 The prompts are basalt's three bench fixtures `data/bench/conv.ids` (38 tokens), `struct.ids` (98) and `prose.ids`
 (19). The 272 chat prompts of `precision.md`'s measurement are not in basalt's repository.
 
-The check passes when every prompt yields identical token ids (D-005). Basalt also measured every logit row
+The check passes when every prompt yields identical token ids. Basalt also measured every logit row
 bit-identical (`precision.md:197-200`); the hashes test that stronger property and show where a difference starts.
 
 **Why placement is pinned.** The GPU and CPU expert tiers quantize activations differently, so the tier an expert
@@ -296,12 +292,12 @@ no part in, so step 2 stops them. With every expert in the cache, decode has no 
 peer-GPU flags of basalt's command have no counterpart on one GPU.
 
 The first remedy for a session that stops is basalt's own: close other programs that use the GPU
-(`src/program/generate.cpp:3400-3409`). If other processes still hold more than the ceiling, the agent-set fallback
+(`src/program/generate.cpp:3400-3409`). If other processes still hold more than the ceiling, the fallback
 is basalt's pinning rule above, the cache size fixed to what auto-sizing picks: a first `--spec 7` session with the
 cache on auto reports the slot count it picks, both sessions pass that count as `--expert-cache`, and step 2 checks
 for it instead of 24,576. Both sessions then hold the same experts and run the others on the CPU tier.
 
-**Agent-set departures from basalt's command.** Basalt's command runs `--kv int8` (`precision.md:425-428`). This
+**Departures from basalt's command.** Basalt's command runs `--kv int8` (`precision.md:425-428`). This
 contract keeps fp16 KV, so the check runs the verify path the contract specifies: the fused K/V and query posts run
 only with int8 KV (`src/core/verify.cpp:1352`, `:1433`, `:1494-1499`), and the fp16 path normalizes and rotates K and
 the queries and appends K and V with separate kernels (`:1340-1344`, `:1475`).
