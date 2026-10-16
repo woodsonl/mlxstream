@@ -52,7 +52,7 @@ current code wherever the two differ. Paths under `runtime/` are this repository
 | MTP drafter | Q8_0 and BF16 dense weights, Q2_0 experts. Its precision changes drafts, never output | `precision.md:47-52` |
 | Compiler arithmetic | The kernels adapted from llama.cpp's arithmetic (`native_*.cu`, `qsa_dec_fused.cu`, `q5k_head.cu`, `q6k_head.cu`) and the prompt path's MMQ build with `--use_fast_math`: approximate `expf`, division and square root, denormals flushed. Every other kernel builds with nvcc's IEEE defaults, which still contract a multiply and an add into an FMA. Several of those IEEE-built kernels write approximate or flush-to-zero operations by hand, most of them to give a fast-math kernel's bits (the list below) | `CMakeLists.txt:185-202`, `:728`; `src/kernels/cuda/hc_fused.cu:1-5`; `src/kernels/cuda/dec_gdn_rec.cu:4-5` |
 
-**Approximate operations in IEEE-built kernels.** These kernels on this pack's path compute some operations with
+**Approximate operations in IEEE-built kernels.** These decode and drafter kernels compute some operations with
 approximate or flush-to-zero instructions although their files build without `--use_fast_math`, and one calls a CUDA
 math library function that is not correctly rounded (`log1pf`):
 
@@ -75,6 +75,10 @@ math library function that is not correctly rounded (`log1pf`):
   `__expf` (`src/kernels/cuda/s2_expert_grouped.cu:170`).
 - `src/kernels/cuda/sampler.cu:311`: `__expf` in the probability of the drafter's greedy pick
   (`src/core/mtp.cpp:1036`).
+
+The prompt path's own kernels, `src/prefill/kernels.cu`, build the same way (`CMakeLists.txt:285`) and write `__expf`,
+`rsqrtf` and `log1pf` too (for example `src/prefill/kernels.cu:39`, `:74`, `:214`); the prompt path's port lists the
+ones this pack runs.
 
 ### Exactness invariants
 
