@@ -168,8 +168,12 @@ as follows.
    (`src/program/bench_main.cpp:900-912`, `:1066-1076`). Serving refuses to start without `--prefill`
    (`src/program/generate.cpp:4805-4810`) and the bench does not set it, so the contract adds `--prefill auto`, the
    value of basalt's sample configuration and of its reproduction command (`README.md:92`; `precision.md:418`). The
-   expert cache stays on auto. On this Mac auto resolves to every expert (see the memory budget), and the run checks
-   that the engine's `INFO` line reports `expert_slots=24576` (`src/program/generate.cpp:5965-5984`). KV stays fp16.
+   expert cache stays on auto. On this Mac auto resolves to every expert only while other processes hold at most
+   930,296,392 bytes of GPU memory (see the memory budget). The run records IOAccelerator's "In use system memory"
+   before it starts, and stops unless the engine's `INFO` line reports `expert_slots=24576`
+   (`src/program/generate.cpp:5965-5984`). If closing programs that use the GPU does not bring other processes under
+   the ceiling, the agent-set fallback keeps auto and records the slot count instead, which puts the remaining experts
+   on the CPU tier as auto sizing does on any GPU that holds fewer. KV stays fp16.
 4. **Per chunk k.** The request is `GEN 255 ppl=k ppl_t=3` followed by the chunk's first 257 tokens
    (`src/program/bench_main.cpp:1086-1093`; T = 3 is the bench default, `:391`). The engine checks the prompt against
    the base's chunk (`include/basalt/program/ppl_gate.hpp:40-54`) and forces greedy decoding
@@ -180,9 +184,11 @@ as follows.
    `precision.md:116-119`). Positions 256 to 510 are teacher-forced through verify windows of exactly 3 rows, filled
    with the reference tokens instead of drafts (`src/program/generate.cpp:8379-8382`, `:8400-8401`). Every row is
    scored and committed (`:8470-8480`), and relaxed drafting is off under the gate (`:8184`).
-5. **Score.** For each row, `nll = lse - logit[target]`, with the exponentials summed in double and the log-sum-exp
-   rounded to fp32 (`include/basalt/program/ppl_gate.hpp:125-145`). PPL is `exp(mean nll)` over the 20 x 255 = 5,100
-   rows (`src/program/bench_main.cpp:768-806`).
+5. **Score.** For each row, `nll = lse - logit[target]`. Each exponential `exp(logit - max)` is computed in fp32 and
+   only their sum is double; the sum's log is taken in double and rounded to fp32, the max is added in fp32, and
+   `nll` is the fp32 difference (`include/basalt/program/ppl_gate.hpp:125-145`; the float `std::exp` at `:141`, `lse`
+   at `:142`, `nll` at `:144`). Each row's `nll` is written to `rows.tsv` with six decimals (`:155`), and PPL is
+   `exp(mean nll)` in double over the 20 x 255 = 5,100 rows read back from it (`src/program/bench_main.cpp:768-806`).
 6. **Pass.** `|PPL - 2.971| <= 0.01`. KLD and top-1 agreement need the base; they are not part of the bar.
 
 **What the port supplies itself.** No base is published (the pinned revision has no `.kld` file), and making one needs
@@ -205,14 +211,17 @@ Every run of the gate records its full engine command line.
 
 ### Greedy identity: `--spec 0` against `--spec 7`
 
-This is basalt's own MTP on/off check (`precision.md:183-205`, `:422-437`), with expert placement pinned.
+This is basalt's own MTP on/off check (`precision.md:183-205`, `:422-437`), with expert placement pinned and two
+agent-set departures from basalt's command: fp16 KV and `--short-read 8192` (both below).
 
 1. Two `--serve` sessions. The first runs `--spec 0`: every step is a one-token window through the verify path, and
    no drafter is loaded (`src/program/generate.cpp:1860-1867`). The second runs `--spec 7 --spec-min-p 0.5`. Its
    drafts come from the MTP layer in windows of up to 7 rows, and the default prompt-lookup drafter raises the cap to
    8, so its windows run 1 to 8 rows (`src/program/generate.cpp:1868-1874`).
 2. Both sessions take `--prefill auto --resident-experts --max-context 8192 --adapt-swaps 0 --peer-adapt-swaps 0
-   --pcie-frac 0 --expert-cache 24576 --short-read 8192 --exp concur9_logit_hash=1`, with KV left at fp16.
+   --pcie-frac 0 --expert-cache 24576 --short-read 8192 --exp concur9_logit_hash=1`, with KV left at fp16. The run
+   records IOAccelerator's "In use system memory" before each session starts, and each session stops unless its
+   `INFO` line reports `expert_slots=24576` (`src/program/generate.cpp:5965-5984`).
 3. Both sessions receive the same prompts in the same order, each as `GEN 256 temperature=0` followed by the ids.
 4. Compare the token ids. Also compare the per-position logit hashes that each session prints on stderr as
    `LH -1 <position> <hash>`: FNV-1a over the fp32 logits of every accepted row
@@ -227,11 +236,28 @@ bit-identical (`precision.md:197-200`); the hashes test that stronger property a
 **Why placement is pinned.** The GPU and CPU expert tiers quantize activations differently, so the tier an expert
 sits on changes the rounding of its rows (`precision.md:227-232`). Basalt pins the tiers with `--adapt-swaps 0
 --peer-adapt-swaps 0 --pcie-frac 0` and with cache sizes fixed to what auto-sizing picks, "so the same experts sit on
-the same device in both runs" (`precision.md:194-195`). On this Mac `--expert-cache 24576` holds every expert, so
-decode has no CPU tier in either session. The peer-GPU flags of basalt's command have no counterpart on one GPU.
+the same device in both runs" (`precision.md:194-195`). An explicit `--expert-cache` does not pin the size by
+itself: with a profile, basalt caps the cache at the free figure less the 700 MiB reserve and lowers it without a
+warning (`src/program/generate.cpp:3434-3449`); only the logs show the count (`:3557-3558` and the `INFO` line). On
+this Mac 24,576 slots hold every expert only while other processes hold at most 1,257,594,720 bytes of GPU memory in
+the `--spec 7` session and 2,089,565,712 in the `--spec 0` session (see the memory budget). Short of that, the two
+sessions get different slot counts, put different experts on the CPU tier and can differ for reasons the kernels have
+no part in, so step 2 stops them. With every expert in the cache, decode has no CPU tier in either session. The
+peer-GPU flags of basalt's command have no counterpart on one GPU.
 
-**The one agent-set addition: `--short-read 8192`.** For chunks below 1,024 tokens, basalt's prompt path hands a
-measured share of the non-resident experts to the CPU, so a prompt read twice is not bit-reproducible
+The first remedy for a session that stops is basalt's own: close other programs that use the GPU
+(`src/program/generate.cpp:3400-3409`). If other processes still hold more than the ceiling, the agent-set fallback
+is basalt's pinning rule above, the cache size fixed to what auto-sizing picks: a first `--spec 7` session with the
+cache on auto reports the slot count it picks, both sessions pass that count as `--expert-cache`, and step 2 checks
+for it instead of 24,576. Both sessions then hold the same experts and run the others on the CPU tier.
+
+**Agent-set departures from basalt's command.** Basalt's command runs `--kv int8` (`precision.md:425-428`). This
+contract keeps fp16 KV, so the check runs the verify path the contract specifies: the fused K/V and query posts run
+only with int8 KV (`src/core/verify.cpp:1352`, `:1433`, `:1494-1499`), and the fp16 path normalizes and rotates K and
+the queries and appends K and V with separate kernels (`:1340-1344`, `:1475`).
+
+The second departure is `--short-read 8192`. For chunks below 1,024 tokens, basalt's prompt path hands a measured
+share of the non-resident experts to the CPU, so a prompt read twice is not bit-reproducible
 (`precision.md:116-119`; `src/prefill/prefill.cpp:1868-1895`). With every expert resident, the only non-resident
 experts during a prompt are the coldest slots the prompt path borrows, and those with a RAM copy (the RAM tier below)
 are CPU candidates (`src/prefill/prefill.cpp:1881`). With `--short-read` at least as long as the prompt,
@@ -342,7 +368,11 @@ diff == 0 && worst <= 1e-4 * (scale + 1e-30);` (`src/kernels/mmvq_multi_parity.c
 
 **Inputs, measured on this Mac.** Unified memory is 51,539,607,552 bytes (48 GiB, `hw.memsize`) in 16 KiB pages. The
 GPU working set (`recommendedMaxWorkingSetSize`) is 40,200,896,512 bytes, `maxBufferLength` is 30,150,672,384 bytes,
-and `iogpu.wired_limit_mb` is at its default of 0.
+and `iogpu.wired_limit_mb` is at its default of 0, with the GPU's wired-memory collector on
+(`iogpu.disable_wired_collector` 0, `iogpu.dynamic_lwm` 1). A fresh Metal process reports a `currentAllocatedSize` of
+81,920 bytes: the figure counts that process's allocations only. With no engine running, other processes held
+2,102,771,712 to 2,434,203,648 bytes of GPU memory (IOAccelerator's "In use system memory", readings on 2026-10-15
+and 2026-10-16), 5.72 to 6.54 GB of RAM was wired, and 3.5 to 3.9 GB of swap was in use.
 
 **Mode.** Basalt's low-RAM resident mode, `--resident-experts` (`src/program/generate.cpp:872-876`; the flags it sets,
 `:1608-1611`). The experts section stays memory-mapped. The experts no GPU slot holds are copied into RAM once, and so
@@ -350,8 +380,15 @@ are the experts of the cache slots the prompt path may borrow, as far as RAM all
 (`src/core/expert_source.cpp:588-760`).
 
 **Mapping to unified memory [H].** Basalt sizes the GPU tier from `cudaMemGetInfo`'s free VRAM and the RAM tier from
-Linux's MemAvailable. The port reads the GPU figure as `recommendedMaxWorkingSetSize - currentAllocatedSize` and the
-RAM figure as macOS's available memory. Every GPU buffer and every host allocation come out of the same 48 GiB.
+Linux's MemAvailable. `cudaMemGetInfo` covers the whole device, so its free figure already leaves out every other
+program's GPU memory, and basalt's own refusal tells the user to "close other programs that use the GPU"
+(`src/program/generate.cpp:3302-3303`, `:3400-3409`). The port's free figure is device-wide as well:
+`recommendedMaxWorkingSetSize`, less the other processes' GPU memory read before the engine allocates anything, less
+`currentAllocatedSize`. Whether macOS charges other processes' GPU memory against the same limit, or its collector
+reclaims that memory under pressure (which would make this figure conservative), is [H]. The RAM figure is macOS's
+available memory. Every GPU buffer and every host allocation come out of the same 48 GiB. Mapped host memory the GPU
+reads, and pinned host memory basalt's copy engine reads, both become shared Metal buffers (a kernel argument or a
+blit source), so both count against the working set.
 
 **Session.** The tables below are for the identity check's `--spec 7` session, the largest of the acceptance
 sessions: 8192 cells, which also covers the quality gate's 4096, and verify buffers for 8 rows (`--spec 7` with the
@@ -378,13 +415,14 @@ over to Metal.
 | Session at 8192 cells | 343,102,976 | exact | 36 GDN states 117,669,888; 12 attention states with indexer keys and one RoPE table 216,147,392; per-layer buffers 9,285,696 (`src/core/session.cpp:56-75`; `src/core/layer.cpp:147-179`, `:297-315`, `:515-533`, `:796-808`, `:1153-1165`) |
 | Logits and small buffers | 1,372,912 | estimate | logits 993,280 (`src/program/generate.cpp:3194`), n-gram scratch 264,112 and embedding row 10,240 (`:2581-2582`), expert parts 102,400 (`:2630`), head q8_1 scratch 2,880 (`src/core/native_head.cpp:75`); kernels' own scratch, such as the fused hyper-connection read's (`src/kernels/cuda/hc_fused.cu:1150-1152`), not counted |
 | **Allocated before the cache** | **4,235,436,192** | | |
-| Reserve kept free (`--vram-reserve-mib 700`) | 734,003,200 | allowance [H] | for the graphs, the hit scratch and other small tables (`src/program/generate.cpp:474-476`, `:3339`) |
-| Draft head, bound after the cache | 229,259,012 | exact | logits for 8 rows 7,946,240; 106,811 gathered head rows 187,987,360; 2-bit copy of the 41,037 leading rows and its scratch 32,896,120; id maps 429,292 (`src/core/mtp.cpp:524-549`) |
-| Verify windows and the deferred checkpoint copy | 218,333,184 | allowance [H] | 96 MiB of windows and one GDN state, 117,669,888 (`src/program/generate.cpp:2841`, `:3313-3319`) |
-| **Expert cache** | **33,973,862,400** | exact | `min(24576, (40,200,896,512 - 4,235,436,192 - 1,181,595,396) / 1,382,400)` = 24,576 slots: every expert (`src/program/generate.cpp:3299-3343`) |
-| Allocated after the cache | 417,798,252 | exact | verifier arena 69,878,784 and mapped staging 990,568 (`src/core/verify.cpp:733-821`), the draft head 229,259,012 and the deferred GDN copy 117,669,888, all out of the reserve terms above |
-| **Used at READY** | **38,627,096,844** | | 35.97 of 37.44 GiB |
-| Left | 1,573,799,668 | | includes the 700 MiB reserve |
+| Reserve kept free (`--vram-reserve-mib 700`) | 734,003,200 | allowance [H] | for the graphs, the hit scratch and other small tables (`src/program/generate.cpp:474-476`, `:3339`); the only term an explicit cache keeps free (`:3440-3441`) |
+| Draft head, bound after the cache | 229,259,012 | exact | logits for 8 rows 7,946,240; 106,811 gathered head rows 187,987,360; 2-bit copy of the 41,037 leading rows and its scratch 32,896,120; id maps 429,292 (`src/core/mtp.cpp:524-549`); auto sizing keeps it free as well (`src/program/generate.cpp:3309-3311`) |
+| Verify windows and the deferred checkpoint copy | 218,333,184 | allowance [H] | 96 MiB of windows and one GDN state, 117,669,888; auto sizing keeps them free as well (`src/program/generate.cpp:2841`, `:3313-3319`) |
+| Other processes' GPU memory | 2,102,771,712 to 2,434,203,648 | measured | IOAccelerator's "In use system memory" with no engine running; not in the sums of this table. It comes out of the free figure the cache is sized from (the next row) |
+| **Expert cache** | **33,973,862,400** | exact | the identity sessions' explicit `--expert-cache 24576`, capped at the free figure less the 734,003,200-byte reserve (`src/program/generate.cpp:3434-3449`): 24,576 slots, every expert, while other processes hold at most `40,200,896,512 - 4,235,436,192 - 734,003,200 - 33,973,862,400` = 1,257,594,720 bytes, and one slot fewer for each further 1,382,400 bytes |
+| Allocated after the cache | 631,122,300 | exact | verifier arena 69,878,784 and mapped staging 990,568 (`src/core/verify.cpp:733-821`), the draft head 229,259,012, the deferred GDN copy 117,669,888; the prompt path's mapped grouping table 987,408, and the pinned PLE double buffer 167,772,160 and `Stager` ring 44,236,800 its copies read (`src/prefill/prefill.cpp:153-166`, `:725-750`, set up from `src/program/generate.cpp:5016`); slot offsets 196,608 and the penalty history 131,072 (`src/core/verify.cpp:901-904`; `src/program/generate.cpp:5109-5114`); all allocated once the cache is sized. MMQ's buffer pool fills at the first prompt and is not counted (`src/prefill/mmq/mmq_host.cu:47-58`) |
+| **Used at READY** | **38,840,420,892** | | 36.17 of 37.44 GiB |
+| Left | 1,360,475,620 | | includes the 700 MiB reserve; other processes' GPU memory must fit here too |
 
 Loading also stages the BF16 hyper-connection down and up matrices, 1,271,398,400 bytes, to quantize their copies,
 and frees them before the cache is sized (`src/program/generate.cpp:2334-2358`).
@@ -396,7 +434,7 @@ and frees them before the cache is sized (`src/program/generate.cpp:2334-2358`).
 | GPU buffers allocated before the RAM copy is sized | 38,209,298,592 | exact | the table above, through the expert cache |
 | n-gram row cache and reader slab | 100,794,368 | exact | 1,048,576 rows of 90 bytes in 8-way sets with 4-byte keys, and 256 two-page read slots (`src/ngram/ple_reader.cpp:35-50`, `:350`; `src/program/generate.cpp:369-370`) |
 | n-gram table | 0 | design | the 28,800,138,240-byte table stays on the SSD and is read unbuffered (`--ple-io direct`, `src/program/generate.cpp:368`; `include/basalt/platform/direct_file.hpp:3-5`) |
-| Engine memory taken after the copy | 2,147,483,648 | allowance | `kLateHostBytes` (`include/basalt/platform/memory.hpp:33-35`). On this Mac it also holds the 417,798,252 bytes of GPU buffers allocated after the cache |
+| Engine memory taken after the copy | 2,147,483,648 | allowance | `kLateHostBytes` (`include/basalt/platform/memory.hpp:33-35`). On this Mac it also holds the 631,122,300 bytes of GPU buffers allocated after the cache |
 | Serving growth | 1,094,877,520 | exact; one allowance | 7 conversation checkpoints of 118,063,152 bytes (`--prompt-cache 6` plus one) and one request's 256 MiB (`src/program/generate.cpp:1175-1192`; `src/core/conversation_state.cpp:106-128`) |
 | RAM margin | 2,576,980,377 | allowance | the larger of 2 GiB and 5 % of the RAM (`src/platform/memory.cpp:51-53`) |
 | File-cache floor for the OS | 0 | rule | kept only while an expert is read from the file, then 5,173,673,984: the larger of 4 GiB and 3.5 GiB plus two layers' experts (`include/basalt/platform/memory.hpp:41-62`; `src/program/generate.cpp:4665-4691`). Here every expert has a GPU slot |
@@ -419,43 +457,64 @@ therefore `min(3,732,480,000, 7,410,173,047 - macOS and other processes)`, in wh
 | 6 GiB | 967,680,000 bytes (700 slots) |
 | 6.90 GiB or more | 0 |
 
-How much macOS and other processes take on this Mac has not been measured [H]. A lent slot whose expert the RAM tier
-lacks is refilled from the file after the prompt (`src/core/expert_source.cpp:947-951`); the quality gate's 256-token
-prompts borrow only the last 191 slots (262,852,352 bytes), which the RAM tier holds first. Basalt also sets aside
-spare places for adaptive swaps, 96 blobs or 132,710,400 bytes (`src/core/expert_source.cpp:711-726`), only when
-adaptation is on. Both acceptance runs pin it off, and with every expert resident no swap would have a candidate.
+While serving, basalt stops a request with "RAM low" once available RAM falls below its guard, here the margin alone
+(2,576,980,377 bytes), since no expert is read from the file (`src/program/generate.cpp:6033-6034`, `:5926-5931`,
+`:8790-8800`; `include/basalt/platform/memory.hpp:64-70`). In the `--spec 7` session that happens once macOS and
+other processes take more than 8,926,534,395 bytes (8.31 GiB) less the RAM tier: the 48 GiB less the working set at
+READY, the n-gram cache, the serving growth and the margin. Metal's own host memory comes out of the same bytes.
+
+How much macOS and other processes take on this Mac, at load and while serving, has not been measured [H]. With no
+engine running, 5.72 to 6.54 GB was already wired, against the 7,410,173,047 bytes the largest session leaves for
+macOS, other processes and the RAM tier. A lent slot whose expert the RAM tier lacks is refilled from the file after
+the prompt (`src/core/expert_source.cpp:947-951`). The quality gate's 256-token prompts take a 262,852,352-byte loan,
+the last 191 slots (264,038,400 bytes of blobs), which the RAM tier holds first. Basalt also sets aside spare places
+for adaptive swaps, 96 blobs or 132,710,400 bytes (`src/core/expert_source.cpp:711-726`), only when adaptation is on.
+Both acceptance runs pin it off, and with every expert resident no swap would have a candidate.
 
 ### Result
 
-- **GPU expert cache: 24,576 slots, 33,973,862,400 bytes (31.64 GiB), every expert.** Decode runs basalt's
-  zero-doorbell window, planned on the device with no host service and no CPU tier (`src/core/verify.cpp:876-882`),
-  and the device-planned MoE tail is off (`src/core/verify.cpp:313`).
+- **GPU expert cache: 24,576 slots, 33,973,862,400 bytes (31.64 GiB), every expert, while other processes' GPU
+  memory stays under the session's ceiling.** Decode then runs basalt's zero-doorbell window, planned on the device
+  with no host service and no CPU tier (`src/core/verify.cpp:876-882`), and the device-planned MoE tail is off
+  (`src/core/verify.cpp:313`).
 - **RAM tier: 0 to 3,732,480,000 bytes**, set by what macOS leaves when the copy is built.
-- Every acceptance session holds every expert:
+- Each acceptance session holds every expert only while other processes hold at most its ceiling of GPU memory: the
+  identity sessions through the explicit cache's cap (`src/program/generate.cpp:3434-3449`), the quality gate through
+  auto sizing (`:3299-3343`). Even the least that other processes were measured to hold, 2,102,771,712 bytes, exceeds
+  all three ceilings, so other programs must release GPU memory first, or the acceptance setup's fallbacks apply.
 
-  | Session | Working set at READY | Left of the working set | Room for macOS and the RAM tier |
-  |---|---:|---:|---:|
-  | Identity, `--spec 7`, 8192 cells (the tables above) | 38,627,096,844 | 1,573,799,668 | 7,410,173,047 |
-  | Identity, `--spec 0`, 8192 cells: no drafter, verify buffers for 2 rows | 37,529,321,424 | 2,671,575,088 | 8,242,144,039 |
-  | Quality gate, `--spec 5`, 4096 cells: verify buffers for 7 rows | 38,500,684,212 | 1,700,212,300 | 7,529,473,635 |
+  | Session | Working set at READY | Left of the working set | Ceiling for other processes' GPU memory | Slots with 2,102,771,712 to 2,434,203,648 held | Room for macOS and the RAM tier |
+  |---|---:|---:|---:|---:|---:|
+  | Identity, `--spec 7`, 8192 cells (the tables above) | 38,840,420,892 | 1,360,475,620 | 1,257,594,720 | 23,724 to 23,964 | 7,410,173,047 |
+  | Identity, `--spec 0`, 8192 cells: no drafter, verify buffers for 2 rows | 37,742,645,472 | 2,458,251,040 | 2,089,565,712 | 24,326 to 24,566 | 8,242,144,039 |
+  | Quality gate, `--spec 5`, 4096 cells: verify buffers for 7 rows | 38,714,008,260 | 1,486,888,252 | 930,296,392 | 23,488 to 23,727 | 7,529,473,635 |
 
 - Longer contexts: each cell backed at startup costs about 28,980 bytes of the working set (the 26,380 above, the
-  drafter's 2,177 and its per-cell scratch), so the 810,002,524 bytes of slack at 8192 cells keep every expert
-  GPU-resident up to about 36,000 backed cells. A server backs at most 32,768 cells at startup (elastic KV,
+  drafter's 2,177 and its per-cell scratch). Under auto sizing, the 810,002,524 bytes of slack at 8192 cells keep
+  every expert GPU-resident up to about 36,000 backed cells while no other process holds GPU memory; other processes'
+  GPU memory comes out of the same slack. A server backs at most 32,768 cells at startup (elastic KV,
   `src/program/generate.cpp:2970-2977`); a request that needs more borrows the cache's last slots for its K/V, and
   those slots' experts then run on the CPU tier from their RAM copies (`src/program/generate.cpp:6291-6324`).
 
 ### Constraints for the Metal port
 
-1. **The cache needs at least two buffers.** At 33,973,862,400 bytes it exceeds `maxBufferLength` (30,150,672,384).
-   Basalt's segmented arena (`src/core/expert_cache.cpp:146-264`) is the precedent; slot addressing must survive the
-   split.
-2. **The RAM tier stays outside Metal buffers.** As a Metal buffer it would count against the working set [H]: 38.6 GB
+1. **The cache needs at least two buffers.** At 33,973,862,400 bytes it exceeds `maxBufferLength` (30,150,672,384),
+   which holds at most 21,810 slots. Slot addressing must survive the split, and so must the prompt path's loan:
+   basalt bump-allocates it as one contiguous region from slot `lend_first` to the end of the cache
+   (`src/prefill/prefill.cpp:95-117`; `src/program/generate.cpp:4956-4958`), 2,700 slots from slot 21,876 for an
+   8192-token chunk. The last buffer must therefore start at or below `lend_first`. Any two-buffer split between
+   slots 2,766 and 21,810 does; the rule bites with three or more buffers, and basalt-style 1 GiB segments
+   (776 slots) would spread the loan over four or five. Basalt's segmented arena (`src/core/expert_cache.cpp:146-264`)
+   is no precedent for separate buffers: it maps its segments into one reserved address range (`:146-170`).
+2. **The RAM tier stays outside Metal buffers.** As a Metal buffer it would count against the working set [H]: 38.8 GB
    in use plus a 3.7 GB tier exceeds 40.2 GB. The prompt path copies a lent expert into GPU memory the way basalt's
    `Stager` copies blobs that are not pinned (`src/prefill/prefill.cpp:121-271`).
-3. **Basalt's CUDA allowances need measuring on Metal [H].** These are the 700 MiB reserve, the 96 MiB window
-   allowance and the host-mapping probe (`src/program/generate.cpp:3321-3338`), which costs nothing on unified memory.
-   The 1,573,799,668 bytes left in the working set must absorb Metal's own allocations (pipelines, command buffers);
-   measure them at the first load.
+3. **Basalt's CUDA allowances and other processes' GPU memory need measuring on Metal [H].** The allowances are the
+   700 MiB reserve, the 96 MiB window allowance and the host-mapping probe (`src/program/generate.cpp:3321-3338`),
+   which costs nothing on unified memory. The 1,360,475,620 bytes left in the working set must absorb Metal's own
+   allocations (pipelines, command buffers) and, under the port's device-wide free figure, other processes' GPU
+   memory, which as measured already exceeds every session's ceiling. Measure both at the first load.
 4. **Available RAM needs a macOS reading [H].** MemAvailable has no macOS equivalent, and the port's reading of
-   available memory decides the RAM tier.
+   available memory decides the RAM tier and when serving stops a request. Measure what macOS and other processes
+   take at the first load and while serving: above 7,410,173,047 bytes the largest session's RAM tier is 0, and above
+   8,926,534,395 bytes (8.31 GiB) its requests stop with "RAM low".
