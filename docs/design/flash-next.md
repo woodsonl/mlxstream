@@ -78,8 +78,8 @@ CUDA math library functions that are not correctly rounded (`log1pf`, and the li
 - `src/kernels/cuda/hc8_gr.cu`, the 8-bit hyper-connection read the drafter's prompt catch-up runs once per verify
   window: `MtpDrafter::prefill_cur` (`src/core/mtp.cpp:1393-1402`) records the forward without the fused read, which
   calls `gr_read` or `fused_gr_read_multi` (`:819-823`), and both run `hc8_gr_read_multi` because `hc8_enabled()` is
-  always true (`src/kernels/cuda/hc_fused.cu:1248`). It computes `rsqrtf` in the norm (`:78`) and the library `expf`
-  in the SiLU (`:165`) and the sigmoid (`:233`).
+  always true (`src/kernels/cuda/hc_fused.cu:1248`). It computes `rsqrtf` in the norm (`hc8_gr.cu:78`) and the library
+  `expf` in the SiLU (`hc8_gr.cu:165`) and the sigmoid (`hc8_gr.cu:233`).
 
 The prompt path's own kernels, `src/prefill/kernels.cu`, build the same way (`CMakeLists.txt:285`) and write `__expf`,
 `rsqrtf` and `log1pf` too (for example `src/prefill/kernels.cu:39`, `:74`, `:214`); the prompt path's port lists the
@@ -121,7 +121,7 @@ ones this pack runs.
    zero" (section 8.1), and round to nearest even or toward zero "may be supported" (section 8.2). Whether Apple family
    9 flushes subnormals under `MTLMathModeSafe`, as basalt's `.ftz` instructions do, and rounds to nearest even, as
    CUDA does, is [H], for a probe to measure. Where nvcc contracts implicitly, where basalt approximates or calls
-   `log1pf`, and on subnormal values, the Metal result can therefore differ from CUDA's last bits. D-005's tolerances
+   `log1pf` or the library `expf`, and on subnormal values, the Metal result can therefore differ from CUDA's last bits. D-005's tolerances
    accept that, and invariant 1 still holds, because each Metal kernel rounds the same way at every window width.
 
 ### How this departs from the repository-wide contract
@@ -371,7 +371,7 @@ These basalt tests do not run on this pack's path:
 - `gr_parity`: its read checks (`:367`, `:566`, `:752`) run `gr_read` and `fused_gr_read` on BF16 matrices without
   an 8-bit copy, and this pack always reads through the copies (`src/kernels/cuda/hc_fused.cu:1248`). Its write
   checks (`:645`, `:689`) run `gr_write_kernel`, because `native_mmvf` defaults to false
-  (`src/kernels/cuda/gr.cu:43`) and the test switches modes only at its end (`:763`). Decode folds the write into
+  (`src/kernels/cuda/gr.cu:43`) and the test switches modes only after them (`:741`, `:763`). Decode folds the write into
   `hc_fused` or runs `native_gr_post` (`src/kernels/cuda/gr.cu:394-395`, with `gr_native_mmvf` forced at
   `src/program/generate.cpp:1890`, `:2383`); both are in the table of kernels without a reference test below.
 - `elementwise_parity`: `gdn_gate`, `silu_inplace`, `rms_norm_weighted`, the S-form `embedding_gather` and
@@ -447,7 +447,7 @@ and `iogpu.wired_limit_mb` is at its default of 0, with the GPU's wired-memory c
 (`iogpu.disable_wired_collector` 0, `iogpu.dynamic_lwm` 1). A fresh Metal process reports a `currentAllocatedSize` of
 81,920 bytes: the figure counts that process's allocations only. With no engine running, other processes held
 962,134,016 to 2,434,203,648 bytes of GPU memory (IOAccelerator's "In use system memory", readings on 2026-10-15
-and 2026-10-16), 5.24 to 6.59 GB of RAM was wired, and 3.1 to 3.9 GB of swap was in use.
+and 2026-10-16), 5.24 to 6.59 GB of RAM was wired, and 3.2 to 3.9 GB of swap was in use.
 
 **Mode.** Basalt's low-RAM resident mode, `--resident-experts` (`src/program/generate.cpp:872-876`; the flags it sets,
 `:1608-1611`). The experts section stays memory-mapped. The experts no GPU slot holds are copied into RAM once, and so
