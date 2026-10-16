@@ -32,12 +32,12 @@ current code wherever the two differ. Paths under `runtime/` are this repository
 |---|---|---|
 | Residual stream | fp32: four streams of 2560 values per row (`R_` holds `T x 4 x 2560` floats) | `src/core/verify.cpp:779`; `precision.md:21` |
 | RMSNorm | fp32, eps `1e-6` | `src/core/verify.cpp:116` |
-| Hyper-connection weights | int8 copies of the BF16 down, up and inject matrices: `s = fp16(absmax / 127)` per 32 consecutive values of a row, `q = clamp(rint(w / s), -127, 127)`. Always on: decode never reads the BF16 matrices | `src/kernels/cuda/hc_fused.cu:343`, `:1168-1186`, `:1248-1250`; `precision.md:17-18` |
+| Hyper-connection weights | int8 copies of the BF16 down, up and inject matrices: `s = fp16(absmax / 127)` per 32 consecutive values of a row, `q = clamp(rint(w / s), -127, 127)`, and `q = 0` when `s` is 0. Always on: decode never reads the BF16 matrices | `src/kernels/cuda/hc_fused.cu:343`, `:1168-1186` (`s = 0`: `:1185`), `:1248-1250`; `precision.md:17-18` |
 | Hyper-connection read | fp32 activations, never quantized. Down and inject: the int8 weights converted exactly, fp32 FMA per group. Up: the fp32 input split into fp16 high and low parts, fp16 matrix products with fp32 accumulation | `include/basalt/kernels/hc_fused.hpp:1-17`; `precision.md:58-59`, `:70` |
-| Router | fp32 activation times BF16 weight, in fp32. Softmax and top-10 in fp32, ties to the lower expert id. The ten weights are renormalized, their sum floored at `6.103515625e-5` (2^-14) | `src/kernels/cuda/native_router.cu:52-99` (tie rule `:86`, floor `:97`); `precision.md:60` |
+| Router | fp32 activation times BF16 weight, in fp32. Softmax and top-10 in fp32, ties to the lower expert id. The ten weights are renormalized, their sum floored at `6.103515625e-5` (2^-14). Decode and the drafter route inside the fused hyper-connection read: its router GEMV and `hc_top10` give the bits of the MMVF GEMV and of `native_router.cu`'s `route`, which run only where the fused read does not | `src/kernels/cuda/hc_fused.cu:1-5`, `:737-809` (GEMV), `:811-916` (`hc_top10`; tie rule `:849`, floor `:910`); `src/core/verify.cpp:1611-1617`, `:1634`; `src/core/mtp.cpp:907-913`; `src/kernels/cuda/native_router.cu:52-99`; `precision.md:60` |
 | Activations into quantized matrix products | q8_1: int8 codes per 32 values with an fp16 scale and an fp16 sum. This covers the dense projections, the shared expert, the routed experts on the GPU (gate/up from the fp32 FFN input, down from the fp32 SwiGLU) and the head | `include/basalt/kernels/iq_kernels.hpp:5-7`; `precision.md:61-67` |
 | Integer dot products | exact int32 per 32-value block (`mma.sync ... s32.s8.s8.s32` on CUDA), then the format's fp32 terms, summed in fp32 | `src/kernels/cuda/dense_tc.cu:60-64`; `include/basalt/kernels/dense_tc.hpp:1-13`; `precision.md:76` |
-| BF16 projections: GDN alpha/beta, indexer q/k, shared-expert scalar gate, PLE value | fp32 activation times BF16 weight, fp32 FMA | `precision.md:39-41`, `:66`; `src/program/generate.cpp:1889-1893` |
+| BF16 projections: GDN alpha/beta, indexer q/k, shared-expert scalar gate, PLE value | fp32 activation times BF16 weight, fp32 FMA | `precision.md:39-41`, `:66`; the PLE value: `src/program/generate.cpp:340`, `:1889-1893`, `src/kernels/cuda/ple.cu:14` |
 | Gated DeltaNet state | fp32: a `128 x 48 x 128` recurrent state and a `10240 x 3` conv history per layer | `include/basalt/kernels/dec_gdn.hpp:19` |
 | KV cache | fp16, the engine default. The int8, q4_0 and k8v4 options are outside this contract | `src/program/generate.cpp:373` |
 | Attention | K/V widened to fp32, fp32 scores, online softmax per 64-cell chunk, fp32 merge, sigmoid output gate | `include/basalt/kernels/qsa_dec_attn.hpp:1-2`; `precision.md:82` |
@@ -46,11 +46,35 @@ current code wherever the two differ. Paths under `runtime/` are this repository
 | Logits | fp32, `T x 248320` | `src/core/verify.cpp:808` |
 | Greedy pick | fp32 argmax; the lowest index wins a tie | `src/kernels/cuda/sampler.cu:88-90` |
 | Sampling | Philox, counter-based on (seed, absolute position) | `include/basalt/kernels/sampler.hpp:25`; `src/core/verify.cpp:2652-2654` |
-| Weights | the GGUF blocks as shipped. The int8 hyper-connection copies are the only requantization | `precision.md:17-18` |
+| Weights | the GGUF blocks as shipped. Two copies are requantized: the int8 hyper-connection copies, and the drafter's 2-bit copy of its draft head's leading rows, which scores drafts only | `precision.md:17-18`, `:49`; `src/core/mtp.cpp:532-539` |
 | CPU expert tier (decode misses, the prompt path's CPU share) | For this pack's Q2_0 experts: the fp32 FFN input, and the fp32 SwiGLU before down, quantized per 32 values to int8 with an fp32 scale `amax / 127`, codes `trunc(x * (1 / scale) ± 0.5)` clamped to ±127; products on `q2_0_gguf_rows_multi`. The GPU's q8_1 has an fp16 scale, so the two tiers round differently. The AVX-512 kernel and its AVX2 fallback sum in different orders; the port transcribes the AVX-512 one, which basalt runs wherever AVX-512 is present (agent-set) | `src/kernels/cpu/expert.cpp:336-398`, `:503-556`; `src/kernels/cpu/expert_layout.cpp:124-133`; `src/core/expert_source.cpp:1592-1593`; `src/kernels/cpu/pool.cpp:423-444`, `:559`; `src/kernels/cpu/q2_avx2.cpp:37-62` |
 | Prompt path | a different computation (fp16/BF16 GEMMs, llama.cpp MMQ for the routed experts, fp16 hi/lo attention, 3xTF32 indexer scores) that writes the same KV and state formats. Quality is scored through decode | `precision.md:23-24`, `:94-108` |
 | MTP drafter | Q8_0 and BF16 dense weights, Q2_0 experts. Its precision changes drafts, never output | `precision.md:47-52` |
-| Compiler arithmetic | The kernels adapted from llama.cpp's arithmetic (`native_*.cu`, `qsa_dec_fused.cu`, `q5k_head.cu`, `q6k_head.cu`) and the prompt path's MMQ build with `--use_fast_math`: approximate `expf`, division and square root, denormals flushed. Every other kernel builds with nvcc's IEEE defaults, which still contract a multiply and an add into an FMA | `CMakeLists.txt:185-202`, `:728` |
+| Compiler arithmetic | The kernels adapted from llama.cpp's arithmetic (`native_*.cu`, `qsa_dec_fused.cu`, `q5k_head.cu`, `q6k_head.cu`) and the prompt path's MMQ build with `--use_fast_math`: approximate `expf`, division and square root, denormals flushed. Every other kernel builds with nvcc's IEEE defaults, which still contract a multiply and an add into an FMA. Several of those IEEE-built kernels write approximate or flush-to-zero operations by hand, most of them to give a fast-math kernel's bits (the list below) | `CMakeLists.txt:185-202`, `:728`; `src/kernels/cuda/hc_fused.cu:1-5`; `src/kernels/cuda/dec_gdn_rec.cu:4-5` |
+
+**Approximate operations in IEEE-built kernels.** These kernels on this pack's path compute some operations with
+approximate or flush-to-zero instructions although their files build without `--use_fast_math`, and one calls a CUDA
+math library function that is not correctly rounded (`log1pf`):
+
+- `src/kernels/cuda/hc_fused.cu`, the fused hyper-connection read (decode and drafter): the router's GEMV and top-10
+  as the fast-math build's flush-to-zero PTX, `fma`, `add`, `sub`, `mul` and `max` with `.ftz`, `ex2.approx.ftz.f32`
+  and `rcp.approx.ftz.f32` (`:270-306`, used at `:737-916`); `div.approx.ftz.f32` in the q8_1 rows (`:80-101`);
+  `__expf` in the stream and up sigmoids (`:341`) and the SiLU (`:538`); `rsqrtf` in the norm (`:526`).
+- `src/kernels/cuda/dec_gdn_rec.cu`, the GDN recurrence: `div.approx.ftz.f32` in its q8_1 (`:40-51`, `:128`); `__expf`
+  in the SiLU, the gates, the decay and the output gate (`:65`, `:109`, `:111`, `:120`, `:248`); `log1pf` in the
+  softplus (`:111`); `rsqrtf` in the norms (`:119`, `:228-229`, `:266`).
+- `src/kernels/cuda/verify_kernels.cu:315`, the GDN commit's replay (`gdn_commit_layers`, `src/core/verify.cpp:2133`):
+  `__expf` in the decay.
+- `src/kernels/cuda/qsa_dec_attn.cu`, the attention: `__expf` in the chunk softmax and the merge (`:259-260`, `:380`;
+  the drafter's wide window, `:576-577`, `:667`); the output gate as `mul.ftz`, `ex2.approx.ftz`, `add.ftz` and
+  `rcp.approx.ftz` (`:308-319`); the q8_1 rows' `max`, `abs` and `add` with `.ftz` and `div.approx.ftz.f32`
+  (`:321-345`).
+- `src/kernels/cuda/shared_expert.cu:170`, the shared expert's scalar gate: `__fdividef(1.0f, 1.0f + __expf(-g[t]))`.
+- The routed experts' SwiGLU: `__expf` (`src/kernels/cuda/gu2.cuh:387`, the chained pass decode runs,
+  `src/kernels/cuda/iq_kernels.cu:2567`, `:2585`; otherwise `iq_kernels.cu:1918`). The drafter's Q2_0 experts' SwiGLU:
+  `__expf` (`src/kernels/cuda/s2_expert_grouped.cu:170`).
+- `src/kernels/cuda/sampler.cu:311`: `__expf` in the probability of the drafter's greedy pick
+  (`src/core/mtp.cpp:1036`).
 
 ### Exactness invariants
 
@@ -72,13 +96,23 @@ current code wherever the two differ. Paths under `runtime/` are this repository
    kernel arguments (`include/basalt/core/graph.hpp:14-17`).
 5. **Basalt's rounding sequence, Metal's arithmetic.** The default arithmetic is the forced `native_*` set
    (`src/program/generate.cpp:1889-1893`), including its rounding sequence. The Metal kernels build in
-   `MTLMathModeSafe`, this repository's default (`runtime/src/metal_core.mm:103`). An FMA appears where the basalt
-   source writes one, and a multiply basalt rounds on its own (`__fmul_rn`, as in
-   `src/kernels/cuda/native_ple_postops.cu:41-50`; the embedding gather that
-   `src/kernels/elementwise_parity.cpp:358-362` checks) is never contracted into one. Where nvcc contracts
-   implicitly, or a `--use_fast_math` file approximates, the Metal result can differ from CUDA's last bits. D-005's
-   tolerances accept that, and invariant 1 still holds, because each Metal kernel rounds the same way at every window
-   width.
+   `MTLMathModeSafe`, this repository's default (`runtime/src/metal_core.mm:103`), where `+`, `-`, `*`, `/`, `sqrt` and
+   `fma` round correctly (MSL 4.1, section 8.4, Table 8.1): an operation CUDA also rounds correctly gives CUDA's bits
+   on the same inputs. An FMA appears where the basalt source writes one, and a multiply basalt rounds on its own
+   (`__fmul_rn`, as in `src/kernels/cuda/native_ple_postops.cu:41-50` and the routed experts' SwiGLU product,
+   `src/kernels/cuda/iq_kernels.cu:1902-1918`) is never contracted into one. NVIDIA's approximate instructions have no
+   Metal counterpart. Each approximate operation basalt computes, whether a `--use_fast_math` file produces it or an
+   IEEE-built kernel writes it (the list above), maps to the `metal::fast::` function of the same operation:
+   `fast::exp2` of the product with log2(e) that `__expf` or basalt's PTX forms, `fast::divide` for an approximate
+   division or reciprocal (MSL has no `fast::recip`), `fast::rsqrt` for `rsqrtf` (Table 8.2). MSL has no `log1p`, so
+   `log1pf` gets a helper of its own. One helper serves each operation at every site, so kernels that basalt checks
+   bitwise against each other (`hc_fused_parity`, `qsa_dec_attn_parity`, `dec_gdn_parity`) stay bitwise equal on
+   Metal. MSL leaves subnormals and the rounding mode to the GPU: subnormal inputs and results "may be flushed to
+   zero" (section 8.1), and round to nearest even or toward zero "may be supported" (section 8.2). Whether Apple family
+   9 flushes subnormals under `MTLMathModeSafe`, as basalt's `.ftz` instructions do, and rounds to nearest even, as
+   CUDA does, is [H], for a probe to measure. Where nvcc contracts implicitly, where basalt approximates or calls
+   `log1pf`, and on subnormal values, the Metal result can therefore differ from CUDA's last bits. D-005's tolerances
+   accept that, and invariant 1 still holds, because each Metal kernel rounds the same way at every window width.
 
 ### How this departs from the repository-wide contract
 
@@ -93,7 +127,7 @@ unchanged.
 | Weights as stored | The hyper-connection matrices are requantized to int8 copies |
 | FP32 accumulators and recurrent state | The same, except that integer block dots are exact int32 and the hyper-connection up projection multiplies fp16 high and low halves into fp32 accumulators |
 | Reference: the HF model run on the dequantized weights | Basalt's own kernels and their CPU references (`AGENTS.md:17`); quality against llama.cpp's Q8_0 base |
-| Gates: leaf ops within 2 ULP, layers at cosine above 0.999 | Basalt's per-kernel criteria: bitwise, `1e-6` to `1e-4` against double-precision references, and quantization-level bounds from `1e-3` to `5e-2` (the table below) |
+| Gates: leaf ops within 2 ULP, layers at cosine above 0.999 | Basalt's per-kernel criteria (the table below): bitwise; `1e-6` to `5e-3` against double-precision references; quantization-level bounds from `1e-3` to `0.15`; looser bounds for the drafter's approximations |
 | Greedy tokens equal to the golden; repeated runs bit-identical | Greedy tokens identical between `--spec 0` and `--spec 7`; perplexity within 0.01 of 2.971. Runs are bit-identical only with expert placement pinned (`precision.md:227-228`) |
 
 ### How basalt's test tiers carry over to Metal
@@ -102,17 +136,21 @@ Basalt's parity programs check three kinds of results:
 
 1. **Bitwise:** a kernel against the kernel it replaces; every window, column and batch invariance; quantizer codes;
    integer outputs (token ids, router ids, route counts); state after a commit.
-2. **Floating point against a double-precision CPU reference** on the same quantized bytes, within `1e-6` to `1e-4`.
-3. **Quantization-level bounds** where a kernel quantizes activations, from `1e-3` to `5e-2`.
+2. **Floating point against a double-precision CPU reference** on the same quantized bytes, within `1e-6` to `5e-3`.
+3. **Quantization-level bounds** where a kernel quantizes activations or reads a requantized copy, from `1e-3` to
+   `0.15` (a worst row, `tests/cuda/prefill_mmq_kq_test.cpp:375`), or relative to another path's error (the CPU
+   share). The drafter's 2-bit head copy has the loosest: at most 2% of its picks off the exact argmax, and the pick's
+   probability within 100% of the exact one (`src/kernels/q5k_head_parity.cpp:349`).
 
 Basalt builds for CUDA compute capability 12.0 only (`CMakeLists.txt:25-30`), so none of its tests runs on this Mac;
 the port re-implements each one against its Metal kernel. Tiers 2 and 3 keep basalt's references and tolerances
 unchanged. In tier 1 the invariance checks stay bitwise. A comparison against the CUDA kernel that a kernel replaced
 cannot run here, so the ported test compares the Metal kernel bitwise against its own one-token or one-column calls,
 which is what those comparisons establish, and the kernel's accuracy rests on the tier 2 and 3 tests of the same
-operation. The hardware preconditions in basalt's tests (thread-block clusters, int8 tensor cores, AVX-512) describe
-CUDA and x86 code paths; the arithmetic they specify still applies. Several basalt gates fold errors with `std::max`,
-which drops a NaN, so the ported tests also count non-finite outputs.
+operation. Where basalt has no such test, the port adds one (the end of the parity tests below). The hardware
+preconditions in basalt's tests (thread-block clusters, int8 tensor cores, AVX-512) describe CUDA and x86 code
+paths; the arithmetic they specify still applies. Several basalt gates fold errors with `std::max`, which drops a
+NaN, so the ported tests also count non-finite outputs.
 
 ## Acceptance setup
 
