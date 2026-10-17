@@ -523,7 +523,7 @@ def test_a_command_buffer_that_finishes_without_its_signal_fails_at_once(monkeyp
     assert st["done"] == 1 and st["error"] == 4
 
 
-@pytest.mark.parametrize("value", ["-1:0", "+3:0", " 3:0", "3:", ":0", "3:0x", "3:9"])
+@pytest.mark.parametrize("value", ["-1:0", "+3:0", " 3:0", "3:", ":0", "3:0x", "3:9", "123456789012345678901:0"])
 def test_a_malformed_drop_signal_is_refused(monkeypatch, value):
     """The hook takes two decimal numbers and a point the program has; anything else fails instead of dropping nothing."""
     monkeypatch.setenv("LITHOS_HOST_STEPS_DROP_SIGNAL", value)

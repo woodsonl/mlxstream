@@ -412,7 +412,9 @@ void Runner::set_host_points(std::vector<HostPoint> points, uint32_t error_offse
   if (const char* v = getenv("LITHOS_HOST_STEPS_DROP_SIGNAL"); v && *v) {
     const std::string s(v);
     const size_t colon = s.find(':');
-    auto digits = [](const std::string& t) { return !t.empty() && t.find_first_not_of("0123456789") == std::string::npos; };
+    auto digits = [](const std::string& t) {       // at most 19 digits: std::stoull cannot overflow
+      return !t.empty() && t.size() <= 19 && t.find_first_not_of("0123456789") == std::string::npos;
+    };
     if (colon == std::string::npos || !digits(s.substr(0, colon)) || !digits(s.substr(colon + 1)))
       throw std::runtime_error("LITHOS_HOST_STEPS_DROP_SIGNAL: expected <step>:<point> in decimal digits, got '" + s + "'");
     const uint64_t k = std::stoull(s.substr(colon + 1));
