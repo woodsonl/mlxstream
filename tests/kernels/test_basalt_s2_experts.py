@@ -167,6 +167,17 @@ def test_quantize_q8_0_scaled(dist):
 
 
 # ---- s2_expert_grouped_parity (s2_expert_grouped_parity.cpp:79-104, :150-260, :263-458) ------------------------------
+# Ported: section 4 (moe_grouped_s2, 8 tokens x 10 entries, a blob outside the arena), section 5 (moe_group_resident +
+# moe_grouped_s2 at the drafter's shape), and the properties sections 2 and 3 check (a device count below the
+# capacity; each entry reading its own token's row), on the grouped kernels. Left out, as this path does not run them:
+# - the per-hit kernels (sections 1-3 and 6-8: moe_hit_grouped_s2, _dev, _multi) and the previous grouped kernels
+#   (OLD_GROUPED=1): the drafter calls moe_grouped_s2 only (mtp.cpp:934), and the contract compares each kernel with
+#   its own per-entry calls instead of a previous kernel (docs/design/flash-next.md);
+# - the fp16-d runs (a null x_scales): they select quantize_q8_0 for the intermediate (s2_expert_grouped.cu:1112),
+#   and the drafter always passes its fp32 scales (it allocates hit_xs_, mtp.cpp:438);
+# - the misaligned fallbacks (sections 6-8): new_grouped (s2_expert_grouped.cu:504-508) sends a misaligned x or
+#   scratch to the previous kernels; here 4-byte aligned x and scratch are a precondition the program binding
+#   enforces.
 
 BLOB = kernels.S2_BLOB_BYTES
 
@@ -385,7 +396,7 @@ def test_grouped_8_tokens(fx):
     selects quantize_q8_0, which the drafter never takes (it allocates hit_xs_, mtp.cpp:438)."""
     n = 8 * K
     sizes = [8, 1, 5, 2, 7, 3, 1, 6, 4, 8, 1, 2, 3, 4, 5, 6, 7, 1, 1, 5]
-    order = fx.rng.permutation(n)
+    order = np.random.default_rng(4).permutation(n)
     grp, gstart, edst = [], [0], []
     at = gi = 0
     while at < n:
@@ -405,8 +416,8 @@ def test_group_resident_drafter_shape(fx):
     ids (distinct within a token, shared across tokens, from 12 experts resident at base + id * BLOB), cap_groups =
     cap_entries = 50 (mtp.cpp:931-935); the plan read back from the device as basalt's test does, and checked against a
     host transcription of group_resident_kernel (groups in first-appearance order, entries in routing order)."""
-    T, n = 5, 5 * K
-    ids = np.concatenate([fx.rng.permutation(fx.nb)[:K] for _ in range(T)]).astype(np.int32)
+    T, n, rng = 5, 5 * K, np.random.default_rng(5)
+    ids = np.concatenate([rng.permutation(fx.nb)[:K] for _ in range(T)]).astype(np.int32)
     r, (grp, gstart, ng, etok, edst) = check_call("moe_group_resident + moe_grouped_s2 (fp32)", fx, None, None, 0,
                                                     None, None, n, n, n, resident=(ids, K, 0, 0))
     experts, want_start, order = groups_by_expert(list(ids))
@@ -421,9 +432,9 @@ def test_verify_window_rows(fx):
     capacity and a device group count below cap_groups. basalt runs this section on the per-hit kernels
     (moe_hit_grouped_s2_multi), which the drafter does not call; the property it checks, rows per token, is
     moe_grouped_s2's ent_tok."""
-    n, count = 4 * K, 29
-    ent_ids = fx.rng.permutation(n)
-    slot = fx.rng.integers(0, fx.nb, n)
+    n, count, rng = 4 * K, 29, np.random.default_rng(3)
+    ent_ids = rng.permutation(n)
+    slot = rng.integers(0, fx.nb, n)
     dst = np.sort(ent_ids[:count])
     experts, gstart, order = groups_by_expert([int(s) for s in slot[:count]])
     edst = [int(dst[h]) for h in order]
@@ -438,7 +449,7 @@ def test_device_count(fx):
     per-hit kernels (moe_hit_grouped_s2_dev), which the drafter does not call."""
     cap, count = 10, 7
     slot = [(i * 7 + 1) % fx.nb for i in range(cap)]
-    dst = fx.rng.permutation(cap)
+    dst = np.random.default_rng(2).permutation(cap)
     experts, gstart, order = groups_by_expert(slot[:count])
     edst = [int(dst[h]) for h in order] + [int(d) for d in dst[count:]]
     r, _ = check_call("moe_grouped_s2 (count 7 of 10)", fx, [(0, s * BLOB) for s in experts], gstart, len(experts),
