@@ -20,9 +20,12 @@ Q4_K, Q5_K, Q6_K and IQ4_XS weights, in every summation order basalt's variant r
 - Bit for bit against the numpy emulation of what nvcc compiles (tests/kernels/basalt_emu.py ``dense_tc``,
   docs/research/basalt-nvcc/dense_tc.md), every order, at shapes with empty warp groups (n_in 2560 in the one order),
   KS 2 at n_in 1024 and 2048, and row tails; the orders must differ somewhere, so the comparison can tell them apart.
-- A float64 reference per type, under the nearest basalt bound: dense_tc's comparand native_mmvq is checked against a
-  reference by iq_parity, ``const bool ok = dq_err < 1e-6 && mm_err < 2e-2 && multi_bad == 0;`` (iq_parity.cpp:112),
-  mm_err the relative L1 error against ref . x in float64 on the float activations."""
+- A float64 reference per type, every order, under the bound docs/design/flash-next.md gives dense_tc's comparand
+  native_mmvq: for Q4_K, Q5_K and Q6_K, which no basalt test checks against a reference, mmvq_multi_parity's Q8_0
+  rule on the same q8_1 bytes, ``const bool ok = diff == 0 && worst <= 1e-4 * (scale + 1e-30);``
+  (mmvq_multi_parity.cpp:461); for Q3_K, IQ4_XS and Q2_0, which iq_parity runs (iq_parity.cpp:29), ``const bool ok =
+  dq_err < 1e-6 && mm_err < 2e-2 && multi_bad == 0;`` (iq_parity.cpp:112), mm_err the relative L1 error against
+  ref . x in float64 on the float activations."""
 
 import numpy as np
 import pytest
@@ -31,7 +34,7 @@ from monolith import kernels
 from tests.contract import gguf_reference
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
-from tests.kernels.test_basalt_mmvq import columns, weights
+from tests.kernels.test_basalt_mmvq import columns, reference, weights
 
 F32 = np.float32
 NAMES = {11: "Q3_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 23: "IQ4_XS", 42: "Q2_0"}
@@ -177,19 +180,31 @@ def test_pair_emulation_bit_for_bit():
 
 @pytest.mark.parametrize("type_id", sorted(NAMES), ids=[NAMES[t] for t in sorted(NAMES)])
 def test_float64_reference(type_id):
-    """iq_parity's rule (iq_parity.cpp:103-112) for every order: mm_err = sum |y - ref . x| / sum |ref . x| < 2e-2
-    over eight columns, ref the weights dequantized by gguf-py's decoders (tests/contract/gguf_reference.py) and x the
-    float activations, ref . x in float64."""
+    """Every order, eight columns. Q4_K, Q5_K and Q6_K: mmvq_multi_parity.cpp:461's rule, worst |y - ref| <= 1e-4 *
+    max |ref| per column, ref the float64 product on the same q8_1 bytes (test_basalt_mmvq.reference); its diff == 0
+    is test_dense_tc_parity's bits == 0. Q3_K, IQ4_XS and Q2_0: iq_parity's rule (iq_parity.cpp:103-112), mm_err =
+    sum |y - ref . x| / sum |ref . x| < 2e-2, ref the weights dequantized by gguf-py's decoders
+    (tests/contract/gguf_reference.py) and x the float activations, ref . x in float64."""
     n_in, n_out = 6144, 40
     rng = np.random.default_rng(31 * type_id)
     w = weights(type_id, n_in, n_out, rng)
     x = rng.standard_normal(8 * n_in).astype(F32)
     xq = gpu.q8_1(x, "native")
-    ref = gguf_reference.dequantize(type_id, w).astype(np.float64)                  # (n_out, n_in)
-    acc = x.reshape(8, n_in).astype(np.float64) @ ref.T                             # (8, n_out)
+    same_bytes = type_id in (12, 13, 14)
+    if same_bytes:
+        ref = np.stack([reference(type_id, w, columns(xq, n_in, j), n_in, n_out) for j in range(8)])   # (8, n_out)
+    else:
+        ref = x.reshape(8, n_in).astype(np.float64) @ gguf_reference.dequantize(type_id, w).astype(np.float64).T
     for v in variants(n_in):
-        y = gpu.dense_tc(type_id, w, xq, n_in, n_out, (8,), v)[8]
-        mm_err = np.abs(y - acc).sum() / (np.abs(acc).sum() + 1e-30)
-        print(f"{NAMES[type_id]} {v}: mm_err {mm_err:.2e}")
-        # basalt: ``const bool ok = dq_err < 1e-6 && mm_err < 2e-2 && multi_bad == 0;`` (iq_parity.cpp:112)
-        assert np.all(np.isfinite(y)) and mm_err < 2e-2, (v, mm_err)
+        y = gpu.dense_tc(type_id, w, xq, n_in, n_out, (8,), v)[8].astype(np.float64)
+        assert np.all(np.isfinite(y)), v
+        if same_bytes:
+            worst, scale = np.abs(y - ref).max(axis=1), np.abs(ref).max(axis=1)
+            print(f"{NAMES[type_id]} {v}: worst / scale up to {(worst / scale).max():.2e}")
+            # basalt: ``const bool ok = diff == 0 && worst <= 1e-4 * (scale + 1e-30);`` (mmvq_multi_parity.cpp:461)
+            assert np.all(worst <= 1e-4 * (scale + 1e-30)), (v, worst / scale)
+        else:
+            mm_err = np.abs(y - ref).sum() / (np.abs(ref).sum() + 1e-30)
+            print(f"{NAMES[type_id]} {v}: mm_err {mm_err:.2e}")
+            # basalt: ``const bool ok = dq_err < 1e-6 && mm_err < 2e-2 && multi_bad == 0;`` (iq_parity.cpp:112)
+            assert mm_err < 2e-2, (v, mm_err)
