@@ -96,6 +96,11 @@ dx is the quantizer's fp32 s, any non-negative float. Site by site:
   (g > 87.3: `ex2.approx.f32` keeps it through the halving path below −126) and the GPU's `fast::exp2` may flush it; t =
   fl(e + 1) = 1 either way. h = u · q can be subnormal: `ieee_mul`.
 - **The intermediate's quantizer**: as the first row, on h.
+- **NaN bit patterns**: sm_120's `FFMA`, `FADD`, `FMUL` and `div.rn.f32` give the canonical NaN 0x7fffffff whatever
+  their operands; this GPU's fma, add and division give 0x7fc00000 (`ieee_mul`'s explicit path returns 0x7fffffff).
+  A NaN in gate/up, the SwiGLU or down comes from one of those operations or passes through them (a NaN g makes e and
+  t NaN), so the port rewrites a NaN to 0x7fffffff in every float those kernels store (`cuda_nan`, `basalt_q8_1.metal`)
+  and stores CUDA's bits. The quantizer stores no NaN: s never is one, and a NaN r gives code 0.
 
 ## 1. `quantize_q8_0_scaled_warp_kernel` (`quantize_act.cu:78-101`; launch `:219-238`)
 

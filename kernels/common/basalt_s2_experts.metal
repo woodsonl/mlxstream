@@ -14,7 +14,9 @@
 // quantizer's fp32 s, any non-negative float, so a subnormal can occur at every rounding site: each goes through
 // basalt_q8_1.metal's IEEE helpers (ieee_div127, ieee_rcp, ieee_mul, ieee_fma, ieee_div, warp_sum_ieee), whose
 // hardware path is the plain operation (fma() where SASS has FFMA), and every compare that a subnormal could reach is
-// on bits. Contraction is off (basalt_fp.metal's pragma).
+// on bits. Contraction is off (basalt_fp.metal's pragma). A NaN can come only from FFMA, FADD, FMUL and div.rn.f32 (or
+// pass through them), each of which gives sm_120's canonical 0x7fffffff, so every float the gate/up, SwiGLU and down
+// kernels store goes through cuda_nan (this GPU's NaN is 0x7fc00000).
 //
 // The plan (basalt's): n_groups[0] groups; group g's blob starts at grp_ptr[g] (a table of 64-bit GPU addresses, one a
 // group, each 2-byte aligned and inside a buffer the dispatch makes resident, so the blobs may sit in several buffers)
@@ -252,8 +254,8 @@ kernel void basalt_s2_gu(device const GrpPtr* grp_ptr [[buffer(0)]], device cons
             const float s0 = warp_sum_ieee(acc0), s1 = warp_sum_ieee(acc1);
             if (lane == 0) {
                 const int e = e0 + k, r = i >> 1;
-                gate_up[ulong(e) * S2_FF + ulong(r)] = s0;
-                gate_up[ulong(p.cap_entries) * S2_FF + ulong(e) * S2_FF + ulong(r)] = s1;
+                gate_up[ulong(e) * S2_FF + ulong(r)] = cuda_nan(s0);
+                gate_up[ulong(p.cap_entries) * S2_FF + ulong(e) * S2_FF + ulong(r)] = cuda_nan(s1);
             }
         }
     }
@@ -271,7 +273,7 @@ kernel void basalt_s2_swiglu(device float* gate_up [[buffer(0)]], constant S2Par
     const ulong n_pairs = ulong(p.cap_entries) * S2_FF, i = ulong(tg) * tpg + tid;
     if (i >= n_pairs) return;
     const float g = gate_up[i], u = gate_up[n_pairs + i];
-    gate_up[i] = ieee_mul(ieee_div(g, expf_neg(g) + 1.0f), u);
+    gate_up[i] = cuda_nan(ieee_mul(ieee_div(g, expf_neg(g) + 1.0f), u));
 }
 
 // ---- down -----------------------------------------------------------------------------------------------------------
@@ -326,8 +328,8 @@ kernel void basalt_s2_down(device const GrpPtr* grp_ptr [[buffer(0)]], device co
             const float s0 = warp_sum_ieee(acc0), s1 = warp_sum_ieee(acc1);
             if (lane == 0) {
                 const ulong o = ulong(ent_dst[e0 + k]) * S2_H + ulong(r);
-                out[o] = s0;
-                out[o + 1] = s1;
+                out[o] = cuda_nan(s0);
+                out[o + 1] = cuda_nan(s1);
             }
         }
     }

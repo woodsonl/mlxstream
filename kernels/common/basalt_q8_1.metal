@@ -206,6 +206,13 @@ static inline float warp_sum_ieee(float x) {
     return x;
 }
 
+// x with a NaN as sm_120's: every FADD, FMUL, FFMA and div.rn.f32 that makes a NaN gives the canonical 0x7fffffff,
+// where this GPU gives 0x7fc00000. A port kernel whose NaN can only come from such operations (or pass through them)
+// applies it to the float it stores.
+static inline float cuda_nan(float x) {
+    return (as_type<uint>(x) & 0x7fffffffu) > 0x7f800000u ? as_type<float>(0x7fffffffu) : x;
+}
+
 static inline void q8_1_store_ieee(float xi, device uchar* y, uint i) {
     int key = isnan(xi) ? -1 : int(as_type<uint>(fabs(xi)));        // fmaxf drops a NaN operand
     float sum = xi;

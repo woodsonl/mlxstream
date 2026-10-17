@@ -564,6 +564,19 @@ static inline float rcp_plain(float a) { return 1.0f / a; }
             + body)
 
 
+def hw_nan_source():
+    """The drafter kernels storing the hardware's NaN (0x7fc00000 on this GPU) instead of cuda_nan's 0x7fffffff: the
+    negative control of the NaN tests."""
+    return (kernels.PRELUDE + kernels.template("basalt_fp.metal") + kernels.template("basalt_q8_1.metal")
+            + kernels.template("basalt_s2_experts.metal").replace("cuda_nan(", "("))
+
+
+def nan_bits(v):
+    """The bit patterns of the NaNs among float32 values ``v`` (given as uint32)."""
+    v = np.asarray(v).view(np.uint32).reshape(-1)
+    return v[(v & 0x7FFFFFFF) > 0x7F800000]
+
+
 def test_quantizer_planted_negative_control():
     """The planted blocks of test_quantize_q8_0_scaled through the plain kernel: it must get bytes wrong that the IEEE
     kernel gets right."""
@@ -630,12 +643,40 @@ def test_swiglu_planted():
                       -(-n // kernels.S2_THREADS), kernels.S2_THREADS)
         return np.frombuffer(out[0], F32)
 
-    got, plain = run(kernels.basalt_s2_experts_source()), run(plain_source())
+    got, plain, hw = run(kernels.basalt_s2_experts_source()), run(plain_source()), run(hw_nan_source())
     want = emu.s2_swiglu(g, u, gpu_expf_neg(g))
     nan = np.isnan(want)
     assert np.array_equal(got[n:].view(np.uint32), u.view(np.uint32))          # the up half is read only
     assert np.all((same_bits(got[:n], want) & ~nan) | (np.isnan(got[:n]) & nan))
+    # a NaN stored as sm_120's 0x7fffffff (g = -inf makes a fresh one: -inf / inf); the hardware's differs
+    assert nan_bits(got[:n]).size >= 2 and np.all(nan_bits(got[:n]) == 0x7FFFFFFF), np.unique(nan_bits(got[:n]))
+    assert np.any(nan_bits(hw[:n]) != 0x7FFFFFFF)
     diff = np.count_nonzero(~((same_bits(plain[:n], want) & ~nan) | (np.isnan(plain[:n]) & nan)))
     sub = np.count_nonzero((want != 0) & (np.abs(want) < F32(2.0 ** -126)))
     assert diff > 100 and sub > 100, (diff, sub)
     print(f"\nSwiGLU planted: {n} values bit for bit, {sub} subnormal; the plain kernel differs on {diff}")
+
+
+def test_nan_bit_pattern(fx):
+    """Every NaN the drafter kernels store is sm_120's canonical 0x7fffffff (s2_experts.md, NaN bit patterns), where
+    this GPU's fma, add and division give 0x7fc00000. Token 0's activation row holds an infinity: its block's s is
+    infinite and its codes 0, so each gate/up term fma(dw * inf, 0, acc) is NaN, and the SwiGLU of a NaN gate is NaN.
+    Token 1's holds a finite 3e38: gate and up values near 1e37 whose SwiGLU products overflow, an intermediate block
+    with an infinite s, and each down term fma(dw * inf, 0, acc) NaN. The same kernels storing the hardware's NaN must
+    differ."""
+    rng = np.random.default_rng(16)
+    x = rng.standard_normal((2, H)).astype(F32)
+    x[0, 5], x[1, 5] = np.inf, F32(3e38)
+    xq, xs = gpu.q8_0_scaled(x.reshape(-1))
+
+    def stored(src):
+        r = gpu.s2_experts(fx.bufs, [(0, 0)], [0, 2], 1, [0, 1], [0, 1], xq, xs, 1, 2, 2, src=src)
+        gu = r["scratch"][: 4 * 2 * 2 * FF].view(np.uint32)
+        return {"up 0": gu[2 * FF: 3 * FF], "swiglu 0": gu[:FF], "gate/up": gu, "out 1": r["out"][1], "out": r["out"]}
+
+    got, hw = stored(None), stored(hw_nan_source())
+    pats = {k: (nan_bits(v).size, [hex(int(b)) for b in np.unique(nan_bits(v))]) for k, v in got.items()}
+    assert all(pats[k][0] for k in ("up 0", "swiglu 0", "out 1")), pats
+    assert all(np.all(nan_bits(v) == 0x7FFFFFFF) for v in got.values()), pats
+    assert any(np.any(nan_bits(hw[k]) != 0x7FFFFFFF) for k in ("gate/up", "out"))
+    print(f"\nNaN bit patterns stored: {pats}")
