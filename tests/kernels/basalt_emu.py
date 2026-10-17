@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2023-2026 The ggml authors
 # Copyright (c) 2026 Jesús Gulfo
-# adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu, src/kernels/cuda/iq_kernels.cu and
-# include/basalt/kernels/q8_1_finite.hpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp
-# ggml/src/ggml-common.h (kvalues_iq4nl), ggml/src/ggml-quants.c (get_scale_min_k4) and ggml/src/ggml-cuda/quantize.cu
-# @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+# adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu, src/kernels/cuda/iq_kernels.cu,
+# src/kernels/cuda/native_bf16.cu, src/kernels/cuda/dense_tc.cu and include/basalt/kernels/q8_1_finite.hpp @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp ggml/src/ggml-common.h (kvalues_iq4nl),
+# ggml/src/ggml-quants.c (get_scale_min_k4), ggml/src/ggml-cuda/quantize.cu and ggml/src/ggml-cuda/mmvf.cu @
+# 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
 """numpy emulation of basalt's float32 arithmetic as nvcc compiles it (docs/research/basalt-nvcc/matvec.md), for the
-bit-for-bit tests of the Metal port. Every float operation rounds once to float32, to nearest even: numpy's float32
-add, multiply and divide do; ``fma32`` does by rounding the exact float64 sum to odd before the float32 cast. The
-``*_ftz`` forms flush subnormal inputs and results to the zero of their sign, as SASS's ``.FTZ`` instructions do."""
+bit-for-bit tests of the Metal port. Every float operation rounds once to float32, to nearest even on the float32
+grid, subnormals included (gradual underflow): numpy's float32 add, multiply and divide do; ``fma32`` does by rounding
+the exact float64 sum to odd before the float32 cast. The ``*_ftz`` forms flush subnormal inputs, then flush the
+rounded result if it is subnormal, as PTX defines ``.ftz`` (``fma.f32``: the exact value "rounded to single
+precision"; ``.ftz`` flushes "subnormal inputs and results"): an exact result in [2^-126 - 2^-150, 2^-126) gives
+2^-126, the tie 2^-126 - 2^-150 included (2^-126 is the even neighbour)."""
 
 import numpy as np
 
@@ -23,8 +27,9 @@ def ftz(x):
 
 
 def fma32(a, b, c):
-    """a * b + c rounded once to float32 (to nearest even). a * b is exact in float64; the float64 sum is rounded to
-    odd (TwoSum gives its exact error), which a float32 cast then rounds correctly (53 >= 24 + 2 bits)."""
+    """a * b + c rounded once to float32 (to nearest even, on the grid with subnormals). a * b is exact in float64;
+    the float64 sum is rounded to odd (TwoSum gives its exact error), which a float32 cast then rounds correctly
+    (53 >= 24 + 2 bits)."""
     a, b, c = (np.asarray(v, F32).astype(np.float64) for v in (a, b, c))
     s = a * b
     t = s + c
@@ -48,6 +53,7 @@ def mul_ftz(a, b):
 
 
 def fma_ftz(a, b, c):
+    """fma.rn.ftz.f32: rounded first, then flushed, so 2^-126 - 2^-151 exactly gives 2^-126 (module docstring)."""
     return ftz(fma32(ftz(a), ftz(b), ftz(c)))
 
 
@@ -329,6 +335,41 @@ def swiglu_q8_1(gate, up, e):
     with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
         h = (g / (F32(1.0) + e)) * up
     return q8_1_ieee(h)
+
+
+# ---- the BF16 GEMVs on fp32 activations (docs/research/basalt-nvcc/bf16.md) -----------------------------------------
+# native_bf16.cu builds with --use_fast_math: every FMA and add is .FTZ.
+
+def bf16_bits(x):
+    """float32 to bf16 bits, round to nearest even (bf16_bits.hpp's bf16_from_f32 for non-NaN values)."""
+    b = np.asarray(x, F32).view(np.uint32).astype(np.uint64)
+    return ((b + ((b >> 16) & 1) + 0x7FFF) >> 16).astype(np.uint16)
+
+
+def mmvf(w, x, block, flush=True):
+    """bf16_gemv_fp32_mmvf's outputs (n_tok, n_out) for BF16 bits ``w`` (n_out, n_in) and float32 rows ``x``
+    (n_tok, n_in) with ``block`` threads (basalt's mmvf_block_size), as bf16.md records it: thread t takes the pairs
+    t, t + block, ... in order, acc = fma(bf(w[2p]), x[2p], acc) then fma(bf(w[2p + 1]), x[2p + 1], acc) from +0,
+    all .FTZ; the XOR butterfly per warp; for block > 32 the butterfly again over 32 slots, the warp sums and +0s.
+    ``flush=False``: the same sequence in IEEE float32 (``fma32`` and plain adds), what the kernel would give without
+    .FTZ."""
+    fma, add = (fma_ftz, add_ftz) if flush else (fma32, np.add)
+    w = np.asarray(w, np.uint16)
+    n_out, n_in = w.shape
+    x = np.asarray(x, F32).reshape(-1, n_in)
+    wf = (w.astype(np.uint32) << 16).view(F32)
+    acc = np.zeros((x.shape[0], n_out, block), F32)
+    pairs = n_in // 2
+    for p0 in range(0, pairs, block):
+        p = np.arange(p0, min(p0 + block, pairs))
+        a = fma(wf[None, :, 2 * p], x[:, None, 2 * p], acc[..., p - p0])
+        acc[..., p - p0] = fma(wf[None, :, 2 * p + 1], x[:, None, 2 * p + 1], a)
+    s = butterfly(acc.reshape(-1, 32), add).reshape(x.shape[0], n_out, block // 32)
+    if block > 32:
+        slots = np.zeros(s.shape[:2] + (32,), F32)
+        slots[..., : block // 32] = s
+        s = butterfly(slots.reshape(-1, 32), add).reshape(x.shape[0], n_out, 1)
+    return s[..., 0]
 
 
 # ---- dense_tc and dense_tc_pair (docs/research/basalt-nvcc/dense_tc.md) ----------------------------------------------

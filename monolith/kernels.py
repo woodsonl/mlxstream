@@ -322,7 +322,8 @@ EXPERT_GROUP_ROWS = 24      # basalt's g_dec_gy: the most threadgroup rows a cal
 
 def basalt_experts_source() -> str:
     """basalt's ``native_expert_grouped`` for Q2_0 gate/up and down: ``basalt_expert_gu``, ``basalt_expert_swiglu_q8_1``
-    and ``basalt_expert_down``, dispatched in that order."""
+    and ``basalt_expert_down``, dispatched in that order. The gate/up and down kernels take basalt's ``grp_ptr`` at
+    buffer(1): one 64-bit GPU address a group (each 2-byte aligned, inside a buffer the dispatch makes resident)."""
     return PRELUDE + template("basalt_fp.metal") + template("basalt_q8_1.metal") + template("basalt_experts.metal")
 
 
@@ -388,6 +389,56 @@ def basalt_dequant_macros(type_id: int) -> Dict[str, str]:
     if type_id not in DEQUANT_TYPES:
         raise ValueError(f"basalt_dequant: unsupported ggml type {type_id}")
     return {"DQ_TYPE": str(type_id)}
+
+
+# ---- basalt's BF16 GEMVs on fp32 activations (kernels/common/basalt_mmvf.metal; docs/research/basalt-nvcc/bf16.md) --
+# The launch rules below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_bf16.cu:124-203 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE), whose block-size rule is ggml-org/llama.cpp's
+# ggml/src/ggml-cuda/mmvf.cu @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+
+def basalt_mmvf_source() -> str:
+    """basalt's ``bf16_gemv_fp32_mmvf`` and ``bf16_gemv_fp32_mmvf_multi`` (``basalt_mmvf``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_mmvf.metal")
+
+
+def basalt_mmvf_block(n_in: int) -> int:
+    """basalt's ``mmvf_block_size`` (native_bf16.cu:124-135): 32 threads, unless a block of 64, 96, ..., 256 takes
+    strictly fewer iterations over the n_in / 2 pairs (the first such, then the next that improves on it)."""
+    best, best_it = 32, (n_in + 63) // 64
+    for c in range(64, 257, 32):
+        it = (n_in + 2 * c - 1) // (2 * c)
+        if it < best_it:
+            best, best_it = c, it
+    return best
+
+
+def basalt_mmvf_macros(n_in: int, n_out: int, n_tok: int = 1, ldx: Optional[int] = None,
+                       ldy: Optional[int] = None) -> Dict[str, str]:
+    """basalt's launch for ``n_tok`` activation rows (x row k at k * ldx floats, y row k at k * ldy) after its checks
+    (native_bf16.cu:139-189): one row with ldy >= n_out takes the one-row kernel (NT 1); otherwise the multi kernel,
+    NT 4 up to 4 rows, else 8. BLOCK is ``basalt_mmvf_block(n_in)``; the grid n_out threadgroups of BLOCK threads.
+    ldx and ldy default to n_in and n_out."""
+    ldx = n_in if ldx is None else ldx
+    ldy = n_out if ldy is None else ldy
+    if not (0 < n_in < 2 ** 31 and n_in % 2 == 0 and 0 < n_out < 2 ** 31):
+        raise ValueError("basalt_mmvf: require positive even n_in and positive n_out <= INT_MAX")
+    one_row = n_tok == 1 and ldy >= n_out
+    if not one_row and not (1 <= n_tok <= 8 and ldx % 2 == 0):
+        raise ValueError("basalt_mmvf: 1..8 rows, even n_in/ldx")
+    nt = 1 if one_row else (4 if n_tok <= 4 else 8)
+    return {"BLOCK": str(basalt_mmvf_block(n_in)), "NT": str(nt)}
+
+
+def basalt_mmvf_params(n_in: int, n_out: int, n_tok: int = 1, ldx: Optional[int] = None,
+                       ldy: Optional[int] = None) -> bytes:
+    """``MmvfParams``: n_in, n_out, n_tok, ldx and ldy (defaults n_in and n_out)."""
+    return struct.pack("<8I", n_in, n_out, n_tok, n_in if ldx is None else ldx, n_out if ldy is None else ldy, 0, 0, 0)
+
+
+def basalt_mmvf_cols(ncols: int) -> List[Tuple[int, int]]:
+    """basalt's ``bf16_gemv_fp32_mmvf_cols`` (native_bf16.cu:193-203): (first column, columns) of each launch over
+    ``ncols`` contiguous columns (ldx = n_in, ldy = n_out), chunks of 8; a chunk of one is the one-row kernel's."""
+    return [(c0, min(8, ncols - c0)) for c0 in range(0, ncols, 8)]
 
 
 # ---- basalt's dense_tc and dense_tc_pair (kernels/common/basalt_dense_tc.metal; docs/research/basalt-nvcc/dense_tc.md)

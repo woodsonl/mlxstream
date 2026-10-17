@@ -63,12 +63,14 @@ def mmvq(type_id, w, xq, n_in, n_out, ncols, upstream=False, fill=None):
 
 
 def experts(blobs, grp_off, grp_start, ent_tok, ent_dst, xq, n_embd, n_ff, n_out_rows, *, n_groups=None,
-            cap_groups=None, cap_entries=None, grid_groups=0, gu2=None, sub16=None, out_fill=0xFF, scratch_fill=0x00):
+            cap_groups=None, cap_entries=None, grid_groups=0, gu2=None, sub16=None, out_fill=0xFF, scratch_fill=0x00,
+            grp_buf=None):
     """basalt's ``native_expert_grouped`` for Q2_0 / Q2_0: the gate/up, SwiGLU + q8_1 and down dispatches in order, in
-    one command buffer. ``blobs``: the expert blobs' bytes, ``grp_off`` each group's byte offset into them (basalt's
-    grp_ptr); ``grp_start`` (n_groups + 1 entries), ``ent_tok``, ``ent_dst`` and ``xq`` (q8_1 rows) as basalt's. The
-    output (``n_out_rows`` rows of n_embd floats) starts as ``out_fill`` bytes, the scratch as ``scratch_fill``.
-    Returns the gate, up, q8_1 and output buffers' contents."""
+    one command buffer. ``blobs``: the expert blobs' bytes, or a list of them (one buffer each); group g's blob starts
+    ``grp_off[g]`` bytes into buffer ``grp_buf[g]`` (default 0), and the kernels get basalt's grp_ptr, that buffer's GPU
+    address plus the offset; ``grp_start`` (n_groups + 1 entries), ``ent_tok``, ``ent_dst`` and ``xq`` (q8_1 rows) as
+    basalt's. The output (``n_out_rows`` rows of n_embd floats) starts as ``out_fill`` bytes, the scratch as
+    ``scratch_fill``. Returns the gate, up, q8_1 and output buffers' contents."""
     n_groups = len(grp_off) if n_groups is None else n_groups
     cap_groups = max(n_groups, 1) if cap_groups is None else cap_groups
     cap_entries = max(len(ent_tok), 1) if cap_entries is None else cap_entries
@@ -85,8 +87,10 @@ def experts(blobs, grp_off, grp_start, ent_tok, ent_dst, xq, n_embd, n_ff, n_out
         v[: len(a)] = a
         return nt.Buffer(dev, v.tobytes())
 
-    b_blobs = nt.Buffer(dev, np.ascontiguousarray(blobs, np.uint8).tobytes())
-    b_off = arr(grp_off, np.uint64, cap_groups)
+    arenas = blobs if isinstance(blobs, (list, tuple)) else [blobs]
+    b_blobs = [nt.Buffer(dev, np.ascontiguousarray(a, np.uint8).tobytes()) for a in arenas]
+    grp_buf = [0] * len(grp_off) if grp_buf is None else grp_buf
+    b_ptr = arr([b_blobs[i].gpu_address + int(o) for i, o in zip(grp_buf, grp_off)], np.uint64, cap_groups)
     b_start = arr(grp_start, np.int32, cap_groups + 1)
     b_ng = nt.Buffer(dev, np.int32(n_groups).tobytes())
     b_tok, b_dst = arr(ent_tok, np.int32, cap_entries), arr(ent_dst, np.int32, cap_entries)
@@ -100,22 +104,60 @@ def experts(blobs, grp_off, grp_start, ent_tok, ent_dst, xq, n_embd, n_ff, n_out
     b_out.fill(out_fill)
     params = kernels.basalt_expert_params(n_embd, n_ff)
     d1 = nt.Dispatch().pipeline(pgu)
-    for k, b in enumerate((b_blobs, b_off, b_start, b_ng, b_tok, b_xq, b_gate, b_up)):
+    for k, b in enumerate((b_ptr, b_start, b_ng, b_tok, b_xq, b_gate, b_up), start=1):
         d1 = d1.buffer(k, b)
+    for b in b_blobs:
+        d1 = d1.use(b)
     d1 = d1.bytes(8, params).grid(*ggu).threadgroup(kernels.EXPERT_THREADS)
     d2 = nt.Dispatch().pipeline(psw)
     for k, b in enumerate((b_gate, b_up, b_start, b_ng, b_hq)):
         d2 = d2.buffer(k, b)
     d2 = d2.bytes(5, params).grid(gsw).threadgroup(kernels.EXPERT_THREADS)
     d3 = nt.Dispatch().pipeline(pdn)
-    for k, b in enumerate((b_blobs, b_off, b_start, b_ng, b_dst, b_hq, b_out)):
+    for k, b in enumerate((b_ptr, b_start, b_ng, b_dst, b_hq, b_out), start=1):
         d3 = d3.buffer(k, b)
+    for b in b_blobs:
+        d3 = d3.use(b)
     d3 = d3.bytes(7, params).grid(*gdn).threadgroup(kernels.EXPERT_THREADS)
     r = nt.Queue(dev).run([d1, d2, d3])
     assert not r.error, r.error
     f32 = lambda b: np.frombuffer(b.read(0, b.nbytes), np.float32)
     return {"gate": f32(b_gate).reshape(cap_entries, n_ff), "up": f32(b_up).reshape(cap_entries, n_ff),
             "hq": np.frombuffer(b_hq.read(0, b_hq.nbytes), np.uint8), "out": f32(b_out).reshape(n_out_rows, n_embd)}
+
+
+def mmvf(w, x, n_in, n_out, n_tok=1, ldx=None, ldy=None, fill=None):
+    """``basalt_mmvf`` in basalt's launch (``bf16_gemv_fp32_mmvf_multi``; one row with ldy >= n_out:
+    ``bf16_gemv_fp32_mmvf``) for BF16 bits ``w`` (n_out rows of n_in) and the float32 rows of ``x`` (row k at k * ldx,
+    (n_tok - 1) * ldx + n_in values); the output, (n_tok - 1) * ldy + n_out floats, starts as ``fill`` bytes."""
+    ldx = n_in if ldx is None else ldx
+    ldy = n_out if ldy is None else ldy
+    macros = kernels.basalt_mmvf_macros(n_in, n_out, n_tok, ldx, ldy)
+    pso = pipeline(kernels.basalt_mmvf_source(), "basalt_mmvf", tuple(sorted(macros.items())))
+    out = run(pso, [np.ascontiguousarray(x, np.float32).tobytes(), np.ascontiguousarray(w, np.uint16).tobytes(),
+                    4 * ((n_tok - 1) * ldy + n_out)], kernels.basalt_mmvf_params(n_in, n_out, n_tok, ldx, ldy), 3,
+              n_out, int(macros["BLOCK"]), fill)
+    return np.frombuffer(out[2], np.float32)
+
+
+def mmvf_cols(w, x, n_in, n_out, ncols, fill=None):
+    """basalt's ``bf16_gemv_fp32_mmvf_cols``: ``ncols`` contiguous columns of ``x`` in launches of up to 8 (one command
+    buffer, x and y bound at each chunk's offset), into an (ncols, n_out) output that starts as ``fill`` bytes."""
+    dev = device()
+    bx = nt.Buffer(dev, np.ascontiguousarray(x, np.float32).tobytes())
+    bw = nt.Buffer(dev, np.ascontiguousarray(w, np.uint16).tobytes())
+    by = nt.Buffer(dev, 4 * ncols * n_out)
+    if fill is not None:
+        by.fill(fill)
+    ds = []
+    for c0, nc in kernels.basalt_mmvf_cols(ncols):
+        macros = kernels.basalt_mmvf_macros(n_in, n_out, nc)
+        pso = pipeline(kernels.basalt_mmvf_source(), "basalt_mmvf", tuple(sorted(macros.items())))
+        ds.append(nt.Dispatch().pipeline(pso).buffer(0, bx, 4 * c0 * n_in).buffer(1, bw).buffer(2, by, 4 * c0 * n_out)
+                  .bytes(3, kernels.basalt_mmvf_params(n_in, n_out, nc)).grid(n_out).threadgroup(int(macros["BLOCK"])))
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+    return np.frombuffer(by.read(0, by.nbytes), np.float32).reshape(ncols, n_out)
 
 
 def dequant(type_id, raw, n):

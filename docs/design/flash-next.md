@@ -103,8 +103,8 @@ ones this pack runs.
    (`src/program/generate.cpp:1889-1893`), including its rounding sequence. The authority for that sequence is what
    nvcc compiles, read from basalt's sm_120 PTX and SASS and recorded per kernel and site in
    `docs/research/basalt-nvcc/` (`matvec.md` for the q8_1 quantizers and `native_mmvq`, `dequant.md` for the GGUF
-   dequantizers, `experts.md` for the routed experts, `dense_tc.md` for the window projections): which multiply-adds
-   fuse and
+   dequantizers, `experts.md` for the routed experts, `bf16.md` for the BF16 GEMVs, `dense_tc.md` for the window
+   projections): which multiply-adds fuse and
    with which operands, the operand order of each `a * b - c * d`, where `.FTZ` flushes subnormals, and each
    approximate instruction. The source alone does not settle it: nvcc's default `--fmad=true` fuses where the source
    writes no FMA, `ptxas` fuses further than the PTX (the Q4_K and Q5_K returns, `matvec.md` section 5) and replaces an
@@ -117,10 +117,12 @@ ones this pack runs.
    from CUDA's (measured: with the pragma a runtime-compiled `a * b + c` is never fused; without it safe mode fuses
    it). A multiply basalt rounds on its own (`__fmul_rn`, as in `src/kernels/cuda/native_ple_postops.cu:41-50` and
    the routed experts' SwiGLU product, `src/kernels/cuda/iq_kernels.cu:1902-1918`) is never contracted. Where SASS
-   flushes (`.FTZ`), the Metal kernel flushes the inputs and the result to the zero of their sign explicitly, with
-   integer operations on the bits, so the result does not depend on what the GPU does with subnormals. Where basalt's
-   SASS keeps subnormals (the IEEE-built kernels' unflagged operations), the Metal kernel emulates IEEE behaviour
-   wherever a subnormal can occur: in `MTLMathModeSafe` this GPU flushes subnormal inputs and results of add,
+   flushes (`.FTZ`), the Metal kernel flushes the inputs and the rounded result to the zero of their sign explicitly,
+   with integer operations on the bits, and a multiply or fma whose exact result rounds up to 2^-126, which this GPU
+   flushes before rounding, is rebuilt from the exact value (`fma_ftz`, `mul_ftz`), so the result does not depend on
+   what the GPU does with subnormals. Where basalt's SASS keeps subnormals (the IEEE-built kernels' unflagged
+   operations), the Metal kernel emulates IEEE behaviour wherever a subnormal can occur: in `MTLMathModeSafe` this
+   GPU flushes subnormal inputs and results of add,
    multiply, fma and division to the zero of their sign (MSL section 8.1 permits it), and `fmax` and `fmin` compare a
    subnormal as zero but return the chosen operand unflushed, the second one on a tie (measured,
    `tests/kernels/test_basalt_platform.py`). An approximate division or reciprocal
