@@ -14,7 +14,17 @@ pattern), against host references. Every comparison is bitwise.
   a tie by the sticky bit alone, overflow, every pair of specials, and float-range doubles, float midpoints and edges
   for the conversion. A NaN result must be ``F64_NAN`` (0x7fffffffffffffff), and ``f32_from_f64`` of a NaN
   0x7fffffff.
+- H.2: ``f64_mul``, ``f64_fma``, ``f64_fma_odd`` and ``f64_div`` against the host's binary64 (numpy's ``*`` and
+  ``/``, ``math.fma``) and an exact integer reference that rounds once, to nearest even or to odd (``round64``, its
+  nearest-even results checked against the host's on every row), on uniform patterns and planted classes: every
+  exponent gap between the product and ``c`` over [-140, 140] and beyond, cancellation (shallow, deep into the low
+  word, and exact, which gives +0 in both roundings), exact and near ties of products, sums and quotients (exact ties
+  on the subnormal grid at every denormalization shift), subnormal results, overflow (to inf, and to DBL_MAX when
+  rounded to odd) and every triple of specials.
 """
+
+import math
+import struct
 
 import numpy as np
 
@@ -199,3 +209,249 @@ def test_basalt_f64_basics_vs_host():
     e = at["edges"]
     want_edges = [w for _, w in F32_EDGES]
     assert narrow[e].tolist() == want_edges + [w | 0x80000000 for w in want_edges]
+
+
+# ---- H.2: binary64 multiply, fma, fma rounded to odd, divide -------------------------------------------------------
+
+H2 = """
+kernel void h2_f64(device const ulong* a [[buffer(0)]], device const ulong* b [[buffer(1)]],
+                   device const ulong* c [[buffer(2)]], device ulong* out [[buffer(3)]],
+                   constant uint& n [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const ulong x = a[i], y = b[i], z = c[i];
+  device ulong* o = out + 4 * i;
+  o[0] = f64_mul(x, y);
+  o[1] = f64_fma(x, y, z);
+  o[2] = f64_fma_odd(x, y, z);
+  o[3] = f64_div(x, y);
+}
+"""
+
+SPECIAL, EXACT, INEXACT, NEAR, DOWN, UP = range(-1, 5)   # round64's cases; NEAR: within 2^-40 of a tie, off it
+INF_BITS, MAX_BITS, NAN_BITS = 0x7FF0000000000000, 0x7FEFFFFFFFFFFFFF, int(F64_NAN)
+
+
+def f64_bits(x):
+    return NAN_BITS if math.isnan(x) else struct.unpack("<Q", struct.pack("<d", x))[0]
+
+
+def round64(n, e, odd=False):
+    """n * 2**e (an integer n != 0) rounded once to binary64, with gradual underflow: to nearest even (overflow to
+    inf), or to odd (toward zero, the inexact flag ORed into the last bit; overflow to DBL_MAX). Returns the bits and
+    the case: EXACT, INEXACT, NEAR, or a tie, DOWN or UP by its rounding to even."""
+    s, n = (1 << 63) if n < 0 else 0, abs(n)
+    k = max(n.bit_length() + e - 53, -1074) - e                         # the bits below the result's last place
+    case = EXACT
+    if k > 0:
+        q, rest, half = n >> k, n & ((1 << k) - 1), 1 << (k - 1)
+        case = (EXACT if rest == 0 else (UP if q & 1 else DOWN) if rest == half
+                else NEAR if abs(rest - half) << 40 < half else INEXACT)
+        n, e = (q | (rest != 0)) if odd else q + (rest > half or case == UP), e + k
+    if n.bit_length() + e > 1024:
+        return s | (MAX_BITS if odd else INF_BITS), case
+    return s | f64_bits(math.ldexp(n, e)), case
+
+
+def ref_fma(x, y, z, odd=False):
+    """x * y + z (floats) rounded once, as IEEE's fusedMultiplyAdd or (``odd``) to odd, and round64's case. The
+    specials follow from the operand classes: a NaN, inf * 0 and inf - inf give NaN; a finite product and an
+    infinite z give z; an exact zero is +0, or -0 from -0 + -0."""
+    if math.isnan(x) or math.isnan(y) or math.isnan(z):
+        return NAN_BITS, SPECIAL
+    if math.isinf(x) or math.isinf(y):
+        return f64_bits(x * y + z), SPECIAL
+    if math.isinf(z):
+        return f64_bits(z), SPECIAL
+    (nx, dx), (ny, dy), (nz, dz) = x.as_integer_ratio(), y.as_integer_ratio(), z.as_integer_ratio()
+    n = nx * ny * dz + nz * dx * dy
+    if n == 0:
+        zero_neg = x * y == 0 and math.copysign(1.0, x * y) < 0 and math.copysign(1.0, z) < 0
+        return (1 << 63) * zero_neg, SPECIAL
+    return round64(n, 1 - (dx * dy * dz).bit_length(), odd)
+
+
+def ref_div(x, y):
+    """x / y (finite, nonzero floats) through round64: the quotient to 120 bits and the remainder's sticky bit."""
+    (nx, dx), (ny, dy) = x.as_integer_ratio(), y.as_integer_ratio()
+    num, den = abs(nx) * dy, dx * abs(ny)
+    k = max(0, 120 - num.bit_length() + den.bit_length())
+    q, r = divmod(num << k, den)
+    return round64((-1 if (x < 0) != (y < 0) else 1) * (2 * q + (r != 0)), -k - 1)
+
+
+def lg(x, y=1.0):
+    """floor(log2 |x * y|), exactly, for finite nonzero floats."""
+    (nx, dx), (ny, dy) = x.as_integer_ratio(), y.as_integer_ratio()
+    return abs(nx * ny).bit_length() - (dx * dy).bit_length()
+
+
+def dbl(m, e, neg=False):
+    """The bits of +-m * 2^(e - 1075), m a 53-bit significand, e the biased exponent (1 to 2046)."""
+    return (int(neg) << 63) | (e << 52) | (m - (1 << 52))
+
+
+def odd53(rng):
+    return int(rng.integers(1 << 52, 1 << 53)) | 1
+
+
+def h2_rows(rng):
+    """The H.2 operand triples (uint64 bit patterns) by class."""
+    n = 1 << 12
+    k = np.arange(2 * n)
+    sign = lambda m: words(rng, m) & SIGN
+    rows = {"uniform": tuple(words(rng, 1 << 15) for _ in range(3))}
+    # every exponent gap between the product and c over [-140, 140] and +-300, +-2100 (clamped at the range's ends):
+    # each branch of the 128-bit alignment shift, either operand the larger, either sign
+    ea, eb = rng.integers(623, 1424, 4 * n), rng.integers(623, 1424, 4 * n)
+    gap = rng.choice(np.r_[-140:141, -300, 300, -2100, 2100], 4 * n)
+    rows["gaps"] = (doubles(rng, ea), doubles(rng, eb), doubles(rng, np.clip(ea + eb - 1023 + gap, 0, 2046)))
+    # cancellation: c = -RN(a * b) moved by up to 4 ulps (exactly -RN(a * b), the product's rounding error, for every
+    # 8th), and exact zeros: c = -a * b on 26-bit significands
+    a, b = doubles(rng, rng.integers(723, 1324, 2 * n)), doubles(rng, rng.integers(723, 1324, 2 * n))
+    p = (a.view(F64) * b.view(F64)).view(U64)
+    rows["cancel"] = (a, b, offset(p, np.where(k % 8 == 0, 0, rng.integers(-4, 5, 2 * n))) ^ SIGN)
+    sig26 = lambda m: ((rng.integers(1 << 25, 1 << 26, m) | 1) << 27).astype(U64) & FRAC
+    a = sign(n) | sig26(n) | (rng.integers(723, 1324, n).astype(U64) << U64(52))
+    b = sign(n) | sig26(n) | (rng.integers(723, 1324, n).astype(U64) << U64(52))
+    rows["zeros"] = (a, b, (a.view(F64) * b.view(F64)).view(U64) ^ SIGN)
+    # deep cancellation into the low word: Mb = R / Ma mod 2^53 (Ma odd) and c = -(Ma * Mb without its low 53 bits),
+    # so the exact result is R at the product's last place, R of every bit length 1 to 53
+    deep = []
+    for i in range(2 * n):
+        r = int(rng.integers(1 << (i % 53), 2 << (i % 53)))
+        while True:
+            ma = odd53(rng)
+            mb = r * pow(ma, -1, 1 << 53) % (1 << 53)
+            if mb >= 1 << 52:
+                break
+        ea, eb, neg = int(rng.integers(823, 1224)), int(rng.integers(823, 1224)), i % 2 == 1
+        top = math.ldexp((ma * mb) >> 53, ea + eb - 2097)
+        deep.append((dbl(ma, ea, neg), dbl(mb, eb), f64_bits(top if neg else -top)))
+    rows["deep"] = tuple(np.array(v, U64) for v in zip(*deep))
+    # products on a tie: u * v odd of 54 bits (exact ties, either way to even), or near one, Ma * Mb = 2^52 + d
+    # mod 2^53 (Ma odd, 0 < |d| <= 3); c = +-0 (the product alone) or +-2^-150 of it (a sticky bit past a tie)
+    ties = []
+    for i in range(2 * n):
+        if i % 2 == 0:
+            ma = int(rng.integers(1 << 26, 1 << 27)) | 1
+            mb = int(rng.integers(-(-(1 << 53) // ma), (1 << 54) // ma)) | 1
+        else:
+            d = int(rng.choice([-3, -2, -1, 1, 2, 3]))
+            while True:
+                ma = odd53(rng)
+                mb = (2 ** 52 + d) * pow(ma, -1, 1 << 53) % (1 << 53)
+                if mb >= 1 << 52:
+                    break
+        x = math.copysign(math.ldexp(ma, int(rng.integers(-500, 450))), float(rng.choice([-1.0, 1.0])))
+        y = math.copysign(math.ldexp(mb, int(rng.integers(-500, 450))), float(rng.choice([-1.0, 1.0])))
+        z = math.copysign(0.0 if i % 4 < 2 else math.ldexp(1.0, lg(x, y) - 150), float(rng.choice([-1.0, 1.0])))
+        ties.append((f64_bits(x), f64_bits(y), f64_bits(z)))
+    rows["mul_ties"] = tuple(np.array(v, U64) for v in zip(*ties))
+    # sums on a tie: a * b = +-half an ulp of c (a a power of 2) times 1 - 2^-53, 1 or 1 + 2^-52
+    ec = rng.integers(200, 1901, n)
+    one = np.array([0x3FEFFFFFFFFFFFFF, 0x3FF0000000000000, 0x3FF0000000000001], U64)
+    rows["sum_ties"] = (sign(n) | ((ec - 53).astype(U64) << U64(52)), rng.choice(one, n), doubles(rng, ec))
+    # subnormal results: products at biased exponents -60 to 2, and subnormal a times 1 to 2^60; c +-0, subnormal,
+    # in the two lowest binades, or near the product
+    t, ea = rng.integers(-60, 3, 2 * n), rng.integers(1, 961, 2 * n)
+    a = np.where(k % 4 == 3, doubles(rng, np.zeros(2 * n, int)), doubles(rng, ea))
+    b = np.where(k % 4 == 3, doubles(rng, rng.integers(1023, 1084, 2 * n)), doubles(rng, t + 1023 - ea))
+    c = np.select([k % 4 == 0, k % 4 == 1, k % 4 == 2],
+                  [sign(2 * n), doubles(rng, np.zeros(2 * n, int)), doubles(rng, rng.integers(1, 3, 2 * n))],
+                  doubles(rng, np.clip(t + rng.integers(-2, 3, 2 * n), 0, 2046)))
+    rows["subnormal"] = (a, b, c)
+    # ties on the subnormal grid: x = +-(2q + 1) * 2^(s - 1075), q of every bit length 0 to 52 (the denormalization
+    # shifts 53 down to 1), exactly or one ulp of x off; times 2^-s and over 2^s, c = +-0
+    s = rng.integers(1, 1001, 2 * n)
+    q = [0 if j == 0 else int(rng.integers(1 << (j - 1), 1 << j)) for j in (k % 53).tolist()]
+    x = np.array([f64_bits(math.ldexp(2 * qi + 1, si - 1075)) for qi, si in zip(q, s.tolist())], U64)
+    x = offset(x, rng.choice([-1, 0, 0, 1], 2 * n)) | sign(2 * n)
+    rows["sub_ties_mul"] = (x, ((1023 - s).astype(U64) << U64(52)), sign(2 * n))
+    rows["sub_ties_div"] = (x, ((1023 + s).astype(U64) << U64(52)), sign(2 * n))
+    # overflow: products and quotients at biased exponents 2044 to 2048, c near the top, of either sign
+    t = rng.integers(2044, 2049, n)
+    ea = rng.integers(1100, 2047, n)
+    rows["overflow"] = (doubles(rng, ea), doubles(rng, t + 1023 - ea), doubles(rng, rng.integers(2040, 2047, n)))
+    ea = rng.integers(1026, 2047, n)
+    rows["overflow_div"] = (doubles(rng, ea), doubles(rng, ea + 1023 - t), doubles(rng, rng.integers(2040, 2047, n)))
+    # quotients near a tie: Ma * 2^54 = K * Mb + d (Mb odd, 0 < |d| <= 3) puts Ma / Mb within 3 / Mb of K * 2^-54, a
+    # midpoint for K odd (the quotient below 1; above it, 2^53 and Ma + Mb); a quarter of them subnormal
+    near = []
+    for i in range(2 * n):
+        d = int(rng.choice([-3, -2, -1, 1, 2, 3]))
+        while True:
+            mb = odd53(rng)
+            ma = d * pow(2, -54 if i % 2 else -53, mb) % mb + (0 if i % 2 else mb)
+            if (1 << 52) <= ma < (1 << 53):
+                break
+        ea = int(rng.integers(623, 1424)) if i % 4 != 3 else int(rng.integers(1, 901))
+        eb = int(rng.integers(623, 1424)) if i % 4 != 3 else ea + 1023 - int(rng.integers(-60, 1))
+        near.append((dbl(ma, ea, i % 8 < 4), dbl(mb, eb, i % 3 == 0), 0))
+    rows["div_ties"] = tuple(np.array(v, U64) for v in zip(*near))
+    sp = np.r_[SPECIALS, SPECIALS | SIGN]
+    rows["specials"] = tuple(v.ravel() for v in np.meshgrid(sp, sp, sp, indexing="ij"))
+    return rows
+
+
+def test_basalt_f64_mul_fma_div_vs_host():
+    rng = np.random.default_rng(22)
+    rows = h2_rows(rng)
+    a, b, c = (np.concatenate([v[j] for v in rows.values()]) for j in range(3))
+    got = run_kernel(H2, "h2_f64", [a, b, c], 4)
+    A, B, C = a.view(F64), b.view(F64), c.view(F64)
+    with np.errstate(all="ignore"):
+        mul, div = canon(A * B), canon(A / B)
+    ref = []
+    for x, y, z in zip(A.tolist(), B.tolist(), C.tolist()):
+        fin = math.isfinite(x) and math.isfinite(y) and x != 0 and y != 0
+        try:
+            host = f64_bits(math.fma(x, y, z))
+        except OverflowError:
+            host = INF_BITS                                             # its sign is not the host's to say
+        except ValueError:
+            host = NAN_BITS
+        ref.append((*ref_fma(x, y, z), *ref_fma(x, y, z, True), *ref_fma(x, y, -0.0),
+                    *(ref_div(x, y) if fin else (0, SPECIAL)), host))
+    fma, fcase, odd, _, mref, mcase, dref, dcase, host = (np.array(v, object) for v in zip(*ref))
+    fma, odd, mref, dref, host = (v.astype(U64) for v in (fma, odd, mref, dref, host))
+    fcase, mcase, dcase = (v.astype(int) for v in (fcase, mcase, dcase))
+    # the reference rounds to nearest even as the host does
+    assert np.array_equal(mref, mul), "round64's products differ from the host's"
+    fin = dcase != SPECIAL
+    assert np.array_equal(dref[fin], div[fin]), "round64's quotients differ from the host's"
+    over = host == INF_BITS
+    assert np.array_equal(fma[~over], host[~over]) and np.all((fma[over] & MAG) == U64(INF_BITS)), \
+        "the fma reference differs from math.fma"
+    for col, name, want in [(0, "f64_mul", mul), (1, "f64_fma", fma), (2, "f64_fma_odd", odd), (3, "f64_div", div)]:
+        bad = np.flatnonzero(got[:, col] != want)
+        assert bad.size == 0, (f"{name}: {bad.size} of {len(a)} differ; first a={a[bad[0]]:#018x} b={b[bad[0]]:#018x} "
+                               f"c={c[bad[0]]:#018x}: got {got[bad[0], col]:#x}, want {want[bad[0]]:#x}")
+    # the planted classes are what they claim
+    at, n0 = {}, 0
+    for name, (x, _, _) in rows.items():
+        at[name], n0 = slice(n0, n0 + len(x)), n0 + len(x)
+    ok = lambda v: math.isfinite(v) and v != 0
+    gaps = {lg(x, y) - lg(z) for x, y, z in zip(A[at["gaps"]].tolist(), B[at["gaps"]].tolist(),
+                                                C[at["gaps"]].tolist()) if ok(x) and ok(y) and ok(z)}
+    assert {0, 1, 2, 63, 64, 65, 127, 128, 129} <= {abs(g) for g in gaps if g in gaps and -g in gaps}
+    assert max(abs(g) for g in gaps) > 129
+    d = at["deep"]
+    drop = [lg(x, y) - lg(r) for x, y, r in zip(A[d].tolist(), B[d].tolist(), fma[d].view(F64).tolist())]
+    assert sum(v > 64 for v in drop) > 1000 and max(drop) > 100                       # the low word's normalization
+    z = at["zeros"]
+    assert np.all(fma[z] == 0) and np.all(odd[z] == 0) and np.all(got[z, 1:3] == 0)  # exact cancellation: +0
+    for case, name in [(mcase, "mul_ties"), (mcase, "sub_ties_mul"), (dcase, "sub_ties_div"), (fcase, "sum_ties")]:
+        v = case[at[name]]
+        assert np.count_nonzero(v == DOWN) > 100 and np.count_nonzero(v == UP) > 100, name   # ties, either way
+    for case, name in [(mcase, "mul_ties"), (fcase, "mul_ties"), (fcase, "sum_ties"), (dcase, "div_ties"),
+                       (mcase, "sub_ties_mul"), (dcase, "sub_ties_div")]:
+        assert np.count_nonzero(case[at[name]] == NEAR) > 500, name                  # near ties, off them
+    for col in range(4):
+        assert np.count_nonzero(subnormal(got[:, col])) > 1000, col                  # subnormal results
+    exact_nonzero = (fcase != SPECIAL)
+    assert np.count_nonzero(exact_nonzero & ((fma & MAG) == 0) & ((odd & MAG) == 1)) > 100   # tiny: 0 or the least
+    assert np.count_nonzero(fcase[:] == INEXACT) > 10000 and np.count_nonzero(odd != fma) > 10000
+    fin3 = np.isfinite(A) & np.isfinite(B) & np.isfinite(C)
+    for v in (mul, fma, div):
+        assert np.count_nonzero(fin3 & ((v & MAG) == U64(INF_BITS))) > 100                # overflow to inf
+    assert np.count_nonzero(fin3 & ((odd & MAG) == U64(MAX_BITS)) & ((fma & MAG) == U64(INF_BITS))) > 100
