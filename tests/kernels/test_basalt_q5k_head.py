@@ -8,11 +8,11 @@ q5k_head_parity, ported (basalt src/kernels/q5k_head_parity.cpp, ctest ``q5k_hea
 random Q5_K rows (random bytes, then d and dmin = fp16(|N(0, 1)| * 0.01), :33-43) and N(0, 1) activations quantized
 by native_quantize_q8_1, n_in 2560. numpy's generator stands for basalt's mt19937 + normal_distribution: the same
 distributions, other draws. The timing loops are not ported.
-- The head against native_mmvq (basalt_mmvq.metal, Q5_K) bit for bit, 1 to 8 columns (:64-92).
-- The contract's check at the head's full shape (docs/design/flash-next.md, kernels without a reference test):
-  2560 -> 248,320 rows, bit for bit against native_mmvq.
-- A float64 reference for the Q5_K dot (pr-b-scope-basalt.md section 11's new test) under the nearest basalt bound,
-  mmvq_multi_parity.cpp:461's rule for native_mmvq's types."""
+- The head against native_mmvq (basalt_mmvq.metal, Q5_K) bit for bit, 1 to 8 columns (:64-92); each column also bit
+  for bit the head's one-column call on it (column invariance, flash-next.md invariant 1).
+- The contract's test (docs/design/flash-next.md, kernels without a reference test): mmvq_multi_parity.cpp:461's rule
+  at the head's shape, 2560 -> 248,320 rows, 8 columns, each bit for bit the head's one-column call on it and within
+  1e-4 * max |ref| of the float64 product on the same bytes; the bitwise check against native_mmvq carried over."""
 
 import struct
 
@@ -59,7 +59,8 @@ def bad_bits(a, b):
 
 def test_head_against_native_mmvq(data):
     w, xq, _ = data
-    fail = 0
+    fail = diff = 0
+    one = np.stack([gpu.q5k_head(w, column(xq, j), N_IN, ROWS, 1)[0] for j in range(MT)])
     for nc in range(1, MT + 1):
         a = gpu.mmvq(13, w, xq[: nc * QCOL], N_IN, ROWS, nc, fill=0xFF)        # basalt's pre-fills (:65-66)
         b = gpu.q5k_head(w, xq[: nc * QCOL], N_IN, ROWS, nc, fill=0xEE)
@@ -67,21 +68,39 @@ def test_head_against_native_mmvq(data):
         # basalt: ``for (size_t i = 0; i < a.size(); ++i) bad += std::memcmp(&a[i], &b[i], 4) != 0;`` (:74) and
         # ``if (bad) fail = 1;`` (:91)
         fail |= bad != 0
+        diff += bad_bits(b, one[:nc])
         assert np.all(np.isfinite(b)), nc
-    assert not fail
+    assert not fail and diff == 0, diff
+
+
+def reference_rows(w, xc, rows, chunk=5000):
+    """reference(13, ...) by chunks of rows: its float64 intermediates take ~20 KB a row."""
+    return np.concatenate([reference(13, w[r: r + chunk], xc, N_IN, min(chunk, rows - r))
+                           for r in range(0, rows, chunk)])
 
 
 def test_head_full_shape():
-    """flash-next.md: q5k_head_mmvq at the head's full shape, 2560 -> 248,320, bit for bit against native_mmvq (basalt's
-    test default, q5k_head_parity.cpp:28), one column and eight."""
+    """flash-next.md's test for q5k_head_mmvq: mmvq_multi_parity.cpp:461's rule at the head's shape, 2560 -> 248,320
+    rows (basalt's test default, q5k_head_parity.cpp:28), 8 columns. Per column: ``diff``, the values differing from
+    the head's one-column call on it (basalt's one-column call against its two-column one, :429-430, :457), and
+    ``worst``, the one-column call's largest error against the float64 product on the same bytes, against ``scale``,
+    the largest |ref|. The bitwise check against native_mmvq carries over, one column and eight."""
     rows = 248320
     rng = np.random.default_rng(28)
     w = weights(rows, rng)
     xq = activations(MT, rng)
-    for nc in (1, MT):
-        a = gpu.mmvq(13, w, xq[: nc * QCOL], N_IN, rows, nc, fill=0xFF)
-        b = gpu.q5k_head(w, xq[: nc * QCOL], N_IN, rows, nc, fill=0xEE)
-        assert bad_bits(a, b) == 0, nc
+    y = gpu.q5k_head(w, xq, N_IN, rows, MT, fill=0xEE)
+    assert bad_bits(gpu.mmvq(13, w, xq, N_IN, rows, MT, fill=0xFF), y) == 0
+    for j in range(MT):
+        a = gpu.q5k_head(w, column(xq, j), N_IN, rows, 1)[0]
+        if j == 0:
+            assert bad_bits(gpu.mmvq(13, w, column(xq, 0), N_IN, rows, 1, fill=0xFF), a) == 0
+        ref = reference_rows(w, column(xq, j), rows)
+        diff = bad_bits(a, y[j])
+        worst, scale = np.max(np.abs(a.astype(np.float64) - ref)), np.max(np.abs(ref))
+        # basalt: ``const bool ok = diff == 0 && worst <= 1e-4 * (scale + 1e-30);`` (mmvq_multi_parity.cpp:461); its
+        # std::max fold drops a NaN, so the non-finite values are counted
+        assert np.all(np.isfinite(a)) and diff == 0 and worst <= 1e-4 * (scale + 1e-30), (j, diff, worst, scale)
 
 
 @pytest.mark.parametrize("n_in", [256, 2560, 16384])
@@ -96,19 +115,6 @@ def test_head_shapes_and_grids(n_in):
     for sm_count, per_sm in ((170, 2), (40, 1), (1, 1)):
         b = gpu.q5k_head(w, xq, n_in, rows, ncols, sm_count=sm_count, per_sm=per_sm)
         assert bad_bits(a, b) == 0, (sm_count, per_sm)
-
-
-def test_float64_reference(data):
-    """The Q5_K dot against the float64 product on the same bytes, under mmvq_multi_parity.cpp:461's rule: worst
-    |y - ref| <= 1e-4 * max |ref|, every column."""
-    w, xq, _ = data
-    rows = 2000
-    y = gpu.q5k_head(w[:rows], xq, N_IN, rows, MT)
-    for j in range(MT):
-        ref = reference(13, w[:rows], column(xq, j), N_IN, rows)
-        worst, scale = np.max(np.abs(y[j].astype(np.float64) - ref)), np.max(np.abs(ref))
-        # basalt: ``const bool ok = diff == 0 && worst <= 1e-4 * (scale + 1e-30);`` (mmvq_multi_parity.cpp:461)
-        assert np.all(np.isfinite(y[j])) and worst <= 1e-4 * (scale + 1e-30), (j, worst, scale)
 
 
 def test_launch_rules():
@@ -154,7 +160,7 @@ def test_top1(data):
     sample_greedy_top_prob on the GPU, sampler.cu:930, not on main), the probability against a host double softmax
     over them (the comparison basalt's holes section makes, :171-185)."""
     w, xq, _ = data
-    logit_bad = id_bad = 0
+    logit_bad = id_bad = nonfinite = 0
     max_rel = 0.0
     for rr in (ROWS, 106299, 40525, 1000):
         if rr > ROWS:
@@ -166,9 +172,12 @@ def test_top1(data):
             best, s = host_top(a, np.ones(rr, bool))
             logit_bad += bad_bits(a, b)
             id_bad += b_id != best
+            nonfinite += int(not np.isfinite(b_p)) + int(np.count_nonzero(~np.isfinite(b)))
             max_rel = max(max_rel, abs(float(b_p) - 1.0 / s) * s)
-    # basalt: ``if (logit_bad || id_bad || max_rel > 1e-5) fail = 1;`` (:145)
-    assert logit_bad == 0 and id_bad == 0 and max_rel <= 1e-5, (logit_bad, id_bad, max_rel)
+    # basalt: ``if (logit_bad || id_bad || max_rel > 1e-5) fail = 1;`` (:145); its std::max fold (:123) drops a NaN,
+    # so the non-finite outputs are counted (flash-next.md)
+    assert logit_bad == 0 and id_bad == 0 and nonfinite == 0 and max_rel <= 1e-5, (logit_bad, id_bad, nonfinite,
+                                                                                      max_rel)
 
 
 def holes_map(rr):
@@ -197,6 +206,9 @@ def test_top1_holes(data):
         max_rel = max(max_rel, abs(float(b_p) - 1.0 / s) * s)
         c = gpu.q5k_head_masked(w[:rr], xc, N_IN, rr, mp)
         bad += int(np.count_nonzero(~np.isneginf(c[~mapped]))) + bad_bits(a[mapped], c[mapped])
+        # basalt's std::max fold (:185) drops a NaN: the non-finite outputs are counted (flash-next.md)
+        bad += int(not np.isfinite(b_p)) + int(np.count_nonzero(~np.isfinite(b[mapped])))
+        bad += int(np.count_nonzero(~np.isfinite(c[mapped])))
     # basalt: ``if (bad || max_rel > 1e-5) fail = 1;`` (:210)
     assert bad == 0 and max_rel <= 1e-5, (bad, max_rel)
 
@@ -217,6 +229,29 @@ def test_top1_emulation_bit_for_bit(data, rr, grid):
         assert np.array_equal(part[:, 1].view(np.int32), e_part[1].astype(np.int32))
         e_row = e_row if e_row < rr else 0             # no row taken (every row masked): row 0 (q5k_head.cu:330)
         assert b_id == (e_row if mp is None else mp[e_row]) and bad_bits(b_p, e_p) == 0, (b_id, e_row, b_p, e_p)
+
+
+def test_expf_ftz():
+    """basalt_fp.metal's expf_ftz, whose GPU values the emulations above take for __expf, bit for bit against its
+    definition (q5k_head.md section 2): FMUL.FTZ by fl(log2 e) and the .ftz flush of the result on the host, only
+    fast::exp2 (MUFU.EX2's counterpart, with no bit-exact model) on the GPU. The arguments: the take's and the score's
+    range, the result's flush (x * log2 e below -126: x below -87.34), its underflow to 0 (below -103.3), its overflow
+    (above 88.72), -inf (the take's first row: m = -inf), zeros and subnormals (flushed)."""
+    log2e = F32(np.log2(np.e))
+    assert log2e.view(np.uint32) == 0x3FB8AA3B                       # ptxas's FMUL.FTZ immediate 1.4426950216293334961
+    x = np.concatenate([np.linspace(-30, 0, 4001, dtype=F32), np.linspace(-88, -86.5, 4001, dtype=F32),
+                        np.linspace(-104.5, -102.5, 2001, dtype=F32), np.linspace(88, 89.5, 201, dtype=F32),
+                        F32([-np.inf, 0.0, -0.0]), np.uint32([1, 0x007FFFFF, 0x80000001]).view(F32)]).astype(F32)
+    p = emu.mul_ftz(x, log2e)
+    src = kernels.PRELUDE + """
+kernel void ex2(device const float* p [[buffer(0)]], device float* e [[buffer(1)]], constant uint& n [[buffer(2)]],
+                uint i [[thread_position_in_grid]]) {
+    if (i < n) e[i] = fast::exp2(p[i]);
+}
+"""
+    e = gpu.run(gpu.pipeline(src, "ex2"), [p.tobytes(), 4 * p.size], np.uint32(p.size).tobytes(), 2, -(-p.size // 256),
+                256)[1]
+    assert bad_bits(gpu.expf_ftz(x), emu.ftz(np.frombuffer(e, F32))) == 0
 
 
 # ---- the 2-bit proxy (q5k_head_parity.cpp:212-350) -----------------------------------------------------------------
@@ -335,7 +370,7 @@ def test_proxy_top1(proxy_copy, proxy_rows):
     mp = proxy_map(rr)
     rows = np.flatnonzero(mp >= 0)
     rng = np.random.default_rng(349)
-    trials, miss, max_p_rel, emu_bad = 400, 0, 0.0, 0
+    trials, miss, max_p_rel, emu_bad, nonfinite = 400, 0, 0.0, 0, 0
     for _ in range(trials):
         xq1 = gpu.q8_1(trial_x(rng, proxy_rows, mp), "native")
         a = gpu.mmvq(13, proxy_rows, xq1, N_IN, rr, 1)[0]
@@ -346,10 +381,11 @@ def test_proxy_top1(proxy_copy, proxy_rows):
             max_p_rel = max(max_p_rel, abs(float(p) * s - 1.0))
         else:
             miss += 1
+        nonfinite += int(not np.isfinite(p))       # basalt's std::max fold (:315) drops a NaN (flash-next.md)
         e_id, e_p, _ = emu.q5k_proxy_final(cand, part, a, mp, gpu.expf_ftz)
         emu_bad += e_id != pid or bad_bits(p, e_p) != 0
     # basalt: ``if (miss > trials / 50 || max_p_rel > 1.0) fail = 1;`` (:349)
-    assert miss <= trials // 50 and max_p_rel <= 1.0, (miss, max_p_rel)
+    assert miss <= trials // 50 and max_p_rel <= 1.0 and nonfinite == 0, (miss, max_p_rel, nonfinite)
     assert emu_bad == 0, emu_bad
 
 
