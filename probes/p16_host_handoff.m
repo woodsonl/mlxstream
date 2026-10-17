@@ -12,10 +12,13 @@
 //      by the GPU work after it (1,000 steps, ICB ranges): a. the in-buffer wait, two command buffers in flight;
 //      b. the second command buffer, committed after the CPU write
 //   2. the GPU idle gap across one handoff with no CPU work (stage-boundary timestamps): the in-buffer wait with a
-//      spinning CPU and with waitUntilSignaledValue, the second command buffer, and a plain pass boundary
+//      spinning CPU and with waitUntilSignaledValue, the second command buffer encoded before the signal (the host
+//      only commits it) and encoded after it (as the host-step runtime does), and a plain pass boundary
 //   3. a command buffer parked at an in-buffer wait after its first pass while the CPU sleeps 2 to 6 s: does it
 //      finish without an error (the GPU watchdog), and do another queue's command buffers keep completing meanwhile?
 //   4. the same with the wait as the command buffer's first command (no pass has run before it)
+//   5. a command buffer whose last command is a signal: how long after its status reads Completed is the signal
+//      visible to the CPU (the runtime's grace before it fails a point whose command buffer finished without it)
 static double now_ms(void) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb); return (double)mach_absolute_time() * tb.numer / tb.denom / 1e6; }
 static int cmp_d(const void* a, const void* b) { double x = *(const double*)a, y = *(const double*)b; return x < y ? -1 : x > y; }
 static id<MTLComputePipelineState> pso(id<MTLDevice> d, id<MTLLibrary> l, NSString* n, BOOL icb) {
@@ -31,6 +34,16 @@ static int host_wait(id<MTLSharedEvent> ev, uint64_t v, int mode, double timeout
   double t0 = now_ms();
   while (ev.signaledValue < v) if (now_ms() - t0 > timeout_ms) return 0;
   return 1;
+}
+// part 2's pass B: one small dispatch behind the fence, sampled at stage boundaries 2 and 3
+static void encode_pass_b(id<MTLCommandBuffer> cb, id<MTLCounterSampleBuffer> sb, id<MTLFence> fence,
+                          id<MTLComputePipelineState> spin, id<MTLBuffer> work) {
+  uint32_t one = 1;
+  MTLComputePassDescriptor* p2 = [MTLComputePassDescriptor computePassDescriptor];
+  p2.sampleBufferAttachments[0].sampleBuffer = sb; p2.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2; p2.sampleBufferAttachments[0].endOfEncoderSampleIndex = 3;
+  id<MTLComputeCommandEncoder> en = [cb computeCommandEncoderWithDescriptor:p2];
+  [en waitForFence:fence]; [en setComputePipelineState:spin]; [en setBuffer:work offset:0 atIndex:0]; [en setBytes:&one length:4 atIndex:1];
+  [en dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; [en updateFence:fence]; [en endEncoding];
 }
 int main() { @autoreleasepool {
   id<MTLDevice> d = MTLCreateSystemDefaultDevice(); NSError* e = nil;
@@ -128,11 +141,11 @@ int main() { @autoreleasepool {
       MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
       sd.counterSet = ts; sd.storageMode = MTLStorageModeShared; sd.sampleCount = 4;
       id<MTLCounterSampleBuffer> sb = [d newCounterSampleBufferWithDescriptor:sd error:&e];
-      uint32_t busy = 20000, one = 1;   // pass A runs ~0.5 ms so the command buffer is executing when it signals
-      const char* names[4] = {"plain pass boundary (fence only)", "in-buffer wait, spinning CPU", "in-buffer wait, waitUntilSignaledValue",
-                              "second buffer committed after the signal"};
+      uint32_t busy = 20000;   // pass A runs ~0.5 ms so the command buffer is executing when it signals
+      const char* names[5] = {"plain pass boundary (fence only)", "in-buffer wait, spinning CPU", "in-buffer wait, waitUntilSignaledValue",
+                              "second buffer encoded before the signal", "second buffer encoded after the signal"};
       for (int round = 0; round < 2; round++)
-        for (int mode = -1; mode <= 2; mode++) {
+        for (int mode = -1; mode <= 3; mode++) {
           const int N = 200; double gaps[200];
           MTLTimestamp c0, g0, c1, g1; [d sampleTimestamps:&c0 gpuTimestamp:&g0];
           for (int it = 0; it < N; it++) {
@@ -143,18 +156,21 @@ int main() { @autoreleasepool {
             [en waitForFence:fence]; [en setComputePipelineState:spin]; [en setBuffer:work offset:0 atIndex:0]; [en setBytes:&busy length:4 atIndex:1];
             [en dispatchThreadgroups:MTLSizeMake(cores, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)]; [en updateFence:fence]; [en endEncoding];
             if (mode == 0 || mode == 1) { [cb encodeSignalEvent:gpu_ev value:v + 1]; [cb encodeWaitForEvent:host_ev value:v + 1]; }
-            if (mode == 2) [cb encodeSignalEvent:gpu_ev value:v + 1];
-            id<MTLCommandBuffer> cb2 = mode == 2 ? [q commandBuffer] : cb;
-            MTLComputePassDescriptor* p2 = [MTLComputePassDescriptor computePassDescriptor];
-            p2.sampleBufferAttachments[0].sampleBuffer = sb; p2.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2; p2.sampleBufferAttachments[0].endOfEncoderSampleIndex = 3;
-            en = [cb2 computeCommandEncoderWithDescriptor:p2];
-            [en waitForFence:fence]; [en setComputePipelineState:spin]; [en setBuffer:work offset:0 atIndex:0]; [en setBytes:&one length:4 atIndex:1];
-            [en dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; [en updateFence:fence]; [en endEncoding];
-            if (mode == 2) {           // the continuation is ready to commit; the host commits it after the signal
+            if (mode >= 2) [cb encodeSignalEvent:gpu_ev value:v + 1];
+            if (mode == 2) {           // the continuation is encoded before the signal; the host only commits it
+              id<MTLCommandBuffer> cb2 = [q commandBuffer];
+              encode_pass_b(cb2, sb, fence, spin, work);
               [cb commit]; v++;
               if (!host_wait(gpu_ev, v, 0, 2000)) printf("  host wait timed out\n");
               [cb2 commit]; [cb2 waitUntilCompleted];
+            } else if (mode == 3) {    // the continuation is encoded once the signal is seen, as the runtime does
+              [cb commit]; v++;
+              if (!host_wait(gpu_ev, v, 0, 2000)) printf("  host wait timed out\n");
+              id<MTLCommandBuffer> cb2 = [q commandBuffer];
+              encode_pass_b(cb2, sb, fence, spin, work);
+              [cb2 commit]; [cb2 waitUntilCompleted];
             } else {
+              encode_pass_b(cb, sb, fence, spin, work);
               [cb commit];
               if (mode >= 0) {
                 v++;
@@ -176,14 +192,35 @@ int main() { @autoreleasepool {
     }
   }
 
-  // ---- 3. and 4. a command buffer parked at a wait (P16_PARKS=0 skips these: ~27 s, two deliberate GPU timeouts) --
+  // ---- 5. the last signal of a command buffer whose status reads Completed --------------------------------------
+  {
+    const int N = 2000; double lag[2000]; int missing = 0;
+    for (int it = 0; it < N; it++) {
+      id<MTLCommandBuffer> cb = [q commandBuffer];
+      id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+      [en waitForFence:fence]; [en executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)]; [en updateFence:fence]; [en endEncoding];
+      [cb encodeSignalEvent:gpu_ev value:v + 1];
+      [cb commit]; v++;
+      const double t0 = now_ms();
+      while (cb.status < MTLCommandBufferStatusCompleted && now_ms() - t0 < 2000) {}
+      const double tc = now_ms();
+      while (gpu_ev.signaledValue < v && now_ms() - tc < 100) {}
+      lag[it] = (now_ms() - tc) * 1e3;
+      if (gpu_ev.signaledValue < v) missing++;
+    }
+    qsort(lag, N, sizeof(double), cmp_d);
+    printf("5. %d command buffers ending in a signal: the signal visible after the status reads Completed: min %.2f  median %.2f  "
+           "p99 %.2f  max %.2f us; not within 100 ms: %d\n", N, lag[0], lag[N / 2], lag[99 * N / 100], lag[N - 1], missing);
+  }
+
+  // ---- 3. and 4. a command buffer parked at a wait (P16_PARKS=0 skips these: ~37 s, deliberate GPU timeouts) ------
   if (!getenv("P16_PARKS") || atoi(getenv("P16_PARKS")) != 0) {
     id<MTLCommandQueue> other = [d newCommandQueue];
     // every case runs on a fresh queue: once a queue's buffer has hit the watchdog, Metal ignores that queue's later
     // submissions (kIOGPUCommandBufferCallbackErrorSubmissionsIgnored), which would poison the next case
-    const double parks_s[6] = {2, 4, 4.5, 6, 4, 6};
-    for (int k = 0; k < 6; k++) {
-      const int at_start = k >= 4;                   // part 4: the wait is the first command of the buffer
+    const double parks_s[8] = {2, 4, 4.5, 5, 5.5, 6, 4, 6};
+    for (int k = 0; k < 8; k++) {
+      const int at_start = k >= 6;                   // part 4: the wait is the first command of the buffer
       const double park = parks_s[k];
       id<MTLCommandQueue> cq = [d newCommandQueue]; [cq addResidencySet:rs];
       id<MTLCommandBuffer> cb = [cq commandBuffer];
