@@ -544,6 +544,17 @@ def test_a_failed_runs_tokens_leave_with_its_error():
     assert rep.steps == 5 and rep.tokens == [0, 1, 2, 3, 4] and calls == list(range(9))
 
 
+@pytest.mark.parametrize("host_point", [True, False], ids=["host-steps", "plain"])
+def test_a_run_drops_tokens_an_earlier_run_left_undrained(host_point):
+    """A run interrupted before Engine.run drained it (a KeyboardInterrupt right after the pump returns), or a direct
+    Runner.run, leaves its tokens in the runner; the next run's report holds only its own."""
+    points = [HostPoint("t", 1, 1)] if host_point else []
+    eng = Engine(_program(_base_buffers(100), [_tick()], points), host_tasks={"t": lambda s, k: None})
+    st = eng.runner.run(3, 1, 1, False, 0)
+    assert st.steps_submitted == 3 and not st.error
+    assert eng.run(2).tokens == [3, 4]
+
+
 @pytest.mark.parametrize("raised", [KeyboardInterrupt, SystemExit, LookupError])
 def test_a_tasks_exception_reaches_the_caller(raised):
     """KeyboardInterrupt and SystemExit leave run() as the task raised them; any other exception is the cause of the

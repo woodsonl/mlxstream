@@ -406,9 +406,9 @@ void Runner::set_host_points(std::vector<HostPoint> points, uint32_t error_offse
   if ((size_t)error_offset + 4 > r.state.length) throw std::runtime_error("host points: the error offset lies outside StepState");
   if (timeout_ms == 0) throw std::runtime_error("host points: timeout_ms must be at least 1");
   // Test support: LITHOS_HOST_STEPS_DROP_SIGNAL=<step>:<point> leaves out that one signal (the step counts every step
-  // the runner begins), so a command buffer finishes without it.
+  // the runner begins), so a command buffer finishes without it. An empty value is unset.
   uint64_t drop_step = UINT64_MAX; uint32_t drop_point = 0;
-  if (const char* v = getenv("LITHOS_HOST_STEPS_DROP_SIGNAL")) {
+  if (const char* v = getenv("LITHOS_HOST_STEPS_DROP_SIGNAL"); v && *v) {
     unsigned long long s = 0; unsigned k = 0; char rest = 0;
     if (sscanf(v, "%llu:%u%c", &s, &k, &rest) != 2) throw std::runtime_error("LITHOS_HOST_STEPS_DROP_SIGNAL: expected <step>:<point>");
     drop_step = s; drop_point = k;
