@@ -2,13 +2,33 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 #include <cstring>
+#include <tuple>
 #include "metal_core.h"
 
 namespace nb = nanobind;
 using namespace monolith;
+
+// A host task written in Python: fn(step, point). run() is called with the GIL released, so the call takes it; an
+// exception fails the run with its message.
+struct CallableTask : HostTask {
+  nb::callable fn;
+  explicit CallableTask(nb::callable f) : fn(std::move(f)) {}
+  bool run(const HostCall& call, std::string& error) override {
+    nb::gil_scoped_acquire gil;
+    try {
+      fn(call.step, call.point);
+      return true;
+    } catch (nb::python_error& e) {
+      error = e.what();
+      return false;
+    }
+  }
+};
 
 NB_MODULE(_native, m) {
   m.doc() = "Metal runtime core (v0): device, buffers, runtime-compiled libraries, pipelines, timed dispatches";
@@ -74,6 +94,9 @@ NB_MODULE(_native, m) {
       .def(nb::init<const Device&, const std::vector<Dispatch>&>(), nb::arg("device"), nb::arg("ops"), nb::keep_alive<1, 3>())
       .def_prop_ro("count", &Icb::count);
 
+  nb::class_<HostTask>(m, "HostTask");    // implemented in C++ (later tiers) or by CallableTask
+  nb::class_<CallableTask, HostTask>(m, "CallableTask").def(nb::init<nb::callable>(), nb::arg("fn"));
+
   nb::class_<RunnerStats>(m, "RunnerStats")
       .def_ro("steps_submitted", &RunnerStats::steps_submitted).def_ro("command_buffers", &RunnerStats::command_buffers)
       .def_ro("gpu_ms", &RunnerStats::gpu_ms).def_ro("wall_ms", &RunnerStats::wall_ms).def_ro("host_busy_ms", &RunnerStats::host_busy_ms)
@@ -91,5 +114,11 @@ NB_MODULE(_native, m) {
            nb::keep_alive<1, 3>(), nb::keep_alive<1, 4>(), nb::keep_alive<1, 5>(), nb::keep_alive<1, 6>(), nb::keep_alive<1, 10>())
       .def("run", &Runner::run, nb::arg("max_steps"), nb::arg("steps_per_cb") = 8, nb::arg("in_flight") = 3, nb::arg("reencode") = false, nb::arg("max_tokens") = 0,
            nb::call_guard<nb::gil_scoped_release>())
+      .def("set_host_points", [](Runner& r, const std::vector<std::tuple<uint32_t, uint32_t, std::shared_ptr<HostTask>>>& points,
+                                 uint32_t error_offset, uint32_t timeout_ms, uint32_t spin_us) {
+             std::vector<HostPoint> pts;
+             for (auto& [publish, wait, task] : points) pts.push_back({publish, wait, task});
+             r.set_host_points(std::move(pts), error_offset, timeout_ms, spin_us); },
+           nb::arg("points"), nb::arg("error_offset"), nb::arg("timeout_ms") = 20000, nb::arg("spin_us") = 20000)
       .def("drain", &Runner::drain);
 }

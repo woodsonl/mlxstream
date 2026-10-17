@@ -260,6 +260,18 @@ struct RunnerImpl {
   uint32_t tail = 0;                       // next ring slot the host reads
   std::vector<int32_t> tokens; std::mutex mu;
   bool resident = false;                   // the queue carries residency_set (replaces useResource)
+  // host steps (set_host_points)
+  std::vector<HostPoint> points;
+  uint32_t error_off = 0, timeout_ms = 20000, spin_us = 20000;
+  std::vector<uint32_t> pass_cuts;         // boundaries that end a pass: 0, n and every interior publish or wait
+  std::vector<uint32_t> cb_cuts;           // boundaries that end a command buffer: 0, n and every interior wait
+  std::vector<std::vector<uint32_t>> pub_at, wait_at;   // per boundary 0..n: the points that publish / wait there
+  std::vector<uint32_t> pub_seg;           // per boundary 1..n: the command buffer (index into cb_cuts) whose passes end there
+  id<MTLSharedEvent> gpu_ev = nil;         // the GPU signals V(step, point) after the pass ending at the publish boundary
+  id<MTLFence> fence = nil;                // orders every pass behind the one before it, across command buffers
+  bool fence_live = false;                 // a pass has updated the fence
+  uint64_t step_base = 0;                  // absolute index of the next step the runner begins
+  uint64_t event_base = 0;                 // step index at which gpu_ev was created (its values count from there)
   ~RunnerImpl() { if (resident) [q removeResidencySet:residency_set]; }
 };
 
@@ -321,9 +333,258 @@ static void drain_ring(RunnerImpl& r) {
   *(volatile uint32_t*)((char*)r.state.contents + r.tail_off) = r.tail;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Host steps. Op i of step s; boundary b of step s sits before op b, and boundary n of step s is boundary 0 of step
+// s + 1. A command buffer covers the ops of one step between two consecutive cb_cuts; its passes end at pass_cuts, and
+// the pass that ends at a publish boundary is followed by the signal of every point publishing there. Command buffers
+// are committed in order, the one starting at boundary b only after every point waiting at b has been served, so a
+// committed command buffer never waits on the host and every point's signal is committed before its turn to be served.
+
+void Runner::set_host_points(std::vector<HostPoint> points, uint32_t error_offset, uint32_t timeout_ms, uint32_t spin_us) {
+  RunnerImpl& r = *impl;
+  const uint32_t n = (uint32_t)r.ops.size();
+  uint32_t prev = 0;
+  for (auto& p : points) {
+    if (!p.task) throw std::runtime_error("host point without a task");
+    if (p.publish > p.wait || p.wait > n) throw std::runtime_error("host point: need 0 <= publish <= wait <= the op count");
+    if (p.publish < prev) throw std::runtime_error("host points: publish boundaries must not decrease in program order");
+    prev = p.publish;
+  }
+  if ((size_t)error_offset + 4 > r.state.length) throw std::runtime_error("host points: the error offset lies outside StepState");
+  if (timeout_ms == 0) throw std::runtime_error("host points: timeout_ms must be at least 1");
+  r.points = std::move(points);
+  r.error_off = error_offset; r.timeout_ms = timeout_ms; r.spin_us = spin_us;
+  r.pub_at.assign(n + 1, {}); r.wait_at.assign(n + 1, {});
+  std::vector<bool> pass_cut(n + 1, false), cb_cut(n + 1, false);
+  pass_cut[0] = pass_cut[n] = cb_cut[0] = cb_cut[n] = true;
+  for (uint32_t k = 0; k < r.points.size(); k++) {
+    const HostPoint& p = r.points[k];
+    r.pub_at[p.publish].push_back(k);
+    r.wait_at[p.wait].push_back(k);
+    pass_cut[p.publish] = pass_cut[p.wait] = cb_cut[p.wait] = true;
+  }
+  r.pass_cuts.clear(); r.cb_cuts.clear();
+  for (uint32_t b = 0; b <= n; b++) {
+    if (pass_cut[b]) r.pass_cuts.push_back(b);
+    if (cb_cut[b]) r.cb_cuts.push_back(b);
+  }
+  r.pub_seg.assign(n + 1, 0);
+  for (uint32_t j = 0, b = 1; b <= n; b++) {
+    while (r.cb_cuts[j + 1] < b) j++;
+    r.pub_seg[b] = j;
+  }
+  r.gpu_ev = [r.dev newSharedEvent];                     // a fresh event: its values count from the current step
+  r.event_base = r.step_base;
+  if (!r.fence) r.fence = [r.dev newFence];
+  if (!r.gpu_ev || !r.fence) throw std::runtime_error("host points: newSharedEvent or newFence failed");
+}
+
+static uint64_t event_value(const RunnerImpl& r, uint64_t step, uint32_t point) {
+  return (step - r.event_base) * r.points.size() + point + 1;
+}
+
+// One pass: ops [a, b) of a step, behind the fence of the pass before it (on any earlier command buffer).
+static void encode_pass(RunnerImpl& r, id<MTLCommandBuffer> cb, uint32_t a, uint32_t b, bool reencode) {
+  id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+  if (r.fence_live) [en waitForFence:r.fence];
+  if (!r.resident)   // buffers a kernel reaches only through a GPU address are declared here too
+    for (size_t i = 0; i < r.resources.size(); i++) [en useResource:r.resources[i] usage:r.resource_usage[i]];
+  if (reencode) {
+    for (uint32_t i = a; i < b; i++) {
+      const Dispatch& d = r.ops[i];
+      [en setComputePipelineState:d.pipeline->impl->pso];
+      for (auto& bb : d.buffers) [en setBuffer:bb.buffer->impl->buf offset:bb.offset atIndex:bb.index];
+      for (auto& t : d.threadgroup_memory) [en setThreadgroupMemoryLength:t.second atIndex:t.first];
+      [en dispatchThreadgroups:MTLSizeMake(d.grid[0], d.grid[1], d.grid[2]) threadsPerThreadgroup:MTLSizeMake(d.threadgroup[0], d.threadgroup[1], d.threadgroup[2])];
+    }
+  } else {
+    [en executeCommandsInBuffer:r.icb->icb withRange:NSMakeRange(a, b - a)];
+  }
+  [en updateFence:r.fence];
+  [en endEncoding];
+  r.fence_live = true;
+}
+
+// Commits command buffer `seg` of `step`: its passes, each followed by the signals of the points publishing at its end;
+// the step's last pass also carries the signals of the next step's points that publish at boundary 0.
+static id<MTLCommandBuffer> commit_segment(RunnerImpl& r, uint64_t step, uint32_t seg, bool reencode) {
+  const uint32_t n = (uint32_t)r.ops.size(), a = r.cb_cuts[seg], b = r.cb_cuts[seg + 1];
+  id<MTLCommandBuffer> cb = [r.q commandBuffer];
+  uint32_t start = a;
+  for (uint32_t c : r.pass_cuts) {
+    if (c <= a) continue;
+    if (c > b) break;
+    encode_pass(r, cb, start, c, reencode);
+    for (uint32_t k : r.pub_at[c]) [cb encodeSignalEvent:r.gpu_ev value:event_value(r, step, k)];
+    if (c == n) for (uint32_t k : r.pub_at[0]) [cb encodeSignalEvent:r.gpu_ev value:event_value(r, step + 1, k)];
+    start = c;
+  }
+  [cb commit];
+  return cb;
+}
+
+static std::string cb_error(id<MTLCommandBuffer> cb) {
+  return std::string("command buffer failed: ") + (cb.error ? [cb.error.localizedDescription UTF8String] : "unknown error");
+}
+
+// Waits until the GPU signals `v`: the passes before the point's publish boundary completed and their writes are
+// visible. `carrier` is the command buffer holding the signal (nil once it has been retired): if it finishes without
+// the signal, the wait fails at once. Spins for spin_us, then blocks in 1 ms slices; fails after timeout_ms.
+static bool wait_publish(const RunnerImpl& r, uint64_t v, id<MTLCommandBuffer> carrier, std::string& err) {
+  const double t0 = now_ms();
+  for (uint32_t spins = 0; r.gpu_ev.signaledValue < v; spins++) {
+    if ((spins & 63) != 63) continue;
+    const bool finished = carrier == nil || carrier.status >= MTLCommandBufferStatusCompleted;
+    if (finished && r.gpu_ev.signaledValue < v) {
+      err = carrier != nil && carrier.status == MTLCommandBufferStatusError ? cb_error(carrier)
+                                                                            : "its command buffer finished without the signal";
+      return false;
+    }
+    const double elapsed = now_ms() - t0;
+    if (elapsed > r.timeout_ms) { err = "the GPU did not reach the point within " + std::to_string(r.timeout_ms) + " ms"; return false; }
+    if (elapsed * 1e3 > r.spin_us) [r.gpu_ev waitUntilSignaledValue:v timeoutMS:1];
+  }
+  return true;
+}
+
+// Waits for a committed command buffer; it never waits on the host, so only its GPU work decides how long.
+static bool wait_cb(const RunnerImpl& r, id<MTLCommandBuffer> cb, std::string& err) {
+  const double t0 = now_ms();
+  while (cb.status < MTLCommandBufferStatusCompleted) {
+    const double elapsed = now_ms() - t0;
+    if (elapsed > r.timeout_ms) { err = "a command buffer did not complete within " + std::to_string(r.timeout_ms) + " ms"; return false; }
+    if (elapsed * 1e3 > r.spin_us) usleep(100);
+  }
+  return true;
+}
+
+struct HostCb { id<MTLCommandBuffer> cb; uint64_t step; uint32_t seg; };
+
+static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reencode, uint64_t max_tokens) {
+  RunnerStats st;
+  std::string& err = st.error;
+  const uint32_t n = (uint32_t)r.ops.size(), nseg = (uint32_t)r.cb_cuts.size() - 1, K = (uint32_t)r.points.size();
+  const uint64_t S0 = r.step_base;
+  uint64_t S1 = S0 + max_steps;                    // steps [S0, S1) may begin; a stop lowers S1 to the steps begun
+  uint64_t begun = S0;                             // steps [S0, begun) have begun, and each runs to its end
+  uint64_t enc_step = S0; uint32_t enc_seg = 0;    // the next command buffer to commit
+  uint64_t srv_step = S0; uint32_t srv_k = 0;      // the next point to serve
+  bool stop = false;
+  std::deque<HostCb> pending;
+  const double t0 = now_ms(), c0 = cpu_ms_now();
+  auto served = [&](uint64_t s, uint32_t k) { return s < srv_step || (s == srv_step && k < srv_k); };
+  auto may_begin = [&](uint64_t s) {               // a step begins unless a stop came first
+    if (s < begun) return true;
+    if (stop || s >= S1) { S1 = begun; return false; }
+    begun = s + 1;
+    return true;
+  };
+  auto observe_state = [&]() {                     // the GPU's writes so far are visible: drain, check the stops
+    drain_ring(r);
+    st.done = *(volatile uint32_t*)((char*)r.state.contents + r.done_off) != 0;
+    size_t seen; { std::lock_guard<std::mutex> lk(r.mu); seen = r.tokens.size(); }
+    if (st.done || (max_tokens && seen >= max_tokens)) stop = true;
+  };
+  auto retire = [&](bool block) {                  // retires completed command buffers, waiting for one if `block`
+    while (!pending.empty() && err.empty()) {
+      id<MTLCommandBuffer> cb = pending.front().cb;
+      if (cb.status < MTLCommandBufferStatusCompleted) {
+        if (!block) return;
+        const double w0 = now_ms();
+        const bool ok = wait_cb(r, cb, err);
+        st.wait_ms += now_ms() - w0;
+        if (!ok) return;
+      }
+      st.gpu_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
+      st.command_buffers++;
+      if (cb.error) { err = cb_error(cb); return; }
+      pending.pop_front();
+      block = false;
+      observe_state();
+    }
+  };
+  for (;;) {
+    // commit every command buffer whose waits have all been served
+    while (err.empty() && enc_step < S1) {
+      const uint32_t a = r.cb_cuts[enc_seg];
+      bool ready = true;
+      for (uint32_t k : r.wait_at[a]) ready = ready && served(enc_step, k);
+      if (a == 0 && enc_step > S0) for (uint32_t k : r.wait_at[n]) ready = ready && served(enc_step - 1, k);
+      if (!ready || (enc_seg == 0 && !may_begin(enc_step))) break;
+      const double e0 = now_ms();
+      @autoreleasepool { pending.push_back({commit_segment(r, enc_step, enc_seg, reencode), enc_step, enc_seg}); }
+      st.encode_ms += now_ms() - e0;
+      if (++enc_seg == nseg) { enc_seg = 0; enc_step++; }
+    }
+    if (!err.empty()) break;
+    // serve the next point once its signal is committed; a point publishing at the run's first boundary needs none
+    if (srv_step < S1) {
+      const HostPoint& p = r.points[srv_k];
+      const bool first = p.publish == 0 && srv_step == S0;
+      const bool committed = first || (p.publish == 0 ? enc_step >= srv_step
+                                                      : srv_step < enc_step || (srv_step == enc_step && r.pub_seg[p.publish] < enc_seg));
+      if (committed && may_begin(srv_step)) {
+        if (!first) {
+          const uint64_t cs = p.publish == 0 ? srv_step - 1 : srv_step;
+          const uint32_t cg = p.publish == 0 ? nseg - 1 : r.pub_seg[p.publish];
+          id<MTLCommandBuffer> carrier = nil;
+          for (auto& h : pending) if (h.step == cs && h.seg == cg) carrier = h.cb;
+          const double w0 = now_ms();
+          std::string werr;
+          const bool ok = wait_publish(r, event_value(r, srv_step, srv_k), carrier, werr);
+          st.wait_ms += now_ms() - w0;
+          if (!ok) { err = "host step " + std::to_string(srv_step) + ", point " + std::to_string(srv_k) + ": " + werr; break; }
+        }
+        observe_state();
+        if (!st.done) {                            // a finished program's later steps do no host work
+          const HostCall call{srv_step, srv_k, r.state.contents};
+          std::string terr;
+          bool ok = false;
+          try { ok = p.task->run(call, terr); } catch (const std::exception& e) { terr = e.what(); }
+          if (!ok) {
+            err = "host step " + std::to_string(srv_step) + ", point " + std::to_string(srv_k) + ": " + (terr.empty() ? "the task failed" : terr);
+            break;
+          }
+        }
+        if (++srv_k == K) { srv_k = 0; srv_step++; }
+        retire(false);
+        continue;
+      }
+    }
+    if (pending.empty()) {                         // nothing committed is outstanding and nothing more can start
+      if (enc_step < S1 || srv_step < S1) err = "host steps: no command buffer in flight and no point to serve";
+      break;
+    }
+    retire(true);
+    if (!err.empty()) break;
+  }
+  if (!err.empty()) {
+    // Committed command buffers never wait on the host and every kernel loop is bounded; the GPU watchdog ends a hung
+    // one. They finish before StepState is touched, so the failure leaves no GPU work behind.
+    for (auto& h : pending) {
+      std::string ignored;
+      if (!wait_cb(r, h.cb, ignored)) [h.cb waitUntilCompleted];
+      st.gpu_ms += (h.cb.GPUEndTime - h.cb.GPUStartTime) * 1e3;
+      st.command_buffers++;
+    }
+    pending.clear();
+    volatile uint32_t* state = (volatile uint32_t*)r.state.contents;
+    state[r.done_off / 4] = 1;
+    if (state[r.error_off / 4] == 0) state[r.error_off / 4] = 4;
+  }
+  r.step_base = begun;
+  drain_ring(r);
+  st.done = *(volatile uint32_t*)((char*)r.state.contents + r.done_off) != 0;
+  st.steps_submitted = begun - S0;
+  st.wall_ms = now_ms() - t0;
+  st.host_busy_ms = cpu_ms_now() - c0;
+  return st;
+}
+
 RunnerStats Runner::run(uint32_t max_steps, uint32_t steps_per_cb, uint32_t in_flight, bool reencode, uint64_t max_tokens) {
   impl->tail = *(volatile uint32_t*)((char*)impl->state.contents + impl->tail_off);   // the ring tail lives in StepState: resume (or restart after a reset) from it
   RunnerImpl& r = *impl;
+  if (!r.points.empty()) return run_host_steps(r, max_steps, reencode, max_tokens);
   RunnerStats st;
   if (steps_per_cb == 0 || in_flight == 0) throw std::runtime_error("steps_per_cb and in_flight must be >= 1");
   double t0 = now_ms(), c0 = cpu_ms_now();
