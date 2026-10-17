@@ -27,7 +27,8 @@ and a bare `:N` is a line of the file named last.
   `<8, 10>` has the same per-(row, column) templates).
 - **Reading a site.** As in `matvec.md`: the PTX shows what NVVM fused and each conversion; the SASS what `ptxas` made
   of it. The dataflow tracer of `matvec.md` prints each floating-point SASS instruction as an expression template;
-  the templates below are 13.3's, and 13.0's are the same multiset at every site this page records.
+  the templates below are 13.3's. 13.0 emits the same operations, with the same operands and modifiers, at every
+  site this page records; its listings differ only in scheduling and predicate choice (sections 4.2 and 4.3).
 
 ## Register and shared-memory use (sm_120, `ptxas -v`, both compilers)
 
@@ -222,6 +223,10 @@ is a predicated `MUFU.EX2` instead of an `FSEL` after it.
 | the kPer argmax rounds (`:155-166`) | `FSETP.GEU.FTZ` / `FSETP.NEU.FTZ` and `FSEL` | exact | `ov > bv \|\| (ov == bv && oi < bi)` |
 
 ### 4.3 `q5k_proxy_final_kernel` (`q5k_head.cu:464-496`) with `collect` and `pick`
+
+13.0's listing of this kernel has the same operations at every site. It differs from 13.3's in scheduling, in the
+predicate registers its `FSEL`s test, and in the tracer's leaf classes where a register was loaded outside the traced
+block.
 
 | Site | SASS (13.3) | Template | Metal |
 |---|---|---|---|
