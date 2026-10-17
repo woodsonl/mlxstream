@@ -76,6 +76,8 @@ struct Dispatch {
   uint32_t grid[3] = {1, 1, 1};        // threadgroups
   uint32_t threadgroup[3] = {1, 1, 1}; // threads per threadgroup
   bool barrier_before = false;         // this dispatch waits for every dispatch before it (ICBs, concurrent encoders)
+  std::vector<const Buffer*> uses;     // buffers the kernel reaches only through GPU addresses: Queue.run and
+                                       // Queue.profile make them resident for its dispatch (useResource, read)
 };
 
 // `error`: the command buffer's error (empty = clean). A Metal shader-validation report leaves the command buffer
