@@ -550,10 +550,11 @@ static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reenco
         st.wait_ms += now_ms() - w0;
         if (!ok) return;
       }
+      [cb waitUntilCompleted];                     // returns at once; the validation logs are complete only after it
       st.gpu_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
       st.command_buffers++;
-      if (cb.error) { err = cb_error(cb); return; }
       pending.pop_front();
+      if (std::string e = failure(cb); !e.empty()) { err = e; return; }   // its error or validation reports stop the run
       block = false;
       observe_state();
     }
@@ -617,10 +618,10 @@ static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reenco
     // Committed command buffers never wait on the host and every kernel loop is bounded; the GPU watchdog ends a hung
     // one. They finish before StepState is touched, so the failure leaves no GPU work behind.
     for (auto& h : pending) {
-      std::string ignored;
-      if (!wait_cb(r, h.cb, ignored)) [h.cb waitUntilCompleted];
+      [h.cb waitUntilCompleted];
       st.gpu_ms += (h.cb.GPUEndTime - h.cb.GPUStartTime) * 1e3;
       st.command_buffers++;
+      failure(h.cb);   // counts its validation reports; the run's error is the first failure's
     }
     pending.clear();
     volatile uint32_t* state = (volatile uint32_t*)r.state.contents;
