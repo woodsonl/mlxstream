@@ -213,3 +213,70 @@ def dense_tc_pair(type0, w0, n_out0, type1, w1, n_out1, xq, n_in, widths, fill=0
     assert not r.error, r.error
     f = lambda b, n: np.frombuffer(b.read(0, 32 * n), np.float32).reshape(8, n)
     return {t: (f(b0, n_out0), f(b1, n_out1)) for t, (_, b0, b1) in outs.items()}
+
+
+def _map_buffer(dev, map_, n):
+    """basalt's map (int32 ids, negative: no token) or, for nullptr, a dummy buffer with has_map 0."""
+    if map_ is None:
+        return nt.Buffer(dev, 4), False
+    return nt.Buffer(dev, np.ascontiguousarray(map_, np.int32).tobytes()), True
+
+
+def q5k_head(w, xq, n_in, n_out, ncols, fill=0xEE, **grid):
+    """``basalt_q5k_head`` (basalt's ``q5k_head_mmvq``) for ``ncols`` columns, into an output whose bytes start as
+    ``fill``; ``grid``: ``basalt_q5k_head_grid``'s keywords."""
+    macros = kernels.basalt_q5k_head_macros(n_in, ncols)
+    pso = pipeline(kernels.basalt_q5k_head_source(), "basalt_q5k_head", tuple(sorted(macros.items())))
+    out = run(pso, [np.ascontiguousarray(w, np.uint8).tobytes(), np.ascontiguousarray(xq, np.uint8).tobytes(),
+                    4 * ncols * n_out], kernels.basalt_q5k_head_params(n_in, n_out), 3,
+              kernels.basalt_q5k_head_grid(n_out, **grid), kernels.Q5K_HEAD_THREADS, fill)
+    return np.frombuffer(out[2], np.float32).reshape(ncols, n_out)
+
+
+def q5k_head_masked(w, xq, n_in, n_out, map_):
+    """basalt's plain head then ``q5k_head_mask_unmapped`` on its logits, in one command buffer: one column."""
+    dev = device()
+    src = kernels.basalt_q5k_head_source()
+    macros = tuple(sorted(kernels.basalt_q5k_head_macros(n_in, 1).items()))
+    bw = nt.Buffer(dev, np.ascontiguousarray(w, np.uint8).tobytes())
+    bx = nt.Buffer(dev, np.ascontiguousarray(xq, np.uint8).tobytes())
+    by = nt.Buffer(dev, 4 * n_out)
+    by.fill(0xEE)
+    bm, _ = _map_buffer(dev, map_, n_out)
+    params = kernels.basalt_q5k_head_params(n_in, n_out)
+    d1 = (nt.Dispatch().pipeline(pipeline(src, "basalt_q5k_head", macros)).buffer(0, bw).buffer(1, bx).buffer(2, by)
+          .bytes(3, params).grid(kernels.basalt_q5k_head_grid(n_out)).threadgroup(kernels.Q5K_HEAD_THREADS))
+    d2 = (nt.Dispatch().pipeline(pipeline(src, "basalt_q5k_head_mask_unmapped", macros)).buffer(0, by).buffer(1, bm)
+          .bytes(2, params).grid(-(-n_out // 256)).threadgroup(256))
+    r = nt.Queue(dev).run([d1, d2])
+    assert not r.error, r.error
+    return np.frombuffer(by.read(0, 4 * n_out), np.float32)
+
+
+def q5k_top1(w, xq, n_out, map_=None, **grid):
+    """basalt's ``q5k_head_top1`` (n_in 2560, one column): ``basalt_q5k_head_top1`` then ``basalt_q5k_head_top1_merge``
+    in one command buffer. Returns (logits, id, probability, the threadgroup partials as (m, idx, s) rows)."""
+    dev = device()
+    src = kernels.basalt_q5k_head_source()
+    macros = tuple(sorted(kernels.basalt_q5k_head_macros(2560, 1).items()))
+    blocks = kernels.basalt_q5k_head_grid(n_out, **grid)
+    bw = nt.Buffer(dev, np.ascontiguousarray(w, np.uint8).tobytes())
+    bx = nt.Buffer(dev, np.ascontiguousarray(xq, np.uint8).tobytes())
+    by, bpart, bid, bp = nt.Buffer(dev, 4 * n_out), nt.Buffer(dev, 12 * blocks), nt.Buffer(dev, 4), nt.Buffer(dev, 4)
+    for b in (by, bpart, bid, bp):
+        b.fill(0xEE)
+    bm, has = _map_buffer(dev, map_, n_out)
+    params = kernels.basalt_q5k_head_params(2560, n_out, has, blocks)
+    d1 = nt.Dispatch().pipeline(pipeline(src, "basalt_q5k_head_top1", macros))
+    for k, b in enumerate((bw, bx, by, bm, bpart)):
+        d1 = d1.buffer(k, b)
+    d1 = d1.bytes(5, params).grid(blocks).threadgroup(kernels.Q5K_HEAD_THREADS)
+    d2 = nt.Dispatch().pipeline(pipeline(src, "basalt_q5k_head_top1_merge", macros))
+    for k, b in enumerate((bpart, bm, bid, bp)):
+        d2 = d2.buffer(k, b)
+    d2 = d2.bytes(4, params).grid(1).threadgroup(kernels.Q5K_HEAD_THREADS)
+    r = nt.Queue(dev).run([d1, d2])
+    assert not r.error, r.error
+    part = np.frombuffer(bpart.read(0, 12 * blocks), np.float32).reshape(blocks, 3)
+    return (np.frombuffer(by.read(0, 4 * n_out), np.float32), int(np.frombuffer(bid.read(0, 4), np.int32)[0]),
+            np.frombuffer(bp.read(0, 4), np.float32)[0], part)

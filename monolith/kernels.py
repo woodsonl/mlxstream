@@ -524,6 +524,49 @@ def basalt_dense_tc_pair_grid(n_out0: int, n_out1: int) -> Tuple[int, int]:
     return -(-n_out0 // 16) + -(-n_out1 // 16), 256
 
 
+# ---- basalt's Q5_K head (kernels/common/basalt_q5k_head.metal; docs/research/basalt-nvcc/q5k_head.md)
+# adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:337-386 and :365-368 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE)
+
+Q5K_HEAD_THREADS = 256      # basalt's WPB * WARP: 8 SIMD-groups, one row each
+Q5K_TOP1_SM_COUNT = 170     # the multiprocessors of basalt's measured GPU (an RTX 5090)
+Q5K_TOP1_PER_SM = 2         # cudaOccupancyMaxActiveBlocksPerMultiprocessor of q5k_head_top1_kernel on sm_120: 126
+                            # registers (ptxas, NVCC 13.0 and 13.3) round to 128; 128 x 256 of 65,536 (q5k_head.md)
+Q5K_TOP1_MAX_BLOCKS = 4096  # basalt's cap: q5k_head_top1_scratch_bytes holds 4096 partials
+
+
+def basalt_q5k_head_source() -> str:
+    """basalt's ``q5k_head_mmvq`` (``basalt_q5k_head``), ``q5k_head_mask_unmapped`` (``basalt_q5k_head_mask_unmapped``)
+    and ``q5k_head_top1`` (``basalt_q5k_head_top1`` then ``basalt_q5k_head_top1_merge``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_q5k_head.metal")
+
+
+def basalt_q5k_head_macros(n_in: int, ncols: int) -> Dict[str, str]:
+    """``q5k_head_supported`` (q5k_head.cu:365-368): n_in a positive multiple of 256 with at most 64 blocks a row, 1..8
+    columns whose staging (6 int4 per q8_1 block) fits basalt's 96 KiB; the port reads the columns from device memory,
+    so the rule is the API's, not Metal's."""
+    if n_in <= 0 or n_in % 256 or n_in // 256 > 64 or not 1 <= ncols <= 8 or ncols * (n_in // 32) * 96 > 96 * 1024:
+        raise ValueError(f"basalt_q5k_head: unsupported shape (n_in {n_in}, ncols {ncols})")
+    return {"NC": str(ncols)}
+
+
+def basalt_q5k_head_grid(n_out: int, *, sm_count: int = Q5K_TOP1_SM_COUNT, per_sm: int = Q5K_TOP1_PER_SM,
+                         cap: int = Q5K_TOP1_MAX_BLOCKS) -> int:
+    """basalt's grid rule (q5k_head.cu:353-354, 375-386): min(ceil(n_out / 8), sm_count * per_sm, cap) threadgroups of
+    256 threads. The top-1's probability sums in this order, so its last bits follow ``sm_count`` and ``per_sm``
+    (mtp.cpp:1007-1008); the defaults are basalt's on its measured GPU. The plain head's values do not depend on the
+    grid (basalt sizes it with the head kernel's own occupancy; the cap is the top-1's)."""
+    if n_out <= 0 or sm_count <= 0 or per_sm <= 0:
+        raise ValueError(f"basalt_q5k_head: n_out, sm_count and per_sm must be positive")
+    return min(-(-n_out // 8), sm_count * per_sm, cap)
+
+
+def basalt_q5k_head_params(n_in: int, n_out: int, has_map: bool = False, n_blocks: int = 0) -> bytes:
+    """``Q5kHeadParams``: n_in, n_out, whether a map is bound, and for the top-1's merge the first dispatch's
+    threadgroup count."""
+    return struct.pack("<IIII", n_in, n_out, int(has_map), n_blocks)
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)

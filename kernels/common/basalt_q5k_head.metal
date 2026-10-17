@@ -1,0 +1,161 @@
+// Copyright (c) 2023-2026 The ggml authors (MIT)
+// Copyright (c) 2026 Jesús Gulfo (MIT)
+// Adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:19-404 @ b4c63b55754637f4c72ad53a0f791d425f71eb36
+// (MIT; third_party/NOTICE), whose Q5_K dot repeats native_mmvq.cu's, an adaptation of ggml-org/llama.cpp
+// ggml/src/ggml-cuda/vecdotq.cuh @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+//
+// basalt's Q5_K head (n_in a multiple of 256, at most 64 blocks a row): y[j][r] = Q5_K row r times q8_1 column j
+// (basalt_q8_1.metal's layout, column j's blocks from block j * n_in / 32), each value bit for bit native_mmvq's
+// (basalt_mmvq.metal, MMVQ_TYPE 13): the same q5k_load / q5k_dot (basalt_fp.metal) per (row, block, column), the
+// same order. Needs basalt_fp.metal ahead of it. Arithmetic: docs/research/basalt-nvcc/q5k_head.md.
+//
+// Mapping (q5k_head.cu:108-141, 225-252): threadgroups of 8 SIMD-groups (basalt's WPB warps), one row per SIMD-group,
+// rows row0 = 8 tg + sg strided by 8 * threadgroups; lane L stands for native_mmvq's threads L + 32v, v = 0..3, whose
+// blocks kbx = (L + 32v) / 16, + 8, ... it takes in ascending order at kqs = 2 (L % 16), each thread's sum from +0;
+// then ((p0 + p1) + p2) + p3 (native_mmvq's warp order) and the XOR butterfly. At 10 blocks a row this is
+// q5k_rows_10's assignment (thread L: a = L / 16 and a + 8; threads L + 32, L + 64, L + 96: a + 2, a + 4, a + 6).
+// q5k_rows_10's next-row register prefetch and the top-1's L2 prefetch schedule loads only and are not ported. The
+// columns are read from device memory: basalt stages them in shared memory (61,440 bytes at 8 columns and n_in 2560,
+// more than Apple9's 32 KiB), which is not arithmetic.
+//
+// Kernels:
+// - basalt_q5k_head (q5k_head_mmvq; NC columns, 1..8): grid basalt_q5k_head_grid threadgroups of 256 threads.
+// - basalt_q5k_head_mask_unmapped (q5k_head_mask_unmapped): y[i] = -inf where map[i] < 0; ceil(n / 256) x 256.
+// - basalt_q5k_head_top1 then basalt_q5k_head_top1_merge (q5k_head_top1, one column, n_in 2560): the first writes the
+//   logits and each threadgroup's (max, its first row, sum of exp(l - max)) to part[3 tg .. 3 tg + 2]; the second, one
+//   threadgroup of 256, merges the partials in basalt's order and writes the token id and its probability. basalt
+//   elects the last block with an atomic counter and merges there (q5k_head.cu:303-334); Metal documents no ordering
+//   that makes the other threadgroups' partials visible to the elected one, so the merge is a second dispatch, ordered
+//   after the first by the dispatch boundary (q5k_head.md section 3). Same arithmetic, same order.
+#pragma STDC FP_CONTRACT OFF
+
+#ifndef NC
+#define NC 1
+#endif
+
+constant constexpr int Q5K_WPB = 8;                 // SIMD-groups (rows in flight) per threadgroup
+constant constexpr int Q5K_USHORTS = 88;            // a Q5_K block, as 16-bit words
+constant constexpr int TOP_NONE = 0x7fffffff;       // Top::idx before any row
+
+// n_in, n_out, has_map (0: no map; basalt's nullptr) and, for the merge, the first dispatch's threadgroup count
+struct Q5kHeadParams { uint n_in; uint n_out; uint has_map; uint n_blocks; };
+
+static inline float neg_inf() { return as_type<float>(0xff800000u); }
+
+// q5k_row_dev (q5k_head.cu:110-141): row `wr` (bpr blocks) times NCOL columns of x, every lane's t[j] the same bits.
+template <int NCOL>
+static inline void q5k_row(device const ushort* wr, device const uint* x, int x_stride, int bpr, int lane,
+                           thread float* t) {
+    const int kqs = 2 * (lane % 16);
+    float p[4][NCOL];
+    for (int v = 0; v < 4; ++v)
+        for (int j = 0; j < NCOL; ++j) p[v][j] = 0.0f;
+    for (int v = 0; v < 4; ++v) {
+        for (int kbx = (lane + 32 * v) / 16; kbx < bpr; kbx += 8) {
+            const Q5KW wv = q5k_load(wr + kbx * Q5K_USHORTS, kqs);
+            for (int j = 0; j < NCOL; ++j) p[v][j] = add_ftz(p[v][j], q5k_dot(wv, x + 9 * (j * x_stride + 8 * kbx), kqs));
+        }
+    }
+    for (int j = 0; j < NCOL; ++j) {
+        float s = p[0][j];
+        for (int v = 1; v < 4; ++v) s = add_ftz(s, p[v][j]);
+        t[j] = warp_sum_ftz(s);
+    }
+}
+
+kernel void basalt_q5k_head(device const ushort* w [[buffer(0)]], device const uint* x [[buffer(1)]],
+                            device float* y [[buffer(2)]], constant Q5kHeadParams& p [[buffer(3)]],
+                            uint tg [[threadgroup_position_in_grid]], uint ntg [[threadgroups_per_grid]],
+                            ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const int n_in = int(p.n_in), n_out = int(p.n_out), bpr = n_in / 256;
+    for (int row = Q5K_WPB * int(tg) + int(sg); row < n_out; row += Q5K_WPB * int(ntg)) {
+        float t[NC];
+        q5k_row<NC>(w + uint(row) * uint(bpr * Q5K_USHORTS), x, n_in / 32, bpr, int(lane), t);
+        if (lane == 0)
+            for (int j = 0; j < NC; ++j) y[j * n_out + row] = t[j];
+    }
+}
+
+kernel void basalt_q5k_head_mask_unmapped(device float* y [[buffer(0)]], device const int* map [[buffer(1)]],
+                                          constant Q5kHeadParams& p [[buffer(2)]],
+                                          uint i [[thread_position_in_grid]]) {
+    if (i < p.n_out && map[i] < 0) y[i] = neg_inf();
+}
+
+// ---- the top-1 (q5k_head.cu:146-176, 256-335) ----------------------------------------------------------------------
+
+// the running (max, its first row, sum of exp(l - max)) of the logits taken so far
+struct Top { float m; int idx; float s; };
+static inline Top top_init() { return Top{neg_inf(), TOP_NONE, 0.0f}; }
+static inline void top_take(thread Top& t, float l, int row) {
+    if (l > t.m) {
+        t.s = fma_ftz(t.s, expf_ftz(add_ftz(t.m, -l)), 1.0f);
+        t.m = l;
+        t.idx = row;
+    } else {
+        t.s = add_ftz(t.s, expf_ftz(add_ftz(l, -t.m)));
+        if (l == t.m && row < t.idx) t.idx = row;
+    }
+}
+static inline void top_merge(thread Top& t, Top o) {
+    if (o.idx == TOP_NONE) return;
+    if (t.idx == TOP_NONE || o.m > t.m) {
+        t.s = fma_ftz(t.s, expf_ftz(add_ftz(t.m, -o.m)), o.s);
+        t.m = o.m;
+        t.idx = o.idx;
+    } else {
+        t.s = fma_ftz(o.s, expf_ftz(add_ftz(o.m, -t.m)), t.s);
+        if (o.m == t.m && o.idx < t.idx) t.idx = o.idx;
+    }
+}
+
+kernel void basalt_q5k_head_top1(device const ushort* w [[buffer(0)]], device const uint* x [[buffer(1)]],
+                                 device float* y [[buffer(2)]], device const int* map [[buffer(3)]],
+                                 device float* part [[buffer(4)]], constant Q5kHeadParams& p [[buffer(5)]],
+                                 uint tg [[threadgroup_position_in_grid]], uint ntg [[threadgroups_per_grid]],
+                                 ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+                                 ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup Top wt[Q5K_WPB];
+    const int n_out = int(p.n_out);
+    Top top = top_init();
+    for (int row = Q5K_WPB * int(tg) + int(sg); row < n_out; row += Q5K_WPB * int(ntg)) {
+        float t[1];
+        q5k_row<1>(w + uint(row) * uint(10 * Q5K_USHORTS), x, 80, 10, int(lane), t);
+        // a row whose id is negative holds no token: it never wins and adds nothing to the sum
+        if (p.has_map != 0u && map[row] < 0) t[0] = neg_inf();
+        else top_take(top, t[0], row);
+        if (lane == 0) y[row] = t[0];
+    }
+    if (lane == 0) wt[sg] = top;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        Top b = wt[0];
+        for (int i = 1; i < Q5K_WPB; ++i) top_merge(b, wt[i]);
+        part[3 * tg] = b.m;
+        part[3 * tg + 1] = as_type<float>(b.idx);
+        part[3 * tg + 2] = b.s;
+    }
+}
+
+kernel void basalt_q5k_head_top1_merge(device const float* part [[buffer(0)]], device const int* map [[buffer(1)]],
+                                       device int* out_id [[buffer(2)]], device float* out_prob [[buffer(3)]],
+                                       constant Q5kHeadParams& p [[buffer(4)]],
+                                       ushort tid [[thread_index_in_threadgroup]],
+                                       ushort lane [[thread_index_in_simdgroup]],
+                                       ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup Top wt[Q5K_WPB];
+    Top g = top_init();   // each thread a strided share of the block partials, then the block
+    for (int i = int(tid); i < int(p.n_blocks); i += 32 * Q5K_WPB)
+        top_merge(g, Top{part[3 * i], as_type<int>(part[3 * i + 1]), part[3 * i + 2]});
+    for (ushort off = 16; off > 0; off >>= 1)
+        top_merge(g, Top{shfl_xor(g.m, off), simd_shuffle_xor(g.idx, off), shfl_xor(g.s, off)});
+    if (lane == 0) wt[sg] = g;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        Top b = wt[0];
+        for (int i = 1; i < Q5K_WPB; ++i) top_merge(b, wt[i]);
+        const int id = b.idx < int(p.n_out) ? b.idx : 0;
+        *out_id = p.has_map != 0u ? map[id] : id;
+        *out_prob = rcp_ftz(b.s);
+    }
+}
