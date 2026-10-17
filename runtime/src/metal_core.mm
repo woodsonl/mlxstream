@@ -601,6 +601,7 @@ static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reenco
             err = "host step " + std::to_string(srv_step) + ", point " + std::to_string(srv_k) + ": " + (terr.empty() ? "the task failed" : terr);
             break;
           }
+          observe_state();                         // a task may set done itself: then no later step begins
         }
         if (++srv_k == K) { srv_k = 0; srv_step++; }
         retire(false);

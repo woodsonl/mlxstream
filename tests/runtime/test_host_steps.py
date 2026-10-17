@@ -456,6 +456,30 @@ def test_max_tokens_and_stop_at_end_runs_on_whole_steps():
     assert eng.state()["step"] == steps_with_work
 
 
+@pytest.mark.parametrize("stop_point", [0, 1])
+def test_a_task_that_sets_done_ends_the_run_after_its_step(stop_point):
+    """A task may stop the program by writing StepState.done (host acceptance at EOS): the step whose task wrote it runs
+    to its end, and no later step begins or runs a task."""
+    calls, eng = [], None
+
+    def watch(step, point):
+        calls.append((step, point))
+        if step == 5 and point == stop_point:
+            eng.buffers["step_state"].write(struct.pack("<I", 1), LAYOUT.offset("done"))
+
+    ops = [_op("tick", [(0, "step_state", 0), (1, "params", 0), (2, "ring", 0)], [0, 2])]
+    points = [HostPoint("watch", 1, 1, writes=["step_state"]), HostPoint("watch", 1, 1, writes=["step_state"])]
+    eng = Engine(_program(_base_buffers(1000), ops, points), host_tasks={"watch": watch})
+    rep = eng.run(100)
+    assert rep.done and rep.steps == 6 and rep.tokens == list(range(6))
+    assert calls == [(s, k) for s in range(6) for k in (0, 1)]
+
+
+def test_profile_refuses_a_program_with_host_points():
+    with pytest.raises(RuntimeError, match="host points"):
+        _Exchange().engine(10).profile(1)                                 # its ops would run without their tasks
+
+
 def _validation_program(points, **overrides):
     buffers = {**_base_buffers(10), "x": BufferSpec(W * 4), "acc": BufferSpec(16), "staging": BufferSpec(W * 4, role="host"),
                "w": BufferSpec(16384, role="weights")}

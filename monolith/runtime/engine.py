@@ -145,6 +145,8 @@ class Engine:
         """Per-dispatch GPU (start, end) ms for ``steps`` re-encoded steps (one encoder per op with timestamp counter
         samples, so the numbers carry encoder-boundary gaps the ICB replay does not have — use them for the shares
         and the per-op durations, not for the step total)."""
+        if self.program.host_points:
+            raise RuntimeError("profile() dispatches the ops without their tasks; a program with host points runs only through run()")
         q = nt.Queue(self.dev)
         return [q.profile(self.ops) for _ in range(steps)]
 
