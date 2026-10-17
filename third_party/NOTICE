@@ -139,9 +139,12 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
 - `kernels/common/basalt_dense_tc.metal` — adapted from `src/kernels/cuda/dense_tc.cu:32-931` (MIT): `half_sb_terms`
   for Q2_0, Q3_K, Q4_K, Q5_K, Q6_K and IQ4_XS with the `mma.sync` fragment layout, and the warps' chunks and warp-sum
   trees of `dense_tc_one_kernel`, `dense_tc_tile_kernel`, `dense_tc_kernel` (KS 1 and 2) and `dense_tc_pair_kernel`,
-  written in the rounding sequence nvcc compiles for them (`docs/research/basalt-nvcc/dense_tc.md`); its variant rule
-  in `monolith/kernels.py` (`basalt_dense_tc_variant`) follows `launch<TYPE>` (`:1017-1059`). License:
+  written in the rounding sequence nvcc compiles for them (`docs/research/basalt-nvcc/dense_tc.md`). License:
   `third_party/BASALT-LICENSE`.
+- `monolith/kernels.py` — adapted from `src/kernels/cuda/dense_tc.cu:35-42`, `:52-54`, `:698-702` and `:1017-1105`
+  (MIT): `Fmt<TYPE>::SB` (`DENSE_TC_SB`), and in `basalt_dense_tc_variant` the variant rule of `launch<TYPE>` with
+  `one_ok`, `one_row_stride` and `one_smem_bytes<TYPE, 24>`; `dense_tc_supported` (`_dense_tc_check`) and
+  `dense_tc_pair_supported`'s shared-memory test (`basalt_dense_tc_pair_macros`). License: `third_party/BASALT-LICENSE`.
 - `tests/kernels/test_basalt_dense_tc.py` — adapted from `src/kernels/dense_tc_parity.cpp` (MIT): its cases and pairs
   with their scale offsets and seeds, the T = 1..8 sweep, the 0xff output pre-fill and the pass criteria. License:
   `third_party/BASALT-LICENSE`.

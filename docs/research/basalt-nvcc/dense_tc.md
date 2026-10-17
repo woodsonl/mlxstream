@@ -49,8 +49,10 @@ and a bare `:N` is a line of the file named last.
 As in `matvec.md`: fl(e) rounds once to fp32, to nearest even; fma(a, b, c) rounds a·b + c once; h(x) is an fp16 value
 converted to fp32 (exact); f(n) an int32 converted to fp32. dot is the exact int32 dot of a 32-value block (or a
 16-value half) of weight codes with the 32 (16) q8_1 codes of a column, which `mma.sync` computes for 16 rows by 8
-columns; d8 is the column's q8_1 scale, h(the low half of the block's `ds`). Every integer converted here is below 2^24
-in magnitude (the largest, IQ4_XS's dot·(ls − 32), is at most 32·127·127·32 = 16,516,096), so f(n) is exact.
+columns; d8 is the column's q8_1 scale, h(the low half of the block's `ds`). Every integer converted here is below
+2^24 = 16,777,216 in magnitude, so f(n) is exact. The largest is Q6_K's sc0·e0 + sc1·e1, int8 scales (|sc| ≤ 128)
+on 16-value dots of codes in [−32, 31]: at most 2·128·16·32·127 = 16,646,144; next is IQ4_XS's dot·(ls − 32), at
+most 32·127·127·32 = 16,516,096.
 
 **No flush to zero.** No float add, multiply or fma in any unit carries `.FTZ` (the only `.FTZ` instructions are
 `F2I.FTZ.U32.TRUNC.NTZ` in the index arithmetic), and the PTX has no `.ftz`: every float operation is IEEE's.
@@ -191,7 +193,7 @@ the column count:
 The multiprocessor count is the device's (`sm_count()`, `:967-975`), so on basalt's hardware the order, and with it
 the bits, follow the GPU model. The port fixes it at 170, the count of basalt's measured RTX 5090
 (`docs/precision.md:6`; 170 SMs per KitGuru's review, quoted in the scoping report). At 170, every native weight is
-its own `cudaMalloc` (aligned, `native_dense.cpp:156-157`), and this pack's projections take:
+its own `cudaMalloc` (aligned, `native_dense.cpp:215-216`), and this pack's projections take:
 
 | Projection | n_in → n_out | Tiles | Order at 170 | Why |
 |---|---|---|---|---|

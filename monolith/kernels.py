@@ -391,6 +391,8 @@ def basalt_dequant_macros(type_id: int) -> Dict[str, str]:
 
 
 # ---- basalt's dense_tc and dense_tc_pair (kernels/common/basalt_dense_tc.metal; docs/research/basalt-nvcc/dense_tc.md)
+# adapted from basalt (jesdga95/basalt) src/kernels/cuda/dense_tc.cu:35-42, :52-54, :698-702, :1017-1105 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE)
 
 DENSE_TC_SB = {11: 110, 12: 144, 13: 176, 14: 210, 23: 136, 42: 72}   # Fmt<TYPE>::SB: bytes of 256 values
 DENSE_TC_ORDERS = {"one": 0, "tile": 1, "s1": 2, "s2": 3}             # DTC_ORDER; s1 / s2: dense_tc_kernel at KS 1 / 2
