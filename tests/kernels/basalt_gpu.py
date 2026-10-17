@@ -126,9 +126,90 @@ def experts(blobs, grp_off, grp_start, ent_tok, ent_dst, xq, n_embd, n_ff, n_out
             "hq": np.frombuffer(b_hq.read(0, b_hq.nbytes), np.uint8), "out": f32(b_out).reshape(n_out_rows, n_embd)}
 
 
+def mmvf(w, x, n_in, n_out, n_tok=1, ldx=None, ldy=None, fill=None):
+    """``basalt_mmvf`` in basalt's launch (``bf16_gemv_fp32_mmvf_multi``; one row with ldy >= n_out:
+    ``bf16_gemv_fp32_mmvf``) for BF16 bits ``w`` (n_out rows of n_in) and the float32 rows of ``x`` (row k at k * ldx,
+    (n_tok - 1) * ldx + n_in values); the output, (n_tok - 1) * ldy + n_out floats, starts as ``fill`` bytes."""
+    ldx = n_in if ldx is None else ldx
+    ldy = n_out if ldy is None else ldy
+    macros = kernels.basalt_mmvf_macros(n_in, n_out, n_tok, ldx, ldy)
+    pso = pipeline(kernels.basalt_mmvf_source(), "basalt_mmvf", tuple(sorted(macros.items())))
+    out = run(pso, [np.ascontiguousarray(x, np.float32).tobytes(), np.ascontiguousarray(w, np.uint16).tobytes(),
+                    4 * ((n_tok - 1) * ldy + n_out)], kernels.basalt_mmvf_params(n_in, n_out, n_tok, ldx, ldy), 3,
+              n_out, int(macros["BLOCK"]), fill)
+    return np.frombuffer(out[2], np.float32)
+
+
+def mmvf_cols(w, x, n_in, n_out, ncols, fill=None):
+    """basalt's ``bf16_gemv_fp32_mmvf_cols``: ``ncols`` contiguous columns of ``x`` in launches of up to 8 (one command
+    buffer, x and y bound at each chunk's offset), into an (ncols, n_out) output that starts as ``fill`` bytes."""
+    dev = device()
+    bx = nt.Buffer(dev, np.ascontiguousarray(x, np.float32).tobytes())
+    bw = nt.Buffer(dev, np.ascontiguousarray(w, np.uint16).tobytes())
+    by = nt.Buffer(dev, 4 * ncols * n_out)
+    if fill is not None:
+        by.fill(fill)
+    ds = []
+    for c0, nc in kernels.basalt_mmvf_cols(ncols):
+        macros = kernels.basalt_mmvf_macros(n_in, n_out, nc)
+        pso = pipeline(kernels.basalt_mmvf_source(), "basalt_mmvf", tuple(sorted(macros.items())))
+        ds.append(nt.Dispatch().pipeline(pso).buffer(0, bx, 4 * c0 * n_in).buffer(1, bw).buffer(2, by, 4 * c0 * n_out)
+                  .bytes(3, kernels.basalt_mmvf_params(n_in, n_out, nc)).grid(n_out).threadgroup(int(macros["BLOCK"])))
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+    return np.frombuffer(by.read(0, by.nbytes), np.float32).reshape(ncols, n_out)
+
+
 def dequant(type_id, raw, n):
     """``basalt_dequant_f32``: the ``n`` values (a multiple of 256) of the GGUF blocks ``raw``, as float32."""
     pso = pipeline(kernels.basalt_dequant_source(), "basalt_dequant_f32",
                    tuple(sorted(kernels.basalt_dequant_macros(type_id).items())))
     out = run(pso, [np.ascontiguousarray(raw, np.uint8).tobytes(), 4 * n], None, 0, n // 256, 32)
     return np.frombuffer(out[1], np.float32)
+
+
+def dense_tc(type_id, w, xq, n_in, n_out, widths, variant=None, fill=0xFF):
+    """``basalt_dense_tc`` in ``variant`` (default: the rule's at 170 multiprocessors), one call per column count T in
+    ``widths``, in one command buffer with the weights bound once: call T reads the first T columns of ``xq`` (its
+    buffer holds only those) and writes an output of 8 columns whose bytes start as ``fill``. Returns {T: (8, n_out)}."""
+    macros = kernels.basalt_dense_tc_macros(type_id, n_in, n_out, variant)
+    pso = pipeline(kernels.basalt_dense_tc_source(), "basalt_dense_tc", tuple(sorted(macros.items())))
+    grid, threads = kernels.basalt_dense_tc_grid(macros, n_out)
+    dev, qcol = device(), n_in // 32 * kernels.Q8_1_BLOCK_BYTES
+    xq = np.ascontiguousarray(xq, np.uint8)
+    b_w = nt.Buffer(dev, np.ascontiguousarray(w, np.uint8).tobytes())
+    ds, outs = [], {}
+    for t in widths:
+        b_x, b_y = nt.Buffer(dev, xq[: t * qcol].tobytes()), nt.Buffer(dev, 4 * 8 * n_out)
+        b_y.fill(fill)
+        d = nt.Dispatch().pipeline(pso).buffer(0, b_w).buffer(1, b_x).buffer(2, b_y)
+        ds.append(d.bytes(3, kernels.basalt_dense_tc_params(n_in, n_out, t)).grid(grid).threadgroup(threads))
+        outs[t] = (b_x, b_y)
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+    return {t: np.frombuffer(b_y.read(0, 4 * 8 * n_out), np.float32).reshape(8, n_out) for t, (_, b_y) in outs.items()}
+
+
+def dense_tc_pair(type0, w0, n_out0, type1, w1, n_out1, xq, n_in, widths, fill=0xFF):
+    """``basalt_dense_tc_pair`` as ``dense_tc``: {T: ((8, n_out0), (8, n_out1))}."""
+    pso = pipeline(kernels.basalt_dense_tc_source(), "basalt_dense_tc_pair",
+                   tuple(sorted(kernels.basalt_dense_tc_pair_macros(type0, type1, n_in).items())))
+    grid, threads = kernels.basalt_dense_tc_pair_grid(n_out0, n_out1)
+    dev, qcol = device(), n_in // 32 * kernels.Q8_1_BLOCK_BYTES
+    xq = np.ascontiguousarray(xq, np.uint8)
+    b_w0 = nt.Buffer(dev, np.ascontiguousarray(w0, np.uint8).tobytes())
+    b_w1 = nt.Buffer(dev, np.ascontiguousarray(w1, np.uint8).tobytes())
+    ds, outs = [], {}
+    for t in widths:
+        b_x, b_y0, b_y1 = nt.Buffer(dev, xq[: t * qcol].tobytes()), nt.Buffer(dev, 32 * n_out0), nt.Buffer(dev, 32 * n_out1)
+        b_y0.fill(fill)
+        b_y1.fill(fill)
+        d = nt.Dispatch().pipeline(pso)
+        for k, b in enumerate((b_w0, b_w1, b_x, b_y0, b_y1)):
+            d = d.buffer(k, b)
+        ds.append(d.bytes(5, kernels.basalt_dense_tc_params(n_in, n_out0, t, n_out1)).grid(grid).threadgroup(threads))
+        outs[t] = (b_x, b_y0, b_y1)
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+    f = lambda b, n: np.frombuffer(b.read(0, 32 * n), np.float32).reshape(8, n)
+    return {t: (f(b0, n_out0), f(b1, n_out1)) for t, (_, b0, b1) in outs.items()}

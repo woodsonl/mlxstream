@@ -391,6 +391,139 @@ def basalt_dequant_macros(type_id: int) -> Dict[str, str]:
     return {"DQ_TYPE": str(type_id)}
 
 
+# ---- basalt's BF16 GEMVs on fp32 activations (kernels/common/basalt_mmvf.metal; docs/research/basalt-nvcc/bf16.md) --
+# The launch rules below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_bf16.cu:124-203 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE), whose block-size rule is ggml-org/llama.cpp's
+# ggml/src/ggml-cuda/mmvf.cu @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+
+def basalt_mmvf_source() -> str:
+    """basalt's ``bf16_gemv_fp32_mmvf`` and ``bf16_gemv_fp32_mmvf_multi`` (``basalt_mmvf``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_mmvf.metal")
+
+
+def basalt_mmvf_block(n_in: int) -> int:
+    """basalt's ``mmvf_block_size`` (native_bf16.cu:124-135): 32 threads, unless a block of 64, 96, ..., 256 takes
+    strictly fewer iterations over the n_in / 2 pairs (the first such, then the next that improves on it)."""
+    best, best_it = 32, (n_in + 63) // 64
+    for c in range(64, 257, 32):
+        it = (n_in + 2 * c - 1) // (2 * c)
+        if it < best_it:
+            best, best_it = c, it
+    return best
+
+
+def basalt_mmvf_macros(n_in: int, n_out: int, n_tok: int = 1, ldx: Optional[int] = None,
+                       ldy: Optional[int] = None) -> Dict[str, str]:
+    """basalt's launch for ``n_tok`` activation rows (x row k at k * ldx floats, y row k at k * ldy) after its checks
+    (native_bf16.cu:139-189): one row with ldy >= n_out takes the one-row kernel (NT 1); otherwise the multi kernel,
+    NT 4 up to 4 rows, else 8. BLOCK is ``basalt_mmvf_block(n_in)``; the grid n_out threadgroups of BLOCK threads.
+    ldx and ldy default to n_in and n_out."""
+    ldx = n_in if ldx is None else ldx
+    ldy = n_out if ldy is None else ldy
+    if not (0 < n_in < 2 ** 31 and n_in % 2 == 0 and 0 < n_out < 2 ** 31):
+        raise ValueError("basalt_mmvf: require positive even n_in and positive n_out <= INT_MAX")
+    one_row = n_tok == 1 and ldy >= n_out
+    if not one_row and not (1 <= n_tok <= 8 and ldx % 2 == 0):
+        raise ValueError("basalt_mmvf: 1..8 rows, even n_in/ldx")
+    nt = 1 if one_row else (4 if n_tok <= 4 else 8)
+    return {"BLOCK": str(basalt_mmvf_block(n_in)), "NT": str(nt)}
+
+
+def basalt_mmvf_params(n_in: int, n_out: int, n_tok: int = 1, ldx: Optional[int] = None,
+                       ldy: Optional[int] = None) -> bytes:
+    """``MmvfParams``: n_in, n_out, n_tok, ldx and ldy (defaults n_in and n_out)."""
+    return struct.pack("<8I", n_in, n_out, n_tok, n_in if ldx is None else ldx, n_out if ldy is None else ldy, 0, 0, 0)
+
+
+def basalt_mmvf_cols(ncols: int) -> List[Tuple[int, int]]:
+    """basalt's ``bf16_gemv_fp32_mmvf_cols`` (native_bf16.cu:193-203): (first column, columns) of each launch over
+    ``ncols`` contiguous columns (ldx = n_in, ldy = n_out), chunks of 8; a chunk of one is the one-row kernel's."""
+    return [(c0, min(8, ncols - c0)) for c0 in range(0, ncols, 8)]
+
+
+# ---- basalt's dense_tc and dense_tc_pair (kernels/common/basalt_dense_tc.metal; docs/research/basalt-nvcc/dense_tc.md)
+# adapted from basalt (jesdga95/basalt) src/kernels/cuda/dense_tc.cu:35-42, :52-54, :698-702, :1017-1105 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE)
+
+DENSE_TC_SB = {11: 110, 12: 144, 13: 176, 14: 210, 23: 136, 42: 72}   # Fmt<TYPE>::SB: bytes of 256 values
+DENSE_TC_ORDERS = {"one": 0, "tile": 1, "s1": 2, "s2": 3}             # DTC_ORDER; s1 / s2: dense_tc_kernel at KS 1 / 2
+DENSE_TC_SM_COUNT = 170   # the multiprocessors of basalt's measured GPU (an RTX 5090), which its variant rule reads
+
+
+def basalt_dense_tc_source() -> str:
+    """basalt's ``dense_tc`` (``basalt_dense_tc``) and ``dense_tc_pair`` (``basalt_dense_tc_pair``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_dense_tc.metal")
+
+
+def _dense_tc_check(type_id: int, n_in: int) -> int:
+    """dense_tc_supported (dense_tc.cu:1063-1065) for the pack's types: n_in a positive multiple of 512. Returns SB."""
+    if type_id not in DENSE_TC_SB:
+        raise ValueError(f"basalt_dense_tc: unsupported ggml type {type_id}")
+    if n_in <= 0 or n_in % 512:
+        raise ValueError(f"basalt_dense_tc: n_in must be a positive multiple of 512, got {n_in}")
+    return DENSE_TC_SB[type_id]
+
+
+def basalt_dense_tc_variant(type_id: int, n_in: int, n_out: int, *, sm_count: int = DENSE_TC_SM_COUNT,
+                            aligned: bool = True) -> str:
+    """basalt's summation order for a shape (``launch<TYPE>``, dense_tc.cu:1017-1059; never the column count): "one"
+    where the weights are 16-byte aligned, a row is whole 16-byte units, the 16-row tiles number at most ``sm_count``
+    and ``one_smem_bytes<TYPE, 24>`` fits 99 KiB; else "tile" where aligned and two tiles fit 90 KiB; else "s2" (KS 2)
+    where n_in % 1024 == 0 and the tiles number fewer than ``sm_count``; else "s1". ``aligned``: the weights' base
+    is 16-byte aligned (every Metal buffer is)."""
+    sb = _dense_tc_check(type_id, n_in)
+    if n_out < 1:
+        raise ValueError(f"basalt_dense_tc: n_out must be positive, got {n_out}")
+    row_bytes, tiles = n_in // 256 * sb, -(-n_out // 16)
+    one_stride = row_bytes if (row_bytes // 16) % 2 else row_bytes + 16          # one_row_stride, :52-54
+    one_smem = 128 + max(24 * 16 * 8 * 4, 16 * one_stride)                       # one_smem_bytes<TYPE, 24>, :698-702
+    if aligned and row_bytes % 16 == 0 and tiles <= sm_count and one_smem <= 99 * 1024:
+        return "one"
+    if aligned and 2 * 16 * row_bytes <= 90 * 1024:
+        return "tile"
+    return "s2" if n_in % 1024 == 0 and tiles < sm_count else "s1"
+
+
+def basalt_dense_tc_macros(type_id: int, n_in: int, n_out: int, variant: Optional[str] = None, *,
+                           sm_count: int = DENSE_TC_SM_COUNT) -> Dict[str, str]:
+    """``variant`` (default: ``basalt_dense_tc_variant``'s at ``sm_count``) of a dense_tc launch; KS 2 needs
+    n_in % 1024 == 0."""
+    variant = variant or basalt_dense_tc_variant(type_id, n_in, n_out, sm_count=sm_count)
+    _dense_tc_check(type_id, n_in)
+    if variant not in DENSE_TC_ORDERS:
+        raise ValueError(f"basalt_dense_tc: unknown variant {variant!r}")
+    if variant == "s2" and n_in % 1024:
+        raise ValueError(f"basalt_dense_tc: KS 2 needs n_in % 1024 == 0, got {n_in}")
+    return {"DTC_TYPE": str(type_id), "DTC_ORDER": str(DENSE_TC_ORDERS[variant])}
+
+
+def basalt_dense_tc_grid(macros: Mapping[str, str], n_out: int) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup): one threadgroup per 16-row tile, basalt's warps run by up to 8
+    SIMD-groups (the kernel takes any count from 4)."""
+    warps = (24, 8, 4, 8)[int(macros["DTC_ORDER"])]                             # basalt's warps per tile
+    return -(-n_out // 16), 32 * min(warps, 8)
+
+
+def basalt_dense_tc_params(n_in: int, n_out: int, ncols: int, n_out1: int = 0) -> bytes:
+    """``DtcParams``: n_in, n_out (the pair: the first matrix's), ncols 1..8 and the pair's second n_out."""
+    if not 1 <= ncols <= 8:
+        raise ValueError(f"basalt_dense_tc: ncols must be in 1..8, got {ncols}")
+    return struct.pack("<IIII", n_in, n_out, ncols, n_out1)
+
+
+def basalt_dense_tc_pair_macros(type0: int, type1: int, n_in: int) -> Dict[str, str]:
+    """dense_tc_pair's two types, after ``dense_tc_pair_supported`` (dense_tc.cu:1100-1105): two staged tiles of the
+    larger format fit basalt's 99 KiB."""
+    sb = max(_dense_tc_check(type0, n_in), _dense_tc_check(type1, n_in))
+    if 128 + 8 * 16 * 8 * 4 + 2048 + 2 * 16 * (n_in // 256) * sb > 99 * 1024:
+        raise ValueError(f"basalt_dense_tc_pair: types {type0}/{type1} at n_in {n_in} not supported")
+    return {"DTC_TYPE0": str(type0), "DTC_TYPE1": str(type1)}
+
+
+def basalt_dense_tc_pair_grid(n_out0: int, n_out1: int) -> Tuple[int, int]:
+    return -(-n_out0 // 16) + -(-n_out1 // 16), 256
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
