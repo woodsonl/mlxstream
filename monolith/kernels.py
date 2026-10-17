@@ -525,8 +525,8 @@ def basalt_dense_tc_pair_grid(n_out0: int, n_out1: int) -> Tuple[int, int]:
 
 
 # ---- basalt's Q5_K head (kernels/common/basalt_q5k_head.metal; docs/research/basalt-nvcc/q5k_head.md)
-# adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:337-386 and :365-368 @
-# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE)
+# adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:337-386, :500-535 and
+# src/kernels/cuda/head_proxy.cuh:17-28 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE)
 
 Q5K_HEAD_THREADS = 256      # basalt's WPB * WARP: 8 SIMD-groups, one row each
 Q5K_TOP1_SM_COUNT = 170     # the multiprocessors of basalt's measured GPU (an RTX 5090)
@@ -536,8 +536,9 @@ Q5K_TOP1_MAX_BLOCKS = 4096  # basalt's cap: q5k_head_top1_scratch_bytes holds 40
 
 
 def basalt_q5k_head_source() -> str:
-    """basalt's ``q5k_head_mmvq`` (``basalt_q5k_head``), ``q5k_head_mask_unmapped`` (``basalt_q5k_head_mask_unmapped``)
-    and ``q5k_head_top1`` (``basalt_q5k_head_top1`` then ``basalt_q5k_head_top1_merge``)."""
+    """basalt's ``q5k_head_mmvq`` (``basalt_q5k_head``), ``q5k_head_mask_unmapped`` (``basalt_q5k_head_mask_unmapped``),
+    ``q5k_head_top1`` (``basalt_q5k_head_top1`` then ``basalt_q5k_head_top1_merge``), ``q5k_proxy_pack``
+    (``basalt_q5k_proxy_pack``) and ``q5k_proxy_top1`` (``basalt_q5k_proxy_score`` then ``basalt_q5k_proxy_final``)."""
     return PRELUDE + template("basalt_fp.metal") + template("basalt_q5k_head.metal")
 
 
