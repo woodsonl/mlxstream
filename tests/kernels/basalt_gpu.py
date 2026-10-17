@@ -174,7 +174,8 @@ def s2_experts(blob_bufs, grp, grp_start, n_groups, ent_tok, ent_dst, xq, xs, ca
         b_ng, b_dst, b_tok = nt.Buffer(dev, 16), nt.Buffer(dev, 4 * n), nt.Buffer(dev, 4 * n)
         for b in (b_ptr, b_start, b_ng, b_dst, b_tok):
             b.fill(0)
-        d0 = nt.Dispatch().pipeline(pipeline(src, "basalt_s2_group_resident")).buffer(0, b_ids).buffer(1, blob_bufs[bi], bo)
+        d0 = nt.Dispatch().pipeline(pipeline(src, "basalt_s2_group_resident")).buffer(0, b_ids)
+        d0 = d0.buffer(1, blob_bufs[bi], bo)
         for k, b in enumerate((b_ptr, b_start, b_ng, b_dst, b_tok), start=2):
             d0 = d0.buffer(k, b)
         ds.append(d0.bytes(7, kernels.basalt_s2_resident_params(n, k_per_tok)).grid(1).threadgroup(128))

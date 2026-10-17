@@ -40,7 +40,8 @@ static inline char q8_1_code(float q) {
 static inline void q8_1_put(device uchar* y, uint i, char code, float d, float sum) {
     y[36u * (i / 32u) + 4u + i % 32u] = as_type<uchar>(code);
     if (i % 32u == 0u) {
-        *(device uint*) (y + 36u * (i / 32u)) = uint(f16_bits(q8_1_finite(d))) | (uint(f16_bits(q8_1_finite(sum))) << 16);
+        *(device uint*) (y + 36u * (i / 32u)) =
+            uint(f16_bits(q8_1_finite(d))) | (uint(f16_bits(q8_1_finite(sum))) << 16);
     }
 }
 

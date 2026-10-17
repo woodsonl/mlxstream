@@ -57,9 +57,10 @@ def same_bits(got, want):
 
 def test_f16_bits_is_f16_from_f32():
     """basalt_fp.metal's f16_bits (Metal's half(), which q8_1_put and the quantizer share) against basalt's vectors,
-    quoted: ``if (got != c.want) {`` (quantize_act_parity.cpp:322); h2f(0x0001) == 2^-24, quoted: ``if (!sub_ok) ++bad;``
-    (:335); and against the transcription of f16_from_f32 (tests/kernels/basalt_emu.py) on the fp16 subnormal range, the
-    65504-65520 boundary, both overflow edges and random float32 patterns (a NaN's payload is the GPU's)."""
+    quoted: ``if (got != c.want) {`` (quantize_act_parity.cpp:322); h2f(0x0001) == 2^-24, quoted:
+    ``if (!sub_ok) ++bad;`` (:335); and against the transcription of f16_from_f32 (tests/kernels/basalt_emu.py) on
+    the fp16 subnormal range, the 65504-65520 boundary, both overflow edges and random float32 patterns (a NaN's
+    payload is the GPU's)."""
     cases = [(1e30, 0x7C00), (-1e30, 0xFC00), (65536.0, 0x7C00), (3.0e38, 0x7C00), (65504.0, 0x7BFF),
              (65519.996, 0x7BFF), (65520.0, 0x7C00), (65536.0, 0x7C00), (5.9604645e-8, 0x0001), (1.0, 0x3C00),
              (0.0, 0x0000)]
@@ -84,7 +85,8 @@ kernel void f16(device const float* x [[buffer(0)]], device ushort* h [[buffer(1
                   -(-n // 256), 256)
     got = np.frombuffer(out[1], np.uint16)
     fp16_bad = sum(int(got[k]) != want for k, (_, want) in enumerate(cases))
-    assert fp16_bad == 0, [(c, hex(w), hex(int(got[k]))) for k, (c, w) in enumerate(cases)]   # basalt: if (got != c.want)
+    # basalt: if (got != c.want) {
+    assert fp16_bad == 0, [(c, hex(w), hex(int(got[k]))) for k, (c, w) in enumerate(cases)]
     back = np.frombuffer(out[2], F32)[:65536]
     assert back[1] == F32(5.9604645e-8)                    # basalt: sub_ok = (sub == 5.9604645e-8f)
     with np.errstate(invalid="ignore"):
@@ -97,7 +99,7 @@ kernel void f16(device const float* x [[buffer(0)]], device ushort* h [[buffer(1
     print(f"\nf16_bits: {len(cases)} basalt vectors, {np.count_nonzero(~nan)} values bit for bit with f16_from_f32")
 
 
-# ---- quantize_q8_0_scaled: the contract's host transcription (flash-next.md) ------------------------------------------
+# ---- quantize_q8_0_scaled: the contract's host transcription (flash-next.md) -----------------------------------------
 
 def quantize_distributions():
     """quantize_act_parity's five distributions of 131,072 values (quantize_act_parity.cpp:245-275)."""
@@ -233,7 +235,8 @@ def regions(e, cap):
     sc = kernels.basalt_s2_scratch(cap)
     blk = NC_D * kernels.Q8_0_BLOCK_BYTES
     return [slice(4 * e * FF, 4 * (e + 1) * FF), slice(4 * (cap + e) * FF, 4 * (cap + e + 1) * FF),
-            slice(sc["hq"] + e * blk, sc["hq"] + (e + 1) * blk), slice(sc["hs"] + 4 * e * NC_D, sc["hs"] + 4 * (e + 1) * NC_D)]
+            slice(sc["hq"] + e * blk, sc["hq"] + (e + 1) * blk),
+            slice(sc["hs"] + 4 * e * NC_D, sc["hs"] + 4 * (e + 1) * NC_D)]
 
 
 def per_entry(fx, grp, grp_start, n_groups, ent_tok, ent_dst, cap_groups, cap, n_rows, x, xs, src=None):
@@ -294,8 +297,8 @@ def reference(fx, r, plan, cap, x, xs):
             for (ref, mag), got in (
                     (row_ref(cgu[2 * up_rows + 1], sgu[2 * up_rows + 1], x[t * XROW: (t + 1) * XROW],
                              xs[t * NC_GU: (t + 1) * NC_GU]), gu[(cap + e) * FF + up_rows]),
-                    (row_ref(cd[d_rows], sd[d_rows], hq[e * NC_D * 34: (e + 1) * NC_D * 34], hs[e * NC_D: (e + 1) * NC_D]),
-                     out[int(ent_dst[e]), d_rows])):
+                    (row_ref(cd[d_rows], sd[d_rows], hq[e * NC_D * 34: (e + 1) * NC_D * 34],
+                             hs[e * NC_D: (e + 1) * NC_D]), out[int(ent_dst[e]), d_rows])):
                 with np.errstate(invalid="ignore", over="ignore"):
                     ok = np.isfinite(got) & (np.abs(got.astype(np.float64) - ref) <= 4e-5 * mag + 1e-30)
                     rel = np.abs(got.astype(np.float64) - ref) / np.where(mag > 0, mag, np.inf)
@@ -491,7 +494,8 @@ def test_ieee_helpers():
                             signed(rng, n, -149, -90), signed(rng, 4096, -149, -127)])
         k = rng.integers(-8128, 8129, a.size).astype(F32)
         cancel = rng.integers(0, a.size, 8192)                     # c = -a * k + a few units: a subnormal sum
-        c[cancel] = (-(a[cancel].astype(np.float64) * k[cancel]) + rng.integers(-40, 40, 8192) * 2.0 ** -149).astype(F32)
+        exact = -(a[cancel].astype(np.float64) * k[cancel])
+        c[cancel] = (exact + rng.integers(-40, 40, 8192) * 2.0 ** -149).astype(F32)
         tie_a = F32(1 + 2.0 ** -23) * np.exp2(rng.integers(-90, 60, 512)).astype(F32)       # a * 3: a tie of fp32
         extra = [(tie_a, np.full(512, 3, F32), np.where(rng.random(512) < 0.5, F32(1), F32(-1))
                   * np.uint32(rng.integers(1, 1 << 23, 512)).view(F32)),                  # broken by a subnormal c
@@ -507,8 +511,9 @@ def test_ieee_helpers():
         # a / b for b >= 1: the SwiGLU's quotient g / (1 + e)
         g = np.concatenate([signed(rng, n, -149, -90), signed(rng, n, -100, 0), signed(rng, 4096, -20, 7),
                             F32([0.0, -0.0, np.inf, -np.inf, np.nan, 2.0 ** -100, -(2.0 ** -126)])])
-        b = np.concatenate([np.exp2(rng.uniform(0, 1.5, n)), np.exp2(rng.uniform(0, 60, n)), np.exp2(rng.uniform(0, 128, 4096)),
-                            F32([2.0, 1.0, np.inf, 3.0, 2.0, np.inf, np.nan])]).astype(F32)
+        b = np.concatenate([np.exp2(rng.uniform(0, 1.5, n)), np.exp2(rng.uniform(0, 60, n)),
+                            np.exp2(rng.uniform(0, 128, 4096)), F32([2.0, 1.0, np.inf, 3.0, 2.0, np.inf, np.nan])])
+        b = b.astype(F32)
         b[-13] = np.inf
         div_diff = helper_case("ieee_div", "r = ieee_div(a, b);", "r = a / b;", g / b, g, b)
     assert sub > 1000, sub
@@ -528,14 +533,15 @@ def test_warp_sum_ieee():
     print(f"\nwarp_sum_ieee: {v.size // 32} sums bit for bit ({diff} lanes differ with the plain butterfly)")
 
 
-# ---- planted subnormals through the kernels, with the plain kernels as the negative control ---------------------------
+# ---- planted subnormals through the kernels, with the plain kernels as the negative control --------------------------
 
 def plain_source():
     """The drafter kernels with each IEEE helper replaced by the plain Metal operation (what a port without them would
     compute): the negative control the planted tests must catch."""
     body = kernels.template("basalt_s2_experts.metal")
     for ieee, plain in (("ieee_fma(", "fma("), ("ieee_mul(", "mul_plain("), ("ieee_div(", "div_plain("),
-                        ("ieee_div127(", "div127_plain("), ("ieee_rcp(", "rcp_plain("), ("warp_sum_ieee(", "warp_sum(")):
+                        ("ieee_div127(", "div127_plain("), ("ieee_rcp(", "rcp_plain("),
+                        ("warp_sum_ieee(", "warp_sum(")):
         body = body.replace(ieee, plain)
     helpers = """
 static inline float mul_plain(float a, float b) { return a * b; }
@@ -543,7 +549,8 @@ static inline float div_plain(float a, float b) { return a / b; }
 static inline float div127_plain(float a) { return a / 127.0f; }
 static inline float rcp_plain(float a) { return 1.0f / a; }
 """
-    return kernels.PRELUDE + kernels.template("basalt_fp.metal") + kernels.template("basalt_q8_1.metal") + helpers + body
+    return (kernels.PRELUDE + kernels.template("basalt_fp.metal") + kernels.template("basalt_q8_1.metal") + helpers
+            + body)
 
 
 def test_quantizer_planted_negative_control():
@@ -584,7 +591,8 @@ def test_planted_tiny_activations(fx):
     assert all(v > 20 for v in counts.values()), counts
     p = gpu.s2_experts(fx.bufs, grp, gstart, 3, etok, edst, x, xs, 3, 10, 10, src=plain_source())
     wrong = {"out": np.count_nonzero(p["out"] != r["out"]),
-             "scratch": np.count_nonzero(p["scratch"][: sc["hq"]].view(np.uint32) != r["scratch"][: sc["hq"]].view(np.uint32))}
+             "scratch": np.count_nonzero(p["scratch"][: sc["hq"]].view(np.uint32)
+                                         != r["scratch"][: sc["hq"]].view(np.uint32))}
     assert wrong["out"] > 100 and wrong["scratch"] > 100, wrong
     print(f"\nsubnormals in {counts}; the plain kernels differ in {wrong}")
 

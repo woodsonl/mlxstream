@@ -101,9 +101,9 @@ static inline float expf_neg(float g) { return fast::exp2(g * as_type<float>(0xB
 // fp16 field to fp32 (exact): CUDA's __half2float / __low2float, HADD2.F32 in SASS.
 static inline float h2f(ushort h) { return float(as_type<half>(h)); }
 
-// fp32 to fp16 bits, round to nearest even: a finite overflow to infinity, fp16 subnormals kept, an fp32 subnormal to the
-// zero of its sign (basalt's f16_from_f32, f16_bits.hpp:36-65, and __float2half; docs/research/basalt-nvcc/s2_experts.md
-// section 1). A NaN's payload is the GPU's.
+// fp32 to fp16 bits, round to nearest even: a finite overflow to infinity, fp16 subnormals kept, an fp32 subnormal to
+// the zero of its sign (basalt's f16_from_f32, f16_bits.hpp:36-65, and __float2half;
+// docs/research/basalt-nvcc/s2_experts.md section 1). A NaN's payload is the GPU's.
 static inline ushort f16_bits(float x) { return as_type<ushort>(half(x)); }
 
 // one entry of basalt's grp_ptr table: a blob's 64-bit GPU address (MSL takes no pointer-to-pointer kernel argument)

@@ -80,14 +80,18 @@ dx is the quantizer's fp32 s, any non-negative float. Site by site:
 - **The dot products** (`s2_expert_grouped.cu:956-957`, `:1015-1016`): p = dw · dx is subnormal when dx < 2^-126 / |dw|.
   Each p is a multiple of its own ulp, and f(s − hx) an integer, so when every |p| ≥ 2^-103 all terms, partial sums and
   butterfly sums are multiples of 2^-126 and none is subnormal; with a smaller p, a term or a cancelling sum can be.
-  The port's `ieee_fma(a, n, c)` (n an integer) takes the hardware fma when a and c are each zero or at least 2^-100
-  (then a·n + c is a multiple of 2^-123: zero or normal), else computes on operands scaled by 2^64: the exact a·n + c is a
-  multiple of 2^-149, so a subnormal result is exact and the scaled result scales back exactly (`ieee_down64`). The
-  butterfly's adds are `ieee_add`.
+  The port's `ieee_fma(a, n, c)` (n an integer, |n| < 2^24) takes the hardware fma when a and c are each zero or at
+  least 2^-100 (then a·n + c is a multiple of 2^-123: zero or normal). With a nonzero a below 2^-100 and |c| < 2^62 it
+  computes on operands scaled by 2^64: the exact a·n + c is a multiple of 2^-149, so a subnormal result is exact and
+  the scaled result scales back exactly (`ieee_down64`); with a larger c the sum rounds to c, the hardware's result.
+  With a nonzero c below 2^-100 and a zero or at least 2^-100, a finite a·n of zero leaves c; otherwise |a·n| ≥ 2^-100,
+  the sum is at least 2^-124, and a subnormal c changes its rounding only by breaking a tie, which ±2^-126 (normal, not
+  flushed) does the same way. The butterfly's adds are `ieee_add`.
 - **The SwiGLU** (`:170`): g can now be subnormal or below 2^-125. Then g · (−log2 e) is tiny, e rounds to 1 on both
   sides (2^x for |x| < 2^-24 is 1 to fp32), t = 2, and g / 2 is subnormal: `ieee_div(g, t)`, which takes the hardware
-  quotient when |g| ≥ 2^-100 and that quotient is infinite, NaN or at least 2^-125, else divides the significands as
-  integers and rounds to nearest even on the result's grid. For a normal g, |g| e^g ≥ 2.6e-37 on [−88.72, 0) and beyond
+  quotient when g or t is infinite or NaN (t = +inf past g = −88.72: the quotient is −0), or when |g| ≥ 2^-100 and the
+  quotient is at least 2^-125; a zero g gives its signed zero; otherwise it divides the significands as integers and
+  rounds to nearest even on the result's grid. For a normal g, |g| e^g ≥ 2.6e-37 on [−88.72, 0) and beyond
   −88.72 e overflows and q = −0 (`experts.md`, Notation), so the integer path is for tiny g. e itself can be subnormal
   (g > 87.3: `ex2.approx.f32` keeps it through the halving path below −126) and the GPU's `fast::exp2` may flush it; t =
   fl(e + 1) = 1 either way. h = u · q can be subnormal: `ieee_mul`.
@@ -121,8 +125,9 @@ Notes:
   fp16 subnormals kept, an fp32 subnormal to the zero of its sign and a NaN to `sign | 0x7E00` (`f16_bits.hpp:36-65`).
   Metal's float-to-half conversion is IEEE's round to nearest even (MSL 4.1 section 2.7 and `test_basalt_platform.py`);
   `tests/kernels/test_basalt_s2_experts.py` checks it against a transcription of `f16_from_f32` on basalt's own vectors
-  (`quantize_act_parity.cpp:298-336`) and on every scale the quantizer can produce. s is never NaN (a NaN x is dropped by
-  `fmaxf`, and an all-NaN block has amax NaN, so `amax > 0.f` is false and s = 0).
+  (`quantize_act_parity.cpp:298-336`), the fp16 subnormal range, the 65504 to 65536 boundary and 2^20 random bit
+  patterns, and the quantizer's tests compare every block's fp16 d with the transcription. s is never NaN (a NaN x is
+  dropped by `fmaxf`, and an all-NaN block has amax NaN, so `amax > 0.f` is false and s = 0).
 - **The fp32 scale is stored unrounded**: `scales[b] = s` (`:91`), the value the next matrix-vector step multiplies by.
 
 ## 2. Gate and up: `gu_grouped_t_kernel` (`s2_expert_grouped.cu:904-968`)
@@ -200,7 +205,9 @@ the same values, the addresses as `GrpPtr` (a 64-bit GPU address a group).
 `ieee_fma`, whose hardware path is `fma()`. The IEEE helpers live with their siblings in `basalt_q8_1.metal`:
 `ieee_div127` (factored out of `q8_1_store_ieee`, which now calls it), `ieee_rcp`, `ieee_fma`, `ieee_div` next to the
 existing `ieee_up64`, `ieee_down64`, `ieee_add` and `ieee_mul`, and `warp_sum_ieee`; `f16_bits` (the float-to-half
-conversion `q8_1_put` already used, as bits) moves into `basalt_fp.metal`. Basalt's plan pointers stay pointers: a table
+conversion `q8_1_put` already used, as bits) and `GrpPtr` move into `basalt_fp.metal`. Every compare a subnormal can
+reach is on bits: basalt's `amax > 0.f` is the integer key's `key > 0`, and `s > 0.f` is `s`'s bits being nonzero (s is
+never negative or NaN), since this GPU compares a subnormal as zero. Basalt's plan pointers stay pointers: a table
 of 64-bit GPU addresses (`GrpPtr`, as `basalt_experts.metal`), each 2-byte aligned and inside a buffer the dispatch makes
 resident, so the blobs may sit in several buffers; the codes are read as 16-bit words (CUDA's `uint2` loads need an
 8-byte aligned blob, a precondition the 16-bit reads do not have).
