@@ -525,6 +525,15 @@ def basalt_dense_tc_pair_grid(n_out0: int, n_out1: int) -> Tuple[int, int]:
     return -(-n_out0 // 16) + -(-n_out1 // 16), 256
 
 
+# ---- basalt's sampler (kernels/common/basalt_sampler.metal; docs/research/basalt-nvcc/sampler.md) ---------------
+
+def basalt_sampler_source() -> str:
+    """basalt's sampler family: the shared helpers, the software binary64 (``basalt_f64.metal``), libdevice's ``exp``
+    and ``logf`` (``basalt_libdevice.metal``) and the sampler kernels (``basalt_sampler.metal``), in that order."""
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
+            + template("basalt_libdevice.metal") + template("basalt_sampler.metal"))
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
