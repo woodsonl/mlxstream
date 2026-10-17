@@ -162,3 +162,283 @@ def test_quantize_q8_0_scaled(dist):
             inf_inv = np.count_nonzero((want_s > 0) & np.isinf(F32(1.0) / want_s))
         assert sub > 100 and inf_inv > 10, (sub, inf_inv)
     print(f"\nquantize_q8_0_scaled, {dist}: {x.size // 32} blocks byte for byte")
+
+
+# ---- s2_expert_grouped_parity (s2_expert_grouped_parity.cpp:79-104, :150-260, :263-458) ------------------------------
+
+BLOB = kernels.S2_BLOB_BYTES
+
+
+def fill_blob(rng):
+    """fill_blob (:81-85): random code bytes, then fp16 scales of either sign with magnitude U[1e-3, 3e-2]."""
+    b = np.empty(BLOB, np.uint8)
+    b[:O_GU_SCALES] = rng.integers(0, 256, O_GU_SCALES)
+    n = (BLOB - O_GU_SCALES) // 2
+    f = np.where(rng.integers(0, 2, n) == 1, F32(-1), F32(1)) * rng.uniform(1e-3, 3e-2, n).astype(F32)
+    b[O_GU_SCALES:] = emu.f16_from_f32(f).view(np.uint8)
+    return b
+
+
+def fill_x(rng, n_tok):
+    """fill_x (:89-104): per 32-value chunk an fp32 scale U[2e-3, 5e-2] (and its fp16 as the block's d), 32 codes
+    uniform in [-127, 127], one chunk in 16 all 127 and one all -127 (saturated on purpose)."""
+    xs = rng.uniform(2e-3, 5e-2, n_tok * NC_GU).astype(F32)
+    blk = np.zeros((n_tok * NC_GU, 34), np.uint8)
+    blk[:, :2] = emu.f16_from_f32(xs).view(np.uint8).reshape(-1, 2)
+    mode = rng.integers(0, 16, len(blk))
+    v = rng.integers(-127, 128, (len(blk), 32))
+    v[mode == 0], v[mode == 1] = 127, -127
+    blk[:, 2:] = v.astype(np.int8).view(np.uint8)
+    return blk.reshape(-1), xs
+
+
+class Fixture:
+    """make_blobs(12) (:240-250) in one buffer, the last blob also alone in a second buffer (the test's mapped host
+    blob, :373-377: on this Mac every buffer is host memory; what carries over is a blob outside the arena), and 8
+    tokens' activation rows with their fp32 scales."""
+
+    def __init__(self, seed=20260928, nb=12):
+        self.rng = np.random.default_rng(seed)
+        self.nb = nb
+        self.h = np.stack([fill_blob(self.rng) for _ in range(nb)])
+        dev = gpu.device()
+        self.bufs = [gpu.nt.Buffer(dev, self.h.tobytes()), gpu.nt.Buffer(dev, self.h[nb - 1].tobytes())]
+        self.x, self.xs = fill_x(self.rng, 8)
+
+    def blob(self, ref):
+        """The host bytes of a group's blob, ``ref`` = (buffer index, byte offset)."""
+        return self.h[self.nb - 1] if ref[0] == 1 else self.h[ref[1] // BLOB]
+
+
+@pytest.fixture(scope="module")
+def fx():
+    return Fixture()
+
+
+def groups_by_expert(slots):
+    """Hits to groups (one a distinct expert, first-appearance order, entries in hit order): (experts, grp_start, the
+    hits in entry order)."""
+    experts, members = [], {}
+    for h, s in enumerate(slots):
+        if s not in members:
+            experts.append(s)
+            members[s] = []
+        members[s].append(h)
+    order = [h for s in experts for h in members[s]]
+    return experts, [int(v) for v in np.cumsum([0] + [len(members[s]) for s in experts])], order
+
+
+def regions(e, cap):
+    """Entry e's slices of the scratch bytes: its gate (SwiGLU) row, up row, intermediate blocks and their scales."""
+    sc = kernels.basalt_s2_scratch(cap)
+    blk = NC_D * kernels.Q8_0_BLOCK_BYTES
+    return [slice(4 * e * FF, 4 * (e + 1) * FF), slice(4 * (cap + e) * FF, 4 * (cap + e + 1) * FF),
+            slice(sc["hq"] + e * blk, sc["hq"] + (e + 1) * blk), slice(sc["hs"] + 4 * e * NC_D, sc["hs"] + 4 * (e + 1) * NC_D)]
+
+
+def per_entry(fx, grp, grp_start, n_groups, ent_tok, ent_dst, cap_groups, cap, n_rows, x, xs, src=None):
+    """Each entry of the plan alone (one group of one entry, the same capacities and entry arrays): the same kernels'
+    arithmetic one entry a call, the contract's comparand for basalt's previous kernels. Returns the output and scratch
+    the grouped call must write: entry e's row and scratch slices from call e, the rest (every capacity slot past the
+    plan, the padding) from the first call, after checking each call left every other output row at its sentinel."""
+    out = np.full((n_rows, H), 0xA5A5A5A5, np.uint32)
+    scratch = None
+    for g in range(n_groups):
+        for e in range(grp_start[g], min(grp_start[g + 1], grp_start[g] + kernels.S2_GMAX)):
+            r = gpu.s2_experts(fx.bufs, [grp[g]], [e, e + 1], 1, ent_tok, ent_dst, x, xs, cap_groups, cap, n_rows,
+                               src=src)
+            d = int(ent_dst[e])
+            assert np.all(np.delete(r["out"], d, axis=0) == 0xA5A5A5A5), ("stray store", e)
+            out[d] = r["out"][d]
+            if scratch is None:
+                scratch = r["scratch"].copy()
+            for sl in regions(e, cap):
+                scratch[sl] = r["scratch"][sl]
+    return out, scratch
+
+
+def row_ref(codes, scales, xq, xs):
+    """row_ref (:110-128) for rows ``codes`` (R, bytes) / fp16 ``scales`` (R, n / 64) against one activation row:
+    (ref, mag), sum_c dw * dx * sum_e (code_e - 1) * x_e in float64 and the sum of |terms|."""
+    nk = codes.shape[1] // 8
+    w = ((codes[:, np.arange(32 * nk) // 4].astype(np.int64) >> (2 * (np.arange(32 * nk) % 4))) & 3) - 1
+    x = np.asarray(xq, np.uint8).reshape(nk, 34)[:, 2:].view(np.int8).astype(np.int64)
+    s = (w.reshape(-1, nk, 32) * x[None]).sum(axis=-1).astype(np.float64)
+    t = emu.h2f(scales).astype(np.float64)[:, np.arange(nk) // 2] * np.asarray(xs, np.float64)[None] * s
+    return t.sum(axis=1), np.abs(t).sum(axis=1)
+
+
+def blob_parts(b):
+    """A blob's gate/up codes (1280 slots) and fp16 scale bits, its down codes and scale bits."""
+    return (b[: O_D_CODES].reshape(2 * FF, H // 4), b[O_GU_SCALES: O_D_SCALES].view(np.uint16).reshape(2 * FF, H // 64),
+            b[O_D_CODES: O_GU_SCALES].reshape(H, FF // 4), b[O_D_SCALES:].view(np.uint16).reshape(H, FF // 64))
+
+
+def reference(fx, r, plan, cap, x, xs):
+    """reference (:204-238): every 7th up row of every entry against the activation row it read, every 13th down row
+    against the run's own intermediate; criterion, quoted: ``return std::isfinite(got) && std::fabs((double) got - ref)
+    <= 4e-5 * mag + 1e-30;`` (:131) and ``if (bad || checked == 0) ++g_fail;`` (:234). Gate rows are not referenced:
+    the SwiGLU overwrites them in place."""
+    grp, grp_start, n_groups, ent_tok, ent_dst = plan
+    sc = kernels.basalt_s2_scratch(cap)
+    gu = r["scratch"][: 4 * 2 * cap * FF].view(F32)
+    hq, hs = r["scratch"][sc["hq"]:], r["scratch"][sc["hs"]: sc["hs"] + 4 * cap * NC_D].view(F32)
+    out = r["out"].view(F32)
+    checked = bad = 0
+    worst = 0.0
+    up_rows, d_rows = np.arange(0, FF, 7), np.arange(0, H, 13)
+    for g in range(n_groups):
+        cgu, sgu, cd, sd = blob_parts(fx.blob(grp[g]))
+        for e in range(grp_start[g], min(grp_start[g + 1], grp_start[g] + kernels.S2_GMAX)):
+            t = int(ent_tok[e])
+            for (ref, mag), got in (
+                    (row_ref(cgu[2 * up_rows + 1], sgu[2 * up_rows + 1], x[t * XROW: (t + 1) * XROW],
+                             xs[t * NC_GU: (t + 1) * NC_GU]), gu[(cap + e) * FF + up_rows]),
+                    (row_ref(cd[d_rows], sd[d_rows], hq[e * NC_D * 34: (e + 1) * NC_D * 34], hs[e * NC_D: (e + 1) * NC_D]),
+                     out[int(ent_dst[e]), d_rows])):
+                with np.errstate(invalid="ignore", over="ignore"):
+                    ok = np.isfinite(got) & (np.abs(got.astype(np.float64) - ref) <= 4e-5 * mag + 1e-30)
+                    rel = np.abs(got.astype(np.float64) - ref) / np.where(mag > 0, mag, np.inf)
+                checked += ok.size
+                bad += np.count_nonzero(~ok)
+                worst = max(worst, float(np.nanmax(rel)))
+    return checked, bad, worst
+
+
+def emulation(fx, r, plan, cap, x, xs):
+    """Every stage bit for bit against tests/kernels/basalt_emu.py (s2_experts.md): each entry's up rows, its SwiGLU
+    row from the emulated gate rows (the exponential taken from the GPU's expf_neg), the intermediate's quantizer over
+    every capacity entry, and the down rows from the GPU's intermediate."""
+    from tests.kernels.test_basalt_experts import gpu_expf_neg
+    grp, grp_start, n_groups, ent_tok, ent_dst = plan
+    sc = kernels.basalt_s2_scratch(cap)
+    s = r["scratch"]
+    gu = s[: 4 * 2 * cap * FF].view(F32)
+    for g in range(n_groups):
+        cgu, sgu, cd, sd = blob_parts(fx.blob(grp[g]))
+        ents = np.arange(grp_start[g], min(grp_start[g + 1], grp_start[g] + kernels.S2_GMAX))
+        if not ents.size:
+            continue
+        toks = np.asarray(ent_tok)[ents]
+        xq = np.stack([x[t * XROW: (t + 1) * XROW] for t in toks])
+        xr = np.stack([xs[t * NC_GU: (t + 1) * NC_GU] for t in toks])
+        gate, up = emu.s2_dots(cgu[0::2], sgu[0::2], xq, xr), emu.s2_dots(cgu[1::2], sgu[1::2], xq, xr)
+        got_up = np.stack([gu[(cap + e) * FF: (cap + e + 1) * FF] for e in ents])
+        assert np.array_equal(got_up.view(np.uint32), up.view(np.uint32)), ("up", g)
+        h = emu.s2_swiglu(gate, up, gpu_expf_neg(gate).reshape(gate.shape))
+        got_h = np.stack([gu[e * FF: (e + 1) * FF] for e in ents])
+        assert np.array_equal(got_h.view(np.uint32), h.view(np.uint32)), ("swiglu", g)
+    hq, hs = emu.q8_0_scaled(gu[: cap * FF])
+    assert np.array_equal(s[sc["hq"]: sc["hq"] + hq.size], hq), "intermediate"
+    assert np.array_equal(s[sc["hs"]: sc["hs"] + 4 * hs.size], hs.view(np.uint8)), "intermediate scales"
+    blk = NC_D * 34
+    for g in range(n_groups):
+        cgu, sgu, cd, sd = blob_parts(fx.blob(grp[g]))
+        ents = list(range(grp_start[g], min(grp_start[g + 1], grp_start[g] + kernels.S2_GMAX)))
+        if not ents:
+            continue
+        want = emu.s2_dots(cd, sd, np.stack([hq[e * blk: (e + 1) * blk] for e in ents]),
+                           np.stack([hs[e * NC_D: (e + 1) * NC_D] for e in ents]))
+        for k, e in enumerate(ents):
+            assert np.array_equal(r["out"][int(ent_dst[e])], want[k].view(np.uint32)), ("down", e)
+
+
+def check_call(name, fx, grp, grp_start, n_groups, ent_tok, ent_dst, cap_groups, cap, n_rows, resident=None, x=None,
+               xs=None):
+    """``twice`` (:150-200) with the contract's comparand: the grouped call from sentinel-filled buffers (out 0xA5,
+    scratch 0x5A, :155-156) against the per-entry calls, the output and the scratch (gate/up, the quantized
+    intermediate, its scales) byte for byte, quoted: ``diff_out += std::memcmp(&r[0].out[i], &r[1].out[i], 4) != 0;``
+    (:175) and ``const bool ok = diff_out + diff_gu + diff_q8 + diff_hs == 0;`` (:182); then reference() and the
+    emulation. Returns the grouped run and its plan."""
+    x, xs = (fx.x, fx.xs) if x is None else (x, xs)
+    r = gpu.s2_experts(fx.bufs, grp, grp_start, n_groups, ent_tok, ent_dst, x, xs, cap_groups, cap, n_rows,
+                       resident=resident)
+    if resident is not None:                                 # the device's plan, as basalt's test reads it back (:438)
+        n_groups, grp_start = int(r["n_groups"][0]), [int(v) for v in r["grp_start"]]
+        ent_tok, ent_dst = r["ent_tok"], r["ent_dst"]
+        grp = [(0, int(a) - fx.bufs[0].gpu_address) for a in r["grp_ptr"][:n_groups]]
+    plan = (grp, grp_start, n_groups, ent_tok, ent_dst)
+    want_out, want_s = per_entry(fx, *plan, cap_groups, cap, n_rows, x, xs)
+    sc = kernels.basalt_s2_scratch(cap)
+    diff_out = np.count_nonzero(r["out"] != want_out)
+    diff = r["scratch"] != want_s
+    diff_gu, diff_q8, diff_hs = (np.count_nonzero(diff[a:b]) for a, b in ((0, sc["hq"]), (sc["hq"], sc["hs"]),
+                                                                           (sc["hs"], sc["bytes"])))
+    ok = diff_out + diff_gu + diff_q8 + diff_hs == 0
+    assert ok, (name, diff_out, diff_gu, diff_q8, diff_hs)
+    checked, bad, worst = reference(fx, r, plan, cap, x, xs)
+    assert not (bad or checked == 0), (name, checked, bad, worst)    # basalt: if (bad || checked == 0) ++g_fail;
+    emulation(fx, r, plan, cap, x, xs)
+    print(f"\n{name}: bitwise identical to {grp_start[n_groups] - grp_start[0]} per-entry calls; host reference: "
+          f"{checked} rows, {bad} outside tolerance, worst {worst:.2e} of sum|term|; emulation bit for bit")
+    return r, plan
+
+
+def test_grouped_8_tokens(fx):
+    """Section 4 (:367-422): moe_grouped_s2 with 8 tokens x 10 entries in groups of 8, 1, 5, 2, 7, 3, 1, 6, 4, ...,
+    group 3 on the blob in its own buffer (the mapped host blob), the others blob gi % 11 of the arena, destinations a
+    shuffle of the 80 rows, each entry reading its own token's row (dst / 10), cap_groups = groups + 3 with the table
+    padded by group 0's address and the starts by the last. Only the fp32-scale run: a null x_scales (the fp16 d run)
+    selects quantize_q8_0, which the drafter never takes (it allocates hit_xs_, mtp.cpp:438)."""
+    n = 8 * K
+    sizes = [8, 1, 5, 2, 7, 3, 1, 6, 4, 8, 1, 2, 3, 4, 5, 6, 7, 1, 1, 5]
+    order = fx.rng.permutation(n)
+    grp, gstart, edst = [], [0], []
+    at = gi = 0
+    while at < n:
+        sz = min(sizes[gi % 20], n - at)
+        grp.append((1, 0) if gi == 3 else (0, (gi % (fx.nb - 1)) * BLOB))
+        edst += [int(o) for o in order[at: at + sz]]
+        at += sz
+        gstart.append(at)
+        gi += 1
+    r, _ = check_call(f"moe_grouped_s2 ({gi} groups, fp32 scales)", fx, grp, gstart, gi, [d // K for d in edst], edst,
+                      gi + 3, n, n)
+    assert np.count_nonzero(r["out"] == 0xA5A5A5A5) == 0                 # every row written
+
+
+def test_group_resident_drafter_shape(fx):
+    """Section 5 (:424-458): moe_group_resident then moe_grouped_s2 at the drafter layer's shape, 5 tokens x 10 routed
+    ids (distinct within a token, shared across tokens, from 12 experts resident at base + id * BLOB), cap_groups =
+    cap_entries = 50 (mtp.cpp:931-935); the plan read back from the device as basalt's test does, and checked against a
+    host transcription of group_resident_kernel (groups in first-appearance order, entries in routing order)."""
+    T, n = 5, 5 * K
+    ids = np.concatenate([fx.rng.permutation(fx.nb)[:K] for _ in range(T)]).astype(np.int32)
+    r, (grp, gstart, ng, etok, edst) = check_call("moe_group_resident + moe_grouped_s2 (fp32)", fx, None, None, 0,
+                                                    None, None, n, n, n, resident=(ids, K, 0, 0))
+    experts, want_start, order = groups_by_expert(list(ids))
+    assert ng == len(experts) and gstart[: ng + 1] == want_start and r["n_groups"][1] == n
+    assert [o for _, o in grp] == [int(e) * BLOB for e in experts]
+    assert list(edst[:n]) == order and list(etok[:n]) == [i // K for i in order]
+
+
+def test_verify_window_rows(fx):
+    """Section 3's verify window (:316-345) on the grouped kernels: 4 tokens x 10 routed entries, 29 hits (routing
+    order, each on a random blob), grouped by expert, each entry reading its own token's row (dst / 10); 40-entry
+    capacity and a device group count below cap_groups. basalt runs this section on the per-hit kernels
+    (moe_hit_grouped_s2_multi), which the drafter does not call; the property it checks, rows per token, is
+    moe_grouped_s2's ent_tok."""
+    n, count = 4 * K, 29
+    ent_ids = fx.rng.permutation(n)
+    slot = fx.rng.integers(0, fx.nb, n)
+    dst = np.sort(ent_ids[:count])
+    experts, gstart, order = groups_by_expert([int(s) for s in slot[:count]])
+    edst = [int(dst[h]) for h in order]
+    check_call("moe_grouped_s2 (4 tokens, 29 entries)", fx, [(0, s * BLOB) for s in experts], gstart, len(experts),
+               [d // K for d in edst], edst, n, n, n)
+
+
+def test_device_count(fx):
+    """Section 2's device count (:303-336) on the grouped kernels: capacity 10, 7 entries counted (blob (7i + 1) mod 12,
+    destinations a shuffle of the 10 rows), one token; the group count on the device, below cap_groups; quoted: ``if
+    (touched) ++g_fail;`` (:335), the rows of the entries past the count keep the sentinel. basalt runs it on the
+    per-hit kernels (moe_hit_grouped_s2_dev), which the drafter does not call."""
+    cap, count = 10, 7
+    slot = [(i * 7 + 1) % fx.nb for i in range(cap)]
+    dst = fx.rng.permutation(cap)
+    experts, gstart, order = groups_by_expert(slot[:count])
+    edst = [int(dst[h]) for h in order] + [int(d) for d in dst[count:]]
+    r, _ = check_call("moe_grouped_s2 (count 7 of 10)", fx, [(0, s * BLOB) for s in experts], gstart, len(experts),
+                      [0] * cap, edst, cap, cap, cap)
+    touched = np.count_nonzero(r["out"][dst[count:]] != 0xA5A5A5A5)
+    assert touched == 0, touched

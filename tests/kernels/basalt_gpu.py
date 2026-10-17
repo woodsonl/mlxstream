@@ -126,19 +126,20 @@ def experts(blobs, grp_off, grp_start, ent_tok, ent_dst, xq, n_embd, n_ff, n_out
             "hq": np.frombuffer(b_hq.read(0, b_hq.nbytes), np.uint8), "out": f32(b_out).reshape(n_out_rows, n_embd)}
 
 
-def q8_0_scaled(x, fill=0x5A):
+def q8_0_scaled(x, fill=0x5A, src=None):
     """``basalt_quantize_q8_0_scaled`` over the float32 vector ``x`` (a multiple of 32 values), into blocks and scales
-    whose bytes start as ``fill``: (34-byte blocks as bytes, fp32 scales)."""
+    whose bytes start as ``fill``: (34-byte blocks as bytes, fp32 scales). ``src``: another source of the kernels (the
+    tests' negative controls)."""
     x = np.ascontiguousarray(x, np.float32)
     nb = x.size // 32
-    pso = pipeline(kernels.basalt_s2_experts_source(), "basalt_quantize_q8_0_scaled")
+    pso = pipeline(src or kernels.basalt_s2_experts_source(), "basalt_quantize_q8_0_scaled")
     out = run(pso, [x.tobytes(), nb * kernels.Q8_0_BLOCK_BYTES, 4 * nb], kernels.basalt_q8_0_scaled_params(x.size), 3,
               kernels.basalt_q8_0_scaled_grid(x.size), kernels.S2_THREADS, fill)
     return np.frombuffer(out[1], np.uint8), np.frombuffer(out[2], np.float32)
 
 
 def s2_experts(blob_bufs, grp, grp_start, n_groups, ent_tok, ent_dst, xq, xs, cap_groups, cap_entries, n_out_rows, *,
-               resident=None, out_fill=0xA5, scratch_fill=0x5A):
+               resident=None, out_fill=0xA5, scratch_fill=0x5A, src=None):
     """basalt's ``moe_grouped_s2`` (with ``resident``: ``moe_group_resident`` first) in one command buffer.
     ``blob_bufs``: device buffers holding the expert blobs; group g's blob is ``grp[g]`` = (buffer index, byte offset),
     and the kernels get basalt's grp_ptr, that buffer's GPU address plus the offset (the table padded to cap_groups
@@ -147,8 +148,8 @@ def s2_experts(blob_bufs, grp, grp_start, n_groups, ent_tok, ent_dst, xq, xs, ca
     ``grp_start``, ``n_groups``, ``ent_tok`` and ``ent_dst`` are ignored. ``xq``: the activation rows (34-byte
     blocks), ``xs`` their fp32 scales. The output (``n_out_rows`` rows of 2560 floats) starts as ``out_fill`` bytes,
     the scratch (``basalt_s2_scratch``'s size) as ``scratch_fill``. Returns the output and scratch bytes, and the plan
-    the kernels read."""
-    dev, src = device(), kernels.basalt_s2_experts_source()
+    the kernels read. ``src``: another source of the kernels (the tests' negative controls)."""
+    dev, src = device(), src or kernels.basalt_s2_experts_source()
     pgu, psw, pq, pdn = (pipeline(src, n) for n in ("basalt_s2_gu", "basalt_s2_swiglu", "basalt_quantize_q8_0_scaled",
                                                      "basalt_s2_down"))
     grids, sc = kernels.basalt_s2_grids(cap_groups, cap_entries), kernels.basalt_s2_scratch(cap_entries)
