@@ -77,8 +77,8 @@ compilers.
 
 | Site | SASS (13.3) | Template | Metal |
 |---|---|---|---|
-| `sumf_d += d8 * (dot1 * r.sc[i])` (`:102`), i = 0, 1 | `FFMA.FTZ R30, R31, R30, RZ`; `FFMA.FTZ R118, R35, R34, R30` | `FFMA.FTZ(i, in, FFMA.FTZ(i, in, 0))` | `fma_ftz(d8, float(dot1 * sc), sumf_d)` from 0 |
-| `sumf_m += d8 * (dot2 * r.m[i])` (`:103`) | `FFMA.FTZ R28, R31, R28, RZ`; `FFMA.FTZ R116, R35, R33, R28` | the same | `fma_ftz(d8, float(dot2 * m), sumf_m)` |
+| `sumf_d += d8 * (dot1 * r.sc[i])` (`:102`), i = 0, 1 | `FFMA.FTZ R28, R31, R28, RZ`; `FFMA.FTZ R116, R35, R33, R28` | `FFMA.FTZ(i, in, FFMA.FTZ(i, in, 0))` | `fma_ftz(d8, float(dot1 * sc), sumf_d)` from 0 |
+| `sumf_m += d8 * (dot2 * r.m[i])` (`:103`) | `FFMA.FTZ R30, R31, R30, RZ`; `FFMA.FTZ R118, R35, R34, R30` | the same | `fma_ftz(d8, float(dot2 * m), sumf_m)` |
 | `r.dm.x * sumf_d - r.dm.y * sumf_m` (`:105`) | `FMUL.FTZ R45, R118, R113`; `FFMA.FTZ R116, R116, R51, -R45` | `FFMA.FTZ(sumf, in, −FMUL.FTZ(sumf, in))` | `fma_ftz(dmx, sumf_d, -mul_ftz(dmy, sumf_m))` |
 | `p[vt[c]][j] += q5_apply(...)` (`:206`) | `FADD.FTZ R3, RZ, R116`; `FADD.FTZ R3, R3, R118` (virtual thread 0's two blocks); `FADD.FTZ R6, RZ, R6` (threads 1..3, one block each) | `FADD.FTZ(0, v)`, `FADD.FTZ(p, v)` | `add_ftz(p, v)` from 0 |
 | `t = p[0][j]; t += p[v][j]` (`:209-211`) | `FADD.FTZ R3, R3, R6`; `FADD.FTZ R3, R2, R3`; `FADD.FTZ R3, R4, R3` | `((p0 + p1) + p2) + p3` | `add_ftz` ×3 in virtual-thread order |
