@@ -376,6 +376,25 @@ def basalt_expert_params(n_embd: int, n_ff: int) -> bytes:
     return struct.pack("<8I", n_embd, n_ff, lay["gu_row"], lay["d_row"], lay["up_off"], lay["down_off"], 0, 0)
 
 
+# ---- basalt's drafter experts (kernels/common/basalt_s2_experts.metal; docs/research/basalt-nvcc/s2_experts.md) ----
+# The constants and the scratch layout are adapted from basalt (jesdga95/basalt) src/kernels/cuda/s2_expert_grouped.cu
+# :34-46, :554-562, :1085-1122 and src/kernels/cuda/quantize_act.cu:219-238 @ b4c63b55754637f4c72ad53a0f791d425f71eb36
+# (MIT; third_party/NOTICE).
+
+Q8_0_BLOCK_BYTES = 34       # fp16 d, 32 int8 codes
+S2_THREADS = 256            # every dispatch but the plan's: 256-thread threadgroups
+S2_H, S2_FF, S2_GMAX = 2560, 640, 8
+S2_BLOB_BYTES = 2 * S2_FF * S2_H // 4 + S2_H * S2_FF // 4 + 2 * S2_FF * S2_H // 64 * 2 + S2_H * S2_FF // 64 * 2
+
+
+def basalt_s2_experts_source() -> str:
+    """basalt's drafter experts: ``basalt_s2_group_resident`` (moe_group_resident), ``basalt_quantize_q8_0_scaled`` and
+    moe_grouped_s2's ``basalt_s2_gu``, ``basalt_s2_swiglu``, ``basalt_quantize_q8_0_scaled`` (the intermediate) and
+    ``basalt_s2_down``, dispatched in that order. The gate/up and down kernels take basalt's ``grp_ptr`` at buffer(0):
+    one 64-bit GPU address a group (each 2-byte aligned, inside a buffer the dispatch makes resident)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_q8_1.metal") + template("basalt_s2_experts.metal")
+
+
 DEQUANT_TYPES = (11, 20, 23, 42)   # Q3_K, IQ4_NL, IQ4_XS, Q2_0: basalt's dequantizers for the types iq_parity checks
 
 
