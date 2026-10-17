@@ -497,3 +497,67 @@ def dense_tc(type_id, w, xq, n_in, n_out, ncols, order):
     else:
         out = (((ws[0] + ws[1]) + ws[2]) + ws[3]) + (((ws[4] + ws[5]) + ws[6]) + ws[7])
     return out.T.copy()
+
+
+# ---- the Q5_K head's top-1 (docs/research/basalt-nvcc/q5k_head.md section 2) -------------------------------------
+# A Top is (m, idx, s) arrays. m and idx change only through comparisons of logits, so every __expf argument follows
+# from the logits; ``expf`` evaluates the kernel's own expf_ftz on an array (MUFU.EX2 has no bit-exact model).
+
+TOP_NONE = 0x7FFFFFFF
+
+
+def top_take(t, l, row, on, expf):
+    """Top::take of logit l at row ``row`` where ``on`` (q5k_head.cu:155-164)."""
+    m, idx, s = t
+    up = l > m
+    with np.errstate(invalid="ignore"):
+        e = expf(np.where(up, add_ftz(m, -l), add_ftz(l, -m)))
+    s2 = np.where(up, fma_ftz(s, e, F32(1.0)), add_ftz(s, e))
+    i2 = np.where(up | ((l == m) & (row < idx)), row, idx)
+    return np.where(on, np.where(up, l, m), m).astype(F32), np.where(on, i2, idx), np.where(on, s2, s).astype(F32)
+
+
+def top_merge(t, o, expf):
+    """Top::merge of o into t (q5k_head.cu:165-175), elementwise."""
+    (m, idx, s), (om, oidx, os_) = t, o
+    on = oidx != TOP_NONE
+    take = (idx == TOP_NONE) | (om > m)
+    with np.errstate(invalid="ignore"):
+        e = expf(np.where(on, np.where(take, add_ftz(m, -om), add_ftz(om, -m)), F32(0.0)))
+    s2 = np.where(take, fma_ftz(s, e, os_), fma_ftz(os_, e, s))
+    i2 = np.where(take | ((om == m) & (oidx < idx)), oidx, idx)
+    return np.where(on & take, om, m).astype(F32), np.where(on, i2, idx), np.where(on, s2, s).astype(F32)
+
+
+def q5k_top1(logits, mapped, blocks, expf):
+    """q5k_head_top1 from the kernel's logits: SIMD-group k of threadgroup g takes rows 8g + k + 8 blocks i in order,
+    unmapped rows skipped (:191-219); thread 0 merges SIMD-groups 0..7 (:297-299) into the partial; the merge: thread t
+    merges partials t, t + 256, ... (:309-317), the XOR butterfly 16..1 over each SIMD-group (:318-324), thread 0 the
+    SIMD-groups in order (:327-329). Returns (the partials (m, idx, s) per threadgroup, the row, the probability)."""
+    n = len(logits)
+    nw = 8 * blocks
+    t = (np.full(nw, -np.inf, F32), np.full(nw, TOP_NONE, np.int64), np.zeros(nw, F32))
+    for r0 in range(0, n, nw):
+        row = r0 + np.arange(nw)
+        ok = row < n
+        rr = np.minimum(row, n - 1)
+        t = top_take(t, np.asarray(logits, F32)[rr], row, ok & np.asarray(mapped)[rr], expf)
+    w = [a.reshape(blocks, 8) for a in t]
+    b = tuple(a[:, 0] for a in w)
+    for k in range(1, 8):
+        b = top_merge(b, tuple(a[:, k] for a in w), expf)
+    part = b
+    g = (np.full(256, -np.inf, F32), np.full(256, TOP_NONE, np.int64), np.zeros(256, F32))
+    for i0 in range(0, blocks, 256):
+        i = i0 + np.arange(256)
+        ok = i < blocks
+        ii = np.minimum(i, blocks - 1)
+        o = (part[0][ii], np.where(ok, part[1][ii], TOP_NONE), part[2][ii])
+        g = top_merge(g, o, expf)
+    for off in (16, 8, 4, 2, 1):
+        src = np.arange(256) ^ off
+        g = top_merge(g, tuple(a[src] for a in g), expf)
+    f = tuple(a[0:1] for a in g)
+    for k in range(1, 8):
+        f = top_merge(f, tuple(a[32 * k: 32 * k + 1] for a in g), expf)
+    return part, int(f[1][0]), rcp_ftz(f[2])[0]

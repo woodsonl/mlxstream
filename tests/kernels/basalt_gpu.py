@@ -280,3 +280,18 @@ def q5k_top1(w, xq, n_out, map_=None, **grid):
     part = np.frombuffer(bpart.read(0, 12 * blocks), np.float32).reshape(blocks, 3)
     return (np.frombuffer(by.read(0, 4 * n_out), np.float32), int(np.frombuffer(bid.read(0, 4), np.int32)[0]),
             np.frombuffer(bp.read(0, 4), np.float32)[0], part)
+
+
+def expf_ftz(x):
+    """basalt_fp.metal's expf_ftz (``__expf`` in a fast-math file) on the GPU, elementwise: the values the kernels use."""
+    src = kernels.PRELUDE + kernels.template("basalt_fp.metal") + """
+kernel void ex(device const float* x [[buffer(0)]], device float* e [[buffer(1)]], constant uint& n [[buffer(2)]],
+               uint i [[thread_position_in_grid]]) {
+    if (i < n) e[i] = expf_ftz(x[i]);
+}
+"""
+    x = np.ascontiguousarray(x, np.float32)
+    flat = x.reshape(-1)
+    out = run(pipeline(src, "ex"), [flat.tobytes(), 4 * flat.size], np.uint32(flat.size).tobytes(), 2,
+              -(-flat.size // 256), 256)
+    return np.frombuffer(out[1], np.float32).reshape(x.shape)

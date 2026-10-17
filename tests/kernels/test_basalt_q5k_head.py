@@ -17,6 +17,7 @@ distributions, other draws. The timing loops are not ported.
 import numpy as np
 import pytest
 
+from monolith import kernels
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
 from tests.kernels.test_basalt_mmvq import reference
@@ -115,3 +116,85 @@ def test_head_emulation_bit_for_bit(data):
     rows = 96
     got = gpu.q5k_head(w[:rows], xq[: 3 * QCOL], N_IN, rows, 3)
     assert bad_bits(got, emu.mmvq(13, w[:rows], xq[: 3 * QCOL], N_IN, rows, 3)) == 0
+
+
+# ---- the fused top-1 (q5k_head_parity.cpp:93-211) ------------------------------------------------------------------
+
+def host_top(a, mapped):
+    """The host argmax over the GPU logits (the lowest row on ties: basalt's ``a[i] > a[best]`` scan and the sampler's
+    greedy rule, flash-next.md "Greedy pick") and the double softmax sum relative to it (:171-179)."""
+    rows = np.flatnonzero(mapped)
+    best = int(rows[np.argmax(a[rows])])                # np.argmax: the first maximum
+    s = float(np.sum(np.exp(a[rows].astype(np.float64) - np.float64(a[best]))))
+    return best, s
+
+
+def test_top1(data):
+    """:93-146 at ctest's row counts ({20000, 106299, 40525, 1000}, the larger skipped above 20,000, :105-107), each of
+    8 columns: the logits bit for bit against native_mmvq, the id against the host argmax over the GPU logits (basalt:
+    sample_greedy_top_prob on the GPU, sampler.cu:930, not on main), the probability against a host double softmax
+    over them (the comparison basalt's holes section makes, :171-185)."""
+    w, xq, _ = data
+    logit_bad = id_bad = 0
+    max_rel = 0.0
+    for rr in (ROWS, 106299, 40525, 1000):
+        if rr > ROWS:
+            continue
+        for col in range(MT):
+            xc = column(xq, col)
+            a = gpu.mmvq(13, w[:rr], xc, N_IN, rr, 1)[0]
+            b, b_id, b_p, _ = gpu.q5k_top1(w[:rr], xc, rr)
+            best, s = host_top(a, np.ones(rr, bool))
+            logit_bad += bad_bits(a, b)
+            id_bad += b_id != best
+            max_rel = max(max_rel, abs(float(b_p) - 1.0 / s) * s)
+    # basalt: ``if (logit_bad || id_bad || max_rel > 1e-5) fail = 1;`` (:145)
+    assert logit_bad == 0 and id_bad == 0 and max_rel <= 1e-5, (logit_bad, id_bad, max_rel)
+
+
+def holes_map(rr):
+    """:157-158: every fifth row (i % 5 == 2) and the last 2048 rows without a token, the others id 3i + 7."""
+    i = np.arange(rr)
+    return np.where((i % 5 == 2) | (i >= rr - 2048), -1, 3 * i + 7).astype(np.int32)
+
+
+def test_top1_holes(data):
+    """:147-211 at min(rows, 106299) = 20,000 rows, 8 columns: masked rows -inf, the others bit for bit native_mmvq's;
+    the id against map[host argmax], the probability against the host double softmax; then the mask kernel after a
+    plain head the same way (:186-193)."""
+    w, xq, _ = data
+    rr = min(ROWS, 106299)
+    mp = holes_map(rr)
+    mapped = mp >= 0
+    bad = 0
+    max_rel = 0.0
+    for col in range(MT):
+        xc = column(xq, col)
+        a = gpu.mmvq(13, w[:rr], xc, N_IN, rr, 1)[0]
+        b, b_id, b_p, _ = gpu.q5k_top1(w[:rr], xc, rr, mp)
+        bad += int(np.count_nonzero(~np.isneginf(b[~mapped]))) + bad_bits(a[mapped], b[mapped])
+        best, s = host_top(a, mapped)
+        bad += b_id != mp[best]
+        max_rel = max(max_rel, abs(float(b_p) - 1.0 / s) * s)
+        c = gpu.q5k_head_masked(w[:rr], xc, N_IN, rr, mp)
+        bad += int(np.count_nonzero(~np.isneginf(c[~mapped]))) + bad_bits(a[mapped], c[mapped])
+    # basalt: ``if (bad || max_rel > 1e-5) fail = 1;`` (:210)
+    assert bad == 0 and max_rel <= 1e-5, (bad, max_rel)
+
+
+@pytest.mark.parametrize("rr,grid", [(20000, {}), (1000, {}), (20000, {"sm_count": 40, "per_sm": 1}),
+                                     (5000, {"sm_count": 3, "per_sm": 1})])
+def test_top1_emulation_bit_for_bit(data, rr, grid):
+    """The partials, the id and the probability bit for bit against the numpy emulation of the take and merge
+    (basalt_emu.q5k_top1) on the kernel's logits, with the GPU's expf_ftz; with and without the holes map; at basalt's
+    grid and others (the probability's last bits follow the grid, mtp.cpp:1007-1008)."""
+    w, xq, _ = data
+    blocks = kernels.basalt_q5k_head_grid(rr, **grid)
+    for mp in (None, holes_map(rr)):
+        y, b_id, b_p, part = gpu.q5k_top1(w[:rr], column(xq, 3), rr, mp, **grid)
+        mapped = np.ones(rr, bool) if mp is None else mp >= 0
+        e_part, e_row, e_p = emu.q5k_top1(y, mapped, blocks, gpu.expf_ftz)
+        assert bad_bits(part[:, 0], e_part[0]) == 0 and bad_bits(part[:, 2], e_part[2]) == 0
+        assert np.array_equal(part[:, 1].view(np.int32), e_part[1].astype(np.int32))
+        e_row = e_row if e_row < rr else 0             # no row taken (every row masked): row 0 (q5k_head.cu:330)
+        assert b_id == (e_row if mp is None else mp[e_row]) and bad_bits(b_p, e_p) == 0, (b_id, e_row, b_p, e_p)
