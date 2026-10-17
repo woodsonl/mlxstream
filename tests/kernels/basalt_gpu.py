@@ -331,3 +331,32 @@ def q5k_proxy_score(proxy, xq, n_rows, n_cap, map_):
     s = np.frombuffer(bs.read(0, nbytes), np.float32)
     ntc, t = kernels.basalt_q5k_proxy_tiles(n_cap), kernels.basalt_q5k_proxy_tiles(n_rows)
     return s[: 8 * t].reshape(t, 4, 2), s[8 * ntc: 8 * ntc + 2 * t].reshape(t, 2)
+
+
+def q5k_proxy_top1(proxy, q5, xq, n_rows, n_cap, map_):
+    """basalt's ``q5k_proxy_top1`` (q5k_head.cu:516-535): ``basalt_q5k_proxy_score`` then ``basalt_q5k_proxy_final``
+    in one command buffer, over the first ``n_rows`` rows of the copy ``proxy`` and of the Q5_K rows ``q5``, for one
+    q8_1 column. Returns (id, probability, the score's cand (tiles, 4, 2) and part (tiles, 2))."""
+    dev = device()
+    src = kernels.basalt_q5k_head_source()
+    final = pipeline(src, "basalt_q5k_proxy_final")
+    assert final.max_threads_per_threadgroup >= kernels.PX_THREADS_FINAL, final.max_threads_per_threadgroup
+    nbytes = kernels.basalt_q5k_proxy_scratch_bytes(n_cap)
+    bp, bq = (nt.Buffer(dev, np.ascontiguousarray(a, np.uint8).tobytes()) for a in (proxy, q5))
+    bx = nt.Buffer(dev, np.ascontiguousarray(xq, np.uint8).tobytes())
+    bm = nt.Buffer(dev, np.ascontiguousarray(map_, np.int32).tobytes())
+    bs, bid, bpr = nt.Buffer(dev, nbytes), nt.Buffer(dev, 4), nt.Buffer(dev, 4)
+    for b in (bs, bid, bpr):
+        b.fill(0xEE)
+    params = kernels.basalt_q5k_proxy_params(n_cap, n_rows=n_rows)
+    d1 = (nt.Dispatch().pipeline(pipeline(src, "basalt_q5k_proxy_score")).buffer(0, bp).buffer(1, bx).buffer(2, bm)
+          .buffer(3, bs).bytes(4, params).grid(kernels.basalt_q5k_proxy_tiles(n_rows))
+          .threadgroup(kernels.PX_THREADS_SCORE))
+    d2 = (nt.Dispatch().pipeline(final).buffer(0, bq).buffer(1, bx).buffer(2, bm).buffer(3, bs).buffer(4, bid)
+          .buffer(5, bpr).bytes(6, params).grid(1).threadgroup(kernels.PX_THREADS_FINAL))
+    r = nt.Queue(dev).run([d1, d2])
+    assert not r.error, r.error
+    s = np.frombuffer(bs.read(0, nbytes), np.float32)
+    ntc, t = kernels.basalt_q5k_proxy_tiles(n_cap), kernels.basalt_q5k_proxy_tiles(n_rows)
+    return (int(np.frombuffer(bid.read(0, 4), np.int32)[0]), np.frombuffer(bpr.read(0, 4), np.float32)[0],
+            s[: 8 * t].reshape(t, 4, 2), s[8 * ntc: 8 * ntc + 2 * t].reshape(t, 2))

@@ -271,3 +271,81 @@ def test_proxy_score_emulation_bit_for_bit(proxy_copy, data):
     e_cand, e_part = emu.q5k_proxy_score(proxy, xc, rr, n_cap, mp, tiles, gpu.expf_ftz)
     assert bad_bits(cand[tiles], e_cand) == 0 and bad_bits(part[tiles], e_part) == 0
     assert np.all(np.isneginf(cand[t - 1, :, 0]))       # the last tile: rows 19,968.. masked (map's last 300 rows)
+
+
+def dequant(row):
+    """A Q5_K row's values as basalt's test computes them on the host (:270-290): d * sc * q - dmin * m in float."""
+    b = np.asarray(row, np.uint8).reshape(10, 176)
+    d, dmin = (b[:, :4].copy().view(np.float16).astype(F32)[:, k] for k in (0, 1))
+    out = np.zeros((10, 8, 32), F32)
+    for j in range(8):
+        scl = b[:, 4:16].astype(np.int64)
+        if j < 4:
+            sci, mi = scl[:, j] & 63, scl[:, j + 4] & 63
+        else:
+            sci = (scl[:, j + 4] & 0xF) | ((scl[:, j - 4] >> 6) << 4)
+            mi = (scl[:, j + 4] >> 4) | ((scl[:, j] >> 6) << 4)
+        qs = b[:, 48 + 32 * (j // 2): 80 + 32 * (j // 2)].astype(np.int64)
+        q = ((qs >> 4) if j & 1 else (qs & 15)) | (((b[:, 16:48].astype(np.int64) >> j) & 1) << 4)
+        out[:, j] = (d * sci.astype(F32))[:, None] * q.astype(F32) - (dmin * mi.astype(F32))[:, None]
+    return out.reshape(-1)
+
+
+def trial_x(rng, q5, mp):
+    """:263-293: 0.8 N(0, 1) noise plus two planted rows among those with a token, the pick at 20 / |row|^2 and a
+    runner-up at (16 + 0..3) / |row|^2, as a head's logits have."""
+    xh = (F32(0.8) * rng.standard_normal(N_IN).astype(F32)).astype(F32)
+    for pl in range(2):
+        r = int(rng.integers(len(mp)))
+        while mp[r] < 0:
+            r = int(rng.integers(len(mp)))
+        dq = dequant(q5[r]).astype(np.float64)
+        alpha = (20.0 if pl == 0 else 16.0 + int(rng.integers(4))) / float(np.sum(dq * dq))
+        xh = (xh + (alpha * dq).astype(F32)).astype(F32)
+    return xh
+
+
+def test_proxy_top1(proxy_copy, proxy_rows):
+    """:254-349: the two-stage argmax against the exact one, 400 trials on the rescaled rows with basalt's map; a miss
+    is a pick other than map[host argmax over native_mmvq's logits] (the first maximum, basalt's ``a[i] > a[best]``),
+    and for a hit |p * sum - 1| with the host double softmax sum. Each trial's id and probability are also checked bit
+    for bit against the numpy emulation of collect and pick (basalt_emu.q5k_proxy_final) on the score's own outputs
+    and native_mmvq's logits of the rescored rows."""
+    proxy, n_cap = proxy_copy
+    rr = len(proxy_rows)
+    mp = proxy_map(rr)
+    rows = np.flatnonzero(mp >= 0)
+    rng = np.random.default_rng(349)
+    trials, miss, max_p_rel, emu_bad = 400, 0, 0.0, 0
+    for _ in range(trials):
+        xq1 = gpu.q8_1(trial_x(rng, proxy_rows, mp), "native")
+        a = gpu.mmvq(13, proxy_rows, xq1, N_IN, rr, 1)[0]
+        pid, p, cand, part = gpu.q5k_proxy_top1(proxy, proxy_rows, xq1, rr, n_cap, mp)
+        best = int(rows[np.argmax(a[rows])])
+        if pid == mp[best]:
+            s = float(np.sum(np.exp(a[rows].astype(np.float64) - np.float64(a[best]))))
+            max_p_rel = max(max_p_rel, abs(float(p) * s - 1.0))
+        else:
+            miss += 1
+        e_id, e_p, _ = emu.q5k_proxy_final(cand, part, a, mp, gpu.expf_ftz)
+        emu_bad += e_id != pid or bad_bits(p, e_p) != 0
+    # basalt: ``if (miss > trials / 50 || max_p_rel > 1.0) fail = 1;`` (:349)
+    assert miss <= trials // 50 and max_p_rel <= 1.0, (miss, max_p_rel)
+    assert emu_bad == 0, emu_bad
+
+
+def test_proxy_top1_edges(proxy_copy, proxy_rows):
+    """Two cases basalt's test does not reach. Every row masked: collect's early exit, map[0] (0 when negative) with
+    probability 1 (head_proxy.cuh:193-196). A zero column: every approximate score is 0, so every candidate is within
+    kDelta and the list keeps 64 of them; the port's fixed order decides which, checked bit for bit against the
+    emulation."""
+    proxy, n_cap = proxy_copy
+    rr = len(proxy_rows)
+    zero = gpu.q8_1(np.zeros(N_IN, F32), "native")
+    pid, p, _, _ = gpu.q5k_proxy_top1(proxy, proxy_rows, zero, rr, n_cap, np.full(rr, -1, np.int32))
+    assert pid == 0 and p == 1.0
+    mp = proxy_map(rr)
+    pid, p, cand, part = gpu.q5k_proxy_top1(proxy, proxy_rows, zero, rr, n_cap, mp)
+    e_id, e_p, listed = emu.q5k_proxy_final(cand, part, gpu.mmvq(13, proxy_rows, zero, N_IN, rr, 1)[0], mp,
+                                            gpu.expf_ftz)
+    assert len(listed) == 64 and pid == e_id == mp[0] and bad_bits(p, e_p) == 0, (pid, e_id, p, e_p)

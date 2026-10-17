@@ -315,3 +315,100 @@ kernel void basalt_q5k_proxy_score(device const uint4* proxy [[buffer(0)]], devi
         if (int(lane) == bi) v = neg_inf();
     }
 }
+
+// q5k_proxy_final_kernel (q5k_head.cu:464-496) with px::collect and px::pick (head_proxy.cuh:169-240): one threadgroup
+// of 512 threads (16 SIMD-groups) after the score pass. collect: m, the best approximate score over the candidates
+// (FMNMX.FTZ), then every candidate above -inf and at least FADD.FTZ(m, -5) into the list, at most 64 (the others are
+// dropped); each listed row is rescored by the head's own row (q5k_row: the Q5_K head's bits, a SIMD-group per row);
+// pick (SIMD-group 0): the largest exact score, the lowest row on ties; the sum of the tiles' partials rescaled,
+// FFMA.FTZ(sum_t, expf_ftz(m_t - best), acc) where sum_t > 0, plus each listed row's
+// FADD.FTZ(expf_ftz(exact - best), -expf_ftz(approx - best)), in lane order, then the butterfly; the probability is
+// rcp_ftz(max_ftz(sum, the pick's own term 1)). When every row is masked: map[0] (0 when negative), probability 1.
+// The list's order: basalt fills it with a shared-memory atomicAdd, which nvcc aggregates per warp (VOTEU.ANY, POPC,
+// one ATOMS.ADD per request, each requesting lane at base + its rank among them), the requests taking slots in arrival
+// order. The port fixes that order to ascending candidate index (pass k of the 512-strided loop, SIMD-groups 0..15,
+// lanes in order), one of the orders basalt's kernel produces, so the list, the rows rescored when more than 64
+// qualify and the probability's last bits repeat run to run (q5k_head.md section 4). The column is read from device
+// memory (basalt stages it in shared memory: not arithmetic).
+kernel void basalt_q5k_proxy_final(device const ushort* w [[buffer(0)]], device const uint* x [[buffer(1)]],
+                                   device const int* map [[buffer(2)]], device const float2* scratch [[buffer(3)]],
+                                   device int* out_id [[buffer(4)]], device float* out_prob [[buffer(5)]],
+                                   constant PxParams& p [[buffer(6)]], ushort tid [[thread_index_in_threadgroup]],
+                                   ushort lane [[thread_index_in_simdgroup]],
+                                   ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float wmax[16];
+    threadgroup int counts[16];
+    threadgroup int list[PX_MAX_CAND];
+    threadgroup float lp[PX_MAX_CAND], ex[PX_MAX_CAND];
+    const int n_tiles = int(px_tiles(p.n_rows)), nc = n_tiles * PX_PER;
+    device const float2* cand = scratch;
+    device const float2* part = scratch + px_tiles(p.n_cap) * uint(PX_PER);
+    float m = neg_inf();
+    for (int i = tid; i < nc; i += 512) m = max_ftz(m, cand[i].x);
+    for (ushort o = 16; o > 0; o >>= 1) m = max_ftz(m, shfl_xor(m, o));
+    if (lane == 0) wmax[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = wmax[0];
+    for (int i = 1; i < 16; ++i) m = max_ftz(m, wmax[i]);
+    if (m == neg_inf()) {                                   // every row is masked
+        if (tid == 0) {
+            *out_id = map[0] < 0 ? 0 : map[0];
+            *out_prob = 1.0f;
+        }
+        return;
+    }
+    const float lo = add_ftz(m, -5.0f);                     // m - kDelta
+    int cnt = 0;
+    for (int i0 = 0; i0 < nc; i0 += 512) {
+        const int i = i0 + int(tid);
+        const float2 c = i < nc ? cand[i] : float2(neg_inf(), 0.0f);
+        const int take = c.x > neg_inf() && c.x >= lo ? 1 : 0;
+        const int rank = simd_prefix_exclusive_sum(take);  // POPC(ballot & lanemask_lt): lane order
+        const int total = simd_sum(take);
+        if (lane == 0) counts[sg] = total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int slot = cnt + rank, all = 0;
+        for (int k = 0; k < 16; ++k) {
+            slot += k < int(sg) ? counts[k] : 0;
+            all += counts[k];
+        }
+        if (take != 0 && slot < PX_MAX_CAND) {
+            list[slot] = as_type<int>(c.y);
+            lp[slot] = c.x;
+        }
+        cnt += all;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int n = cnt < PX_MAX_CAND ? cnt : PX_MAX_CAND;
+    for (int c = sg; c < n; c += 16) {
+        float t[1];
+        q5k_row<1>(w + uint(list[c]) * uint(10 * Q5K_USHORTS), x, 80, 10, int(lane), t);
+        if (lane == 0) ex[c] = t[0];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg != 0) return;
+    float bv = neg_inf();
+    int bi = TOP_NONE;
+    for (int c = lane; c < n; c += 32)
+        if (ex[c] > bv || (ex[c] == bv && list[c] < bi)) { bv = ex[c]; bi = list[c]; }
+    for (ushort o = 16; o > 0; o >>= 1) {
+        const float ov = shfl_xor(bv, o);
+        const int oi = simd_shuffle_xor(bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    float sum = 0.0f;
+    for (int t = lane; t < n_tiles; t += 32) {
+        const float2 q = part[t];
+        if (q.y > 0.0f) sum = fma_ftz(q.y, expf_ftz(add_ftz(q.x, -bv)), sum);
+    }
+    for (int c = lane; c < n; c += 32)
+        sum = add_ftz(sum, add_ftz(expf_ftz(add_ftz(ex[c], -bv)), -expf_ftz(add_ftz(lp[c], -bv))));
+    sum = warp_sum_ftz(sum);
+    if (lane == 0) {
+        float one = 0.0f;                                   // the pick's own term is exactly 1
+        for (int c = 0; c < n; ++c)
+            if (list[c] == bi) one = 1.0f;
+        *out_id = map[bi < TOP_NONE ? bi : 0];
+        *out_prob = rcp_ftz(max_ftz(sum, one));
+    }
+}

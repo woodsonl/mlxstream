@@ -681,3 +681,31 @@ def q5k_proxy_score(proxy, xq, n_rows, n_cap, map_, tiles, expf):
         cand[:, k, 1] = (tiles * 32 + bi).astype(np.int32).view(F32)
         vv[at, bi] = -np.inf
     return cand, part
+
+
+def q5k_proxy_final(cand, part, exact, map_, expf):
+    """q5k_proxy_final_kernel (collect, the exact rescoring, pick) from the score's ``cand`` (tiles, 4, 2) and ``part``
+    (tiles, 2); ``exact``: the head's logits of every row (the kernel rescores the listed rows with the head's own row,
+    native_mmvq's bits). The list in ascending candidate order, the port's fixed order (q5k_head.md section 4); ``expf``
+    evaluates the kernel's expf_ftz. Returns (id, probability, the listed rows)."""
+    c, pt = np.asarray(cand, F32).reshape(-1, 2), np.asarray(part, F32)
+    m = np.max(c[:, 0])
+    if m == -np.inf:                                        # every row is masked
+        return (0 if map_[0] < 0 else int(map_[0])), F32(1.0), np.zeros(0, np.int64)
+    sel = np.flatnonzero((c[:, 0] > -np.inf) & (c[:, 0] >= add_ftz(m, F32(-5.0))))[:64]
+    rows, lp = c[sel, 1].view(np.int32).astype(np.int64), c[sel, 0]
+    ex = np.asarray(exact, F32)[rows]
+    bv = np.max(ex)
+    bi = int(np.min(rows[ex == bv]))                        # the largest exact score, the lowest row on ties
+    live = pt[:, 1] > 0
+    et = expf(np.where(live, add_ftz(pt[:, 0], -bv), F32(0.0)))
+    ed = add_ftz(expf(add_ftz(ex, -bv)), -expf(add_ftz(lp, -bv)))
+    s = np.zeros(32, F32)                                   # lane L: tiles L, L + 32, ..., then rows L, L + 32
+    for t0 in range(0, len(pt), 32):
+        k = min(32, len(pt) - t0)
+        s[:k] = np.where(live[t0:t0 + k], fma_ftz(pt[t0:t0 + k, 1], et[t0:t0 + k], s[:k]), s[:k])
+    for c0 in range(0, len(rows), 32):
+        k = min(32, len(rows) - c0)
+        s[:k] = add_ftz(s[:k], ed[c0:c0 + k])
+    total = max_ftz(butterfly(s[None], add_ftz)[0], F32(1.0 if bi in rows else 0.0))
+    return int(np.asarray(map_)[bi]), rcp_ftz(total), rows
