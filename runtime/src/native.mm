@@ -20,6 +20,7 @@ struct CallableTask : HostTask {
   explicit CallableTask(nb::callable f) : fn(std::move(f)) {}
   bool run(const HostCall& call, std::string& error) override {
     nb::gil_scoped_acquire gil;
+    if (!fn.is_valid()) { error = "the task's callable has been released"; return false; }
     try {
       fn(call.step, call.point);
       return true;
@@ -29,6 +30,34 @@ struct CallableTask : HostTask {
     }
   }
 };
+
+// Garbage-collector support. A task's callable usually reaches the Engine that owns the Runner holding the task, a cycle
+// through C++ references the collector cannot see unless these types report and break them.
+static int callable_task_traverse(PyObject* self, visitproc visit, void* arg) {
+  Py_VISIT(Py_TYPE(self));
+  if (!nb::inst_ready(self)) return 0;
+  Py_VISIT(nb::inst_ptr<CallableTask>(self)->fn.ptr());
+  return 0;
+}
+static int callable_task_clear(PyObject* self) {
+  nb::inst_ptr<CallableTask>(self)->fn = nb::callable();
+  return 0;
+}
+static int runner_traverse(PyObject* self, visitproc visit, void* arg) {
+  Py_VISIT(Py_TYPE(self));
+  if (!nb::inst_ready(self)) return 0;
+  for (auto& task : nb::inst_ptr<Runner>(self)->host_tasks()) {
+    nb::handle h = nb::find(task);
+    Py_VISIT(h.ptr());
+  }
+  return 0;
+}
+static int runner_clear(PyObject* self) {
+  nb::inst_ptr<Runner>(self)->release_host_tasks();
+  return 0;
+}
+static PyType_Slot callable_task_slots[] = {{Py_tp_traverse, (void*)callable_task_traverse}, {Py_tp_clear, (void*)callable_task_clear}, {0, nullptr}};
+static PyType_Slot runner_slots[] = {{Py_tp_traverse, (void*)runner_traverse}, {Py_tp_clear, (void*)runner_clear}, {0, nullptr}};
 
 NB_MODULE(_native, m) {
   m.doc() = "Metal runtime core (v0): device, buffers, runtime-compiled libraries, pipelines, timed dispatches";
@@ -95,7 +124,7 @@ NB_MODULE(_native, m) {
       .def_prop_ro("count", &Icb::count);
 
   nb::class_<HostTask>(m, "HostTask");    // implemented in C++ (later tiers) or by CallableTask
-  nb::class_<CallableTask, HostTask>(m, "CallableTask").def(nb::init<nb::callable>(), nb::arg("fn"));
+  nb::class_<CallableTask, HostTask>(m, "CallableTask", nb::type_slots(callable_task_slots)).def(nb::init<nb::callable>(), nb::arg("fn"));
 
   nb::class_<RunnerStats>(m, "RunnerStats")
       .def_ro("steps_submitted", &RunnerStats::steps_submitted).def_ro("command_buffers", &RunnerStats::command_buffers)
@@ -103,7 +132,7 @@ NB_MODULE(_native, m) {
       .def_ro("encode_ms", &RunnerStats::encode_ms).def_ro("commit_ms", &RunnerStats::commit_ms).def_ro("wait_ms", &RunnerStats::wait_ms)
       .def_ro("done", &RunnerStats::done).def_ro("error", &RunnerStats::error);
 
-  nb::class_<Runner>(m, "Runner")
+  nb::class_<Runner>(m, "Runner", nb::type_slots(runner_slots))
       .def("__init__", [](Runner* self, const Device& d, const Icb& icb, const std::vector<Dispatch>& ops, std::vector<const Buffer*> resources,
                           const Buffer& state, uint32_t done_offset, uint32_t ring_head_offset, uint32_t ring_tail_offset, const Buffer& ring, uint32_t ring_capacity,
                           std::vector<const Buffer*> read_only_resources) {

@@ -379,6 +379,16 @@ void Runner::set_host_points(std::vector<HostPoint> points, uint32_t error_offse
   if (!r.gpu_ev || !r.fence) throw std::runtime_error("host points: newSharedEvent or newFence failed");
 }
 
+std::vector<std::shared_ptr<HostTask>> Runner::host_tasks() const {
+  std::vector<std::shared_ptr<HostTask>> out;
+  for (auto& p : impl->points) if (p.task) out.push_back(p.task);
+  return out;
+}
+
+void Runner::release_host_tasks() {
+  for (auto& p : impl->points) p.task.reset();
+}
+
 static uint64_t event_value(const RunnerImpl& r, uint64_t step, uint32_t point) {
   return (step - r.event_base) * r.points.size() + point + 1;
 }
@@ -463,6 +473,8 @@ struct HostCb { id<MTLCommandBuffer> cb; uint64_t step; uint32_t seg; };
 static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reencode, uint64_t max_tokens) {
   RunnerStats st;
   std::string& err = st.error;
+  for (auto& p : r.points)
+    if (!p.task) { err = "host steps: a task has been released"; return st; }
   const uint32_t n = (uint32_t)r.ops.size(), nseg = (uint32_t)r.cb_cuts.size() - 1, K = (uint32_t)r.points.size();
   const uint64_t S0 = r.step_base;
   uint64_t S1 = S0 + max_steps;                    // steps [S0, S1) may begin; a stop lowers S1 to the steps begun

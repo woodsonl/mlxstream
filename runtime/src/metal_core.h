@@ -178,6 +178,10 @@ class Runner {
   // waits for the GPU to reach a publish boundary or finish a command buffer; `spin_us`: how long such a wait spins
   // before it blocks.
   void set_host_points(std::vector<HostPoint> points, uint32_t error_offset, uint32_t timeout_ms, uint32_t spin_us = 20000);
+  // The installed tasks, and their release: the bindings' garbage-collector support (a Python task's callable usually
+  // reaches the object that owns this runner).
+  std::vector<std::shared_ptr<HostTask>> host_tasks() const;
+  void release_host_tasks();
   // Tokens drained so far (in ring order); cleared by the call.
   std::vector<int32_t> drain();
   std::shared_ptr<RunnerImpl> impl;
