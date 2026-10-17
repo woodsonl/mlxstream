@@ -57,7 +57,10 @@ def same_bits(got, want):
     return got.view(np.uint32) == np.asarray(want, F32).view(np.uint32)
 
 
-# ---- the fp16 conversion: quantize_act_parity's fp16 half (quantize_act_parity.cpp:280-336) -------------------------
+# ---- the fp16 conversion: quantize_act_parity's fp16 half (quantize_act_parity.cpp:283-336) -------------------------
+# The file's Q8_0 half (run_case on quantize_q8_0, :70-130, :241-277) and Q8_K half (:337-401) are not ported: this
+# path calls neither quantize_q8_0 nor quantize_q8_K; the drafter quantizes with quantize_q8_0_scaled (mtp.cpp:933;
+# docs/design/flash-next.md), whose test below borrows the Q8_0 half's five distributions and byte criterion.
 
 def test_f16_bits_is_f16_from_f32():
     """basalt_fp.metal's f16_bits (Metal's half(), which q8_1_put and the quantizer share) against basalt's vectors,
@@ -121,7 +124,7 @@ def test_builders_take_basalt_launches_only():
 # ---- quantize_q8_0_scaled: the contract's host transcription (flash-next.md) -----------------------------------------
 
 def quantize_distributions():
-    """quantize_act_parity's five distributions of 131,072 values (quantize_act_parity.cpp:245-275)."""
+    """quantize_act_parity's five distributions of 131,072 values (quantize_act_parity.cpp:246-275)."""
     rng = np.random.default_rng(7)
     n = 32 * 4096
     d = ((np.arange(n) % 200) - 100 + 0.5).astype(F32)
@@ -185,7 +188,7 @@ def test_quantize_q8_0_scaled(dist):
     print(f"\nquantize_q8_0_scaled, {dist}: {x.size // 32} blocks byte for byte")
 
 
-# ---- s2_expert_grouped_parity (s2_expert_grouped_parity.cpp:79-104, :150-260, :263-458) ------------------------------
+# ---- s2_expert_grouped_parity (s2_expert_grouped_parity.cpp:83-106, :149-260, :263-460) ------------------------------
 # Ported: section 4 (moe_grouped_s2, 8 tokens x 10 entries, a blob outside the arena), section 5 (moe_group_resident +
 # moe_grouped_s2 at the drafter's shape), and the properties sections 2 and 3 check (a device count below the
 # capacity; each entry reading its own token's row), on the grouped kernels. Left out, as this path does not run them:
@@ -202,7 +205,7 @@ BLOB = kernels.S2_BLOB_BYTES
 
 
 def fill_blob(rng):
-    """fill_blob (:81-85): random code bytes, then fp16 scales of either sign with magnitude U[1e-3, 3e-2]."""
+    """fill_blob (:84-88): random code bytes, then fp16 scales of either sign with magnitude U[1e-3, 3e-2]."""
     b = np.empty(BLOB, np.uint8)
     b[:O_GU_SCALES] = rng.integers(0, 256, O_GU_SCALES)
     n = (BLOB - O_GU_SCALES) // 2
@@ -212,7 +215,7 @@ def fill_blob(rng):
 
 
 def fill_x(rng, n_tok):
-    """fill_x (:89-104): per 32-value chunk an fp32 scale U[2e-3, 5e-2] (and its fp16 as the block's d), 32 codes
+    """fill_x (:90-106): per 32-value chunk an fp32 scale U[2e-3, 5e-2] (and its fp16 as the block's d), 32 codes
     uniform in [-127, 127], one chunk in 16 all 127 and one all -127 (saturated on purpose)."""
     xs = rng.uniform(2e-3, 5e-2, n_tok * NC_GU).astype(F32)
     blk = np.zeros((n_tok * NC_GU, 34), np.uint8)
@@ -225,8 +228,8 @@ def fill_x(rng, n_tok):
 
 
 class Fixture:
-    """make_blobs(12) (:240-250) in one buffer, the last blob also alone in a second buffer (the test's mapped host
-    blob, :373-377: on this Mac every buffer is host memory; what carries over is a blob outside the arena), and 8
+    """make_blobs(12) (:244-252) in one buffer, the last blob also alone in a second buffer (the test's mapped host
+    blob, :372-376: on this Mac every buffer is host memory; what carries over is a blob outside the arena), and 8
     tokens' activation rows with their fp32 scales."""
 
     def __init__(self, seed=20260928, nb=12):
@@ -308,7 +311,7 @@ def blob_parts(b):
 
 
 def reference(fx, r, plan, cap, x, xs):
-    """reference (:204-238): every 7th up row of every entry against the activation row it read, every 13th down row
+    """reference (:200-235): every 7th up row of every entry against the activation row it read, every 13th down row
     against the run's own intermediate; criterion, quoted: ``return std::isfinite(got) && std::fabs((double) got - ref)
     <= 4e-5 * mag + 1e-30;`` (:131) and ``if (bad || checked == 0) ++g_fail;`` (:234). Gate rows are not referenced:
     the SwiGLU overwrites them in place."""
@@ -378,15 +381,15 @@ def emulation(fx, r, plan, cap, x, xs):
 
 def check_call(name, fx, grp, grp_start, n_groups, ent_tok, ent_dst, cap_groups, cap, n_rows, resident=None, x=None,
                xs=None):
-    """``twice`` (:150-200) with the contract's comparand: the grouped call from sentinel-filled buffers (out 0xA5,
-    scratch 0x5A, :155-156) against the per-entry calls, the output and the scratch (gate/up, the quantized
+    """``twice`` (:149-191) with the contract's comparand: the grouped call from sentinel-filled buffers (out 0xA5,
+    scratch 0x5A, :153-154) against the per-entry calls, the output and the scratch (gate/up, the quantized
     intermediate, its scales) byte for byte, quoted: ``diff_out += std::memcmp(&r[0].out[i], &r[1].out[i], 4) != 0;``
     (:175) and ``const bool ok = diff_out + diff_gu + diff_q8 + diff_hs == 0;`` (:182); then reference() and the
     emulation. Returns the grouped run and its plan."""
     x, xs = (fx.x, fx.xs) if x is None else (x, xs)
     r = gpu.s2_experts(fx.bufs, grp, grp_start, n_groups, ent_tok, ent_dst, x, xs, cap_groups, cap, n_rows,
                        resident=resident)
-    if resident is not None:                                 # the device's plan, as basalt's test reads it back (:438)
+    if resident is not None:                                 # the device's plan, as basalt's test reads it back (:446)
         n_groups, grp_start = int(r["n_groups"][0]), [int(v) for v in r["grp_start"]]
         ent_tok, ent_dst = r["ent_tok"], r["ent_dst"]
         grp = [(0, int(a) - fx.bufs[0].gpu_address) for a in r["grp_ptr"][:n_groups]]
@@ -408,7 +411,7 @@ def check_call(name, fx, grp, grp_start, n_groups, ent_tok, ent_dst, cap_groups,
 
 
 def test_grouped_8_tokens(fx):
-    """Section 4 (:367-422): moe_grouped_s2 with 8 tokens x 10 entries in groups of 8, 1, 5, 2, 7, 3, 1, 6, 4, ...,
+    """Section 4 (:369-425): moe_grouped_s2 with 8 tokens x 10 entries in groups of 8, 1, 5, 2, 7, 3, 1, 6, 4, ...,
     group 3 on the blob in its own buffer (the mapped host blob), the others blob gi % 11 of the arena, destinations a
     shuffle of the 80 rows, each entry reading its own token's row (dst / 10), cap_groups = groups + 3 with the table
     padded by group 0's address and the starts by the last. Only the fp32-scale run: a null x_scales (the fp16 d run)
@@ -431,7 +434,7 @@ def test_grouped_8_tokens(fx):
 
 
 def test_group_resident_drafter_shape(fx):
-    """Section 5 (:424-458): moe_group_resident then moe_grouped_s2 at the drafter layer's shape, 5 tokens x 10 routed
+    """Section 5 (:427-460): moe_group_resident then moe_grouped_s2 at the drafter layer's shape, 5 tokens x 10 routed
     ids (distinct within a token, shared across tokens, from 12 experts resident at base + id * BLOB), cap_groups =
     cap_entries = 50 (mtp.cpp:931-935); the plan read back from the device as basalt's test does, and checked against a
     host transcription of group_resident_kernel (groups in first-appearance order, entries in routing order)."""
@@ -446,7 +449,7 @@ def test_group_resident_drafter_shape(fx):
 
 
 def test_verify_window_rows(fx):
-    """Section 3's verify window (:316-345) on the grouped kernels: 4 tokens x 10 routed entries, 29 hits (routing
+    """Section 3's verify window (:339-367) on the grouped kernels: 4 tokens x 10 routed entries, 29 hits (routing
     order, each on a random blob), grouped by expert, each entry reading its own token's row (dst / 10); 40-entry
     capacity and a device group count below cap_groups. basalt runs this section on the per-hit kernels
     (moe_hit_grouped_s2_multi), which the drafter does not call; the property it checks, rows per token, is
@@ -462,9 +465,9 @@ def test_verify_window_rows(fx):
 
 
 def test_device_count(fx):
-    """Section 2's device count (:303-336) on the grouped kernels: capacity 10, 7 entries counted (blob (7i + 1) mod 12,
+    """Section 2's device count (:304-337) on the grouped kernels: capacity 10, 7 entries counted (blob (7i + 1) mod 12,
     destinations a shuffle of the 10 rows), one token; the group count on the device, below cap_groups; quoted: ``if
-    (touched) ++g_fail;`` (:335), the rows of the entries past the count keep the sentinel. basalt runs it on the
+    (touched) ++g_fail;`` (:336), the rows of the entries past the count keep the sentinel. basalt runs it on the
     per-hit kernels (moe_hit_grouped_s2_dev), which the drafter does not call."""
     cap, count = 10, 7
     slot = [(i * 7 + 1) % fx.nb for i in range(cap)]
@@ -479,8 +482,9 @@ def test_device_count(fx):
 
 def test_whole_expert_against_float64():
     """The contract's double-precision reference for the drafter expert (docs/design/flash-next.md): basalt checks
-    swiglu_kernel only by comparing two GPU runs (s2_expert_grouped.cu:1108), and its float64 reference covers the up
-    rows and the down rows from the run's own intermediate. Here the quantizer on fp32 activations, then
+    swiglu_kernel only by comparing a run of its old path with one of its new, both of which launch it
+    (s2_expert_grouped.cu:1108), and its float64 reference covers the up rows and the down rows from the run's own
+    intermediate (s2_expert_grouped_parity.cpp:200-235). Here the quantizer on fp32 activations, then
     moe_grouped_s2 (gate/up, the SwiGLU, the intermediate's quantizer, down), against a float64 expert on the fp32
     activations, built as test_basalt_experts.py's test_whole_expert_against_float64 builds the routed expert's
     (native_expert_parity.cpp:46-78, :387-402): 3 tokens of N(0, 1) values, row r's weights

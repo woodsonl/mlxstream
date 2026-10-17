@@ -91,8 +91,9 @@ dx is the quantizer's fp32 s, any non-negative float. Site by site:
   sides (2^x for |x| < 2^-24 is 1 to fp32), t = 2, and g / 2 is subnormal: `ieee_div(g, t)`, which takes the hardware
   quotient when g or t is infinite or NaN (t = +inf past g = −88.72: the quotient is −0), or when |g| ≥ 2^-100 and the
   quotient is at least 2^-125; a zero g gives its signed zero; otherwise it divides the significands as integers and
-  rounds to nearest even on the result's grid. For a normal g, |g| e^g ≥ 2.6e-37 on [−88.72, 0) and beyond
-  −88.72 e overflows and q = −0 (`experts.md`, Notation), so the integer path is for tiny g. e itself can be subnormal
+  rounds to nearest even on the result's grid. For |g| ≥ 2^-100 (up to g = −88.72), |q| ≥ 2.6e-37, and beyond −88.72
+  e overflows and q = −0 (`experts.md`, Notation). The integer path is for |g| < 2^-100, normal g included
+  (g = −2^-126 gives q = −2^-127). e itself can be subnormal
   (g > 87.3: `ex2.approx.f32` keeps it through the halving path below −126) and the GPU's `fast::exp2` may flush it; t =
   fl(e + 1) = 1 either way. h = u · q can be subnormal: `ieee_mul`.
 - **The intermediate's quantizer**: as the first row, on h.
