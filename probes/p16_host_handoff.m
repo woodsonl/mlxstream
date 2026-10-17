@@ -13,7 +13,9 @@
 //      b. the second command buffer, committed after the CPU write
 //   2. the GPU idle gap across one handoff with no CPU work (stage-boundary timestamps): the in-buffer wait with a
 //      spinning CPU and with waitUntilSignaledValue, the second command buffer encoded before the signal (the host
-//      only commits it) and encoded after it (as the host-step runtime does), and a plain pass boundary
+//      only commits it) and encoded after it, and a plain pass boundary. Encoded after the signal is a lower bound on
+//      the host-step runtime's handoff, which also reads StepState, runs the task and encodes a whole segment of
+//      passes; tools/bench/host_handoff.py measures that handoff itself
 //   3. a command buffer parked at an in-buffer wait after its first pass while the CPU sleeps 2 to 6 s: does it
 //      finish without an error (the GPU watchdog), and do another queue's command buffers keep completing meanwhile?
 //   4. the same with the wait as the command buffer's first command (no pass has run before it)
@@ -163,7 +165,7 @@ int main() { @autoreleasepool {
               [cb commit]; v++;
               if (!host_wait(gpu_ev, v, 0, 2000)) printf("  host wait timed out\n");
               [cb2 commit]; [cb2 waitUntilCompleted];
-            } else if (mode == 3) {    // the continuation is encoded once the signal is seen, as the runtime does
+            } else if (mode == 3) {    // the continuation is encoded once the signal is seen (the runtime's lower bound)
               [cb commit]; v++;
               if (!host_wait(gpu_ev, v, 0, 2000)) printf("  host wait timed out\n");
               id<MTLCommandBuffer> cb2 = [q commandBuffer];
