@@ -33,7 +33,7 @@ def _pytest(args, env):
 @pytest.mark.parametrize("args,to_stderr", [((), True), (("-s",), True), ((), False)],
                          ids=["captured", "no-capture", "report-in-unified-log"])
 def test_validation_report_fails_the_test(args, to_stderr):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("MTL_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MTL_") and k != "PYTEST_ADDOPTS"}   # its summary line
     env["MTL_SHADER_VALIDATION"] = "1"
     env["COLUMNS"] = "1000"                                 # the short summary keeps each failure's exception type
     if to_stderr:

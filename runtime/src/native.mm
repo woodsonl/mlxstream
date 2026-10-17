@@ -172,7 +172,8 @@ NB_MODULE(_native, m) {
       .def_ro("steps_submitted", &RunnerStats::steps_submitted).def_ro("command_buffers", &RunnerStats::command_buffers)
       .def_ro("gpu_ms", &RunnerStats::gpu_ms).def_ro("wall_ms", &RunnerStats::wall_ms).def_ro("host_busy_ms", &RunnerStats::host_busy_ms)
       .def_ro("encode_ms", &RunnerStats::encode_ms).def_ro("commit_ms", &RunnerStats::commit_ms).def_ro("wait_ms", &RunnerStats::wait_ms)
-      .def_ro("done", &RunnerStats::done).def_ro("error", &RunnerStats::error);
+      .def_ro("done", &RunnerStats::done).def_ro("error", &RunnerStats::error)
+      .def_ro("failed_task", &RunnerStats::failed_task).def_ro("handoff_gaps_ms", &RunnerStats::handoff_gaps_ms);
 
   nb::class_<Runner>(m, "Runner", nb::type_slots(runner_slots))
       .def("__init__", [](Runner* self, const Device& d, const Icb& icb, const std::vector<Dispatch>& ops, std::vector<const Buffer*> resources,
@@ -191,5 +192,6 @@ NB_MODULE(_native, m) {
              for (auto& [publish, wait, task] : points) pts.push_back({publish, wait, task});
              r.set_host_points(std::move(pts), error_offset, timeout_ms, spin_us); },
            nb::arg("points"), nb::arg("error_offset"), nb::arg("timeout_ms") = 20000, nb::arg("spin_us") = 20000)
+      .def("host_tasks", &Runner::host_tasks, "the installed tasks, one per host point in program order")
       .def("drain", &Runner::drain);
 }

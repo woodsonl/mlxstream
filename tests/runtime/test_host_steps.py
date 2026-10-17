@@ -523,6 +523,19 @@ def test_a_command_buffer_that_finishes_without_its_signal_fails_at_once(monkeyp
     assert st["done"] == 1 and st["error"] == 4
 
 
+@pytest.mark.parametrize("value", ["-1:0", "+3:0", " 3:0", "3:", ":0", "3:0x", "3:9"])
+def test_a_malformed_drop_signal_is_refused(monkeypatch, value):
+    """The hook takes two decimal numbers and a point the program has; anything else fails instead of dropping nothing."""
+    monkeypatch.setenv("LITHOS_HOST_STEPS_DROP_SIGNAL", value)
+    with pytest.raises(RuntimeError, match="LITHOS_HOST_STEPS_DROP_SIGNAL"):
+        _Exchange().engine(10)
+
+
+def test_an_empty_drop_signal_is_unset(monkeypatch):
+    monkeypatch.setenv("LITHOS_HOST_STEPS_DROP_SIGNAL", "")
+    assert _Exchange().engine(10).run(3).steps == 3
+
+
 def test_a_failed_runs_tokens_leave_with_its_error():
     """The failed run's report rides on its error, so none of its tokens reach a later run (a session resets StepState
     and the ring, then runs the next request on the same Engine)."""
@@ -553,6 +566,25 @@ def test_a_run_drops_tokens_an_earlier_run_left_undrained(host_point):
     st = eng.runner.run(3, 1, 1, False, 0)
     assert st.steps_submitted == 3 and not st.error
     assert eng.run(2).tokens == [3, 4]
+
+
+def test_a_task_exception_no_run_took_stays_out_of_later_errors():
+    """A task raised in a run nothing took the exception from (a direct Runner.run here, or an Engine.run interrupted
+    before it did); a later run that fails for another reason carries no cause."""
+    def watch(step, point):
+        if step == 2:
+            raise ValueError("stale, from the direct run")
+
+    eng = Engine(_program(_base_buffers(100), [_tick()], [HostPoint("watch", 1, 1)]), host_tasks={"watch": watch})
+    assert "stale, from the direct run" in eng.runner.run(5, 1, 1, False, 0).error
+    for field in ("done", "error"):
+        eng.buffers["step_state"].write(struct.pack("<I", 0), LAYOUT.offset(field))
+    assert eng.run(3).steps == 3
+    eng.buffers["step_state"].write(struct.pack("<I", 1), LAYOUT.offset("done"))
+    eng.buffers["step_state"].write(struct.pack("<I", 3), LAYOUT.offset("error"))
+    with pytest.raises(RuntimeError, match="bounded worker barrier timed out") as failed:
+        eng.run(1)
+    assert failed.value.__cause__ is None
 
 
 @pytest.mark.parametrize("raised", [KeyboardInterrupt, SystemExit, LookupError])
@@ -710,6 +742,15 @@ def test_set_host_points_again_with_fewer_points_waits_for_the_gpu():
     assert all(b > a for a, b in zip(sinks, sinks[1:]))                  # each task ran after its step's slow op
 
 
+def test_handoff_gaps_measure_each_handoff():
+    """One gap per handoff: the GPU idle time from the command buffer that ends at the point to the one after the task."""
+    buffers, ops = _slow_tick(100, 1000)
+    eng = Engine(_program(buffers, ops, [HostPoint("t", 1, 1)]), host_tasks={"t": lambda s, k: None})
+    gaps = eng.run(10).handoff_gaps_ms
+    assert len(gaps) == 10 and min(gaps) > 0 and max(gaps) < 1000
+    assert Engine(_program(*_slow_tick(100, 1000))).run(10).handoff_gaps_ms == []
+
+
 def test_profile_refuses_a_program_with_host_points():
     with pytest.raises(RuntimeError, match="host points"):
         _Exchange().engine(10).profile(1)                                 # its ops would run without their tasks
@@ -821,7 +862,7 @@ def test_residency_declarations_hold_under_shader_validation():
     import sys
     from pathlib import Path
     here = Path(__file__).resolve()
-    env = {k: v for k, v in os.environ.items() if not k.startswith("MTL_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MTL_") and k != "PYTEST_ADDOPTS"}   # its summary line
     env["MTL_SHADER_VALIDATION"] = "1"
     p = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", str(here), "-k", "unbound_host_buffers"],
                        cwd=here.parents[2], env=env, capture_output=True, text=True, timeout=600)

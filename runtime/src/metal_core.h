@@ -164,6 +164,9 @@ struct RunnerStats {
   double wait_ms = 0;         // host wall time waiting for completion (overlaps GPU time)
   bool done = false;          // StepState.done was observed
   std::string error;          // the first failed command buffer's error and validation reports; stops the pump (Engine.run raises it)
+  int32_t failed_task = -1;   // the host point whose task failed the run (-1: none did)
+  std::vector<double> handoff_gaps_ms;   // per command buffer committed once a host point's task returned: its GPU start
+                                         // minus the GPU end of the one before it, the GPU's idle time at that handoff
 };
 
 class Runner {

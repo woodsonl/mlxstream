@@ -307,7 +307,8 @@ struct RunnerImpl {
   id<MTLBuffer> done_log = nil;            // StepState.done copied at the end of each step, indexed by step % kDoneLog
   uint64_t step_base = 0;                  // absolute index of the next step the runner begins
   uint64_t event_base = 0;                 // step index at which gpu_ev was created (its values count from there)
-  uint64_t drop_step = UINT64_MAX;         // test support: the one signal commit_segment leaves out
+  bool drop = false;                       // test support: commit_segment leaves out the signal of (drop_step, drop_point)
+  uint64_t drop_step = 0;
   uint32_t drop_point = 0;
   ~RunnerImpl() { if (resident) [q removeResidencySet:residency_set]; }
 };
@@ -405,18 +406,25 @@ void Runner::set_host_points(std::vector<HostPoint> points, uint32_t error_offse
   }
   if ((size_t)error_offset + 4 > r.state.length) throw std::runtime_error("host points: the error offset lies outside StepState");
   if (timeout_ms == 0) throw std::runtime_error("host points: timeout_ms must be at least 1");
-  // Test support: LITHOS_HOST_STEPS_DROP_SIGNAL=<step>:<point> leaves out that one signal (the step counts every step
-  // the runner begins), so a command buffer finishes without it. An empty value is unset.
-  uint64_t drop_step = UINT64_MAX; uint32_t drop_point = 0;
+  // Test support: LITHOS_HOST_STEPS_DROP_SIGNAL=<step>:<point>, two decimal numbers, leaves out that one signal (the
+  // step counts every step the runner begins), so a command buffer finishes without it. An empty value is unset.
+  bool drop = false; uint64_t drop_step = 0; uint32_t drop_point = 0;
   if (const char* v = getenv("LITHOS_HOST_STEPS_DROP_SIGNAL"); v && *v) {
-    unsigned long long s = 0; unsigned k = 0; char rest = 0;
-    if (sscanf(v, "%llu:%u%c", &s, &k, &rest) != 2) throw std::runtime_error("LITHOS_HOST_STEPS_DROP_SIGNAL: expected <step>:<point>");
-    drop_step = s; drop_point = k;
+    const std::string s(v);
+    const size_t colon = s.find(':');
+    auto digits = [](const std::string& t) { return !t.empty() && t.find_first_not_of("0123456789") == std::string::npos; };
+    if (colon == std::string::npos || !digits(s.substr(0, colon)) || !digits(s.substr(colon + 1)))
+      throw std::runtime_error("LITHOS_HOST_STEPS_DROP_SIGNAL: expected <step>:<point> in decimal digits, got '" + s + "'");
+    const uint64_t k = std::stoull(s.substr(colon + 1));
+    if (!points.empty() && k >= points.size())
+      throw std::runtime_error("LITHOS_HOST_STEPS_DROP_SIGNAL: point " + std::to_string(k) + ", but the program has " +
+                               std::to_string(points.size()) + " host points");
+    drop = true; drop_step = std::stoull(s.substr(0, colon)); drop_point = (uint32_t)k;
   }
   old.swap(r.points);
   r.points = std::move(points);
   r.error_off = error_offset; r.timeout_ms = timeout_ms; r.spin_us = spin_us;
-  r.drop_step = drop_step; r.drop_point = drop_point;
+  r.drop = drop; r.drop_step = drop_step; r.drop_point = drop_point;
   r.pub_at.assign(n + 1, {}); r.wait_at.assign(n + 1, {});
   std::vector<bool> pass_cut(n + 1, false), cb_cut(n + 1, false);
   pass_cut[0] = pass_cut[n] = cb_cut[0] = cb_cut[n] = true;
@@ -487,7 +495,7 @@ static id<MTLCommandBuffer> commit_segment(RunnerImpl& r, uint64_t step, uint32_
   const uint32_t n = (uint32_t)r.ops.size(), a = r.cb_cuts[seg], b = r.cb_cuts[seg + 1];
   id<MTLCommandBuffer> cb = [r.q commandBuffer];
   auto signal = [&](uint64_t s, uint32_t k) {
-    if (s != r.drop_step || k != r.drop_point) [cb encodeSignalEvent:r.gpu_ev value:event_value(r, s, k)];
+    if (!r.drop || s != r.drop_step || k != r.drop_point) [cb encodeSignalEvent:r.gpu_ev value:event_value(r, s, k)];
   };
   uint32_t start = a;
   for (uint32_t c : r.pass_cuts) {
@@ -547,7 +555,8 @@ static bool wait_cb(const RunnerImpl& r, id<MTLCommandBuffer> cb, std::string& e
   return true;
 }
 
-struct HostCb { id<MTLCommandBuffer> cb; uint64_t step; uint32_t seg; };
+struct HostCb { id<MTLCommandBuffer> cb; uint64_t step; uint32_t seg; bool after_point; };   // after_point: committed once
+                                                                                            // a host point's task returned
 
 static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reencode, uint64_t max_tokens) {
   RunnerStats st;
@@ -582,6 +591,7 @@ static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reenco
     size_t seen; { std::lock_guard<std::mutex> lk(r.mu); seen = r.tokens.size(); }
     if (st.done || (max_tokens && seen >= max_tokens)) stop = true;
   };
+  double prev_end = 0;                             // GPU end of the command buffer retired last (0: none in this run)
   auto retire = [&](bool block) {                  // retires completed command buffers, waiting for one if `block`
     while (!pending.empty() && err.empty()) {
       id<MTLCommandBuffer> cb = pending.front().cb;
@@ -595,6 +605,8 @@ static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reenco
       [cb waitUntilCompleted];                     // returns at once; the validation logs are complete only after it
       st.gpu_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
       st.command_buffers++;
+      if (pending.front().after_point && prev_end > 0) st.handoff_gaps_ms.push_back((cb.GPUStartTime - prev_end) * 1e3);
+      prev_end = cb.GPUEndTime;
       pending.pop_front();
       if (std::string e = failure(cb); !e.empty()) { err = e; return; }   // its error or validation reports stop the run
       block = false;
@@ -612,7 +624,8 @@ static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reenco
         if (a == 0 && enc_step > S0) for (uint32_t k : r.wait_at[n]) ready = ready && served(enc_step - 1, k);
         if (!ready || (enc_seg == 0 && !may_begin(enc_step))) break;
         const double e0 = now_ms();
-        @autoreleasepool { pending.push_back({commit_segment(r, enc_step, enc_seg, reencode), enc_step, enc_seg}); }
+        const bool after_point = !r.wait_at[a].empty() || (a == 0 && enc_step > S0 && !r.wait_at[n].empty());
+        @autoreleasepool { pending.push_back({commit_segment(r, enc_step, enc_seg, reencode), enc_step, enc_seg, after_point}); }
         st.encode_ms += now_ms() - e0;
         if (++enc_seg == nseg) { enc_seg = 0; enc_step++; }
       }
@@ -645,6 +658,7 @@ static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reenco
             catch (...) { terr = "the task threw an exception that is not a std::exception"; }   // an int, an NSException
             if (!ok) {
               err = "host step " + std::to_string(srv_step) + ", point " + std::to_string(srv_k) + ": " + (terr.empty() ? "the task failed" : terr);
+              st.failed_task = (int32_t)srv_k;
               break;
             }
             observe_state();                       // a task may set done itself: then no later step begins

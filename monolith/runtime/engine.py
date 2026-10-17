@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Union
 
 from . import _native as nt
@@ -21,6 +21,7 @@ class StepReport:
     encode_ms: float = 0.0
     commit_ms: float = 0.0
     wait_ms: float = 0.0
+    handoff_gaps_ms: List[float] = field(default_factory=list)   # GPU idle time at each host-point handoff
 
     @property
     def host_fraction(self) -> float:
@@ -141,14 +142,16 @@ class Engine:
         task's KeyboardInterrupt or SystemExit is raised as it was."""
         st = self.runner.run(max_steps, steps_per_cb, in_flight, reencode, max_tokens)
         report = StepReport(st.steps_submitted, st.command_buffers, st.gpu_ms, st.wall_ms, st.host_busy_ms, st.done, self.runner.drain(),
-                            st.encode_ms, st.commit_ms, st.wait_ms)
+                            st.encode_ms, st.commit_ms, st.wait_ms, list(st.handoff_gaps_ms))
         code = int(self.state()["error"]) if st.done else 0
         message = st.error or {3: "Megakernel: bounded worker barrier timed out",
                                4: "a host step failed in an earlier run; the program's state is unusable"}.get(code)
         if not message:
             return report
-        raised = [task.take_exception() for _, _, task in self.host_tasks if isinstance(task, nt.CallableTask)]
-        cause = next((e for e in raised if e is not None), None)
+        cause = None
+        if st.failed_task >= 0:                               # the failing task's own: an older one left elsewhere stays out
+            task = self.runner.host_tasks()[st.failed_task]
+            cause = task.take_exception() if isinstance(task, nt.CallableTask) else None
         if cause is not None and not isinstance(cause, Exception):
             raise cause                                       # KeyboardInterrupt, SystemExit
         error = RuntimeError(message)
