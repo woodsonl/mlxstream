@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 from . import _native as nt
 from .program import Program
@@ -46,16 +46,28 @@ def compile_pipelines(program, device, *, fast_math=False, cache=None):
 
 class Engine:
     """``buffers`` lets several programs share device buffers by name (a prefill program at T = P and a decode
-    program at T = 1 over the same weights, states and StepState)."""
+    program at T = 1 over the same weights, states and StepState), and supplies every buffer of role "host"."""
 
     def __init__(self, program: Program, device: Optional[nt.Device] = None, buffers: Optional[Dict[str, nt.Buffer]] = None,
-                 fast_math: bool = False, pipeline_cache: Optional[dict] = None) -> None:
-        """``fast_math``: compile the kernels with Metal's fast math mode (the default is the safe mode)."""
+                 fast_math: bool = False, pipeline_cache: Optional[dict] = None,
+                 host_tasks: Optional[Dict[str, Union["nt.HostTask", Callable[[int, int], None]]]] = None,
+                 host_timeout_ms: int = 20000) -> None:
+        """``fast_math``: compile the kernels with Metal's fast math mode (the default is the safe mode).
+        ``host_tasks``: the task of each host point, by its task name: an ``nt.HostTask`` or a Python callable
+        ``fn(step, point)``. ``host_timeout_ms``: the longest a run waits for the GPU to reach a host point or finish a
+        command buffer."""
         self.program = program
         self.fast_math = fast_math
         self.dev = device or nt.Device()
         self.buffers: Dict[str, nt.Buffer] = {}
         for name, spec in program.buffers.items():
+            if spec.role == "host":                          # the session allocates it; the program binds it by name
+                if buffers is None or name not in buffers:
+                    raise ValueError(f"host buffer {name}: the session allocates it and passes it in Engine(buffers=...)")
+                if buffers[name].nbytes < spec.nbytes:
+                    raise ValueError(f"host buffer {name}: {buffers[name].nbytes} bytes, program needs {spec.nbytes}")
+                self.buffers[name] = buffers[name]
+                continue
             if buffers is not None and name in buffers and spec.role != "params" and buffers[name].nbytes >= spec.nbytes:
                 self.buffers[name] = buffers[name]           # shared (weights, states, StepState, ring, arena values)
                 continue                                     # never a params record: its bytes are this program's own
@@ -74,6 +86,8 @@ class Engine:
                 buf = nt.Buffer(self.dev, spec.nbytes)
                 buf.fill(0)
             self.buffers[name] = buf
+        if program.host_points:
+            program.check_host_points(self._same_memory)
         self.pipelines = compile_pipelines(program, self.dev, fast_math=fast_math, cache=pipeline_cache)
         self.ops = []
         for o in program.ops:
@@ -88,12 +102,29 @@ class Engine:
         ring = self.buffers[program.ring]
         if ring.nbytes < program.ring_capacity * 8:
             raise ValueError("the token ring needs 8 bytes per slot: (sequence << 32) | token")
-        # Programs can retain unreferenced state buffers for session reuse. Only
-        # buffers actually bound by the ICB need a Metal residency declaration.
+        # Programs can retain unreferenced state buffers for session reuse. Only buffers the ICB binds, buffers its
+        # kernels reach through GPU addresses, and the session's host buffers need a Metal residency declaration.
         resources = {name: self.buffers[name] for op in program.ops for _, name, _ in op.bindings}
+        for op in program.ops:
+            for name in [*op.meta.get("indirect_reads", ()), *op.meta.get("indirect_writes", ())]:
+                resources[name] = self.buffers[name]
+        resources.update({name: self.buffers[name] for name, spec in program.buffers.items() if spec.role == "host"})
         self.runner = nt.Runner(self.dev, self.icb, self.ops, list(resources.values()), self.buffers[program.step_state],
                                 lay.offset("done"), lay.offset("ring_head"), lay.offset("ring_tail"), ring, program.ring_capacity,
                                 [buffer for name, buffer in resources.items() if program.buffers[name].role in ('weights', 'params')])
+        self.host_tasks = []
+        if program.host_points:
+            for p in program.host_points:
+                task = (host_tasks or {}).get(p.task)
+                if task is None:
+                    raise ValueError(f"host point {p.task!r}: no task supplied (Engine(host_tasks={{{p.task!r}: ...}}))")
+                self.host_tasks.append((p.publish, p.wait, task if isinstance(task, nt.HostTask) else nt.CallableTask(task)))
+            self.runner.set_host_points(self.host_tasks, lay.offset("error"), host_timeout_ms)
+
+    def _same_memory(self, a: str, b: str) -> bool:
+        """Whether two buffer names reach overlapping memory (a session can pass one buffer under two names)."""
+        x, y = self.buffers[a], self.buffers[b]
+        return a == b or (x.gpu_address < y.gpu_address + y.nbytes and y.gpu_address < x.gpu_address + x.nbytes)
 
     def run(self, max_steps: int, *, steps_per_cb: int = 8, in_flight: int = 3, reencode: bool = False, max_tokens: int = 0) -> StepReport:
         """Replay up to ``max_steps`` steps (``max_tokens`` > 0: stop submitting once that many tokens arrived; the
@@ -103,6 +134,8 @@ class Engine:
             raise RuntimeError(st.error)
         if st.done and int(self.state()["error"]) == 3:
             raise RuntimeError("Megakernel: bounded worker barrier timed out")
+        if st.done and int(self.state()["error"]) == 4:
+            raise RuntimeError("a host step failed in an earlier run; the program's state is unusable")
         return StepReport(st.steps_submitted, st.command_buffers, st.gpu_ms, st.wall_ms, st.host_busy_ms, st.done, self.runner.drain(),
                           st.encode_ms, st.commit_ms, st.wait_ms)
 
