@@ -151,6 +151,8 @@ def test_emulation_bit_for_bit(type_id):
             want = emu.dense_tc(type_id, w, xq, n_in, n_out, 8, v)
             got[v] = gpu.dense_tc(type_id, w, xq, n_in, n_out, (1, 3, 8), v)
             for t, y in got[v].items():
+                # the bar is docs/design/flash-next.md invariant 5 (nvcc's sequence, bit for bit); basalt has no
+                # counterpart test
                 assert np.array_equal(y[:t].view(np.uint32), want[:t].view(np.uint32)), (n_in, v, t)
         if n_in == 6144:                                                 # power: the orders' bits differ
             for i, u in enumerate(VARIANTS):
@@ -169,6 +171,7 @@ def test_pair_emulation_bit_for_bit():
         for m, (ty, w, n_out) in enumerate(((t0, w0, 35), (t1, w1, 18))):
             want = emu.dense_tc(ty, w, xq, n_in, n_out, 8, "pair")
             for t, o in outs.items():
+                # flash-next.md invariant 5, bit for bit; basalt has no counterpart test
                 assert np.array_equal(o[m][:t].view(np.uint32), want[:t].view(np.uint32)), (t0, t1, m, t)
 
 
