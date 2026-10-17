@@ -442,3 +442,181 @@ def test_device_count(fx):
                       [0] * cap, edst, cap, cap, cap)
     touched = np.count_nonzero(r["out"][dst[count:]] != 0xA5A5A5A5)
     assert touched == 0, touched
+
+
+# ---- the IEEE helpers, bit for bit against numpy's IEEE float32 ------------------------------------------------------
+
+def signed(rng, n, lo, hi):
+    """n float32 of random sign with log2 |x| uniform in [lo, hi) (subnormals by their bit patterns below -126)."""
+    v = rng.choice([-1.0, 1.0], n) * np.exp2(rng.uniform(lo, hi, n))
+    sub = np.abs(v) < 2.0 ** -126
+    v = v.astype(F32)
+    v[sub] = (np.sign(v[sub]) * rng.integers(1, 1 << 23, np.count_nonzero(sub)).astype(np.uint32).view(F32)).astype(F32)
+    return v
+
+
+def helper_case(name, body, plain, want, *args, min_diff=10):
+    """The helper (``body``) bit for bit against numpy (``want``), NaN as NaN; the plain Metal operation (``plain``)
+    must differ from numpy on at least ``min_diff`` inputs, or the planted inputs would not test the helper."""
+    got, raw = gpu_eval(body, *args), gpu_eval(plain, *args)
+    nan = np.isnan(want)
+    ok = (same_bits(got, want) & ~nan) | (np.isnan(got) & nan)
+    assert ok.all(), (name, np.flatnonzero(~ok)[:8], [a[np.flatnonzero(~ok)[:4]] for a in args])
+    diff = np.count_nonzero(~((same_bits(raw, want) & ~nan) | (np.isnan(raw) & nan)))
+    assert diff >= min_diff, (name, diff)
+    return diff
+
+
+def test_ieee_helpers():
+    """basalt_q8_1.metal's ieee_div127, ieee_rcp, ieee_fma (an integer n) and ieee_div (b >= 1) bit for bit against
+    numpy's IEEE float32 (fma: tests/kernels/basalt_emu.py's fma32) on planted inputs: subnormal and tiny operands and
+    results, the 2^-126 boundary, cancellations to a subnormal sum, ties broken by a subnormal addend, overflow to
+    infinity, signed zeros, infinities and NaN; each with the plain Metal operation differing on them (the negative
+    control)."""
+    rng = np.random.default_rng(12)
+    n = 1 << 16
+    with np.errstate(all="ignore"):
+        amax = np.abs(np.concatenate([signed(rng, n, -149, -90), np.uint32(np.arange(1, 4096)).view(F32),
+                                      F32([0.0, 2.0 ** -126, 2.0 ** -119, 2.0 ** -100, 1.0, 3e38, np.inf])]))
+        d127 = helper_case("ieee_div127", "r = ieee_div127(a);", "r = a / 127.0f;", amax / F32(127), amax)
+        s = np.abs(np.concatenate([signed(rng, n, -149, -95), F32([0.0, -0.0, 2.0 ** -149, 2.0 ** -128, 2.0 ** -127,
+                                                                   2.0 ** -126, 2.0 ** -100, 1.0, 2.0 ** 120,
+                                                                   np.inf, np.nan])]))
+        s[-10] = -0.0
+        rcp = helper_case("ieee_rcp", "r = ieee_rcp(a);", "r = 1.0f / a;", F32(1) / s, s)
+        # fma(a, n, c): a and c over every magnitude class, n an integer up to 2^13 (|s - hx| <= 8128)
+        a = np.concatenate([signed(rng, n, -149, -90), signed(rng, n, -100, 10), signed(rng, n, -149, -90),
+                            signed(rng, n, -140, -95), signed(rng, 4096, 60, 120)])
+        c = np.concatenate([signed(rng, n, -149, -90), signed(rng, n, -149, -100), signed(rng, n, -100, 70),
+                            signed(rng, n, -149, -90), signed(rng, 4096, -149, -127)])
+        k = rng.integers(-8128, 8129, a.size).astype(F32)
+        cancel = rng.integers(0, a.size, 8192)                     # c = -a * k + a few units: a subnormal sum
+        c[cancel] = (-(a[cancel].astype(np.float64) * k[cancel]) + rng.integers(-40, 40, 8192) * 2.0 ** -149).astype(F32)
+        tie_a = F32(1 + 2.0 ** -23) * np.exp2(rng.integers(-90, 60, 512)).astype(F32)       # a * 3: a tie of fp32
+        extra = [(tie_a, np.full(512, 3, F32), np.where(rng.random(512) < 0.5, F32(1), F32(-1))
+                  * np.uint32(rng.integers(1, 1 << 23, 512)).view(F32)),                  # broken by a subnormal c
+                 (F32([0.0, -0.0, 0.0, 2.0 ** -90, np.inf, np.nan, 2.0 ** -110, 2.0 ** -110, 2.0 ** -110]),
+                  F32([5, 3, 0, 0, 0, 2, 7, 7, 7]),
+                  np.concatenate([np.uint32([3, 0x80000005, 9, 0x80000001]).view(F32),
+                                  F32([2.0 ** -140, 1.0, 2.0 ** 70, -(2.0 ** 63), np.inf])]))]
+        for ea, ek, ec in extra:
+            a, k, c = np.concatenate([a, ea]), np.concatenate([k, ek]), np.concatenate([c, ec])
+        want = emu.fma32(a, k, c)
+        fma_diff = helper_case("ieee_fma", "r = ieee_fma(a, b, c);", "r = fma(a, b, c);", want, a, k, c)
+        sub = np.count_nonzero((want != 0) & (np.abs(want) < F32(2.0 ** -126)))
+        # a / b for b >= 1: the SwiGLU's quotient g / (1 + e)
+        g = np.concatenate([signed(rng, n, -149, -90), signed(rng, n, -100, 0), signed(rng, 4096, -20, 7),
+                            F32([0.0, -0.0, np.inf, -np.inf, np.nan, 2.0 ** -100, -(2.0 ** -126)])])
+        b = np.concatenate([np.exp2(rng.uniform(0, 1.5, n)), np.exp2(rng.uniform(0, 60, n)), np.exp2(rng.uniform(0, 128, 4096)),
+                            F32([2.0, 1.0, np.inf, 3.0, 2.0, np.inf, np.nan])]).astype(F32)
+        b[-13] = np.inf
+        div_diff = helper_case("ieee_div", "r = ieee_div(a, b);", "r = a / b;", g / b, g, b)
+    assert sub > 1000, sub
+    print(f"\nIEEE helpers bit for bit: ieee_div127 {amax.size} ({d127} differ from the plain division), ieee_rcp "
+          f"{s.size} ({rcp}), ieee_fma {a.size} ({fma_diff}; {sub} subnormal results), ieee_div {g.size} ({div_diff})")
+
+
+def test_warp_sum_ieee():
+    """warp_sum_ieee (basalt's warp_sum with IEEE adds) against the 32-lane butterfly of numpy's float32 adds, on lanes
+    holding subnormal, tiny and cancelling values; the plain butterfly (warp_sum) must differ on them."""
+    rng = np.random.default_rng(13)
+    v = np.concatenate([signed(rng, 32 * 4096, -149, -95), signed(rng, 32 * 2048, -149, -60)])
+    pair = rng.integers(0, v.size // 32, 2048) * 32
+    v[pair + 1] = -v[pair] + np.uint32(rng.integers(1, 64, 2048)).view(F32)     # cancelling neighbours
+    want = np.repeat(emu.butterfly(v.reshape(-1, 32), np.add), 32)
+    diff = helper_case("warp_sum_ieee", "r = warp_sum_ieee(a);", "r = warp_sum(a);", want, v)
+    print(f"\nwarp_sum_ieee: {v.size // 32} sums bit for bit ({diff} lanes differ with the plain butterfly)")
+
+
+# ---- planted subnormals through the kernels, with the plain kernels as the negative control ---------------------------
+
+def plain_source():
+    """The drafter kernels with each IEEE helper replaced by the plain Metal operation (what a port without them would
+    compute): the negative control the planted tests must catch."""
+    body = kernels.template("basalt_s2_experts.metal")
+    for ieee, plain in (("ieee_fma(", "fma("), ("ieee_mul(", "mul_plain("), ("ieee_div(", "div_plain("),
+                        ("ieee_div127(", "div127_plain("), ("ieee_rcp(", "rcp_plain("), ("warp_sum_ieee(", "warp_sum(")):
+        body = body.replace(ieee, plain)
+    helpers = """
+static inline float mul_plain(float a, float b) { return a * b; }
+static inline float div_plain(float a, float b) { return a / b; }
+static inline float div127_plain(float a) { return a / 127.0f; }
+static inline float rcp_plain(float a) { return 1.0f / a; }
+"""
+    return kernels.PRELUDE + kernels.template("basalt_fp.metal") + kernels.template("basalt_q8_1.metal") + helpers + body
+
+
+def test_quantizer_planted_negative_control():
+    """The planted blocks of test_quantize_q8_0_scaled through the plain kernel: it must get bytes wrong that the IEEE
+    kernel gets right."""
+    x = planted_blocks()
+    want_b, want_s = emu.q8_0_scaled(x)
+    blocks, scales = gpu.q8_0_scaled(x, src=plain_source())
+    bad = np.count_nonzero(np.any(blocks.reshape(-1, 34) != want_b.reshape(-1, 34), axis=1)
+                           | (scales.view(np.uint32) != want_s.view(np.uint32)))
+    assert bad > 50, bad
+    print(f"\nplain quantizer: {bad} of {x.size // 32} planted blocks wrong")
+
+
+def test_planted_tiny_activations(fx):
+    """moe_grouped_s2 on activation rows whose fp32 scales are subnormal or tiny (the quantizer's s for rows of tiny
+    activations): products dw * dx, partial sums and butterfly sums below 2^-126, gate and up values whose SwiGLU
+    quotient and product are subnormal, an intermediate quantized on subnormal scales. Every stage bit for bit against
+    the emulation and the output and scratch against the per-entry calls; the plain kernels must differ."""
+    rng = np.random.default_rng(14)
+    x, _ = fill_x(rng, 4)
+    xs = np.concatenate([signed(rng, NC_GU, -149, -100), np.abs(signed(rng, NC_GU, -78, -72)),
+                         np.abs(signed(rng, NC_GU, -140, -60)), np.abs(signed(rng, NC_GU, -126, -110))]).astype(F32)
+    xs = np.abs(xs)
+    grp, gstart = [(0, 2 * BLOB), (1, 0), (0, 5 * BLOB)], [0, 4, 7, 10]
+    etok, edst = [0, 1, 2, 3, 3, 1, 0, 2, 0, 1], list(rng.permutation(10))
+    r, plan = check_call("moe_grouped_s2 (planted tiny activation scales)", fx, grp, gstart, 3, etok, edst, 3, 10, 10,
+                         x=x, xs=xs)
+    sc = kernels.basalt_s2_scratch(10)
+    gu = r["scratch"][: 4 * 2 * 10 * FF].view(F32)
+    hs = r["scratch"][sc["hs"]: sc["hs"] + 4 * 10 * NC_D].view(F32)
+    tiny = lambda v: np.count_nonzero((v != 0) & (np.abs(v) < F32(2.0 ** -126)))
+    with np.errstate(under="ignore"):
+        prods = sum(tiny(emu.h2f(blob_parts(fx.blob(grp[g]))[1])[:, np.arange(NC_GU) // 2][None]
+                         * np.stack([xs[t * NC_GU: (t + 1) * NC_GU] for t in etok[gstart[g]: gstart[g + 1]]])[:, None])
+                    for g in range(3))
+    counts = {"gate/up products": prods, "h": tiny(gu[: 10 * FF]), "h scales": tiny(hs)}
+    assert all(v > 20 for v in counts.values()), counts
+    p = gpu.s2_experts(fx.bufs, grp, gstart, 3, etok, edst, x, xs, 3, 10, 10, src=plain_source())
+    wrong = {"out": np.count_nonzero(p["out"] != r["out"]),
+             "scratch": np.count_nonzero(p["scratch"][: sc["hq"]].view(np.uint32) != r["scratch"][: sc["hq"]].view(np.uint32))}
+    assert wrong["out"] > 100 and wrong["scratch"] > 100, wrong
+    print(f"\nsubnormals in {counts}; the plain kernels differ in {wrong}")
+
+
+def test_swiglu_planted():
+    """basalt_s2_swiglu alone on planted gate and up values, bit for bit against the emulation (the exponential from
+    the GPU): gates tiny and subnormal (g / 2 subnormal), +-0, in [-91, -86] (the exponential overflows past -88.72 and
+    the quotient is -0) and up values making a subnormal product, large and non-finite gates; the plain kernel must
+    differ."""
+    from tests.kernels.test_basalt_experts import gpu_expf_neg
+    rng = np.random.default_rng(15)
+    cap = 8
+    n = cap * FF
+    g = np.concatenate([signed(rng, n // 4, -149, -90), rng.uniform(-91, -86, n // 4),
+                        rng.standard_normal(n // 4) * 4, signed(rng, n // 4, -126, -60)]).astype(F32)
+    u = np.concatenate([rng.standard_normal(n // 4), signed(rng, n // 4, -60, -1), rng.standard_normal(n // 4),
+                        signed(rng, n // 4, -90, -40)]).astype(F32)
+    g[:8] = [0.0, -0.0, np.inf, -np.inf, np.nan, 100.0, -100.0, 2.0 ** -149]
+    gu = np.concatenate([g, u])
+    params = kernels.basalt_s2_params(cap)
+
+    def run(src):
+        out = gpu.run(gpu.pipeline(src, "basalt_s2_swiglu"), [gu.tobytes()], params, 1,
+                      -(-n // kernels.S2_THREADS), kernels.S2_THREADS)
+        return np.frombuffer(out[0], F32)
+
+    got, plain = run(kernels.basalt_s2_experts_source()), run(plain_source())
+    want = emu.s2_swiglu(g, u, gpu_expf_neg(g))
+    nan = np.isnan(want)
+    assert np.array_equal(got[n:].view(np.uint32), u.view(np.uint32))          # the up half is read only
+    assert np.all((same_bits(got[:n], want) & ~nan) | (np.isnan(got[:n]) & nan))
+    diff = np.count_nonzero(~((same_bits(plain[:n], want) & ~nan) | (np.isnan(plain[:n]) & nan)))
+    sub = np.count_nonzero((want != 0) & (np.abs(want) < F32(2.0 ** -126)))
+    assert diff > 100 and sub > 100, (diff, sub)
+    print(f"\nSwiGLU planted: {n} values bit for bit, {sub} subnormal; the plain kernel differs on {diff}")
