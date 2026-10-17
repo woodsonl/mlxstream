@@ -86,6 +86,10 @@ class Engine:
                 buf = nt.Buffer(self.dev, spec.nbytes)
                 buf.fill(0)
             self.buffers[name] = buf
+        for op in program.ops:
+            for name in [*op.meta.get("indirect_reads", ()), *op.meta.get("indirect_writes", ())]:
+                if name not in self.buffers:
+                    raise ValueError(f"op {op.name or op.kernel}: reaches {name!r} through a GPU address, which is not a program buffer")
         if program.host_points:
             program.check_host_points(self._same_memory)
         self.pipelines = compile_pipelines(program, self.dev, fast_math=fast_math, cache=pipeline_cache)
@@ -96,6 +100,10 @@ class Engine:
                 d.buffer(index, self.buffers[bname], off)
             for index, length in o.threadgroup_memory:
                 d.threadgroup_memory(index, length)
+            for name in o.meta.get("indirect_reads", ()):     # Queue.run and Queue.profile declare these resident
+                d.use(self.buffers[name])
+            for name in o.meta.get("indirect_writes", ()):
+                d.use(self.buffers[name], True)
             self.ops.append(d)
         self.icb = nt.Icb(self.dev, self.ops)
         lay = program.layout
@@ -107,8 +115,6 @@ class Engine:
         resources = {name: self.buffers[name] for op in program.ops for _, name, _ in op.bindings}
         for op in program.ops:
             for name in [*op.meta.get("indirect_reads", ()), *op.meta.get("indirect_writes", ())]:
-                if name not in self.buffers:
-                    raise ValueError(f"op {op.name or op.kernel}: reaches {name!r} through a GPU address, which is not a program buffer")
                 resources[name] = self.buffers[name]
         resources.update({name: self.buffers[name] for name, spec in program.buffers.items() if spec.role == "host"})
         self.runner = nt.Runner(self.dev, self.icb, self.ops, list(resources.values()), self.buffers[program.step_state],
@@ -130,16 +136,24 @@ class Engine:
 
     def run(self, max_steps: int, *, steps_per_cb: int = 8, in_flight: int = 3, reencode: bool = False, max_tokens: int = 0) -> StepReport:
         """Replay up to ``max_steps`` steps (``max_tokens`` > 0: stop submitting once that many tokens arrived; the
-        queued buffers still complete, so a few more steps may run)."""
+        queued buffers still complete, so a few more steps may run). A failed run raises RuntimeError with the run's
+        StepReport, its tokens included, as ``report``; the exception a Python task raised is its cause, except that a
+        task's KeyboardInterrupt or SystemExit is raised as it was."""
         st = self.runner.run(max_steps, steps_per_cb, in_flight, reencode, max_tokens)
-        if st.error:
-            raise RuntimeError(st.error)
-        if st.done and int(self.state()["error"]) == 3:
-            raise RuntimeError("Megakernel: bounded worker barrier timed out")
-        if st.done and int(self.state()["error"]) == 4:
-            raise RuntimeError("a host step failed in an earlier run; the program's state is unusable")
-        return StepReport(st.steps_submitted, st.command_buffers, st.gpu_ms, st.wall_ms, st.host_busy_ms, st.done, self.runner.drain(),
-                          st.encode_ms, st.commit_ms, st.wait_ms)
+        report = StepReport(st.steps_submitted, st.command_buffers, st.gpu_ms, st.wall_ms, st.host_busy_ms, st.done, self.runner.drain(),
+                            st.encode_ms, st.commit_ms, st.wait_ms)
+        code = int(self.state()["error"]) if st.done else 0
+        message = st.error or {3: "Megakernel: bounded worker barrier timed out",
+                               4: "a host step failed in an earlier run; the program's state is unusable"}.get(code)
+        if not message:
+            return report
+        raised = [task.take_exception() for _, _, task in self.host_tasks if isinstance(task, nt.CallableTask)]
+        cause = next((e for e in raised if e is not None), None)
+        if cause is not None and not isinstance(cause, Exception):
+            raise cause                                       # KeyboardInterrupt, SystemExit
+        error = RuntimeError(message)
+        error.report = report
+        raise error from cause
 
     def profile(self, steps: int = 3) -> List[List[Tuple[float, float]]]:
         """Per-dispatch GPU (start, end) ms for ``steps`` re-encoded steps (one encoder per op with timestamp counter

@@ -6,7 +6,10 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
+#import <Foundation/Foundation.h>
+#include <algorithm>
 #include <cstring>
+#include <memory>
 #include <tuple>
 #include "metal_core.h"
 
@@ -14,9 +17,10 @@ namespace nb = nanobind;
 using namespace monolith;
 
 // A host task written in Python: fn(step, point). run() is called with the GIL released, so the call takes it; an
-// exception fails the run with its message.
+// exception fails the run with its message and stays on the task (take_exception) for the caller to raise.
 struct CallableTask : HostTask {
   nb::callable fn;
+  nb::object exception;
   explicit CallableTask(nb::callable f) : fn(std::move(f)) {}
   bool run(const HostCall& call, std::string& error) override {
     nb::gil_scoped_acquire gil;
@@ -26,8 +30,24 @@ struct CallableTask : HostTask {
       return true;
     } catch (nb::python_error& e) {
       error = e.what();
+      exception = nb::borrow(e.value());
       return false;
     }
+  }
+};
+
+// Test support: a C++ task that throws, at `step`, what a C++ task may throw besides a std::exception: an int, or an
+// NSException (`objc`).
+struct ThrowingTask : HostTask {
+  uint64_t step;
+  bool objc;
+  ThrowingTask(uint64_t s, bool o) : step(s), objc(o) {}
+  bool run(const HostCall& call, std::string&) override {
+    if (call.step == step) {
+      if (objc) [NSException raise:NSGenericException format:@"thrown at step %llu", (unsigned long long)step];
+      throw 42;
+    }
+    return true;
   }
 };
 
@@ -36,20 +56,29 @@ struct CallableTask : HostTask {
 static int callable_task_traverse(PyObject* self, visitproc visit, void* arg) {
   Py_VISIT(Py_TYPE(self));
   if (!nb::inst_ready(self)) return 0;
-  Py_VISIT(nb::inst_ptr<CallableTask>(self)->fn.ptr());
+  CallableTask* task = nb::inst_ptr<CallableTask>(self);
+  Py_VISIT(task->fn.ptr());
+  Py_VISIT(task->exception.ptr());                    // its traceback's frames usually reach the Engine too
   return 0;
 }
 static int callable_task_clear(PyObject* self) {
   if (!nb::inst_ready(self)) return 0;
-  nb::callable dying = std::move(nb::inst_ptr<CallableTask>(self)->fn);   // the task holds no callable before it dies
+  CallableTask* task = nb::inst_ptr<CallableTask>(self);
+  nb::callable fn = std::move(task->fn);              // the task holds neither before they die
+  nb::object exception = std::move(task->exception);
   return 0;
 }
 static int runner_traverse(PyObject* self, visitproc visit, void* arg) {
   Py_VISIT(Py_TYPE(self));
   if (!nb::inst_ready(self)) return 0;
+  // A task handed in from Python is a shared_ptr whose deleter holds one reference to the Python object, per control
+  // block; a task made in C++ holds none. Visit exactly those references, without making a wrapper.
+  std::vector<const void*> blocks;
   for (auto& task : nb::inst_ptr<Runner>(self)->host_tasks()) {
-    nb::handle h = nb::find(task);
-    Py_VISIT(h.ptr());
+    auto* owner = std::get_deleter<nb::detail::py_deleter>(task);
+    if (!owner || std::find(blocks.begin(), blocks.end(), owner) != blocks.end()) continue;
+    blocks.push_back(owner);
+    Py_VISIT(owner->o);
   }
   return 0;
 }
@@ -113,8 +142,8 @@ NB_MODULE(_native, m) {
       .def("threadgroup", [](Dispatch& d, uint32_t x, uint32_t y, uint32_t z) -> Dispatch& { d.threadgroup[0] = x; d.threadgroup[1] = y; d.threadgroup[2] = z; return d; },
            nb::arg("x"), nb::arg("y") = 1, nb::arg("z") = 1, nb::rv_policy::reference_internal)
       .def("barrier", [](Dispatch& d, bool on) -> Dispatch& { d.barrier_before = on; return d; }, nb::arg("on") = true, nb::rv_policy::reference_internal)
-      .def("use", [](Dispatch& d, const Buffer& b) -> Dispatch& { d.uses.push_back(&b); return d; },
-           nb::arg("buffer"), nb::rv_policy::reference_internal, nb::keep_alive<1, 2>());
+      .def("use", [](Dispatch& d, const Buffer& b, bool write) -> Dispatch& { d.uses.push_back({&b, write}); return d; },
+           nb::arg("buffer"), nb::arg("write") = false, nb::rv_policy::reference_internal, nb::keep_alive<1, 2>());
 
   nb::class_<RunResult>(m, "RunResult")
       .def_ro("gpu_ms", &RunResult::gpu_ms).def_ro("wall_ms", &RunResult::wall_ms).def_ro("error", &RunResult::error);
@@ -130,7 +159,14 @@ NB_MODULE(_native, m) {
       .def_prop_ro("count", &Icb::count);
 
   nb::class_<HostTask>(m, "HostTask");    // implemented in C++ (later tiers) or by CallableTask
-  nb::class_<CallableTask, HostTask>(m, "CallableTask", nb::type_slots(callable_task_slots)).def(nb::init<nb::callable>(), nb::arg("fn"));
+  nb::class_<CallableTask, HostTask>(m, "CallableTask", nb::type_slots(callable_task_slots))
+      .def(nb::init<nb::callable>(), nb::arg("fn"))
+      .def("take_exception", [](CallableTask& t) -> nb::object {
+             nb::object e = std::move(t.exception);
+             if (!e.is_valid()) return nb::none();
+             return e; },
+           "the exception the task's last failing call raised (None if none); the task no longer holds it");
+  nb::class_<ThrowingTask, HostTask>(m, "_ThrowingTask").def(nb::init<uint64_t, bool>(), nb::arg("step"), nb::arg("objc") = false);
 
   nb::class_<RunnerStats>(m, "RunnerStats")
       .def_ro("steps_submitted", &RunnerStats::steps_submitted).def_ro("command_buffers", &RunnerStats::command_buffers)

@@ -167,6 +167,11 @@ def _op(kernel, bindings, writes, threads=32, barrier=True):
     return OpSpec(kernel, bindings, (1, 1, 1), (threads, 1, 1), barrier, name=kernel, meta={"writes": list(writes)})
 
 
+def _tick():
+    """Emits StepState.step and advances it."""
+    return _op("tick", [(0, "step_state", 0), (1, "params", 0), (2, "ring", 0)], [0, 2])
+
+
 def _program(buffers, ops, points=(), ring_cap=1024):
     return Program(kernels={k: KernelSpec(SRC, k) for k in KERNELS}, buffers=buffers, ops=list(ops),
                    ring_capacity=ring_cap, layout=LAYOUT, host_points=list(points))
@@ -378,10 +383,9 @@ def test_several_points_per_step_see_their_boundaries():
     assert seen == want and rep.tokens == tokens and rep.steps == n
 
 
-@pytest.mark.parametrize("reencode", [False, True])
-def test_a_point_at_the_step_start_feeds_a_later_op_across_runs(reencode):
+def _start_point_engine():
     """publish 0, wait 1: the task reads what the previous step left and writes rows only the step's second op reads,
-    while the first op may already run. The first step of each run is served without a signal."""
+    while the first op may already run. Returns the engine and the task's (step, StepState.step, prev) calls."""
     dev = nt.Device()
     rows = nt.Buffer(dev, 16)
     buffers = {**_base_buffers(1000), "l0": BufferSpec(16), "prev": BufferSpec(16), "rows": BufferSpec(16, role="host")}
@@ -397,14 +401,37 @@ def test_a_point_at_the_step_start_feeds_a_later_op_across_runs(reencode):
 
     eng = Engine(_program(buffers, ops, [HostPoint("rows", 0, 1, writes=["rows"], reads=["prev", "step_state"])]), dev,
                  buffers={"rows": rows}, host_tasks={"rows": task})
-    tokens = eng.run(40, reencode=reencode).tokens + eng.run(25, reencode=reencode).tokens
-    prev, want, want_calls = 0, [], []
-    for s in range(65):
+    return eng, calls
+
+
+def _start_point_model(steps):
+    """The task's calls and the tokens of ``steps`` steps of the start-point program."""
+    prev, want_calls, want = 0, [], []
+    for s in range(steps):
         want_calls.append((s, s, prev))
         out = ((s + 1) * 11 + ((prev * 7 + s) & M)) & M
         want.append(out & 0x7FFFFFFF)
         prev = out
-    assert calls == want_calls and tokens == want
+    return want_calls, want
+
+
+@pytest.mark.parametrize("reencode", [False, True])
+def test_a_point_at_the_step_start_feeds_a_later_op_across_runs(reencode):
+    """The first step of each run is served without a signal."""
+    eng, calls = _start_point_engine()
+    tokens = eng.run(40, reencode=reencode).tokens + eng.run(25, reencode=reencode).tokens
+    assert (calls, tokens) == _start_point_model(65)
+
+
+@pytest.mark.parametrize("reencode", [False, True])
+def test_max_tokens_with_a_point_at_the_step_start_across_runs(reencode):
+    """A max_tokens stop comes after the signal of the next step's point was committed: that step does not begin in
+    the stopped run, and the next run serves it without a signal, with its own StepState.step."""
+    eng, calls = _start_point_engine()
+    r1 = eng.run(100, max_tokens=10, reencode=reencode)
+    r2 = eng.run(7, reencode=reencode)
+    assert 10 <= r1.steps <= 12 and not r1.done and r2.steps == 7
+    assert (calls, r1.tokens + r2.tokens) == _start_point_model(r1.steps + 7)
 
 
 def test_a_failing_task_ends_the_run_with_every_command_buffer_finished():
@@ -423,6 +450,49 @@ def test_a_failing_task_ends_the_run_with_every_command_buffer_finished():
     assert time.monotonic() - t0 < 5.0 and len(ex.calls) == 8
 
 
+def _slow_tick(n_stop, width):
+    """A bounded slow loop (``width`` iterations) into ``sink``, then the step's advance."""
+    buffers = {**_base_buffers(n_stop, width=width), "sink": BufferSpec(16)}
+    return buffers, [_op("slow", [(0, "sink", 0), (1, "step_state", 0), (2, "params", 0)], [0]), _tick()]
+
+
+def _sink(eng):
+    return struct.unpack("<f", eng.read("sink", 4))[0]
+
+
+def test_a_failure_returns_after_the_gpu_work_beside_the_task():
+    def fail(step, point):
+        raise ValueError("stop here")
+
+    buffers, ops = _slow_tick(10, 60_000_000)
+    eng = Engine(_program(buffers, ops, [HostPoint("fail", 0, 1)]), host_tasks={"fail": fail})
+    with pytest.raises(RuntimeError, match="stop here"):
+        eng.run(5)
+    assert _sink(eng) > 0                                                 # slow ran beside the task and finished first
+    st = eng.state()
+    assert st["done"] == 1 and st["error"] == 4 and st["step"] == 0
+
+
+@pytest.mark.parametrize("objc", [False, True], ids=["cpp", "objc"])
+def test_a_task_throwing_a_non_standard_exception_fails_the_run_cleanly(objc):
+    """A C++ task may throw what is not a std::exception (an int, an NSException): the run still waits for the GPU,
+    marks the program failed and counts the step, so the next run numbers its steps on."""
+    steps = []
+    buffers, ops = _slow_tick(100, 20_000_000)
+    eng = Engine(_program(buffers, ops, [HostPoint("rec", 0, 1), HostPoint("throw", 0, 1)]),
+                 host_tasks={"rec": lambda s, k: steps.append(s), "throw": nt._ThrowingTask(3, objc)})
+    with pytest.raises(RuntimeError, match="host step 3, point 1: the task threw"):
+        eng.run(10)
+    sink = _sink(eng)
+    time.sleep(0.5)
+    st = eng.state()
+    assert _sink(eng) == sink                                             # step 3's slow op finished before run() returned
+    assert st["done"] == 1 and st["error"] == 4 and st["step"] == 3 and steps == [0, 1, 2, 3]
+    for field in ("done", "error"):
+        eng.buffers["step_state"].write(struct.pack("<I", 0), LAYOUT.offset(field))
+    assert eng.run(2).steps == 2 and steps == [0, 1, 2, 3, 4, 5]
+
+
 def test_a_host_timeout_waits_for_the_gpu_and_fails():
     buffers = {**_base_buffers(10, width=60_000_000), "sink": BufferSpec(16)}
     ops = [_op("slow", [(0, "sink", 0), (1, "step_state", 0), (2, "params", 0)], [0]),
@@ -436,6 +506,62 @@ def test_a_host_timeout_waits_for_the_gpu_and_fails():
     elapsed = time.monotonic() - t0
     st = eng.state()
     assert elapsed < 5.0 and calls == [] and st["done"] == 1 and st["error"] == 4 and st["step"] == 0
+    assert _sink(eng) > 0                                                 # the slow op before the point completed first
+
+
+def test_a_command_buffer_that_finishes_without_its_signal_fails_at_once(monkeypatch):
+    """LITHOS_HOST_STEPS_DROP_SIGNAL leaves out one point's signal; the exchange program commits nothing later before
+    that point is served, so no higher signal masks it."""
+    monkeypatch.setenv("LITHOS_HOST_STEPS_DROP_SIGNAL", "3:0")
+    ex = _Exchange()
+    eng = ex.engine(100, host_timeout_ms=10_000)
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"host step 3, point 0: its command buffer finished without the signal"):
+        eng.run(10)
+    assert time.monotonic() - t0 < 1.0 and [c[0] for c in ex.calls] == [0, 1, 2]
+    st = eng.state()
+    assert st["done"] == 1 and st["error"] == 4
+
+
+def test_a_failed_runs_tokens_leave_with_its_error():
+    """The failed run's report rides on its error, so none of its tokens reach a later run (a session resets StepState
+    and the ring, then runs the next request on the same Engine)."""
+    calls = []
+
+    def watch(step, point):
+        calls.append(step)
+        if step == 3:
+            raise ValueError("stop at step 3")
+
+    eng = Engine(_program(_base_buffers(100), [_tick()], [HostPoint("watch", 1, 1)]), host_tasks={"watch": watch})
+    with pytest.raises(RuntimeError, match="stop at step 3") as failed:
+        eng.run(10)
+    assert failed.value.report.steps == 4 and failed.value.report.tokens == [0, 1, 2, 3]
+    for name, spec in eng.program.buffers.items():                       # the session's reset
+        if spec.role in ("state", "step_state", "ring"):
+            eng.buffers[name].fill(0)
+    rep = eng.run(5, max_tokens=5)
+    assert rep.steps == 5 and rep.tokens == [0, 1, 2, 3, 4] and calls == list(range(9))
+
+
+@pytest.mark.parametrize("raised", [KeyboardInterrupt, SystemExit, LookupError])
+def test_a_tasks_exception_reaches_the_caller(raised):
+    """KeyboardInterrupt and SystemExit leave run() as the task raised them; any other exception is the cause of the
+    run's RuntimeError. The step stopped at the point either way, so the program stays failed until a reset."""
+    def watch(step, point):
+        if step == 3:
+            raise raised("from the task")
+
+    eng = Engine(_program(_base_buffers(100), [_tick()], [HostPoint("watch", 1, 1)]), host_tasks={"watch": watch})
+    if issubclass(raised, Exception):
+        with pytest.raises(RuntimeError, match="from the task") as failed:
+            eng.run(10)
+        assert isinstance(failed.value.__cause__, raised)
+    else:
+        with pytest.raises(raised, match="from the task"):
+            eng.run(10)
+    st = eng.state()
+    assert st["done"] == 1 and st["error"] == 4 and st["step"] == 4
 
 
 def test_max_tokens_and_stop_at_end_runs_on_whole_steps():
@@ -467,27 +593,110 @@ def test_a_task_that_sets_done_ends_the_run_after_its_step(stop_point):
         if step == 5 and point == stop_point:
             eng.buffers["step_state"].write(struct.pack("<I", 1), LAYOUT.offset("done"))
 
-    ops = [_op("tick", [(0, "step_state", 0), (1, "params", 0), (2, "ring", 0)], [0, 2])]
     points = [HostPoint("watch", 1, 1, writes=["step_state"]), HostPoint("watch", 1, 1, writes=["step_state"])]
-    eng = Engine(_program(_base_buffers(1000), ops, points), host_tasks={"watch": watch})
+    eng = Engine(_program(_base_buffers(1000), [_tick()], points), host_tasks={"watch": watch})
     rep = eng.run(100)
     assert rep.done and rep.steps == 6 and rep.tokens == list(range(6))
     assert calls == [(s, k) for s in range(6) for k in (0, 1)]
 
 
+def test_done_set_by_an_op_beside_the_tasks_keeps_the_steps_tasks():
+    """tick runs beside both tasks and sets done in the last step; that step began live, so its second task still runs.
+    q waits (bounded) until tick has advanced the step; it reads StepState undeclared on purpose."""
+    calls, eng = {"q": [], "p": []}, None
+
+    def q(step, point):
+        calls["q"].append(step)
+        for _ in range(1000):
+            if eng.state()["step"] >= step + 1:
+                break
+            time.sleep(0.001)
+        assert eng.state()["step"] >= step + 1
+
+    def p(step, point):
+        calls["p"].append(step)
+
+    ops = [_op("s_b", [(0, "b", 0), (1, "step_state", 0)], [0]), _tick()]
+    eng = Engine(_program({**_base_buffers(5), "b": BufferSpec(16)}, ops, [HostPoint("q", 1, 2), HostPoint("p", 1, 2)]),
+                 host_tasks={"q": q, "p": p})
+    rep = eng.run(100)
+    assert rep.done and rep.steps == 5 and rep.tokens == list(range(5))
+    assert calls == {"q": list(range(5)), "p": list(range(5))}
+
+
 def test_a_second_concurrent_run_fails_at_once():
     import threading
-    buffers = {**_base_buffers(10, width=20_000_000), "sink": BufferSpec(16)}
-    ops = [_op("slow", [(0, "sink", 0), (1, "step_state", 0), (2, "params", 0)], [0]),
-           _op("tick", [(0, "step_state", 0), (1, "params", 0), (2, "ring", 0)], [0, 2])]
-    eng = Engine(_program(buffers, ops, [HostPoint("noop", 1, 1)]), host_tasks={"noop": lambda s, k: None})
+    entered, release = threading.Event(), threading.Event()
+
+    def hold(step, point):
+        if step == 0:
+            entered.set()
+            assert release.wait(5.0)
+
+    eng = Engine(_program(_base_buffers(10), [_tick()], [HostPoint("hold", 1, 1)]), host_tasks={"hold": hold})
     first = threading.Thread(target=eng.run, args=(3,))
     first.start()
-    time.sleep(0.05)                                                      # the first run holds the runner
-    with pytest.raises(RuntimeError, match="already running"):
-        eng.run(1)
-    first.join()
-    assert eng.state()["step"] == 3
+    try:
+        assert entered.wait(5.0)                                          # the first run holds the runner
+        with pytest.raises(RuntimeError, match="Runner.run: already running on another thread"):
+            eng.run(1)
+        with pytest.raises(RuntimeError, match="set_host_points: already running on another thread"):
+            eng.runner.set_host_points([], LAYOUT.offset("error"), 1000)
+    finally:
+        release.set()
+        first.join(10.0)
+    assert not first.is_alive() and eng.state()["step"] == 3
+
+
+def test_a_task_that_calls_its_own_runner_is_refused():
+    errors, eng = [], None
+
+    def reenter(step, point):
+        if step == 1:
+            for call in (lambda: eng.run(1), lambda: eng.runner.set_host_points([], LAYOUT.offset("error"), 1000)):
+                with pytest.raises(RuntimeError) as refused:
+                    call()
+                errors.append(str(refused.value))
+
+    eng = Engine(_program(_base_buffers(5), [_tick()], [HostPoint("reenter", 1, 1)]), host_tasks={"reenter": reenter})
+    rep = eng.run(5)
+    assert rep.steps == 5 and rep.tokens == list(range(5))
+    assert errors == ["Runner.run: called from one of the runner's own host tasks",
+                      "set_host_points: called from one of the runner's own host tasks"]
+
+
+def test_plain_runs_between_host_step_runs_keep_the_step_count():
+    """HostCall.step counts every step the runner began, on either pump."""
+    steps = []
+    eng = Engine(_program(_base_buffers(1000), [_tick()], [HostPoint("watch", 1, 1)]),
+                 host_tasks={"watch": lambda s, k: steps.append(s)})
+    error = LAYOUT.offset("error")
+    eng.run(3)
+    eng.runner.set_host_points([], error, 1000)                           # the plain pump
+    eng.run(4, steps_per_cb=1, in_flight=1)
+    eng.runner.set_host_points(eng.host_tasks, error, 1000)
+    eng.run(2)
+    assert steps == [0, 1, 2, 7, 8] and eng.state()["step"] == 9
+
+
+def test_set_host_points_again_with_fewer_points_waits_for_the_gpu():
+    """A new point list gets a new event: the old one already holds values the new numbering reaches early."""
+    seen, eng = [], None
+
+    def look(step, point):
+        seen.append((step, point, eng.state()["step"], _sink(eng)))
+
+    buffers, ops = _slow_tick(1000, 1_000_000)
+    eng = Engine(_program(buffers, ops, [HostPoint("look", 1, 1, reads=["sink"]), HostPoint("look", 1, 1, reads=["sink"])]),
+                 host_tasks={"look": look})
+    assert eng.run(10).steps == 10
+    eng.runner.set_host_points([(1, 1, nt.CallableTask(look))], LAYOUT.offset("error"), 20000)
+    seen.clear()
+    rep = eng.run(10)
+    assert rep.steps == 10 and rep.tokens == list(range(10, 20))
+    assert [(s, k, st) for s, k, st, _ in seen] == [(s, 0, s) for s in range(10, 20)]
+    sinks = [v for *_, v in seen]
+    assert all(b > a for a, b in zip(sinks, sinks[1:]))                  # each task ran after its step's slow op
 
 
 def test_profile_refuses_a_program_with_host_points():
@@ -518,6 +727,17 @@ def test_check_host_points_rejects(point, message):
         _validation_program([point]).check_host_points()
 
 
+@pytest.mark.parametrize("point, message", [
+    (HostPoint("t", 0, 1, writes=["staging"]), r"op 0 \(produce\) accesses 'staging' while the task writes 'staging'"),
+    (HostPoint("t", 0, 1, reads=["acc"]), r"op 0 \(produce\) writes 'acc' while the task reads 'acc'"),
+])
+def test_check_host_points_sees_what_ops_reach_through_gpu_addresses(point, message):
+    program = _validation_program([point])
+    program.ops[0].meta.update(indirect_reads=["staging"], indirect_writes=["acc"])
+    with pytest.raises(ValueError, match=message):
+        program.check_host_points()
+
+
 def test_check_host_points_accepts_reads_of_what_the_window_only_reads_and_decreasing_publishes_fail():
     _validation_program([HostPoint("t", 0, 1, reads=["step_state"])]).check_host_points()
     with pytest.raises(ValueError, match="must not decrease"):
@@ -541,6 +761,15 @@ def test_engine_rejects_missing_tasks_host_buffers_and_aliases():
         Engine(aliased, dev, buffers={"staging": staging, "x": staging}, host_tasks={"t": lambda s, k: None})
 
 
+@pytest.mark.parametrize("points", [[], [HostPoint("t", 0, 1, writes=["b"])]], ids=["plain", "host-steps"])
+def test_engine_rejects_an_unknown_indirect_buffer(points):
+    buffers = {**_base_buffers(3), "x": BufferSpec(W * 4), "b": BufferSpec(16)}
+    produce = OpSpec("produce", [(0, "x", 0), (1, "step_state", 0), (2, "params", 0)], (1, 1, 1), (W, 1, 1), True,
+                     name="produce", meta={"writes": [0], "indirect_reads": ["nope"]})
+    with pytest.raises(ValueError, match="reaches 'nope' through a GPU address, which is not a program buffer"):
+        Engine(_program(buffers, [produce, _tick()], points), host_tasks={"t": lambda s, k: None})
+
+
 @pytest.mark.parametrize("host_point", [True, False], ids=["host-steps", "plain"])
 @pytest.mark.parametrize("reencode", [False, True])
 @pytest.mark.parametrize("residency_set", ["1", "0"])
@@ -557,16 +786,35 @@ def test_unbound_host_buffers_reached_through_gpu_addresses(monkeypatch, residen
                "ha": BufferSpec(n * 2, role="host"), "hb": BufferSpec(n * 2, role="host")}
     gather = OpSpec("gather", [(0, "table", 0), (1, "out", 0), (2, "step_state", 0), (3, "params", 0)], (1, 1, 1), (n, 1, 1),
                     True, name="gather", meta={"writes": [1], "indirect_reads": ["ha", "hb"]})
-    tick = _op("tick", [(0, "step_state", 0), (1, "params", 0), (2, "ring", 0)], [0, 2])
     calls = []
     points = [HostPoint("t", 1, 1, reads=["out"])] if host_point else []
-    eng = Engine(_program(buffers, [gather, tick], points), dev,
+    eng = Engine(_program(buffers, [gather, _tick()], points), dev,
                  buffers={"table": table, "out": out, "ha": ha, "hb": hb}, host_tasks={"t": lambda s, k: calls.append(s)})
     rep = eng.run(3, reencode=reencode)
     want = np.empty(n, np.uint32)
     want[0::2], want[1::2] = left, right
     assert rep.steps == 3 and calls == ([0, 1, 2] if host_point else [])
     assert np.array_equal(np.frombuffer(out.read(0, n * 4), dtype=np.uint32), want + 2)   # the last step ran at step 2, in place
+    if not host_point:                                                    # Engine.profile declares them on its own queue
+        eng.buffers["step_state"].write(struct.pack("<I", 0), LAYOUT.offset("done"))
+        eng.profile(1)
+        assert np.array_equal(np.frombuffer(out.read(0, n * 4), dtype=np.uint32), want + 3)
+
+
+def test_residency_declarations_hold_under_shader_validation():
+    """Only Metal shader validation sees a kernel reach a buffer nothing declared resident: the cases above run again
+    with it on, whatever this run's environment."""
+    import os
+    import re
+    import subprocess
+    import sys
+    from pathlib import Path
+    here = Path(__file__).resolve()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MTL_")}
+    env["MTL_SHADER_VALIDATION"] = "1"
+    p = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", str(here), "-k", "unbound_host_buffers"],
+                       cwd=here.parents[2], env=env, capture_output=True, text=True, timeout=600)
+    assert p.returncode == 0 and re.search(r"\b8 passed\b", p.stdout), (p.stdout[-3000:], p.stderr[-2000:])
 
 
 def test_host_points_round_trip_through_json(tmp_path):
@@ -578,20 +826,6 @@ def test_host_points_round_trip_through_json(tmp_path):
     d = json.loads(p.to_json())
     del d["host_points"]
     assert Program.from_json(json.dumps(d)).host_points == []
-
-
-def test_handoff_cost_per_step():
-    """Not a gate: prints the wall time a sync point adds per step on this machine (paired, min of 3)."""
-    def per_step(points):
-        best = float("inf")
-        for _ in range(3):
-            eng = Engine(_chain_program(False) if not points else _chain_program(True),
-                         host_tasks={"noop": lambda s, k: None} if points else None)
-            rep = eng.run(150, steps_per_cb=1, in_flight=1)
-            best = min(best, rep.wall_ms / rep.steps)
-        return best
-    plain, cut = per_step(False), per_step(True)
-    print(f"\nwall per step: one command buffer per step {plain * 1e3:.0f} us; with two host points {cut * 1e3:.0f} us")
 
 
 _REENTRANT = """
