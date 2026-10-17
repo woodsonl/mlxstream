@@ -42,7 +42,7 @@
 #define S2_O_GU_SCALES (S2_O_D_CODES + S2_H * S2_ROW_D)
 #define S2_O_D_SCALES (S2_O_GU_SCALES + 2 * S2_FF * S2_SC_GU * 2)
 
-struct Q80Params { uint n_blocks; uint pad0; uint pad1; uint pad2; };
+struct Q80Params { ulong n_blocks; ulong pad0; };                 // n_blocks: basalt's long long (quantize_act.cu:79)
 struct S2Params { uint cap_entries; uint pad0; uint pad1; uint pad2; };
 struct S2ResidentParams { int n; int k_per_tok; uint blob; uint pad0; };
 

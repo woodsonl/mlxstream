@@ -12,6 +12,8 @@ implementation-defined, and these draw the same distributions with numpy. basalt
 scales keep every product above 1e-6), so planted inputs exercise the IEEE paths, each with a negative control: the
 same kernels with the plain Metal operation in place of each IEEE helper must differ on them."""
 
+import struct
+
 import numpy as np
 import pytest
 
@@ -99,6 +101,21 @@ kernel void f16(device const float* x [[buffer(0)]], device ushort* h [[buffer(1
     assert np.array_equal(got[~nan], want[~nan]), np.flatnonzero(got[~nan] != want[~nan])[:8]
     assert np.all((got[nan] & 0x7C00) == 0x7C00) and np.all(got[nan] & 0x3FF)
     print(f"\nf16_bits: {len(cases)} basalt vectors, {np.count_nonzero(~nan)} values bit for bit with f16_from_f32")
+
+
+def test_builders_take_basalt_launches_only():
+    """The builders refuse the shapes basalt cannot launch (CUDA's largest gridDim.x and .y: past them basalt's launch
+    fails and exits, and here a 32-bit threadgroup position or int(tg.y) would wrap) and take its largest: 65,535
+    groups, 858,993,458 entries (2,147,483,645 SwiGLU and quantizer threadgroups), and quantizer block counts past 2^32
+    (Q80Params.n_blocks is 64-bit, basalt's long long)."""
+    g = kernels.basalt_s2_grids(65535, 858_993_458)
+    assert g == {"gu": (40, 65535), "swiglu": 2_147_483_645, "quant": 2_147_483_645, "down": (40, 65535)}
+    assert struct.unpack("<QQ", kernels.basalt_q8_0_scaled_params((2 ** 31 - 1) * 256)) == (2 ** 34 - 8, 0)
+    for f, args in ((kernels.basalt_s2_grids, (65536, 1)), (kernels.basalt_s2_grids, (0, 1)),
+                    (kernels.basalt_s2_grids, (1, 858_993_459)), (kernels.basalt_s2_scratch, (858_993_459,)),
+                    (kernels.basalt_s2_params, (0,)), (kernels.basalt_q8_0_scaled_params, ((2 ** 31 - 1) * 256 + 32,))):
+        with pytest.raises(ValueError):
+            f(*args)
 
 
 # ---- quantize_q8_0_scaled: the contract's host transcription (flash-next.md) -----------------------------------------
