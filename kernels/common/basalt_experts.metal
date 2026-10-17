@@ -6,7 +6,7 @@
 // third_party/NOTICE).
 //
 // basalt's native_expert_grouped for Q2_0 gate/up and Q2_0 down (iq_kernels.cu:2553-2603): three dispatches in order,
-// gate/up -> SwiGLU + q8_1 -> down. Needs basalt_fp.metal and basalt_q8_1.metal ahead of it.
+// gate/up -> SwiGLU + q8_1 -> down. Needs basalt_fp.metal, basalt_ieee.metal and basalt_q8_1.metal ahead of it.
 //
 // The plan (basalt's, read on the device): n_groups[0] groups; group g's expert blob starts at grp_ptr[g] (basalt's
 // grp_ptr: a table of 64-bit GPU addresses, one a group, each 2-byte aligned and inside a resident buffer, so the
