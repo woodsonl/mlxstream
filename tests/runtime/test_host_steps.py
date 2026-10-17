@@ -475,6 +475,21 @@ def test_a_task_that_sets_done_ends_the_run_after_its_step(stop_point):
     assert calls == [(s, k) for s in range(6) for k in (0, 1)]
 
 
+def test_a_second_concurrent_run_fails_at_once():
+    import threading
+    buffers = {**_base_buffers(10, width=20_000_000), "sink": BufferSpec(16)}
+    ops = [_op("slow", [(0, "sink", 0), (1, "step_state", 0), (2, "params", 0)], [0]),
+           _op("tick", [(0, "step_state", 0), (1, "params", 0), (2, "ring", 0)], [0, 2])]
+    eng = Engine(_program(buffers, ops, [HostPoint("noop", 1, 1)]), host_tasks={"noop": lambda s, k: None})
+    first = threading.Thread(target=eng.run, args=(3,))
+    first.start()
+    time.sleep(0.05)                                                      # the first run holds the runner
+    with pytest.raises(RuntimeError, match="already running"):
+        eng.run(1)
+    first.join()
+    assert eng.state()["step"] == 3
+
+
 def test_profile_refuses_a_program_with_host_points():
     with pytest.raises(RuntimeError, match="host points"):
         _Exchange().engine(10).profile(1)                                 # its ops would run without their tasks
@@ -526,8 +541,10 @@ def test_engine_rejects_missing_tasks_host_buffers_and_aliases():
         Engine(aliased, dev, buffers={"staging": staging, "x": staging}, host_tasks={"t": lambda s, k: None})
 
 
+@pytest.mark.parametrize("host_point", [True, False], ids=["host-steps", "plain"])
+@pytest.mark.parametrize("reencode", [False, True])
 @pytest.mark.parametrize("residency_set", ["1", "0"])
-def test_unbound_host_buffers_reached_through_gpu_addresses(monkeypatch, residency_set):
+def test_unbound_host_buffers_reached_through_gpu_addresses(monkeypatch, residency_set, reencode, host_point):
     monkeypatch.setenv("LITHOS_RESIDENCY_SET", residency_set)
     dev = nt.Device()
     n = 512
@@ -542,12 +559,13 @@ def test_unbound_host_buffers_reached_through_gpu_addresses(monkeypatch, residen
                     True, name="gather", meta={"writes": [1], "indirect_reads": ["ha", "hb"]})
     tick = _op("tick", [(0, "step_state", 0), (1, "params", 0), (2, "ring", 0)], [0, 2])
     calls = []
-    eng = Engine(_program(buffers, [gather, tick], [HostPoint("t", 1, 1, reads=["out"])]), dev,
+    points = [HostPoint("t", 1, 1, reads=["out"])] if host_point else []
+    eng = Engine(_program(buffers, [gather, tick], points), dev,
                  buffers={"table": table, "out": out, "ha": ha, "hb": hb}, host_tasks={"t": lambda s, k: calls.append(s)})
-    rep = eng.run(3)
+    rep = eng.run(3, reencode=reencode)
     want = np.empty(n, np.uint32)
     want[0::2], want[1::2] = left, right
-    assert rep.steps == 3 and calls == [0, 1, 2]
+    assert rep.steps == 3 and calls == ([0, 1, 2] if host_point else [])
     assert np.array_equal(np.frombuffer(out.read(0, n * 4), dtype=np.uint32), want + 2)   # the last step ran at step 2, in place
 
 

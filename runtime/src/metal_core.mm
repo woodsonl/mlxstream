@@ -286,6 +286,7 @@ struct RunnerImpl {
   id<MTLBuffer> ring; uint32_t cap;
   uint32_t tail = 0;                       // next ring slot the host reads
   std::vector<int32_t> tokens; std::mutex mu;
+  std::mutex run_mu;                       // held by run() and set_host_points(): one pump per runner
   bool resident = false;                   // the queue carries residency_set (replaces useResource)
   // host steps (set_host_points)
   std::vector<HostPoint> points;
@@ -370,6 +371,8 @@ static void drain_ring(RunnerImpl& r) {
 
 void Runner::set_host_points(std::vector<HostPoint> points, uint32_t error_offset, uint32_t timeout_ms, uint32_t spin_us) {
   RunnerImpl& r = *impl;
+  std::unique_lock<std::mutex> one(r.run_mu, std::try_to_lock);
+  if (!one.owns_lock()) throw std::runtime_error("set_host_points: the runner is running on another thread");
   const uint32_t n = (uint32_t)r.ops.size();
   uint32_t prev = 0;
   for (auto& p : points) {
@@ -639,8 +642,10 @@ static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reenco
 }
 
 RunnerStats Runner::run(uint32_t max_steps, uint32_t steps_per_cb, uint32_t in_flight, bool reencode, uint64_t max_tokens) {
-  impl->tail = *(volatile uint32_t*)((char*)impl->state.contents + impl->tail_off);   // the ring tail lives in StepState: resume (or restart after a reset) from it
   RunnerImpl& r = *impl;
+  std::unique_lock<std::mutex> one(r.run_mu, std::try_to_lock);   // run() releases the GIL: a second caller fails
+  if (!one.owns_lock()) throw std::runtime_error("Runner.run: already running on another thread");
+  r.tail = *(volatile uint32_t*)((char*)r.state.contents + r.tail_off);   // the ring tail lives in StepState: resume (or restart after a reset) from it
   if (!r.points.empty()) return run_host_steps(r, max_steps, reencode, max_tokens);
   RunnerStats st;
   if (steps_per_cb == 0 || in_flight == 0) throw std::runtime_error("steps_per_cb and in_flight must be >= 1");
@@ -665,6 +670,8 @@ RunnerStats Runner::run(uint32_t max_steps, uint32_t steps_per_cb, uint32_t in_f
       uint32_t n = std::min<uint64_t>(steps_per_cb, max_steps - st.steps_submitted);
       id<MTLCommandBuffer> cb = [r.q commandBuffer];
       id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];   // serial: step s+1 starts after step s
+      if (!r.resident)   // buffers a kernel reaches only through a GPU address are declared here too
+        for (size_t i = 0; i < r.resources.size(); i++) [en useResource:r.resources[i] usage:r.resource_usage[i]];
       if (reencode) {
         for (uint32_t s = 0; s < n; s++)
           for (auto& d : r.ops) {
@@ -674,8 +681,6 @@ RunnerStats Runner::run(uint32_t max_steps, uint32_t steps_per_cb, uint32_t in_f
             [en dispatchThreadgroups:MTLSizeMake(d.grid[0], d.grid[1], d.grid[2]) threadsPerThreadgroup:MTLSizeMake(d.threadgroup[0], d.threadgroup[1], d.threadgroup[2])];
           }
       } else {
-        if (!r.resident)
-          for (size_t i = 0; i < r.resources.size(); i++) [en useResource:r.resources[i] usage:r.resource_usage[i]];
         for (uint32_t s = 0; s < n; s++) [en executeCommandsInBuffer:r.icb->icb withRange:NSMakeRange(0, r.icb->count)];
       }
       [en endEncoding];
