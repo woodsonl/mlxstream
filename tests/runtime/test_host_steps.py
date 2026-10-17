@@ -113,6 +113,19 @@ kernel void s_adv(device const uint* c [[buffer(0)]], device StepState* st [[buf
   if (emit(st, p, ring, c[0])) advance(st, p);
 }
 
+// a point that publishes at the step's start and is needed only by the second op (the n-gram rows' shape)
+kernel void ng_first(device uint* l0 [[buffer(0)]], device const StepState* st [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+  if (i == 0 && !st->done) l0[0] = (st->step + 1u) * 11u;
+}
+kernel void ng_second(device const uint* l0 [[buffer(0)]], device const uint* rows [[buffer(1)]], device uint* prev [[buffer(2)]],
+                      device StepState* st [[buffer(3)]], constant Params& p [[buffer(4)]], device ulong* ring [[buffer(5)]],
+                      uint i [[thread_position_in_grid]]) {
+  if (i != 0 || st->done) return;
+  uint out = l0[0] + rows[0];
+  prev[0] = out;
+  if (emit(st, p, ring, out)) advance(st, p);
+}
+
 // a bounded loop of a few hundred milliseconds before a publish boundary
 kernel void slow(device float* sink [[buffer(0)]], device const StepState* st [[buffer(1)]], constant Params& p [[buffer(2)]],
                  uint i [[thread_position_in_grid]]) {
@@ -137,7 +150,7 @@ kernel void gather(device const Ptr* table [[buffer(0)]], device uint* out [[buf
 """
 
 KERNELS = ("produce", "transform", "consume", "chain_a", "chain_b", "chain_c", "verify", "commit", "s_a", "s_b", "s_c",
-           "s_adv", "slow", "tick", "gather")
+           "s_adv", "ng_first", "ng_second", "slow", "tick", "gather")
 
 
 def _params(n_stop, ring_cap, width):
@@ -363,6 +376,35 @@ def test_several_points_per_step_see_their_boundaries():
         tokens.append(c & 0x7FFFFFFF)
         h3 = c ^ 0x1234
     assert seen == want and rep.tokens == tokens and rep.steps == n
+
+
+@pytest.mark.parametrize("reencode", [False, True])
+def test_a_point_at_the_step_start_feeds_a_later_op_across_runs(reencode):
+    """publish 0, wait 1: the task reads what the previous step left and writes rows only the step's second op reads,
+    while the first op may already run. The first step of each run is served without a signal."""
+    dev = nt.Device()
+    rows = nt.Buffer(dev, 16)
+    buffers = {**_base_buffers(1000), "l0": BufferSpec(16), "prev": BufferSpec(16), "rows": BufferSpec(16, role="host")}
+    ops = [_op("ng_first", [(0, "l0", 0), (1, "step_state", 0)], [0]),
+           _op("ng_second", [(0, "l0", 0), (1, "rows", 0), (2, "prev", 0), (3, "step_state", 0), (4, "params", 0), (5, "ring", 0)],
+               [2, 3, 5])]
+    calls, eng = [], None
+
+    def task(step, point):
+        prev = struct.unpack("<I", eng.read("prev", 4))[0]
+        calls.append((step, eng.state()["step"], prev))
+        rows.write(struct.pack("<I", (prev * 7 + step) & M), 0)
+
+    eng = Engine(_program(buffers, ops, [HostPoint("rows", 0, 1, writes=["rows"], reads=["prev", "step_state"])]), dev,
+                 buffers={"rows": rows}, host_tasks={"rows": task})
+    tokens = eng.run(40, reencode=reencode).tokens + eng.run(25, reencode=reencode).tokens
+    prev, want, want_calls = 0, [], []
+    for s in range(65):
+        want_calls.append((s, s, prev))
+        out = ((s + 1) * 11 + ((prev * 7 + s) & M)) & M
+        want.append(out & 0x7FFFFFFF)
+        prev = out
+    assert calls == want_calls and tokens == want
 
 
 def test_a_failing_task_ends_the_run_with_every_command_buffer_finished():
