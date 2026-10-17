@@ -40,7 +40,8 @@ static int callable_task_traverse(PyObject* self, visitproc visit, void* arg) {
   return 0;
 }
 static int callable_task_clear(PyObject* self) {
-  nb::inst_ptr<CallableTask>(self)->fn = nb::callable();
+  if (!nb::inst_ready(self)) return 0;
+  nb::callable dying = std::move(nb::inst_ptr<CallableTask>(self)->fn);   // the task holds no callable before it dies
   return 0;
 }
 static int runner_traverse(PyObject* self, visitproc visit, void* arg) {
@@ -53,6 +54,7 @@ static int runner_traverse(PyObject* self, visitproc visit, void* arg) {
   return 0;
 }
 static int runner_clear(PyObject* self) {
+  if (!nb::inst_ready(self)) return 0;
   nb::inst_ptr<Runner>(self)->release_host_tasks();
   return 0;
 }

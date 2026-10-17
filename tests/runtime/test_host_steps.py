@@ -594,6 +594,45 @@ def test_handoff_cost_per_step():
     print(f"\nwall per step: one command buffer per step {plain * 1e3:.0f} us; with two host points {cut * 1e3:.0f} us")
 
 
+_REENTRANT = """
+import gc, sys
+sys.path[:0] = [{root!r}, {here!r}]
+import test_host_steps as t
+from monolith.runtime import _native as nt
+
+class Collects:
+    def __call__(self, step, point):
+        pass
+    def __del__(self):
+        gc.collect()                         # a collector pass while the runner drops this task's last reference
+
+for i in range(50):
+    ex = t._Exchange()
+    eng = ex.engine(5)
+    err = eng.program.layout.offset("error")
+    eng.runner.set_host_points([(1, 1, nt.CallableTask(Collects()))], err, 1000)
+    eng.runner.set_host_points([(1, 1, nt.CallableTask(Collects()))], err, 1000)
+    del eng, ex
+    gc.collect()
+print("done")
+"""
+
+
+def test_a_task_dropped_while_python_runs_leaves_the_runner_consistent():
+    """Dropping a task's last reference runs Python (its finalizer), which may walk the runner's points through the
+    collector: set_host_points and the collector's clear must leave the points consistent first. Runs under malloc
+    scribbling, which turns a read of freed task state into a crash."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    here = Path(__file__).resolve().parent
+    env = {**os.environ, "MallocScribble": "1", "MallocGuardEdges": "1"}
+    code = _REENTRANT.format(root=str(here.parents[1]), here=str(here))
+    p = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300)
+    assert p.returncode == 0 and "done" in p.stdout, (p.returncode, p.stdout[-2000:], p.stderr[-2000:])
+
+
 def test_an_engine_its_own_task_reaches_is_collected():
     import gc
     import weakref

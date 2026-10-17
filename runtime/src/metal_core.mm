@@ -373,6 +373,8 @@ static void drain_ring(RunnerImpl& r) {
 
 void Runner::set_host_points(std::vector<HostPoint> points, uint32_t error_offset, uint32_t timeout_ms, uint32_t spin_us) {
   RunnerImpl& r = *impl;
+  std::vector<HostPoint> old;   // the replaced points die last, after the lock: a task's last reference may run Python,
+                                // which may walk this runner's points (the collector) or call it
   std::unique_lock<std::mutex> one(r.run_mu, std::try_to_lock);
   if (!one.owns_lock()) throw std::runtime_error("set_host_points: the runner is running on another thread");
   const uint32_t n = (uint32_t)r.ops.size();
@@ -385,6 +387,7 @@ void Runner::set_host_points(std::vector<HostPoint> points, uint32_t error_offse
   }
   if ((size_t)error_offset + 4 > r.state.length) throw std::runtime_error("host points: the error offset lies outside StepState");
   if (timeout_ms == 0) throw std::runtime_error("host points: timeout_ms must be at least 1");
+  old.swap(r.points);
   r.points = std::move(points);
   r.error_off = error_offset; r.timeout_ms = timeout_ms; r.spin_us = spin_us;
   r.pub_at.assign(n + 1, {}); r.wait_at.assign(n + 1, {});
@@ -420,7 +423,8 @@ std::vector<std::shared_ptr<HostTask>> Runner::host_tasks() const {
 }
 
 void Runner::release_host_tasks() {
-  for (auto& p : impl->points) p.task.reset();
+  std::vector<std::shared_ptr<HostTask>> dying;   // the points hold null tasks before any task's destructor runs Python
+  for (auto& p : impl->points) dying.push_back(std::move(p.task));
 }
 
 static uint64_t event_value(const RunnerImpl& r, uint64_t step, uint32_t point) {
