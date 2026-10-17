@@ -16,8 +16,10 @@ import numpy as np
 import pytest
 
 from monolith import kernels
+from tests.contract import gguf_reference
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
+from tests.kernels.test_basalt_iq_parity import quantize_q2_0
 
 F32 = np.float32
 H, FF, K = kernels.S2_H, kernels.S2_FF, 10
@@ -456,6 +458,46 @@ def test_device_count(fx):
                       [0] * cap, edst, cap, cap, cap)
     touched = np.count_nonzero(r["out"][dst[count:]] != 0xA5A5A5A5)
     assert touched == 0, touched
+
+
+def test_whole_expert_against_float64():
+    """The contract's double-precision reference for the drafter expert (docs/design/flash-next.md): basalt checks
+    swiglu_kernel only by comparing two GPU runs (s2_expert_grouped.cu:1108), and its float64 reference covers the up
+    rows and the down rows from the run's own intermediate. Here the quantizer on fp32 activations, then
+    moe_grouped_s2 (gate/up, the SwiGLU, the intermediate's quantizer, down), against a float64 expert on the fp32
+    activations, built as test_basalt_experts.py's test_whole_expert_against_float64 builds the routed expert's
+    (native_expert_parity.cpp:46-78, :387-402): 3 tokens of N(0, 1) values, row r's weights
+    0.02 (0.5 + (r % 7) / 7) N(0, 1) quantized to Q2_0 (quantize_q2_0) and laid out as the drafter's blob, dequantized
+    on the host by ggml's dequantize_row_q2_0 (tests/contract/gguf_reference.py); g and u in double,
+    h = (float) (g / (1 + exp(-g)) * u) with numpy's exp (no device function), out = D h in double. Criterion, the
+    nearest basalt bound, quoted: ``const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);``
+    (native_expert_parity.cpp:368), eg the relative L1 error (:38-42), on out and on the SwiGLU half against h."""
+    nt, rng = 3, np.random.default_rng(17)
+
+    def q2(rows, cols):
+        scale = (0.02 * (0.5 + (np.arange(rows) % 7) / 7.0)).astype(F32)[:, None]
+        return quantize_q2_0(scale * rng.standard_normal((rows, cols)).astype(F32)).reshape(rows, cols // 64, 18)
+
+    G, U, D = q2(FF, H), q2(FF, H), q2(H, FF)
+    gu = np.stack([G, U], axis=1).reshape(2 * FF, H // 64, 18)               # slot 2r gate row r, 2r + 1 up row r
+    blob = np.concatenate([gu[..., 2:].reshape(-1), D[..., 2:].reshape(-1), gu[..., :2].reshape(-1),
+                           D[..., :2].reshape(-1)])
+    assert blob.size == BLOB
+    Wg, Wu, Wd = (gguf_reference.dequantize(42, m.reshape(len(m), -1)).astype(np.float64) for m in (G, U, D))
+    x = rng.standard_normal((nt, H)).astype(F32)
+    g, u = x.astype(np.float64) @ Wg.T, x.astype(np.float64) @ Wu.T
+    h = (g / (1.0 + np.exp(-g)) * u).astype(F32)
+    ref = (h.astype(np.float64) @ Wd.T).astype(F32)
+    xq, xs = gpu.q8_0_scaled(x.reshape(-1))
+    r = gpu.s2_experts([gpu.nt.Buffer(gpu.device(), blob.tobytes())], [(0, 0)], [0, nt], 1, np.arange(nt),
+                       np.arange(nt), xq, xs, 1, nt, nt)
+    got_h, got = r["scratch"][: 4 * nt * FF].view(F32).reshape(nt, FF), r["out"].view(F32)
+    rel = lambda a, b: np.abs(a.astype(np.float64) - b).sum() / (np.abs(b.astype(np.float64)).sum() + 1e-30)
+    eh, eg = rel(got_h, h), rel(got, ref)
+    print(f"\ndrafter expert Q2_0 {H} x {FF}, {nt} tokens against float64: SwiGLU rel {eh:.2e}, out rel {eg:.2e}")
+    # basalt: const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
+    assert np.isfinite(eg) and eg < 3e-2 and np.isfinite(got).all(), eg
+    assert np.isfinite(eh) and eh < 3e-2 and np.isfinite(got_h).all(), eh
 
 
 # ---- the IEEE helpers, bit for bit against numpy's IEEE float32 ------------------------------------------------------
