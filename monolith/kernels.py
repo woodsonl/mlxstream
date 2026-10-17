@@ -556,15 +556,22 @@ def basalt_q5k_head_grid(n_out: int, *, sm_count: int = Q5K_TOP1_SM_COUNT, per_s
     """basalt's grid rule (q5k_head.cu:353-354, 375-386): min(ceil(n_out / 8), sm_count * per_sm, cap) threadgroups of
     256 threads. The top-1's probability sums in this order, so its last bits follow ``sm_count`` and ``per_sm``
     (mtp.cpp:1007-1008); the defaults are basalt's on its measured GPU. The plain head's values do not depend on the
-    grid (basalt sizes it with the head kernel's own occupancy; the cap is the top-1's)."""
+    grid (basalt sizes it with the head kernel's own occupancy; the cap is the top-1's). The rows' loop steps an int
+    by 8 per threadgroup, as basalt's (q5k_head.cu:191-192, 249), so a grid whose last step would pass INT_MAX
+    (n_out > 2^31 - 8 * grid) is refused."""
     if n_out <= 0 or sm_count <= 0 or per_sm <= 0:
         raise ValueError(f"basalt_q5k_head: n_out, sm_count and per_sm must be positive")
-    return min(-(-n_out // 8), sm_count * per_sm, cap)
+    grid = min(-(-n_out // 8), sm_count * per_sm, cap)
+    if n_out > 2 ** 31 - 8 * grid:
+        raise ValueError(f"basalt_q5k_head: n_out {n_out} with {grid} threadgroups steps a row past INT_MAX")
+    return grid
 
 
 def basalt_q5k_head_params(n_in: int, n_out: int, has_map: bool = False, n_blocks: int = 0) -> bytes:
-    """``Q5kHeadParams``: n_in, n_out, whether a map is bound, and for the top-1's merge the first dispatch's
-    threadgroup count."""
+    """``Q5kHeadParams``: n_in, n_out (basalt's int: 1..INT_MAX), whether a map is bound, and for the top-1's merge
+    the first dispatch's threadgroup count."""
+    if not 0 < n_out < 2 ** 31:
+        raise ValueError(f"basalt_q5k_head: n_out must be in 1..INT_MAX, got {n_out}")
     return struct.pack("<IIII", n_in, n_out, int(has_map), n_blocks)
 
 
@@ -589,13 +596,15 @@ def basalt_q5k_proxy_scratch_bytes(n_cap: int) -> int:
     return basalt_q5k_proxy_tiles(n_cap) * (4 + 1) * 8
 
 
-def basalt_q5k_proxy_params(n_cap: int, *, row0: int = 0, n: int = 0, n_rows: int = 0) -> bytes:
-    """``PxParams`` (row0, n, n_cap, n_rows). basalt's API refuses n_rows outside 1..n_cap (q5k_head.cu:518) and packs
-    rows row0 .. row0 + n - 1 of a copy sized for n_cap; the port also refuses a pack past n_cap, which would store
-    outside the copy."""
-    if n_cap <= 0 or row0 < 0 or n < 0 or row0 + n > n_cap or not 0 <= n_rows <= n_cap:
+def basalt_q5k_proxy_params(n_cap: int, *, row0: int = 0, n: int = 0, n_rows: Optional[int] = None) -> bytes:
+    """``PxParams`` (row0, n, n_cap, n_rows): a pack's (rows row0 .. row0 + n - 1 of a copy sized for n_cap; n_rows
+    None) or the score's and top-1's (the first n_rows rows). basalt's API refuses n_rows outside 1..n_cap
+    (q5k_head.cu:518), and n_rows is its int (at most INT_MAX); the port also refuses a pack past n_cap, which would
+    store outside the copy, and an n_cap past the 32-bit field (basalt's int64_t: a copy of 2^32 rows is 3.4 TB)."""
+    if (not 0 < n_cap < 2 ** 32 or row0 < 0 or n < 0 or row0 + n > n_cap
+            or (n_rows is not None and not 0 < n_rows <= min(n_cap, 2 ** 31 - 1))):
         raise ValueError(f"basalt_q5k_proxy: rows out of range (row0 {row0}, n {n}, n_rows {n_rows}, n_cap {n_cap})")
-    return struct.pack("<IIII", row0, n, n_cap, n_rows)
+    return struct.pack("<IIII", row0, n, n_cap, n_rows or 0)
 
 
 # ---- the other decode kernels -------------------------------------------------------------------------------

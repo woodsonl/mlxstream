@@ -14,6 +14,8 @@ distributions, other draws. The timing loops are not ported.
 - A float64 reference for the Q5_K dot (pr-b-scope-basalt.md section 11's new test) under the nearest basalt bound,
   mmvq_multi_parity.cpp:461's rule for native_mmvq's types."""
 
+import struct
+
 import numpy as np
 import pytest
 
@@ -107,6 +109,23 @@ def test_float64_reference(data):
         worst, scale = np.max(np.abs(y[j].astype(np.float64) - ref)), np.max(np.abs(ref))
         # basalt: ``const bool ok = diff == 0 && worst <= 1e-4 * (scale + 1e-30);`` (mmvq_multi_parity.cpp:461)
         assert np.all(np.isfinite(y[j])) and worst <= 1e-4 * (scale + 1e-30), (j, worst, scale)
+
+
+def test_launch_rules():
+    """The builders refuse what basalt's API refuses or its int arithmetic cannot hold: n_out and n_rows are its ints
+    (q5k_head.cu:372-374, 412, 516-518), n_rows 0 included; n_cap past the 32-bit field; a grid whose int row loop
+    would step past INT_MAX."""
+    assert kernels.basalt_q5k_head_grid(248320) == 340 and kernels.basalt_q5k_head_grid(2 ** 31 - 8 * 340) == 340
+    for bad in [lambda: kernels.basalt_q5k_head_params(2560, 0), lambda: kernels.basalt_q5k_head_params(2560, 2 ** 31),
+                lambda: kernels.basalt_q5k_head_grid(2 ** 31 - 8 * 340 + 1),
+                lambda: kernels.basalt_q5k_proxy_params(100, n_rows=0),
+                lambda: kernels.basalt_q5k_proxy_params(100, n_rows=101),
+                lambda: kernels.basalt_q5k_proxy_params(2 ** 32 - 1, n_rows=2 ** 31),
+                lambda: kernels.basalt_q5k_proxy_params(2 ** 32, row0=0, n=1),
+                lambda: kernels.basalt_q5k_proxy_params(100, row0=50, n=51)]:
+        with pytest.raises(ValueError):
+            bad()
+    assert kernels.basalt_q5k_proxy_params(2 ** 32 - 1, row0=2 ** 32 - 2, n=1)[8:] == struct.pack("<II", 2 ** 32 - 1, 0)
 
 
 def test_head_emulation_bit_for_bit(data):

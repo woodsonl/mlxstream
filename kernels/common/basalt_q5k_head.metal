@@ -17,7 +17,8 @@
 // q5k_rows_10's assignment (thread L: a = L / 16 and a + 8; threads L + 32, L + 64, L + 96: a + 2, a + 4, a + 6).
 // q5k_rows_10's next-row register prefetch and the top-1's L2 prefetch schedule loads only and are not ported. The
 // columns are read from device memory: basalt stages them in shared memory (61,440 bytes at 8 columns and n_in 2560,
-// more than Apple9's 32 KiB), which is not arithmetic.
+// more than Apple9's 32 KiB), which is not arithmetic. The row offsets and the output index are ulong, as basalt
+// casts them to size_t (q5k_head.cu:120, 139, 189, 196, 218, 490); the row loop is int, as basalt's.
 //
 // Kernels:
 // - basalt_q5k_head (q5k_head_mmvq; NC columns, 1..8): grid basalt_q5k_head_grid threadgroups of 256 threads.
@@ -71,9 +72,9 @@ kernel void basalt_q5k_head(device const ushort* w [[buffer(0)]], device const u
     const int n_in = int(p.n_in), n_out = int(p.n_out), bpr = n_in / 256;
     for (int row = Q5K_WPB * int(tg) + int(sg); row < n_out; row += Q5K_WPB * int(ntg)) {
         float t[NC];
-        q5k_row<NC>(w + uint(row) * uint(bpr * Q5K_USHORTS), x, n_in / 32, bpr, int(lane), t);
+        q5k_row<NC>(w + ulong(row) * ulong(bpr * Q5K_USHORTS), x, n_in / 32, bpr, int(lane), t);
         if (lane == 0)
-            for (int j = 0; j < NC; ++j) y[j * n_out + row] = t[j];
+            for (int j = 0; j < NC; ++j) y[ulong(j) * ulong(n_out) + ulong(row)] = t[j];
     }
 }
 
@@ -121,7 +122,7 @@ kernel void basalt_q5k_head_top1(device const ushort* w [[buffer(0)]], device co
     Top top = top_init();
     for (int row = Q5K_WPB * int(tg) + int(sg); row < n_out; row += Q5K_WPB * int(ntg)) {
         float t[1];
-        q5k_row<1>(w + uint(row) * uint(10 * Q5K_USHORTS), x, 80, 10, int(lane), t);
+        q5k_row<1>(w + ulong(row) * ulong(10 * Q5K_USHORTS), x, 80, 10, int(lane), t);
         // a row whose id is negative holds no token: it never wins and adds nothing to the sum
         if (p.has_map != 0u && map[row] < 0) t[0] = neg_inf();
         else top_take(top, t[0], row);
@@ -170,10 +171,12 @@ constant constexpr uint PX_NW4 = 40;        // kNw4: 16-byte weight words per ro
 constant constexpr int PX_PER = 4;          // kPer: candidates kept per tile
 constant constexpr int PX_MAX_CAND = 64;    // kMaxCand: rows rescored exactly
 
-// pack: the rows row0 .. row0 + n - 1; score and final: the first n_rows rows; n_cap: the copy's row capacity
+// pack: the rows row0 .. row0 + n - 1; score and final: the first n_rows rows; n_cap: the copy's row capacity.
+// Offsets and counts basalt computes in int64_t or size_t (px::tiles, px::scales, the pack's index and stores, the
+// score's word index, the rows' byte offsets) are ulong here; the ones it computes in int stay int.
 struct PxParams { uint row0; uint n; uint n_cap; uint n_rows; };
 
-static inline uint px_tiles(uint n) { return (n + 31u) / 32u; }
+static inline ulong px_tiles(ulong n) { return (n + 31) / 32; }
 
 // level(w, sh) (head_proxy.cuh:36) as ptxas compiles it: F2I.FTZ.FLOOR.NTZ(FFMA.FTZ(w, MUFU.RCP(sh), 2)), then the
 // clamp to 0..3; rs = rcp_ftz(sh). F2I takes NaN to 0 and saturates the infinities, which the clamp makes 0 and 3: the
@@ -210,12 +213,16 @@ static inline ushort px_fit(thread const float* w, thread float& sh_out) {
 
 // q5k_proxy_pack_kernel (q5k_head.cu:438-462) with pack_group<false> (head_proxy.cuh:72-87): one thread per 32-weight
 // group g of row row0 + i / 80, w = FFMA.FTZ(FMUL.FTZ(d, sc), q, -FMUL.FTZ(dmin, m)). ceil(n * 80 / 128) x 128.
+// i is basalt's (int64_t) blockIdx.x * blockDim.x + threadIdx.x, from the threadgroup's position: a 32-bit
+// thread_position_in_grid would wrap past 2^32 threads.
 kernel void basalt_q5k_proxy_pack(device const uchar* q5 [[buffer(0)]], device uint* proxy [[buffer(1)]],
-                                  constant PxParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if (i >= p.n * 80u) return;
-    const uint row = p.row0 + i / 80u;
-    const int g = int(i % 80u), j = g % 8;
-    device const uchar* b = q5 + row * 1760u + uint(g / 8) * 176u;     // Q5KBlock: dm, scales[12], qh[32], qs[128]
+                                  constant PxParams& p [[buffer(2)]], uint tg [[threadgroup_position_in_grid]],
+                                  uint ntt [[threads_per_threadgroup]], uint tid [[thread_index_in_threadgroup]]) {
+    const ulong i = ulong(tg) * ulong(ntt) + ulong(tid);
+    if (i >= ulong(p.n) * 80) return;
+    const ulong row = ulong(p.row0) + i / 80;
+    const int g = int(i % 80), j = g % 8;
+    device const uchar* b = q5 + row * 1760 + uint(g / 8) * 176u;       // Q5KBlock: dm, scales[12], qh[32], qs[128]
     device const uchar* scl = b + 4;
     int sci, mi;
     if (j < 4) { sci = scl[j] & 63; mi = scl[j + 4] & 63; }
@@ -238,11 +245,11 @@ kernel void basalt_q5k_proxy_pack(device const uchar* q5 [[buffer(0)]], device u
     for (int c = 0; c < 2; ++c)
         for (int ii = 0; ii < 4; ++ii)
             for (int bb = 0; bb < 4; ++bb) words[c] |= uint(px_level(w[c * 16 + 4 * ii + bb], rs)) << (8 * bb + 2 * ii);
-    const uint slot = ((row >> 5) * PX_NW4 + uint(g / 2)) * 32u + (row & 31u), h = uint(g & 1);
-    proxy[slot * 4u + 2u * h] = words[0];
-    proxy[slot * 4u + 2u * h + 1u] = words[1];
-    device ushort* sc = (device ushort*)(proxy + px_tiles(p.n_cap) * PX_NW4 * 32u * 4u);   // px::scales(proxy, n_cap)
-    sc[slot * 2u + h] = hs;
+    const ulong slot = ((row >> 5) * PX_NW4 + ulong(g / 2)) * 32 + (row & 31), h = ulong(g & 1);
+    proxy[slot * 4 + 2 * h] = words[0];
+    proxy[slot * 4 + 2 * h + 1] = words[1];
+    device ushort* sc = (device ushort*)(proxy + px_tiles(p.n_cap) * PX_NW4 * 32 * 4);      // px::scales(proxy, n_cap)
+    sc[slot * 2 + h] = hs;
 }
 
 // px::score_kernel (head_proxy.cuh:89-167): a threadgroup of 4 SIMD-groups per tile of 32 rows (lane = row), SIMD-group
@@ -259,9 +266,9 @@ kernel void basalt_q5k_proxy_score(device const uint4* proxy [[buffer(0)]], devi
     threadgroup int xi[640];
     threadgroup float xs[80], xdd[80];
     threadgroup float red[4][32];
-    const uint ntc = px_tiles(p.n_cap);
-    device const uint* sc = (device const uint*)(proxy + ntc * PX_NW4 * 32u);    // px::scales, two per word
-    const uint base = (tile * PX_NW4 + uint(sg) * 10u) * 32u + lane;
+    const ulong ntc = px_tiles(p.n_cap);
+    device const uint* sc = (device const uint*)(proxy + ntc * PX_NW4 * 32);     // px::scales, two per word
+    const ulong base = (ulong(tile) * PX_NW4 + uint(sg) * 10u) * 32 + lane;
     const int row = int(tile) * 32 + int(lane), n_rows = int(p.n_rows);
     const int id = (sg == 0 && row < n_rows) ? map[row] : 0;
     for (int i = tid; i < 640; i += 128) xi[i] = q8_w(x, i / 8, i % 8);
@@ -275,8 +282,8 @@ kernel void basalt_q5k_proxy_score(device const uint4* proxy [[buffer(0)]], devi
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float acc = 0.0f;
     for (int j = 0; j < 10; ++j) {
-        const uint4 wv = proxy[base + uint(j) * 32u];
-        const uint s = sc[base + uint(j) * 32u];
+        const uint4 wv = proxy[base + ulong(j) * 32];
+        const uint s = sc[base + ulong(j) * 32];
         for (int h = 0; h < 2; ++h) {
             const int g = 2 * (int(sg) * 10 + j) + h;
             int P = 0;
@@ -301,7 +308,7 @@ kernel void basalt_q5k_proxy_score(device const uint4* proxy [[buffer(0)]], devi
     for (ushort o = 16; o > 0; o >>= 1) m = max_ftz(m, shfl_xor(m, o));
     const float e = warp_sum_ftz(v > neg_inf() ? expf_ftz(add_ftz(v, -m)) : 0.0f);
     device float2* cand = scratch;
-    device float2* part = scratch + ntc * uint(PX_PER);
+    device float2* part = scratch + ntc * PX_PER;
     if (lane == 0) part[tile] = float2(m, e);
     for (int k = 0; k < PX_PER; ++k) {          // the tile's best, then the next: a butterfly argmax, ties to the lower row
         float bv = v;
@@ -342,7 +349,7 @@ kernel void basalt_q5k_proxy_final(device const ushort* w [[buffer(0)]], device 
     threadgroup float lp[PX_MAX_CAND], ex[PX_MAX_CAND];
     const int n_tiles = int(px_tiles(p.n_rows)), nc = n_tiles * PX_PER;
     device const float2* cand = scratch;
-    device const float2* part = scratch + px_tiles(p.n_cap) * uint(PX_PER);
+    device const float2* part = scratch + px_tiles(p.n_cap) * PX_PER;
     float m = neg_inf();
     for (int i = tid; i < nc; i += 512) m = max_ftz(m, cand[i].x);
     for (ushort o = 16; o > 0; o >>= 1) m = max_ftz(m, shfl_xor(m, o));
@@ -382,7 +389,7 @@ kernel void basalt_q5k_proxy_final(device const ushort* w [[buffer(0)]], device 
     const int n = cnt < PX_MAX_CAND ? cnt : PX_MAX_CAND;
     for (int c = sg; c < n; c += 16) {
         float t[1];
-        q5k_row<1>(w + uint(list[c]) * uint(10 * Q5K_USHORTS), x, 80, 10, int(lane), t);
+        q5k_row<1>(w + ulong(list[c]) * ulong(10 * Q5K_USHORTS), x, 80, 10, int(lane), t);
         if (lane == 0) ex[c] = t[0];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
