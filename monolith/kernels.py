@@ -411,9 +411,10 @@ def basalt_q8_0_scaled_grid(n_values: int) -> int:
 def basalt_s2_scratch(cap_entries: int) -> Dict[str, int]:
     """moe_grouped_s2's scratch for ``cap_entries`` entries (s2_expert_grouped.cu:1090-1094): the byte offsets of the
     quantized intermediate ("hq") and its fp32 scales ("hs") after gate/up at 0, each region's bytes rounded up to 16,
-    and the size basalt allocates (``moe_hit_grouped_scratch_bytes``, :554-562)."""
-    if cap_entries <= 0:
-        raise ValueError(f"moe_grouped_s2: cap_entries must be positive, got {cap_entries}")
+    and the size basalt allocates (``moe_hit_grouped_scratch_bytes``, :554-562). At most 2^31 - 1 entries: basalt
+    hands the gate/up kernel ``(int) cap_entries`` (:1100)."""
+    if not 0 < cap_entries < 2 ** 31:
+        raise ValueError(f"moe_grouped_s2: cap_entries must be 1..2^31 - 1, got {cap_entries}")
     r16 = lambda n: (n + 15) // 16 * 16
     nc = S2_FF // 32
     gu, q8, hs = r16(cap_entries * 2 * S2_FF * 4), r16(cap_entries * nc * Q8_0_BLOCK_BYTES), r16(cap_entries * nc * 4)

@@ -47,21 +47,25 @@ struct S2ResidentParams { int n; int k_per_tok; uint blob; uint pad0; };
 // ---- quantize_q8_0_scaled ---------------------------------------------------------------------------------------
 
 // quantize_q8_0_scaled_warp_kernel (quantize_act.cu:78-101; s2_experts.md section 1): SIMD-group = 34-byte block,
-// lane = value; grid ceil(n_blocks * 32 / 256) threadgroups of 256 (whole SIMD-groups past the end return). amax is the
-// largest |x| by its bits (fmaxf drops a NaN; an all-NaN block has amax NaN and s 0); s = amax / 127 and inv = 1 / s
-// correctly rounded, subnormals kept; t = fl(x * inv), r = fl(t +- 0.5) (FMUL then FADD: not fused); the code is
-// (int) r clamped to +-127, NaN to 0. The block's fp16 d is f16_from_f32(s) (round to nearest even), the fp32 scale s.
+// lane = value; grid ceil(n_blocks * 32 / 256) threadgroups of 256 (whole SIMD-groups past the end return). The block
+// index and the offsets are 64-bit, as basalt's long long (:80-83, :89): past 2^32 values the grid's 32-bit
+// thread_position_in_grid would wrap. amax is the largest |x| by its bits (fmaxf drops a NaN; an all-NaN block has
+// amax NaN and s 0); s = amax / 127 and inv = 1 / s correctly rounded, subnormals kept; t = fl(x * inv), r = fl(t +-
+// 0.5) (FMUL then FADD: not fused); the code is (int) r clamped to +-127, NaN to 0. The block's fp16 d is
+// f16_from_f32(s) (round to nearest even), the fp32 scale s.
 kernel void basalt_quantize_q8_0_scaled(device const float* x [[buffer(0)]], device uchar* blocks [[buffer(1)]],
                                         device float* scales [[buffer(2)]], constant Q80Params& p [[buffer(3)]],
-                                        uint i [[thread_position_in_grid]]) {
-    const uint b = i >> 5u, lane = i & 31u;
+                                        uint tg [[threadgroup_position_in_grid]], uint tpg [[threads_per_threadgroup]],
+                                        uint tid [[thread_index_in_threadgroup]]) {
+    const ulong b = (ulong(tg) * tpg + tid) >> 5;
+    const uint lane = tid & 31u;
     if (b >= p.n_blocks) return;
-    const float xv = x[i];
+    const float xv = x[b * 32ul + lane];
     int key = isnan(xv) ? -1 : int(as_type<uint>(xv) & 0x7fffffffu);
     for (ushort o = 16; o > 0; o >>= 1) key = max(key, simd_shuffle_xor(key, o));
     const float s = key > 0 ? ieee_div127(as_type<float>(uint(key))) : 0.0f;   // amax > 0.f, by its bits
     const float inv = as_type<uint>(s) != 0u ? ieee_rcp(s) : 0.0f;              // s > 0.f: s is never negative or NaN
-    device uchar* out = blocks + 34u * b;
+    device uchar* out = blocks + b * 34ul;
     if (lane == 0u) {
         scales[b] = s;
         const ushort d16 = f16_bits(s);
@@ -127,13 +131,14 @@ kernel void basalt_s2_group_resident(device const int* ids [[buffer(0)]], device
 
 // ---- the grouped kernels' integer parts --------------------------------------------------------------------------
 
-// load_x_chunk (s2_expert_grouped.cu:240-270): the 32 int8 of the block_q8_0 at byte xb of the 4-byte aligned row
-// words xw as the eight words X[4h + f] = {x[16h + f], x[16h + 4 + f], x[16h + 8 + f], x[16h + 12 + f]}, read as nine
-// aligned words (the ninth, inside the row's next block, only when the codes start 2 bytes into a word: an even chunk,
-// never a row's last), and their sum hx.
-static inline int s2_load_chunk(device const uint* xw, uint xb, thread int* X) {
-    const uint q = xb + 2u, off = q & 3u, sh = off * 8u;
-    device const uint* w = xw + (q - off) / 4u;
+// load_x_chunk (s2_expert_grouped.cu:240-270): the 32 int8 of the block_q8_0 at byte xb (64-bit, as basalt's pointer)
+// of the 4-byte aligned row words xw as the eight words X[4h + f] = {x[16h + f], x[16h + 4 + f], x[16h + 8 + f],
+// x[16h + 12 + f]}, read as nine aligned words (the ninth, inside the row's next block, only when the codes start 2
+// bytes into a word: an even chunk, never a row's last), and their sum hx.
+static inline int s2_load_chunk(device const uint* xw, ulong xb, thread int* X) {
+    const ulong q = xb + 2ul;
+    const uint off = uint(q & 3ul), sh = off * 8u;
+    device const uint* w = xw + (q - off) / 4ul;
     uint v[9];
     for (int j = 0; j < 8; ++j) v[j] = w[j];
     v[8] = off != 0u ? w[8] : 0u;
@@ -159,7 +164,7 @@ static inline int s2_load_chunk(device const uint* xw, uint xb, thread int* X) {
 // stage_chunk (:895-902): chunk i = k * NC + c of a group, its words at xs_w[j * STRIDE + i] and (dx as bits, hx) at
 // xs_dh[i].
 template <int STRIDE>
-static inline void s2_stage(device const uint* xw, uint xb, float dx, threadgroup int* xs_w, threadgroup int2* xs_dh,
+static inline void s2_stage(device const uint* xw, ulong xb, float dx, threadgroup int* xs_w, threadgroup int2* xs_dh,
                             int i) {
     int X[8];
     const int hx = s2_load_chunk(xw, xb, X);
@@ -193,7 +198,8 @@ static inline int s2_chunk_s(thread const int* m, thread const int* X) {
 // gu_grouped_t_kernel (:904-968; s2_experts.md section 2): grid (40, cap_groups) threadgroups of 256; threadgroup
 // (bx, g) takes row slots [32 bx, 32 bx + 32) of group g: SIMD-group w the (gate r, up r) pairs w and w + 8. Per
 // (row, entry), lane L: the chunks c = L, L + 32, L + 64 (< 80) in order, acc = fma(fl(dw * dx), f(s - hx), acc) from
-// +0 (FFMA), then basalt's warp_sum (shift-down; lane 0 is the XOR butterfly's lane 0), lane 0 stores.
+// +0 (FFMA), then basalt's warp_sum (shift-down; lane 0 is the XOR butterfly's lane 0), lane 0 stores. Activation
+// offsets and gate_up indices are 64-bit where basalt's are size_t (:921-922, :963-964).
 kernel void basalt_s2_gu(device const GrpPtr* grp_ptr [[buffer(0)]], device const int* grp_start [[buffer(1)]],
                          device const int* n_groups [[buffer(2)]], device const int* ent_tok [[buffer(3)]],
                          device const uint* x_q8_0 [[buffer(4)]], device const float* x_scales [[buffer(5)]],
@@ -209,7 +215,8 @@ kernel void basalt_s2_gu(device const GrpPtr* grp_ptr [[buffer(0)]], device cons
     for (int i = int(tid); i < ne * NC; i += 256) {
         const int k = i / NC, c = i - k * NC;
         const int tok = ent_tok[e0 + k];
-        s2_stage<S2_GMAX * NC>(x_q8_0, uint(tok * NC * 34 + c * 34), x_scales[tok * NC + c], xs_w, xs_dh, i);
+        s2_stage<S2_GMAX * NC>(x_q8_0, ulong(tok) * NC * 34 + ulong(c) * 34, x_scales[ulong(tok) * NC + ulong(c)], xs_w,
+                               xs_dh, i);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const ushort* blob = grp_ptr[g].p;
@@ -245,8 +252,8 @@ kernel void basalt_s2_gu(device const GrpPtr* grp_ptr [[buffer(0)]], device cons
             const float s0 = warp_sum_ieee(acc0), s1 = warp_sum_ieee(acc1);
             if (lane == 0) {
                 const int e = e0 + k, r = i >> 1;
-                gate_up[e * S2_FF + r] = s0;
-                gate_up[int(p.cap_entries) * S2_FF + e * S2_FF + r] = s1;
+                gate_up[ulong(e) * S2_FF + ulong(r)] = s0;
+                gate_up[ulong(p.cap_entries) * S2_FF + ulong(e) * S2_FF + ulong(r)] = s1;
             }
         }
     }
@@ -255,12 +262,13 @@ kernel void basalt_s2_gu(device const GrpPtr* grp_ptr [[buffer(0)]], device cons
 // ---- SwiGLU ---------------------------------------------------------------------------------------------------------
 
 // swiglu_kernel (:165-171; s2_experts.md section 3): gate_up[i] = (g / (1 + __expf(-g))) * u in place over the gate
-// half, every capacity entry (i < cap * 640); grid ceil(cap * 640 / 256) threadgroups of 256. __expf(-g) is
-// ex2.approx.f32 of fl(g * -log2 e) (expf_neg), the add plain (1 + a subnormal e is 1 either way), the division and
-// the product IEEE's.
+// half, every capacity entry (i < cap * 640); grid ceil(cap * 640 / 256) threadgroups of 256; the pair count and i are
+// 64-bit, as basalt's long long (:165-166). __expf(-g) is ex2.approx.f32 of fl(g * -log2 e) (expf_neg), the add plain
+// (1 + a subnormal e is 1 either way), the division and the product IEEE's.
 kernel void basalt_s2_swiglu(device float* gate_up [[buffer(0)]], constant S2Params& p [[buffer(1)]],
-                             uint i [[thread_position_in_grid]]) {
-    const uint n_pairs = p.cap_entries * S2_FF;
+                             uint tg [[threadgroup_position_in_grid]], uint tpg [[threads_per_threadgroup]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    const ulong n_pairs = ulong(p.cap_entries) * S2_FF, i = ulong(tg) * tpg + tid;
     if (i >= n_pairs) return;
     const float g = gate_up[i], u = gate_up[n_pairs + i];
     gate_up[i] = ieee_mul(ieee_div(g, expf_neg(g) + 1.0f), u);
@@ -271,6 +279,7 @@ kernel void basalt_s2_swiglu(device float* gate_up [[buffer(0)]], constant S2Par
 // down_grouped_t_kernel (:970-1027; s2_experts.md section 5): grid (40, cap_groups) threadgroups of 256; 64 rows a
 // threadgroup, SIMD-group w the row pairs (r, r + 1) w, w + 8, w + 16, w + 24; lane c < 20 holds chunk c: acc =
 // fma(fl(dw * dx), f(s - hx), +0), the other lanes +0; warp_sum; lane 0 stores rows r and r + 1 of ent_dst[e].
+// Intermediate offsets and out indices are 64-bit where basalt's are size_t (:986-987, :1021).
 kernel void basalt_s2_down(device const GrpPtr* grp_ptr [[buffer(0)]], device const int* grp_start [[buffer(1)]],
                            device const int* n_groups [[buffer(2)]], device const int* ent_dst [[buffer(3)]],
                            device const uint* h_q8_0 [[buffer(4)]], device const float* h_scales [[buffer(5)]],
@@ -285,7 +294,8 @@ kernel void basalt_s2_down(device const GrpPtr* grp_ptr [[buffer(0)]], device co
     const int e0 = grp_start[g], ne = min(grp_start[g + 1] - e0, S2_GMAX);
     for (int i = int(tid); i < ne * NC; i += 256) {
         const int k = i / NC, c = i - k * NC;
-        s2_stage<S2_GMAX * NC>(h_q8_0, uint((e0 + k) * NC * 34 + c * 34), h_scales[(e0 + k) * NC + c], hs_w, hs_dh, i);
+        const ulong e = ulong(e0 + k);
+        s2_stage<S2_GMAX * NC>(h_q8_0, e * NC * 34 + ulong(c) * 34, h_scales[e * NC + ulong(c)], hs_w, hs_dh, i);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const ushort* blob = grp_ptr[g].p;
@@ -315,7 +325,7 @@ kernel void basalt_s2_down(device const GrpPtr* grp_ptr [[buffer(0)]], device co
             }
             const float s0 = warp_sum_ieee(acc0), s1 = warp_sum_ieee(acc1);
             if (lane == 0) {
-                const int o = ent_dst[e0 + k] * S2_H + r;
+                const ulong o = ulong(ent_dst[e0 + k]) * S2_H + ulong(r);
                 out[o] = s0;
                 out[o + 1] = s1;
             }
