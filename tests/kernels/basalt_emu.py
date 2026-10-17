@@ -635,3 +635,49 @@ def q5k_proxy_pack(q5, row0, n, n_cap, proxy=None):
     out[px_tiles(n_cap) * 40 * 32 * 16:].view(np.uint16)[slot * 2 + h] = hs
     return out
 
+
+
+def q5k_proxy_score(proxy, xq, n_rows, n_cap, map_, tiles, expf):
+    """px::score_kernel on the tiles ``tiles`` of the copy ``proxy`` (``n_cap`` rows) against one q8_1 column ``xq``:
+    (cand (tiles, 4, 2) float32 with the rows' bits in [..., 1], part (tiles, 2)). The exponent arguments follow from
+    the scores; ``expf`` evaluates the kernel's own expf_ftz on them."""
+    ntc, tiles = px_tiles(n_cap), np.asarray(tiles)
+    nt_ = len(tiles)
+    proxy = np.asarray(proxy, np.uint8)
+    words = proxy[: ntc * 40 * 32 * 16].view(np.uint32).reshape(ntc, 40, 32, 4)[tiles]     # (tile, w4, lane, word)
+    scw = proxy[ntc * 40 * 32 * 16:].view(np.uint32).reshape(ntc, 40, 32)[tiles]
+    xb = np.asarray(xq, np.uint8).reshape(80, 36)
+    d8 = h2f(xb[:, 0].astype(np.uint16) | (xb[:, 1].astype(np.uint16) << 8))
+    codes = xb[:, 4:].view(np.int8).astype(np.int64)                                         # (80, 32)
+    xs = mul_ftz(d8, codes.sum(axis=1).astype(F32))
+    shifts = (8 * (np.arange(16) % 4) + 2 * (np.arange(16) // 4)).astype(np.uint32)        # value 4 ii + bb of a word
+    lv = ((words[..., None] >> shifts) & 3).astype(np.int64).reshape(nt_, 40, 32, 2, 32)   # (.., h, 16 c + value)
+    g = 2 * np.arange(40)[:, None] + np.arange(2)[None, :]                                  # group of (w4, h)
+    P = (lv * codes[g][None, :, None]).sum(axis=-1)                                         # exact, as DP4A
+    inner = fma_ftz(d8[g][None, :, None], P.astype(F32), -mul_ftz(xs[g], F32(1.5))[None, :, None])
+    scale = h2f(np.stack([scw & 0xFFFF, scw >> 16], axis=-1).astype(np.uint16))
+    red = []
+    for k in range(4):                                     # SIMD-group k: w4 = 10 k + j for j = 0..9, then h = 0, 1
+        acc = np.zeros((nt_, 32), F32)
+        for j in range(10):
+            for h in range(2):
+                acc = fma_ftz(scale[:, 10 * k + j, :, h], inner[:, 10 * k + j, :, h], acc)
+        red.append(acc)
+    v = add_ftz(add_ftz(add_ftz(red[0], red[1]), red[2]), red[3])
+    row = tiles[:, None] * 32 + np.arange(32)[None]
+    masked = (row >= n_rows) | (np.asarray(map_, np.int64)[np.minimum(row, n_rows - 1)] < 0)
+    v = np.where(masked, F32(-np.inf), v).astype(F32)
+    m = butterfly(v, max_ftz)
+    live = v > -np.inf
+    with np.errstate(invalid="ignore"):
+        arg = np.where(live, add_ftz(v, -m[:, None]), F32(0.0))
+    e = np.where(live, expf(arg), F32(0.0)).astype(F32)
+    part = np.stack([m, butterfly(e, add_ftz)], axis=-1)
+    cand = np.zeros((nt_, 4, 2), F32)
+    vv, at = v.copy(), np.arange(nt_)
+    for k in range(4):
+        bi = np.argmax(vv, axis=1)                         # the first maximum: ties to the lower row
+        cand[:, k, 0] = vv[at, bi]
+        cand[:, k, 1] = (tiles * 32 + bi).astype(np.int32).view(F32)
+        vv[at, bi] = -np.inf
+    return cand, part

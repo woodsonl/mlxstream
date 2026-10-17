@@ -242,3 +242,32 @@ def test_proxy_pack_incremental(proxy_rows):
     one = gpu.q5k_proxy_pack(proxy_rows, rr + 100, [(0, rr)])
     two = gpu.q5k_proxy_pack(proxy_rows, rr + 100, [(0, 7777), (7777, rr - 7777)])
     assert np.array_equal(one, two)
+
+
+def proxy_map(rr):
+    """:250: rows i % 7 == 3 and the last 300 rows without a token, the others id 5i + 1."""
+    i = np.arange(rr)
+    return np.where((i % 7 == 3) | (i >= rr - 300), -1, 5 * i + 1).astype(np.int32)
+
+
+@pytest.fixture(scope="module")
+def proxy_copy(proxy_rows):
+    """The copy of the rescaled rows with basalt's spare capacity (:216, :253)."""
+    n_cap = len(proxy_rows) + 100
+    return gpu.q5k_proxy_pack(proxy_rows, n_cap, [(0, len(proxy_rows))]), n_cap
+
+
+def test_proxy_score_emulation_bit_for_bit(proxy_copy, data):
+    """px::score_kernel's candidates and tile partials bit for bit against the numpy emulation
+    (basalt_emu.q5k_proxy_score, with the GPU's expf_ftz for __expf), at a row count that ends inside a tile (19,990:
+    a masked tail) with basalt's map (:250), on the first 40 tiles and the last 8."""
+    proxy, n_cap = proxy_copy
+    rr = n_cap - 110
+    mp = proxy_map(rr)
+    xc = column(data[1], 1)
+    cand, part = gpu.q5k_proxy_score(proxy, xc, rr, n_cap, mp)
+    t = kernels.basalt_q5k_proxy_tiles(rr)
+    tiles = np.r_[0:40, t - 8:t]
+    e_cand, e_part = emu.q5k_proxy_score(proxy, xc, rr, n_cap, mp, tiles, gpu.expf_ftz)
+    assert bad_bits(cand[tiles], e_cand) == 0 and bad_bits(part[tiles], e_part) == 0
+    assert np.all(np.isneginf(cand[t - 1, :, 0]))       # the last tile: rows 19,968.. masked (map's last 300 rows)

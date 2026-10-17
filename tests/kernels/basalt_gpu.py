@@ -311,3 +311,23 @@ def q5k_proxy_pack(q5, n_cap, packs, proxy=None):
     r = nt.Queue(dev).run(ds)
     assert not r.error, r.error
     return np.frombuffer(bp.read(0, nbytes), np.uint8)
+
+
+def q5k_proxy_score(proxy, xq, n_rows, n_cap, map_):
+    """``px::score_kernel`` over the first ``n_rows`` rows of the copy ``proxy`` (``n_cap`` rows) for one q8_1 column:
+    (cand: (tiles, 4, 2) pairs (score, row bits), part: (tiles, 2) (max, sum)) from basalt's scratch layout."""
+    dev = device()
+    pso = pipeline(kernels.basalt_q5k_head_source(), "basalt_q5k_proxy_score")
+    nbytes = kernels.basalt_q5k_proxy_scratch_bytes(n_cap)
+    bs = nt.Buffer(dev, nbytes)
+    bs.fill(0xEE)
+    d = (nt.Dispatch().pipeline(pso).buffer(0, nt.Buffer(dev, np.ascontiguousarray(proxy, np.uint8).tobytes()))
+         .buffer(1, nt.Buffer(dev, np.ascontiguousarray(xq, np.uint8).tobytes()))
+         .buffer(2, nt.Buffer(dev, np.ascontiguousarray(map_, np.int32).tobytes())).buffer(3, bs)
+         .bytes(4, kernels.basalt_q5k_proxy_params(n_cap, n_rows=n_rows))
+         .grid(kernels.basalt_q5k_proxy_tiles(n_rows)).threadgroup(kernels.PX_THREADS_SCORE))
+    r = nt.Queue(dev).run([d])
+    assert not r.error, r.error
+    s = np.frombuffer(bs.read(0, nbytes), np.float32)
+    ntc, t = kernels.basalt_q5k_proxy_tiles(n_cap), kernels.basalt_q5k_proxy_tiles(n_rows)
+    return s[: 8 * t].reshape(t, 4, 2), s[8 * ntc: 8 * ntc + 2 * t].reshape(t, 2)
