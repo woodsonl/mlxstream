@@ -22,6 +22,17 @@ pattern), against host references. Every comparison is bitwise.
   on the subnormal grid at every denormalization shift), results decided by a sticky bit alone (a carry into the next
   binade, and products whose lowest bits only the alignment's sticky bit sees), subnormal results, overflow (to inf,
   and to DBL_MAX when rounded to odd) and every triple of specials.
+- H.3: the binary32 operations with IEEE subnormals: ``ieee_add`` and ``ieee_mul`` (basalt_ieee.metal), ``ieee_div``
+  and ``ieee_fma_count`` (basalt_sampler.metal), against each exact value as a ``Fraction`` rounded once to nearest
+  even (``round32``, checked against the host's float32 add, multiply and divide and basalt_emu's fma), on uniform
+  patterns and planted classes, more than half of the rows with a subnormal operand or result: every exponent field,
+  subnormals and the lowest binades, products and quotients at the bottom of the range, a subnormal c that moves a
+  normal fma, exact results just below 2^-126 that round up to it (which the GPU flushes) and the exact pairs at
+  2^-126 and above FLT_MAX, ties and near ties (the subnormal grid at every shift, quotients and fmas near a midpoint
+  just above the hardware path's 2^-125 bound, with divisors of 2^126 and products below 2^-142), fma gaps,
+  cancellation and exact zeros, products beyond FLT_MAX beside a large or an infinite c, fmas that rounding to
+  nearest twice (binary64, then binary32) gets wrong, on both paths, overflow and every triple of specials. A NaN
+  result must be NaN, and 0x7fffffff where an operand is zero or subnormal (the software route).
 - H.4: ``nv_exp`` and ``nv_logf`` (CUDA's binary64 exp and logf) against the reference module's transcriptions
   (tests/basalt_sampler_ref.py), on uniform bit patterns and planted classes: the tail's arguments, both range
   thresholds of exp and the split scale's subnormal and overflowing results, tiny arguments, arguments near a midpoint
@@ -38,6 +49,7 @@ import numpy as np
 
 from monolith import kernels
 from tests.basalt_sampler_ref import nv_exp, nv_logf, u2d
+from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
 
 U32, U64, I64, F32, F64 = np.uint32, np.uint64, np.int64, np.float32, np.float64
@@ -506,6 +518,333 @@ def test_basalt_f64_mul_fma_div_vs_host():
     for v in (mul, fma, div):
         assert np.count_nonzero(fin3 & ((v & MAG) == U64(INF_BITS))) > 100                # overflow to inf
     assert np.count_nonzero(fin3 & ((odd & MAG) == U64(MAX_BITS)) & ((fma & MAG) == U64(INF_BITS))) > 100
+
+
+# ---- H.3: binary32 add, multiply, divide and fma with IEEE subnormals ----------------------------------------------
+
+H3 = """
+kernel void h3_ieee(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]],
+                    device const uint* c [[buffer(2)]], device uint* out [[buffer(3)]],
+                    constant uint& n [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const float x = as_type<float>(a[i]), y = as_type<float>(b[i]), z = as_type<float>(c[i]);
+  device uint* o = out + 4 * i;
+  o[0] = as_type<uint>(ieee_add(x, y));
+  o[1] = as_type<uint>(ieee_mul(x, y));
+  o[2] = as_type<uint>(ieee_div(x, y));
+  o[3] = as_type<uint>(ieee_fma_count(x, y, z));
+}
+"""
+
+INF32, SIGN32 = 0x7F800000, 1 << 31
+
+
+def round32(q):
+    """The nonzero Fraction q rounded once to binary32: to nearest even on the grid of its binade (2^-149 below 2^-126,
+    gradual underflow), infinity from 2^128 - 2^103 up. Returns the bits and round64's case (NEAR: within 2^-21 of a
+    half unit, off it)."""
+    n, d = abs(q.numerator), q.denominator
+    e = n.bit_length() - d.bit_length()
+    if (n << max(0, -e)) < (d << max(0, e)):
+        e -= 1                                                          # 2^e <= |q| < 2^(e + 1)
+    k = max(e, -126) - 23                                               # the grid 2^k
+    den = d << max(0, k)
+    m, r = divmod(n << max(0, -k), den)
+    case = (EXACT if r == 0 else (UP if m & 1 else DOWN) if 2 * r == den
+            else NEAR if abs(2 * r - den) << 20 < den else INEXACT)
+    m += 2 * r > den or case == UP
+    return (int(q < 0) << 31) | min(((k + 149) << 23) + m, INF32), case  # a carry moves the exponent up
+
+
+def neg(v):
+    return math.copysign(1.0, v) < 0
+
+
+def ref_ieee(x, y, z):
+    """IEEE binary32 x + y, x * y, x / y and fma(x, y, z) on float32 values (Python floats): each exact value a
+    Fraction, rounded once (round32); the specials and the signs of an exact zero by IEEE 754's rules. Returns four
+    (bits, case) pairs; a NaN's bits are None."""
+    F, nan, inf = Fraction, math.isnan, math.isinf
+    sign, nan_ = (neg(x) != neg(y)) << 31, (None, SPECIAL)
+    if nan(x) or nan(y) or (inf(x) and inf(y) and x != y):
+        add = nan_
+    elif inf(x) or inf(y):
+        add = (f32_bits(x if inf(x) else y), SPECIAL)
+    else:
+        s = F(x) + F(y)
+        add = round32(s) if s else ((neg(x) and neg(y)) << 31, SPECIAL)   # -0 only from -0 + -0
+    if nan(x) or nan(y) or (inf(x) and y == 0) or (inf(y) and x == 0):
+        mul = nan_
+    elif inf(x) or inf(y) or x == 0 or y == 0:
+        mul = (sign | (INF32 if inf(x) or inf(y) else 0), SPECIAL)
+    else:
+        mul = round32(F(x) * F(y))
+    if nan(x) or nan(y) or (x == 0 and y == 0) or (inf(x) and inf(y)):
+        div = nan_
+    elif inf(x) or y == 0 or inf(y) or x == 0:
+        div = (sign | (INF32 if inf(x) or y == 0 else 0), SPECIAL)
+    else:
+        div = round32(F(x) / F(y))
+    if nan(x) or nan(y) or nan(z) or ((inf(x) or inf(y)) and (x == 0 or y == 0 or (inf(z) and neg(z) != bool(sign)))):
+        fma = nan_
+    elif inf(x) or inf(y):
+        fma = (sign | INF32, SPECIAL)
+    elif inf(z):
+        fma = (f32_bits(z), SPECIAL)
+    else:
+        v = F(x) * F(y) + F(z)
+        fma = round32(v) if v else ((x * y == 0 and bool(sign) and neg(z)) << 31, SPECIAL)   # -0: -0 + -0 only
+    return add, mul, div, fma
+
+
+def f32_bits(v):
+    return struct.unpack("<I", struct.pack("<f", v))[0]
+
+
+def floats(rng, exp):
+    """Random signs and fractions on the biased exponents ``exp`` (float32 bits)."""
+    return (words(rng, len(exp), U32) & U32(0x807FFFFF)) | (np.asarray(exp).astype(U32) << U32(23))
+
+
+def f32(v):
+    """float64 values as float32 bits, rounded to nearest even."""
+    return np.asarray(v, F64).astype(F32).view(U32)
+
+
+def inv32(a):
+    """a^-1 mod 2^32 for odd uint64 a < 2^32 (Newton: each step doubles the correct low bits, 3 to 48)."""
+    m, x = U64(0xFFFFFFFF), a.copy()
+    for _ in range(4):
+        x = (x * ((U64(2) - (a * x & m)) & m)) & m
+    return x
+
+
+# 2^25 - 1 = 31 * 601 * 1801 and 2^24 - 1 = 4095 * 4097: products at 2^-126 - 2^-151 (rounds up to 2^-126), at the
+# tie 2^-126 - 2^-150 (to even: 2^-126) and at 2^128 - 2^103 (the tie above FLT_MAX: to even, infinity)
+EDGE_PAIRS = [(31 * 2.0 ** -70, 1082401 * 2.0 ** -81), (601 * 2.0 ** -75, 55831 * 2.0 ** -76),
+              (1801 * 2.0 ** -75, 18631 * 2.0 ** -76), (4095 * 2.0 ** -75, 4097 * 2.0 ** -75),
+              (18631 * 2.0 ** 50, 1801 * 2.0 ** 53), (601 * 2.0 ** 52, 55831 * 2.0 ** 51)]
+SPECIALS32 = np.array([0, 1, 0x400000, 0x7FFFFF, 0x800000, 0x1000000, 0x3F800000, 0x7F7FFFFF, 0x7F800000, 0x7F800001,
+                       0x7FC00000], U32)   # 0, subnormals, 2^-126, 2^-125, 1, FLT_MAX, inf, NaNs
+
+
+def offset32(x, k):
+    """float32 bits x with the magnitude moved by k units in the last place, clamped to [0, FLT_MAX]; x's sign."""
+    mag = np.clip((x & U32(0x7FFFFFFF)).astype(I64) + np.asarray(k, I64), 0, 0x7F7FFFFF)
+    return mag.astype(U32) | (x & U32(SIGN32))
+
+
+def pow2(e):
+    """2^e (integer e within the normal range) as float32 bits."""
+    return (np.asarray(e) + 127).astype(U32) << U32(23)
+
+
+def h3_rows(rng):
+    """The H.3 operand triples (float32 bit patterns) by class."""
+    n = 1 << 12
+    k = np.arange(2 * n)
+    sign = lambda m: words(rng, m, U32) & U32(SIGN32)
+    rows = {"uniform": tuple(words(rng, n, U32) for _ in range(3))}
+    # exponent fields 0 to 255 for a and b (subnormal, normal, inf, NaN), c within 30 binades of the product
+    ea, eb = rng.integers(0, 256, 2 * n), rng.integers(0, 256, 2 * n)
+    rows["exponents"] = (floats(rng, ea), floats(rng, eb),
+                         floats(rng, np.clip(ea + eb - 127 + rng.integers(-30, 31, 2 * n), 0, 255)))
+    # subnormals (half of the operands) and the two lowest binades, every sign: sums across 2^-126, differences below
+    # it, quotients of them
+    rows["subnormal"] = tuple(floats(rng, rng.choice([0, 0, 1, 2], 2 * n)) for _ in range(3))
+    # products (even rows) and quotients (odd rows) at biased exponents -25 to 3: subnormal, or about 2^-126; c +-0,
+    # subnormal, or near the product
+    k4 = np.arange(4 * n)
+    t, ea = rng.integers(-25, 4, 4 * n), rng.integers(30, 101, 4 * n)
+    c = np.select([k4 % 3 == 0, k4 % 3 == 1], [sign(4 * n), floats(rng, np.zeros(4 * n, int))],
+                  floats(rng, np.clip(t + rng.integers(-2, 3, 4 * n), 0, 254)))
+    rows["sub_results"] = (floats(rng, ea), floats(rng, np.where(k4 % 2 == 0, t + 127 - ea, ea + 127 - t)), c)
+    # a subnormal c beside a product of 2^-125 to 2^-106, where it changes a normal fma; a subnormal a (or b) times
+    # 2^-60 to 2^60 and divided by it (normal products and quotients of a subnormal), c in the low binades
+    t, ea = rng.integers(2, 22, 2 * n), rng.integers(30, 98, 2 * n)
+    rows["sub_c"] = (floats(rng, ea), floats(rng, t + 127 - ea), floats(rng, np.zeros(2 * n, int)))
+    s, x = floats(rng, np.zeros(2 * n, int)), floats(rng, rng.integers(67, 188, 2 * n))
+    rows["sub_ab"] = (np.where(k % 2 == 0, s, x), np.where(k % 2 == 0, x, s), floats(rng, rng.integers(1, 64, 2 * n)))
+    # results within about 2^-150 of +-2^-126 or +-2^-125: b = RN(target / a) (c = 0, or b = RN((target - c) / a) for
+    # c = +-j 2^-126) and a = RN(target * b) in every 4th row; the exact pairs EDGE_PAIRS (2^-126 and FLT_MAX's edges)
+    # and the tie 2^-126 - 2^-150 as +-(2^24 - 1) 2^E / 2^(E + 150), every E: no other quotient of floats lies in
+    # [2^-126 - 2^-150, 2^-126), 2^-150 being 2^-24 of it
+    target = np.where(k % 3 == 0, 2.0 ** -125, 2.0 ** -126) * (1 + rng.integers(-40, 41, 2 * n) * 2.0 ** -26)
+    target *= np.where(k % 2 == 0, 1.0, -1.0)
+    quot = k % 4 == 3
+    x = floats(rng, np.where(quot, rng.integers(128, 178, 2 * n), rng.integers(77, 127, 2 * n))).view(F32).astype(F64)
+    cz = np.where(k % 4 < 2, 0.0, rng.integers(-3, 4, 2 * n) * 2.0 ** -126)
+    p = np.array(EDGE_PAIRS)
+    sg = np.repeat([1.0, -1.0], len(p))
+    e = np.arange(-149, -22)
+    rows["edges"] = (np.r_[np.where(quot, f32(target * x), f32(x)), f32(np.r_[p[:, 0], p[:, 0]] * sg),
+                           f32(np.ldexp(2.0 ** 24 - 1, np.r_[e, e])) ^ np.repeat([U32(0), U32(SIGN32)], len(e))],
+                     np.r_[np.where(quot, f32(x), f32((target - cz) / x)), f32(np.r_[p[:, 1], p[:, 1]]),
+                           pow2(np.r_[e, e] + 150)],
+                     np.r_[np.where(quot, 0, f32(cz)), np.zeros(2 * len(p) + 2 * len(e), U32)])
+    # ties, exactly or (some) one ulp off: products of 13-bit significands (25 or 26 bits); on the subnormal grid,
+    # 2^p * (2j + 1) 2^(-150 - p) and (2j + 1) 2^E / 2^(E + 150), j of every bit length 0 to 22 (every denormalization
+    # shift); sums with b = +-half an ulp of a; fmas with a * b = +-half an ulp of c (2^-150 for a subnormal c), or
+    # 1 + 2^-23 times it
+    j = np.array([0 if v == 0 else int(rng.integers(1 << (v - 1), 1 << v)) for v in (k[:n] % 23).tolist()])
+    odd, pw, e = (2 * j + 1).astype(F64), rng.integers(-60, -23, n), rng.integers(-126, -23, n)
+    sig13 = lambda m: (((rng.integers(1 << 12, 1 << 13, m) - (1 << 12)) << 11).astype(U32)
+                       | (rng.integers(64, 190, m).astype(U32) << U32(23)))
+    ea = rng.integers(64, 190, n)
+    a = floats(rng, ea)
+    ec = rng.integers(0, 254, n)
+    h = np.maximum(ec, 1) - 151                                          # log2 of half an ulp of c
+    pa = h // 2 + rng.integers(-10, 11, n)
+    rows["ties"] = (
+        np.r_[sign(n) | sig13(n), pow2(pw), offset32(f32(odd * np.ldexp(1.0, e)), rng.choice([-1, 0, 0, 1], n)), a,
+              pow2(pa)],
+        np.r_[sig13(n), f32(odd * np.ldexp(1.0, -150 - pw)), pow2(e + 150),
+              offset32(pow2(ea - 151) | sign(n), rng.choice([-1, 0, 0, 1], n)),
+              f32(np.ldexp(np.where(k[:n] % 2 == 0, 1.0, 1 + 2.0 ** -23), h - pa)) | sign(n)],
+        np.r_[words(rng, 4 * n, U32), floats(rng, ec)])
+    # quotients near a midpoint: Ma * 2^24 (2^25 for Ma < Mb) = K * Mb + d, 0 < |d| <= 3, Mb odd: at divisors of
+    # 2^126 and above with quotients of 2^-125 to 2^-119 (the guard's edge), and at random exponents
+    near = []
+    for i in range(n):
+        d = int(rng.choice([-3, -2, -1, 1, 2, 3]))
+        while True:
+            mb = int(rng.integers(1 << 23, 1 << 24)) | 1
+            ma = d * pow(2, -25 if i % 2 else -24, mb) % mb + (0 if i % 2 else mb)
+            if (1 << 23) <= ma < (1 << 24):
+                break
+        if i % 4 < 2:
+            eb = int(rng.integers(253, 255))
+            ea = int(rng.integers(2, 8)) + eb - 127 + i % 2                 # the quotient's biased exponent: 2 to 7
+        else:
+            ea, eb = int(rng.integers(64, 191)), int(rng.integers(64, 191))
+        near.append((int(i % 8 < 4) << 31 | ea << 23 | (ma - (1 << 23)),
+                     int(i % 3 == 0) << 31 | eb << 23 | (mb - (1 << 23))))
+    na, nb = (np.array(v, U32) for v in zip(*near))
+    # fmas near a midpoint at c of 2^-125 to 2^-118, beside a product below 2^-142: a power of two a times b, a * b half
+    # an ulp of c times 1 - j 2^-24, 1 or 1 + j 2^-23 (|j| <= 4)
+    ec, pa = rng.integers(2, 9, n), rng.integers(-60, -30, n)
+    mm = 1 + rng.choice([-4, -3, -2, -1, 0, 0, 0, 1, 2, 3, 4], n) * np.where(k[:n] % 2 == 0, 2.0 ** -24, 2.0 ** -23)
+    rows["near"] = (np.r_[na, pow2(pa) | sign(n)], np.r_[nb, f32(np.ldexp(mm, ec - 151 - pa))],
+                    np.r_[np.zeros(n, U32), floats(rng, ec)])
+    # the fma: gaps of -50 to 50 binades between the product and c; c = -RN(a * b) moved by up to 4 ulps (the
+    # product's rounding error for every 8th: subnormal for products below about 2^-102); exact zeros (12-bit
+    # significands, c = -a * b); products of 2^128 to 2^130 beside a c of the other sign in the top two binades, or
+    # an infinite c (every 4th)
+    ea, eb = rng.integers(1, 255, n), rng.integers(1, 255, n)
+    rows["fma_gaps"] = (floats(rng, ea), floats(rng, eb),
+                        floats(rng, np.clip(ea + eb - 127 + rng.integers(-50, 51, n), 0, 254)))
+    ea = rng.integers(1, 128, n)
+    a = floats(rng, ea)
+    b = floats(rng, np.clip(np.where(k[:n] % 2 == 0, rng.integers(128, 160, n), rng.integers(2, 60, n)) + 127 - ea,
+                            1, 254))
+    pr = f32(a.view(F32).astype(F64) * b.view(F32).astype(F64))
+    rows["cancel"] = (a, b, offset32(pr, np.where(k[:n] % 8 == 0, 0, rng.integers(-4, 5, n))) ^ U32(SIGN32))
+    sig12 = lambda m: sign(m) | (((rng.integers(1 << 11, 1 << 12, m) - (1 << 11)) << 12).astype(U32)) \
+        | (rng.integers(64, 191, m).astype(U32) << U32(23))
+    a, b = sig12(n), sig12(n)
+    rows["zeros"] = (a, b, f32(a.view(F32).astype(F64) * b.view(F32).astype(F64)) ^ U32(SIGN32))
+    ea = rng.integers(128, 255, n)
+    a, b = floats(rng, ea), floats(rng, np.clip(rng.integers(255, 257, n) + 127 - ea, 1, 254))
+    big = (~(a ^ b) & U32(SIGN32)) | (rng.integers(253, 255, n).astype(U32) << U32(23)) | (words(rng, n, U32)
+                                                                                        & U32(0x7FFFFF))
+    rows["fma_over"] = (a, b, np.where(k[:n] % 4 == 0, sign(n) | U32(INF32), big))
+    # double rounding: Ma * Mb = 2^31 + D mod 2^32 (D = +-1 to 3), c's ulp 2^32 units of the product, so a * b + c is a
+    # binary32 midpoint plus D / 8 of a binary64 ulp: rounding to nearest twice gives the even neighbour, the wrong one
+    # for about half of the rows. c's exponent field 0 (c above 2^-127, D = +-1) and 1 take the software route
+    m = rng.integers(1 << 22, 1 << 23, 1 << 21).astype(U64) * U64(2) + U64(1)
+    dd = rng.choice(np.array([-3, -2, -1, 1, 2, 3]), len(m))
+    ec = np.select([np.arange(len(m)) % 3 == 0, np.arange(len(m)) % 3 == 1], [0, 1], rng.integers(2, 254, len(m)))
+    dd = np.where(ec == 0, np.sign(dd), dd)
+    mb = (((U64(1 << 31) + dd.astype(I64).view(U64)) & U64(0xFFFFFFFF)) * inv32(m)) & U64(0xFFFFFFFF)
+    ok = (mb >= U64(1 << 23)) & (mb < U64(1 << 24))
+    nt_ = n // 2
+    ma, mb, ec = m[ok][:nt_], mb[ok][:nt_], ec[ok][:nt_]
+    assert len(ma) == nt_
+    s = np.maximum(ec, 1) - 182                                          # the product's last place: 2^s
+    sa = s // 2
+    cf = np.where(ec == 0, rng.integers(1 << 22, (1 << 23) - (1 << 16), nt_), rng.integers(0, 1 << 23, nt_))
+    rows["traps"] = (sign(nt_) | ((sa + 150).astype(U32) << U32(23)) | (ma.astype(U32) - U32(1 << 23)),
+                     sign(nt_) | ((s - sa + 150).astype(U32) << U32(23)) | (mb.astype(U32) - U32(1 << 23)),
+                     sign(nt_) | (ec.astype(U32) << U32(23)) | cf.astype(U32))
+    # results about FLT_MAX: products (even rows) and quotients (odd rows) at biased exponents 252 to 256, sums with a
+    # b in the top binades (every 3rd), and FLT_MAX plus 2^103 (half its ulp: the tie, to infinity), plus the float
+    # below 2^103, and plus FLT_MAX
+    ea, t = rng.integers(128, 255, n), rng.integers(252, 257, n)
+    b = np.where(k[:n] % 3 == 0, floats(rng, rng.integers(252, 255, n)),
+                 floats(rng, np.clip(np.where(k[:n] % 2 == 0, t + 127 - ea, ea + 127 - t), 1, 254)))
+    rows["overflow"] = (np.r_[floats(rng, ea), np.full(3, 0x7F7FFFFF, U32)],
+                        np.r_[b, np.array([0x73000000, 0x72FFFFFF, 0x7F7FFFFF], U32)],
+                        np.r_[floats(rng, rng.integers(250, 255, n)), np.zeros(3, U32)])
+    sp = np.r_[SPECIALS32, SPECIALS32 | U32(SIGN32)]
+    rows["specials"] = tuple(v.ravel() for v in np.meshgrid(sp, sp, sp, indexing="ij"))
+    return rows
+
+
+def test_basalt_ieee_add_mul_div_fma_vs_fraction():
+    rng = np.random.default_rng(23)
+    rows = h3_rows(rng)
+    a, b, c = (np.concatenate([v[j] for v in rows.values()]) for j in range(3))
+    assert a.dtype == b.dtype == c.dtype == U32
+    got = run_kernel(H3, "h3_ieee", [a, b, c], 4, U32)
+    A, B, C = (v.view(F32) for v in (a, b, c))
+    ref = [ref_ieee(x, y, z) for x, y, z in zip(A.tolist(), B.tolist(), C.tolist())]
+    want = np.array([[-1 if r[0] is None else r[0] for r in row] for row in ref], I64)       # -1: NaN
+    case = np.array([[r[1] for r in row] for row in ref], int)
+    nan, mag = want < 0, want & 0x7FFFFFFF
+    # the reference rounds as the host's IEEE float32 add, multiply and divide do, and as basalt_emu's fma
+    with np.errstate(all="ignore"):
+        host = [A + B, A * B, A / B, emu.fma32(A, B, C)]
+    for col, h in enumerate(host):
+        assert np.array_equal(np.isnan(h), nan[:, col]), col
+        assert np.array_equal(h.view(U32)[~nan[:, col]], want[~nan[:, col], col]), col
+    for col, name in enumerate(["ieee_add", "ieee_mul", "ieee_div", "ieee_fma_count"]):
+        g = got[:, col]
+        bad = np.flatnonzero(np.where(nan[:, col], (g & U32(0x7FFFFFFF)) <= U32(INF32), g != want[:, col]))
+        assert bad.size == 0, (f"{name}: {bad.size} of {len(a)} differ; first a={a[bad[0]]:#010x} b={b[bad[0]]:#010x} "
+                               f"c={c[bad[0]]:#010x}: got {g[bad[0]]:#x}, want {want[bad[0], col]:#x}")
+    # a NaN from the software route (a zero or subnormal operand) is 0x7fffffff
+    low = lambda x: (x & U32(INF32)) == 0
+    for col, sw in ((1, low(a) | low(b)), (2, low(a) | low(b)), (3, low(a) | low(b) | low(c))):
+        assert np.count_nonzero(sw & nan[:, col]) > 10 and np.all(got[sw & nan[:, col], col] == U32(0x7FFFFFFF)), col
+    # the planted classes are what they claim
+    at = slices({name: v[0] for name, v in rows.items()})
+    sub = lambda x: low(x) & ((x & U32(0x7FFFFF)) != 0)
+    wsub = (mag > 0) & (mag < 0x800000) & ~nan                                         # subnormal results
+    assert 2 * np.count_nonzero(sub(a) | sub(b) | sub(c) | wsub.any(axis=1)) >= len(a)   # half subnormal-heavy
+    normal = ~nan & (mag >= 0x800000) & (mag < INF32)
+    big = nan | (mag >= 0x1000000)                                                     # 2^-125 and above
+    hw = {2: ~low(a) & ~low(b) & big[:, 2], 3: ~low(a) & ~low(b) & ~low(c) & big[:, 3]}   # the hardware's results
+    for col, fast in hw.items():
+        assert np.count_nonzero(fast) > 20000 and np.count_nonzero(~fast & normal[:, col]) > 2000, col
+        assert np.count_nonzero(~fast & wsub[:, col]) > 5000, col
+    with np.errstate(all="ignore"):
+        exact = [None, A.astype(F64) * B, A.astype(F64) / B, A.astype(F64) * B + C]    # float64: classes only
+    e = at["edges"]
+    for col in (1, 2, 3):                                     # below 2^-126, rounded up to it (the GPU flushes these)
+        assert np.count_nonzero((np.abs(exact[col][e]) < 2.0 ** -126) & (mag[e, col] == 0x800000)) > 50, col
+    for col in range(4):
+        v = case[at["ties"], col]
+        assert np.count_nonzero(v == DOWN) > 100 and np.count_nonzero(v == UP) > 100, col          # ties, either way
+    assert np.count_nonzero(case[at["near"], 2] == NEAR) > 500 and np.count_nonzero(case[at["near"], 3] == NEAR) > 500
+    s = at["sub_c"]
+    assert np.count_nonzero(normal[s, 3] & (want[s, 3] != want[s, 1])) > 1000         # a subnormal c moves the fma
+    s = at["sub_ab"]
+    assert np.count_nonzero(normal[s, 1]) > 500 and np.count_nonzero(normal[s, 2]) > 500   # of a subnormal operand
+    s = at["fma_over"]
+    beyond = np.abs(exact[1][s]) >= 2.0 ** 128
+    assert np.count_nonzero(beyond & normal[s, 3]) > 100 and np.all(beyond)
+    assert np.count_nonzero(beyond & ((c[s] & U32(0x7FFFFFFF)) == U32(INF32)) & (want[s, 3] == c[s])) > 500
+    assert np.count_nonzero(wsub[at["cancel"], 3]) > 100 and np.all(want[at["zeros"], 3] == 0)   # +0 when exact
+    # the double-rounding traps: rounding to nearest in binary64 first, then to binary32, differs from the fma
+    t = at["traps"]
+    twice = []
+    for x, y, z in zip(A[t].tolist(), B[t].tolist(), C[t].tolist()):
+        v = Fraction(x) * Fraction(y) + Fraction(z)
+        bits, _ = round64(v.numerator, 1 - v.denominator.bit_length())
+        twice.append(bits)
+    twice = np.array(twice, U64).view(F64).astype(F32).view(U32).astype(I64)
+    differ = twice != want[t, 3]
+    assert np.count_nonzero(differ & ~hw[3][t]) > 300 and np.count_nonzero(differ & hw[3][t]) > 100
 
 
 # ---- H.4: libdevice's exp and logf ---------------------------------------------------------------------------------
