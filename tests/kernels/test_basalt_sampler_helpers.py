@@ -22,14 +22,22 @@ pattern), against host references. Every comparison is bitwise.
   on the subnormal grid at every denormalization shift), results decided by a sticky bit alone (a carry into the next
   binade, and products whose lowest bits only the alignment's sticky bit sees), subnormal results, overflow (to inf,
   and to DBL_MAX when rounded to odd) and every triple of specials.
+- H.4: ``nv_exp`` and ``nv_logf`` (CUDA's binary64 exp and logf) against the reference module's transcriptions
+  (tests/basalt_sampler_ref.py), on uniform bit patterns and planted classes: the tail's arguments, both range
+  thresholds of exp and the split scale's subnormal and overflowing results, tiny arguments, arguments near a midpoint
+  of the reduction's rounding, logf's subnormal, negative, above-1 and near-1 arguments, the edges of its binade split
+  and the specials. A NaN result must be NaN: ``F64_NAN`` for ``nv_exp``; ``nv_logf``'s carries the hardware fma's
+  payload. The references must also differ from ``math.exp`` and float32 ``math.log`` somewhere, by at most an ulp.
 """
 
 import math
 import struct
+from fractions import Fraction
 
 import numpy as np
 
 from monolith import kernels
+from tests.basalt_sampler_ref import nv_exp, nv_logf, u2d
 from tests.kernels import basalt_gpu as gpu
 
 U32, U64, I64, F32, F64 = np.uint32, np.uint64, np.int64, np.float32, np.float64
@@ -498,3 +506,132 @@ def test_basalt_f64_mul_fma_div_vs_host():
     for v in (mul, fma, div):
         assert np.count_nonzero(fin3 & ((v & MAG) == U64(INF_BITS))) > 100                # overflow to inf
     assert np.count_nonzero(fin3 & ((odd & MAG) == U64(MAX_BITS)) & ((fma & MAG) == U64(INF_BITS))) > 100
+
+
+# ---- H.4: libdevice's exp and logf ---------------------------------------------------------------------------------
+
+H4 = """
+kernel void h4_libdevice(device const ulong* x [[buffer(0)]], device const uint* f [[buffer(1)]],
+                         device ulong* out [[buffer(2)]], constant uint& n [[buffer(3)]],
+                         uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  out[2 * i] = nv_exp(x[i]);
+  out[2 * i + 1] = ulong(as_type<uint>(nv_logf(as_type<float>(f[i]))));
+}
+"""
+
+# exp's edges, run at both signs: 0, inf, 1, ln 2, the least subnormal, DBL_MIN, DBL_MAX, the range thresholds
+# 708.396... (1022 ln 2) and 745, and the |x| whose results are 2^-+1023, the least subnormal and half of it (either
+# side), and DBL_MAX (either side)
+EXP_EDGES = [0.0, math.inf, 1.0, math.log(2.0), 5e-324, 2.0 ** -1022, 1.7976931348623157e308, 708.3964185322641,
+             745.0, 746.0, 709.0895657128241, 744.4400719213812, 745.1332191019411, 745.1332191019412,
+             709.782712893384, 709.7827128933841]
+EXP_NANS = [0x7FF0000000000001, 0x7FF8000000000000, 0xFFF8000000000000, 0x7FFFFFFFFFFFFFFF, 0xFFF0000000000001]
+# logf's edges, run at both signs: 0, subnormals and the normal range's ends, 1 and its neighbours, the binade split
+# 0x3F2AAAAB, inf, NaNs, every power of two and all-ones significand among the subnormals, and the fixtures' min_p
+LOGF_EDGES = ([0, 1, 2, 0x7FFFFF, 0x800000, 0x800001, 0x3F800000, 0x3F7FFFFF, 0x3F800001, 0x3F2AAAAA, 0x3F2AAAAB,
+               0x3F2AAAAC, 0x7F7FFFFF, 0x7F800000, 0x7F800001, 0x7FC00000, 0x7FFFFFFF]
+              + [1 << j for j in range(23)] + [(2 << j) - 1 for j in range(23)]
+              + [0x3D4CCCCD, 0x3DCCCCCD, 0x3E4CCCCD, 0x3E99999A, 0x3ECCCCCD, 0x3F000000, 0x3F666666])
+ONE = U64(0x3FF0000000000000)
+
+
+def h4_exp_args(rng):
+    """nv_exp's arguments (binary64 bit patterns) by class."""
+    n = 1 << 12
+    args = {"uniform": words(rng, 1 << 15),                                     # every class of bit pattern
+            "tail": rng.uniform(-50.0, 0.0, 2 * n).view(U64),                   # the tail's x - max <= 0
+            "underflow": rng.uniform(-746.0, -708.0, n).view(U64),              # the split scale: subnormal results
+            "overflow": rng.uniform(708.0, 746.0, 2 * n).view(U64)}             # and overflowing ones
+    # high words at each range threshold and either side of it, random low words, either sign
+    hw = rng.choice(np.array([0x4086232A, 0x4086232B, 0x4086232C, 0x408747FF, 0x40874800, 0x40874801], U64), n)
+    args["thresholds"] = (hw << U64(32)) | (words(rng, n) & U64(0xFFFFFFFF)) | (words(rng, n) & SIGN)
+    # every binade below 2^-20, the subnormals included: i is 0 and r is x
+    args["tiny"] = doubles(rng, rng.integers(0, 1023 - 20, n))
+    # x / ln 2 within 10^-12 of k + 1/2, a midpoint of t's rounding to an integer, for every k of the range
+    mid = ((np.arange(-1075, 1024) + 0.5) * math.log(2.0)).view(U64)
+    args["midpoints"] = np.concatenate([offset(mid, d) for d in (-2, -1, 0, 1, 2)])
+    e = np.array(EXP_EDGES, F64).view(U64)
+    args["edges"] = np.r_[e, e | SIGN, np.array(EXP_NANS, U64)]
+    return args
+
+
+def h4_logf_args(rng):
+    """nv_logf's arguments (binary32 bit patterns) by class."""
+    n = 1 << 12
+    k = np.arange(n)
+    args = {"uniform": words(rng, 1 << 13, U32),                                # every class of bit pattern
+            "tail": rng.uniform(1e-6, 1.0, n).astype(F32).view(U32),           # min_p's range
+            "decades": (10.0 ** rng.uniform(-46.0, 38.5, n)).astype(F32).view(U32),   # 0, subnormals, ... 3e38
+            # subnormals, a quarter negative
+            "subnormal": rng.integers(1, 1 << 23, n).astype(U32) | np.where(k % 4 == 0, U32(1 << 31), U32(0)),
+            # 1 + j ulps for |j| <= 2048: f = m - 1 down to 2^-24
+            "near_one": (np.int64(0x3F800000) + rng.integers(-2048, 2049, n)).astype(U32)}
+    # the significands 0x2AAAAB - 3 to + 3 about the split of [2/3, 4/3) in every binade
+    split = (np.arange(1, 255, dtype=U32)[:, None] << U32(23)) | (U32(0x2AAAAB) + np.arange(-3, 4).astype(U32))
+    args["split"] = split.ravel()
+    e = np.array(LOGF_EDGES, U32)
+    args["edges"] = np.r_[e, e | U32(1 << 31)]
+    return args
+
+
+def slices(args):
+    """Each class's slice of the concatenated arguments."""
+    at, n0 = {}, 0
+    for name, v in args.items():
+        at[name], n0 = slice(n0, n0 + len(v)), n0 + len(v)
+    return at
+
+
+def test_basalt_nv_exp_nv_logf_vs_ref():
+    rng = np.random.default_rng(24)
+    xa, fa = h4_exp_args(rng), h4_logf_args(rng)
+    x, f = np.concatenate(list(xa.values())), np.concatenate(list(fa.values()))
+    assert x.dtype == U64 and f.dtype == U32
+    n = max(len(x), len(f))
+    got = run_kernel(H4, "h4_libdevice", [np.r_[x, np.zeros(n - len(x), U64)], np.r_[f, np.zeros(n - len(f), U32)]], 2)
+    gx, gf = got[: len(x), 0], got[: len(f), 1].astype(U32)
+    X, Fl = x.view(F64), f.view(F32)
+    wx = canon(np.array([nv_exp(v) for v in X.tolist()], F64))
+    wfl = np.array([nv_logf(v) for v in Fl], F32)
+    wf = wfl.view(U32)
+    bad = np.flatnonzero(gx != wx)
+    assert bad.size == 0, (f"nv_exp: {bad.size} of {len(x)} differ; first x={x[bad[0]]:#018x}: got {gx[bad[0]]:#x}, "
+                           f"want {wx[bad[0]]:#x}")
+    nan_want, nan_got = np.isnan(wfl), (gf & U32(0x7FFFFFFF)) > U32(0x7F800000)
+    bad = np.flatnonzero(np.where(nan_want, ~nan_got, gf != wf))
+    assert bad.size == 0, (f"nv_logf: {bad.size} of {len(f)} differ; first x={f[bad[0]]:#010x}: got {gf[bad[0]]:#x}, "
+                           f"want {wf[bad[0]]:#x}")
+    # the planted classes are what they claim
+    ax, af = slices(xa), slices(fa)
+    hx = (x >> U64(32)) & U64(0x7FFFFFFF)
+    assert np.count_nonzero((hx >= 0x4086232B) & (hx < 0x40874800)) > 4000            # the split scale
+    assert np.count_nonzero(hx >= 0x40874800) > 1000                                  # 0, inf or NaN outright
+    assert np.count_nonzero(subnormal(wx[ax["underflow"]])) > 1000                    # subnormal results
+    assert np.count_nonzero(wx[ax["underflow"]] == 0) > 10                            # and underflows to 0
+    over = wx[ax["overflow"]]
+    assert np.count_nonzero(over == U64(INF_BITS)) > 1000 and np.count_nonzero(over < U64(INF_BITS)) > 100
+    assert np.count_nonzero(wx[ax["tiny"]] == ONE) > 1000                             # exp of a tiny x is 1
+    assert np.count_nonzero(wx[ax["tiny"]] != ONE) > 50
+    c = Fraction(u2d(0x3FF71547652B82FE))                                             # nv_exp's 1 / ln 2
+    dev = [float(Fraction(v) * c % 1 - Fraction(1, 2)) for v in X[ax["midpoints"]].tolist()]
+    assert max(map(abs, dev)) < 1e-12 and min(dev) < 0 < max(dev)                     # either side of k + 1/2
+    e, m = wx[ax["edges"]], len(EXP_EDGES)
+    assert [e[0], e[1], e[m], e[m + 1]] == [ONE, INF_BITS, ONE, 0]                    # exp(+-0) = 1, exp(+-inf)
+    assert np.all(e[2 * m:] == F64_NAN)
+    pos = (f & U32(1 << 31)) == 0
+    sub = ((f & U32(0x7F800000)) == 0) & ((f & U32(0x7FFFFF)) != 0)
+    assert np.all(np.isfinite(wfl[sub & pos])) and np.count_nonzero(sub & pos) > 3000   # no subnormal is flushed
+    neg = ~pos & ((f & U32(0x7FFFFFFF)) != 0)
+    assert np.all(np.isnan(wfl[neg])) and np.count_nonzero(neg & sub) > 1000           # log of a negative is NaN
+    assert np.all(wfl[(f & U32(0x7FFFFFFF)) == 0] == -np.inf) and np.all(wfl[f == U32(0x7F800000)] == np.inf)
+    assert np.count_nonzero(pos & (f > U32(0x3F800000)) & (f < U32(0x7F800000))) > 3000    # above 1
+    # CUDA's functions, not the platform's: within an ulp of math.exp and float32 math.log, and not equal to them
+    t = ax["tail"]
+    lib = np.array([math.exp(v) for v in X[t].tolist()], F64).view(U64)
+    d = np.abs(wx[t].view(I64) - lib.view(I64))
+    assert d.max() <= 1 and np.count_nonzero(d) > 100, ("exp", d.max(), np.count_nonzero(d))
+    t = af["tail"]
+    lib = np.array([math.log(v) for v in Fl[t].tolist()], F64).astype(F32).view(U32)
+    d = np.abs(wf[t].astype(I64) - lib.astype(I64))
+    assert d.max() <= 1 and np.count_nonzero(d) > 100, ("logf", d.max(), np.count_nonzero(d))
