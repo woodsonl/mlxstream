@@ -107,6 +107,8 @@ class Engine:
         resources = {name: self.buffers[name] for op in program.ops for _, name, _ in op.bindings}
         for op in program.ops:
             for name in [*op.meta.get("indirect_reads", ()), *op.meta.get("indirect_writes", ())]:
+                if name not in self.buffers:
+                    raise ValueError(f"op {op.name or op.kernel}: reaches {name!r} through a GPU address, which is not a program buffer")
                 resources[name] = self.buffers[name]
         resources.update({name: self.buffers[name] for name, spec in program.buffers.items() if spec.role == "host"})
         self.runner = nt.Runner(self.dev, self.icb, self.ops, list(resources.values()), self.buffers[program.step_state],

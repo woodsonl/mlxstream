@@ -250,6 +250,8 @@ Icb::Icb(const Device& d, const std::vector<Dispatch>& ops) : impl(std::make_sha
 Icb::~Icb() = default;
 size_t Icb::count() const { return impl->count; }
 
+static constexpr uint32_t kDoneLog = 64;   // steps of done snapshots kept; the GPU runs at most two steps ahead of the host
+
 struct RunnerImpl {
   id<MTLDevice> dev; id<MTLCommandQueue> q;
   std::shared_ptr<IcbImpl> icb; std::vector<Dispatch> ops;
@@ -270,6 +272,7 @@ struct RunnerImpl {
   id<MTLSharedEvent> gpu_ev = nil;         // the GPU signals V(step, point) after the pass ending at the publish boundary
   id<MTLFence> fence = nil;                // orders every pass behind the one before it, across command buffers
   bool fence_live = false;                 // a pass has updated the fence
+  id<MTLBuffer> done_log = nil;            // StepState.done copied at the end of each step, indexed by step % kDoneLog
   uint64_t step_base = 0;                  // absolute index of the next step the runner begins
   uint64_t event_base = 0;                 // step index at which gpu_ev was created (its values count from there)
   ~RunnerImpl() { if (resident) [q removeResidencySet:residency_set]; }
@@ -376,7 +379,8 @@ void Runner::set_host_points(std::vector<HostPoint> points, uint32_t error_offse
   r.gpu_ev = [r.dev newSharedEvent];                     // a fresh event: its values count from the current step
   r.event_base = r.step_base;
   if (!r.fence) r.fence = [r.dev newFence];
-  if (!r.gpu_ev || !r.fence) throw std::runtime_error("host points: newSharedEvent or newFence failed");
+  if (!r.done_log) r.done_log = [r.dev newBufferWithLength:kDoneLog * 4 options:MTLResourceStorageModeShared];
+  if (!r.gpu_ev || !r.fence || !r.done_log) throw std::runtime_error("host points: newSharedEvent, newFence or newBuffer failed");
 }
 
 std::vector<std::shared_ptr<HostTask>> Runner::host_tasks() const {
@@ -415,8 +419,9 @@ static void encode_pass(RunnerImpl& r, id<MTLCommandBuffer> cb, uint32_t a, uint
   r.fence_live = true;
 }
 
-// Commits command buffer `seg` of `step`: its passes, each followed by the signals of the points publishing at its end;
-// the step's last pass also carries the signals of the next step's points that publish at boundary 0.
+// Commits command buffer `seg` of `step`: its passes, each followed by the signals of the points publishing at its end.
+// After the step's last pass, StepState.done is copied into done_log (whether the next step begins live), and the
+// next step's points that publish at boundary 0 are signalled.
 static id<MTLCommandBuffer> commit_segment(RunnerImpl& r, uint64_t step, uint32_t seg, bool reencode) {
   const uint32_t n = (uint32_t)r.ops.size(), a = r.cb_cuts[seg], b = r.cb_cuts[seg + 1];
   id<MTLCommandBuffer> cb = [r.q commandBuffer];
@@ -425,6 +430,13 @@ static id<MTLCommandBuffer> commit_segment(RunnerImpl& r, uint64_t step, uint32_
     if (c <= a) continue;
     if (c > b) break;
     encode_pass(r, cb, start, c, reencode);
+    if (c == n) {
+      id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+      [bl waitForFence:r.fence];
+      [bl copyFromBuffer:r.state sourceOffset:r.done_off toBuffer:r.done_log destinationOffset:(step % kDoneLog) * 4 size:4];
+      [bl updateFence:r.fence];
+      [bl endEncoding];
+    }
     for (uint32_t k : r.pub_at[c]) [cb encodeSignalEvent:r.gpu_ev value:event_value(r, step, k)];
     if (c == n) for (uint32_t k : r.pub_at[0]) [cb encodeSignalEvent:r.gpu_ev value:event_value(r, step + 1, k)];
     start = c;
@@ -445,7 +457,7 @@ static bool wait_publish(const RunnerImpl& r, uint64_t v, id<MTLCommandBuffer> c
   for (uint32_t spins = 0; r.gpu_ev.signaledValue < v; spins++) {
     if ((spins & 63) != 63) continue;
     const bool finished = carrier == nil || carrier.status >= MTLCommandBufferStatusCompleted;
-    if (finished && r.gpu_ev.signaledValue < v) {
+    if (finished && ![r.gpu_ev waitUntilSignaledValue:v timeoutMS:10]) {   // a finished buffer's signal lands at once
       err = carrier != nil && carrier.status == MTLCommandBufferStatusError ? cb_error(carrier)
                                                                             : "its command buffer finished without the signal";
       return false;
@@ -484,6 +496,12 @@ static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reenco
   bool stop = false;
   std::deque<HostCb> pending;
   const double t0 = now_ms(), c0 = cpu_ms_now();
+  const bool done_at_start = *(volatile uint32_t*)((char*)r.state.contents + r.done_off) != 0;   // nothing is in flight
+  // A step's tasks run when the program was live as the step began: done at the end of the previous step, from
+  // done_log. Reading StepState at the point itself would race an op that runs beside the task and sets done.
+  auto live = [&](uint64_t s) {
+    return s == S0 ? !done_at_start : ((volatile uint32_t*)r.done_log.contents)[(s - 1) % kDoneLog] == 0;
+  };
   auto served = [&](uint64_t s, uint32_t k) { return s < srv_step || (s == srv_step && k < srv_k); };
   auto may_begin = [&](uint64_t s) {               // a step begins unless a stop came first
     if (s < begun) return true;
@@ -548,7 +566,7 @@ static RunnerStats run_host_steps(RunnerImpl& r, uint32_t max_steps, bool reenco
           if (!ok) { err = "host step " + std::to_string(srv_step) + ", point " + std::to_string(srv_k) + ": " + werr; break; }
         }
         observe_state();
-        if (!st.done) {                            // a finished program's later steps do no host work
+        if (live(srv_step)) {                      // a step that began after the program finished does no host work
           const HostCall call{srv_step, srv_k, r.state.contents};
           std::string terr;
           bool ok = false;
