@@ -198,3 +198,47 @@ def test_top1_emulation_bit_for_bit(data, rr, grid):
         assert np.array_equal(part[:, 1].view(np.int32), e_part[1].astype(np.int32))
         e_row = e_row if e_row < rr else 0             # no row taken (every row masked): row 0 (q5k_head.cu:330)
         assert b_id == (e_row if mp is None else mp[e_row]) and bad_bits(b_p, e_p) == 0, (b_id, e_row, b_p, e_p)
+
+
+# ---- the 2-bit proxy (q5k_head_parity.cpp:212-350) -----------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def proxy_rows(data):
+    """:215-235: min(rows, 41037) = 20,000 rows whose blocks' d and dmin are scaled by f = 3 / sd(column 0's logits),
+    so the logits spread 3: fp16(f32(d) * f)."""
+    w, xq, _ = data
+    rr = min(ROWS, 41037)
+    l0 = gpu.mmvq(13, w[:rr], column(xq, 0), N_IN, rr, 1)[0].astype(np.float64)
+    f = F32(3.0 / np.sqrt(np.mean(l0 * l0) - np.mean(l0) ** 2))
+    blk = w[:rr].copy().reshape(rr * 10, 176)
+    dm = blk[:, :4].copy().view(np.float16).astype(F32) * f
+    blk[:, :4] = dm.astype(np.float16).view(np.uint8).reshape(-1, 4)
+    return blk.reshape(rr, 1760)
+
+
+def test_proxy_pack_emulation_bit_for_bit(proxy_rows):
+    """q5k_proxy_pack byte for byte against the numpy emulation of nvcc's fit and packing (basalt_emu.q5k_proxy_pack;
+    q5k_head.md section 4), on basalt's rescaled rows with two planted blocks: one with zero scales (w = 0, so sh = 0
+    and every level comes from a NaN, which F2I takes to 0) and one with d = 65504 (s past fp16's range, sh = inf);
+    into a copy with spare rows, n_cap = rows + 100 as basalt's test (:216)."""
+    rows = 640
+    q5 = proxy_rows[:rows].copy()
+    blk = q5.reshape(rows * 10, 176)
+    blk[3, 4:16] = 0                                         # row 0, block 3: groups 24..31 have sc = m = 0
+    blk[25, 0:2] = np.array([65504], np.float16).view(np.uint8)   # row 2, block 5: d = 65504
+    n_cap = rows + 100
+    got = gpu.q5k_proxy_pack(q5, n_cap, [(0, rows)])
+    assert np.array_equal(got, emu.q5k_proxy_pack(q5, 0, rows, n_cap))
+    words = got[: emu.px_tiles(n_cap) * 40 * 32 * 16].view(np.uint32).reshape(-1, 40, 32, 4)
+    sc = got[emu.px_tiles(n_cap) * 40 * 32 * 16:].view(np.uint16).reshape(-1, 40, 32, 2)
+    assert np.all(words[0, 12:16, 0] == 0) and np.all(sc[0, 12:16, 0] == 0)        # zero groups: levels 0, scale 0
+    assert np.any(sc[0, 20:24, 2] == 0x7C00)                                          # an infinite scale
+
+
+def test_proxy_pack_incremental(proxy_rows):
+    """basalt's runtime packs the copy as rows arrive (mtp.cpp:680, 1446), its test in one call: two calls give the
+    one call's bytes, with n_cap = rows + 100 (629 tiles, not 625: the scales start where n_cap puts them)."""
+    rr = len(proxy_rows)
+    one = gpu.q5k_proxy_pack(proxy_rows, rr + 100, [(0, rr)])
+    two = gpu.q5k_proxy_pack(proxy_rows, rr + 100, [(0, 7777), (7777, rr - 7777)])
+    assert np.array_equal(one, two)

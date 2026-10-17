@@ -561,3 +561,77 @@ def q5k_top1(logits, mapped, blocks, expf):
     for k in range(1, 8):
         f = top_merge(f, tuple(a[32 * k: 32 * k + 1] for a in g), expf)
     return part, int(f[1][0]), rcp_ftz(f[2])[0]
+
+
+# ---- the 2-bit proxy (q5k_head.md section 4) ------------------------------------------------------------------------
+
+PX_RCP15 = np.uint32(0x3F2AAAAB).view(F32)   # fl(1 / 1.5): ptxas's multiply for amax / 1.5f
+
+
+def px_tiles(n):
+    return (n + 31) // 32
+
+
+def px_level(w, rs):
+    """level(w, sh) as compiled: floor(FFMA.FTZ(w, rcp(sh), 2)) converted by F2I (NaN to 0, saturating), clamped."""
+    with np.errstate(invalid="ignore"):
+        f = np.floor(fma_ftz(w, rs, F32(2.0)))
+        return np.where(np.isnan(f), 0, np.clip(f, 0, 3)).astype(np.int64)
+
+
+def px_fit(w):
+    """fit_group<false> on groups ``w`` (..., 32): (the fp16 scale bits, its value)."""
+    amax = np.full(w.shape[:-1], F32(1e-9), F32)
+    for l in range(32):
+        amax = max_ftz(amax, ftz(np.abs(w[..., l])))
+    a15 = mul_ftz(amax, PX_RCP15)
+    best_s, best_e = a15, np.full(a15.shape, np.inf, F32)
+    for t in range(6):
+        s = mul_ftz(a15, fma_ftz(F32(t), F32(-0.1), F32(1.0)))
+        sh = h2f(half_bits(s))
+        lv = px_level(w, rcp_ftz(sh)[..., None])
+        with np.errstate(invalid="ignore", over="ignore"):
+            r = fma_ftz(add_ftz(lv.astype(F32), F32(-1.5)), sh[..., None], -w)
+            e = np.zeros(a15.shape, F32)
+            for l in range(32):
+                e = fma_ftz(r[..., l], r[..., l], e)
+        better = e < best_e
+        best_e, best_s = np.where(better, e, best_e), np.where(better, s, best_s)
+    hs = half_bits(best_s)
+    return hs, h2f(hs)
+
+
+def q5k_proxy_pack(q5, row0, n, n_cap, proxy=None):
+    """q5k_proxy_pack_kernel with pack_group<false>: rows row0 .. row0 + n - 1 of the Q5_K rows ``q5`` (1760 bytes
+    each) into the copy ``proxy`` (uint8 bytes; zeros when None). Returns the copy."""
+    out = np.zeros(px_tiles(n_cap) * 40 * 32 * 20, np.uint8) if proxy is None else np.array(proxy, np.uint8)
+    rows = row0 + np.arange(n)
+    b = np.asarray(q5, np.uint8).reshape(-1, 1760)[rows].reshape(n, 10, 176)[:, np.arange(80) // 8]   # (n, 80, 176)
+    j = np.arange(80) % 8
+    scl = b[..., 4:16].astype(np.int64)
+    at = lambda k: np.take_along_axis(scl, np.broadcast_to(k[None, :, None], (n, 80, 1)), axis=-1)[..., 0]
+    lo = j < 4
+    sci = np.where(lo, at(np.clip(j, 0, 3)) & 63, (at(np.clip(j, 4, 7) + 4) & 0xF) | ((at(np.clip(j, 4, 7) - 4) >> 6) << 4))
+    mi = np.where(lo, at(np.clip(j, 0, 3) + 4) & 63, (at(np.clip(j, 4, 7) + 4) >> 4) | ((at(np.clip(j, 4, 7)) >> 6) << 4))
+    d = mul_ftz(_h(b, 0), sci.astype(F32))
+    mn = mul_ftz(_h(b, 2), mi.astype(F32))
+    l = np.arange(32)
+    qs = np.take_along_axis(b, np.broadcast_to((48 + 32 * (j // 2))[None, :, None] + l, (n, 80, 32)), axis=-1)
+    qs = qs.astype(np.int64)
+    nib = np.where((j & 1)[None, :, None] == 1, qs >> 4, qs & 15)
+    q = nib | (((b[..., 16:48].astype(np.int64) >> j[None, :, None]) & 1) << 4)
+    with np.errstate(invalid="ignore", over="ignore"):
+        w = fma_ftz(d[..., None], q.astype(F32), -mn[..., None])
+    hs, sh = px_fit(w)
+    lv = px_level(w, rcp_ftz(sh)[..., None])                              # (n, 80, 32)
+    sh_bits = (8 * (np.arange(16) % 4) + 2 * (np.arange(16) // 4)).astype(np.uint64)   # value 4 ii + bb: bit 8 bb + 2 ii
+    words = [(lv[..., 16 * c: 16 * c + 16].astype(np.uint64) << sh_bits).sum(axis=-1).astype(np.uint32) for c in (0, 1)]
+    g = np.arange(80)
+    slot = ((rows[:, None] >> 5) * 40 + g[None] // 2) * 32 + (rows[:, None] & 31)
+    h = (g & 1)[None]
+    u32 = out[: px_tiles(n_cap) * 40 * 32 * 16].view(np.uint32)
+    u32[slot * 4 + 2 * h] = words[0]
+    u32[slot * 4 + 2 * h + 1] = words[1]
+    out[px_tiles(n_cap) * 40 * 32 * 16:].view(np.uint16)[slot * 2 + h] = hs
+    return out
+

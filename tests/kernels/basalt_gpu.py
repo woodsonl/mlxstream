@@ -295,3 +295,19 @@ kernel void ex(device const float* x [[buffer(0)]], device float* e [[buffer(1)]
     out = run(pipeline(src, "ex"), [flat.tobytes(), 4 * flat.size], np.uint32(flat.size).tobytes(), 2,
               -(-flat.size // 256), 256)
     return np.frombuffer(out[1], np.float32).reshape(x.shape)
+
+
+def q5k_proxy_pack(q5, n_cap, packs, proxy=None):
+    """basalt's ``q5k_proxy_pack`` for each (row0, n) of ``packs`` in order, in one command buffer, into a copy for
+    ``n_cap`` rows that starts as ``proxy`` (bytes) or zeros (basalt's test clears it, q5k_head_parity.cpp:243)."""
+    dev = device()
+    pso = pipeline(kernels.basalt_q5k_head_source(), "basalt_q5k_proxy_pack")
+    nbytes = kernels.basalt_q5k_proxy_bytes(n_cap)
+    bq = nt.Buffer(dev, np.ascontiguousarray(q5, np.uint8).tobytes())
+    bp = nt.Buffer(dev, bytes(proxy) if proxy is not None else bytes(nbytes))
+    ds = [nt.Dispatch().pipeline(pso).buffer(0, bq).buffer(1, bp)
+          .bytes(2, kernels.basalt_q5k_proxy_params(n_cap, row0=row0, n=n))
+          .grid(-(-n * 80 // kernels.PX_THREADS_PACK)).threadgroup(kernels.PX_THREADS_PACK) for row0, n in packs]
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+    return np.frombuffer(bp.read(0, nbytes), np.uint8)

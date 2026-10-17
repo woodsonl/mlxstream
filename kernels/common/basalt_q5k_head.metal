@@ -1,7 +1,8 @@
 // Copyright (c) 2023-2026 The ggml authors (MIT)
 // Copyright (c) 2026 Jesús Gulfo (MIT)
-// Adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:19-404 @ b4c63b55754637f4c72ad53a0f791d425f71eb36
-// (MIT; third_party/NOTICE), whose Q5_K dot repeats native_mmvq.cu's, an adaptation of ggml-org/llama.cpp
+// Adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:19-496 and src/kernels/cuda/head_proxy.cuh:17-240
+// @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE), whose Q5_K dot repeats native_mmvq.cu's, an
+// adaptation of ggml-org/llama.cpp
 // ggml/src/ggml-cuda/vecdotq.cuh @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
 //
 // basalt's Q5_K head (n_in a multiple of 256, at most 64 blocks a row): y[j][r] = Q5_K row r times q8_1 column j
@@ -158,4 +159,88 @@ kernel void basalt_q5k_head_top1_merge(device const float* part [[buffer(0)]], d
         *out_id = p.has_map != 0u ? map[id] : id;
         *out_prob = rcp_ftz(b.s);
     }
+}
+
+// ---- the 2-bit proxy (head_proxy.cuh; q5k_head.cu:434-535) --------------------------------------------------------
+// A copy of the head's leading rows (n_in 2560) at four levels and an fp16 scale per 32 weights; the proxy buffer is
+// basalt's px::bytes(n_cap): per tile of 32 rows and per 64 weights (w4 = 0..39) a 16-byte word per row (lane = row),
+// then from px::scales(proxy, n_cap) the fp16 scales, two per (tile, w4, lane) (head_proxy.cuh:17-28, 72-87).
+
+constant constexpr uint PX_NW4 = 40;        // kNw4: 16-byte weight words per row
+constant constexpr int PX_PER = 4;          // kPer: candidates kept per tile
+constant constexpr int PX_MAX_CAND = 64;    // kMaxCand: rows rescored exactly
+
+// pack: the rows row0 .. row0 + n - 1; score and final: the first n_rows rows; n_cap: the copy's row capacity
+struct PxParams { uint row0; uint n; uint n_cap; uint n_rows; };
+
+static inline uint px_tiles(uint n) { return (n + 31u) / 32u; }
+
+// level(w, sh) (head_proxy.cuh:36) as ptxas compiles it: F2I.FTZ.FLOOR.NTZ(FFMA.FTZ(w, MUFU.RCP(sh), 2)), then the
+// clamp to 0..3; rs = rcp_ftz(sh). F2I takes NaN to 0 and saturates the infinities, which the clamp makes 0 and 3: the
+// NaN case is real (a group of zeros has sh = 0, rs = +inf, 0 * inf + 2 = NaN). MSL takes NaN to 0 (section 8.6) but
+// converts without saturation (section 2.23), so the clamp is done in float.
+static inline int px_level(float w, float rs) {
+    const float f = floor(fma_ftz(w, rs, 2.0f));
+    return isnan(f) ? 0 : int(clamp(f, 0.0f, 3.0f));
+}
+
+// fit_group<false> (head_proxy.cuh:42-70; q5k_head.md section 4): the fp16 scale's bits, sh_out its value.
+// amax / 1.5f is FMUL.FTZ by fl(1 / 1.5) (ptxas's constant division), 1.0f - 0.1f * t is FFMA.FTZ(t, -0.1f, 1),
+// each squared error FFMA.FTZ(r, r, e) from 0 in weight order, r = FFMA.FTZ(level - 1.5, sh, -w).
+static inline ushort px_fit(thread const float* w, thread float& sh_out) {
+    float amax = as_type<float>(0x3089705Fu);                           // 1e-9f
+    for (int l = 0; l < 32; ++l) amax = max_ftz(amax, abs_ftz(w[l]));
+    const float a15 = mul_ftz(amax, as_type<float>(0x3F2AAAABu));
+    float best_s = a15, best_e = INFINITY;
+    for (int t = 0; t < 6; ++t) {
+        const float s = mul_ftz(a15, fma_ftz(float(t), -0.1f, 1.0f));
+        const float sh = float(half(s));                                  // __half2float(__float2half(s)): RNE
+        const float rs = rcp_ftz(sh);
+        float e = 0.0f;
+        for (int l = 0; l < 32; ++l) {
+            const float r = fma_ftz(add_ftz(float(px_level(w[l], rs)), -1.5f), sh, -w[l]);
+            e = fma_ftz(r, r, e);
+        }
+        if (e < best_e) { best_e = e; best_s = s; }
+    }
+    const half hs = half(best_s);
+    sh_out = float(hs);
+    return as_type<ushort>(hs);
+}
+
+// q5k_proxy_pack_kernel (q5k_head.cu:438-462) with pack_group<false> (head_proxy.cuh:72-87): one thread per 32-weight
+// group g of row row0 + i / 80, w = FFMA.FTZ(FMUL.FTZ(d, sc), q, -FMUL.FTZ(dmin, m)). ceil(n * 80 / 128) x 128.
+kernel void basalt_q5k_proxy_pack(device const uchar* q5 [[buffer(0)]], device uint* proxy [[buffer(1)]],
+                                  constant PxParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.n * 80u) return;
+    const uint row = p.row0 + i / 80u;
+    const int g = int(i % 80u), j = g % 8;
+    device const uchar* b = q5 + row * 1760u + uint(g / 8) * 176u;     // Q5KBlock: dm, scales[12], qh[32], qs[128]
+    device const uchar* scl = b + 4;
+    int sci, mi;
+    if (j < 4) { sci = scl[j] & 63; mi = scl[j + 4] & 63; }
+    else {
+        sci = (scl[j + 4] & 0xF) | ((scl[j - 4] >> 6) << 4);
+        mi = (scl[j + 4] >> 4) | ((scl[j] >> 6) << 4);
+    }
+    const float d = mul_ftz(h2f(ushort(b[0] | (b[1] << 8))), float(sci));
+    const float mn = mul_ftz(h2f(ushort(b[2] | (b[3] << 8))), float(mi));
+    float w[32];
+    for (int l = 0; l < 32; ++l) {
+        const int qs = b[48 + 32 * (j / 2) + l];
+        const int q = ((j & 1) ? (qs >> 4) : (qs & 15)) | (((b[16 + l] >> j) & 1) << 4);
+        w[l] = fma_ftz(d, float(q), -mn);
+    }
+    float sh;
+    const ushort hs = px_fit(w, sh);
+    const float rs = rcp_ftz(sh);
+    uint words[2] = {0u, 0u};
+    for (int c = 0; c < 2; ++c)
+        for (int ii = 0; ii < 4; ++ii)
+            for (int bb = 0; bb < 4; ++bb) words[c] |= uint(px_level(w[c * 16 + 4 * ii + bb], rs)) << (8 * bb + 2 * ii);
+    const uint slot = ((row >> 5) * PX_NW4 + uint(g / 2)) * 32u + (row & 31u), h = uint(g & 1);
+    proxy[slot * 4u + 2u * h] = words[0];
+    proxy[slot * 4u + 2u * h + 1u] = words[1];
+    device ushort* sc = (device ushort*)(proxy + px_tiles(p.n_cap) * PX_NW4 * 32u * 4u);   // px::scales(proxy, n_cap)
+    sc[slot * 2u + h] = hs;
 }

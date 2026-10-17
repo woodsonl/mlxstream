@@ -567,6 +567,36 @@ def basalt_q5k_head_params(n_in: int, n_out: int, has_map: bool = False, n_block
     return struct.pack("<IIII", n_in, n_out, int(has_map), n_blocks)
 
 
+# basalt's 2-bit proxy of the head's rows (head_proxy.cuh:17-28; q5k_head.cu:500-535)
+PX_THREADS_PACK = 128       # q5k_proxy_pack: one thread per 32-weight group
+PX_THREADS_SCORE = 128      # px::score_kernel: four SIMD-groups per tile of 32 rows
+PX_THREADS_FINAL = 512      # q5k_proxy_final_kernel: one threadgroup
+
+
+def basalt_q5k_proxy_tiles(n: int) -> int:
+    """``px::tiles``: tiles of 32 rows."""
+    return (n + 31) // 32
+
+
+def basalt_q5k_proxy_bytes(n_cap: int) -> int:
+    """``q5k_proxy_bytes``: a 16-byte word per (tile, 64 weights, row), then two fp16 scales per word."""
+    return basalt_q5k_proxy_tiles(n_cap) * 40 * 32 * (16 + 4)
+
+
+def basalt_q5k_proxy_scratch_bytes(n_cap: int) -> int:
+    """``q5k_proxy_scratch_bytes``: the score's 4 candidates per tile, then its (max, sum) per tile, float2 each."""
+    return basalt_q5k_proxy_tiles(n_cap) * (4 + 1) * 8
+
+
+def basalt_q5k_proxy_params(n_cap: int, *, row0: int = 0, n: int = 0, n_rows: int = 0) -> bytes:
+    """``PxParams`` (row0, n, n_cap, n_rows). basalt's API refuses n_rows outside 1..n_cap (q5k_head.cu:518) and packs
+    rows row0 .. row0 + n - 1 of a copy sized for n_cap; the port also refuses a pack past n_cap, which would store
+    outside the copy."""
+    if n_cap <= 0 or row0 < 0 or n < 0 or row0 + n > n_cap or not 0 <= n_rows <= n_cap:
+        raise ValueError(f"basalt_q5k_proxy: rows out of range (row0 {row0}, n {n}, n_rows {n_rows}, n_cap {n_cap})")
+    return struct.pack("<IIII", row0, n, n_cap, n_rows)
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
