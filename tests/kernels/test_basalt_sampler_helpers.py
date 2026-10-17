@@ -19,8 +19,9 @@ pattern), against host references. Every comparison is bitwise.
   nearest-even results checked against the host's on every row), on uniform patterns and planted classes: every
   exponent gap between the product and ``c`` over [-140, 140] and beyond, cancellation (shallow, deep into the low
   word, and exact, which gives +0 in both roundings), exact and near ties of products, sums and quotients (exact ties
-  on the subnormal grid at every denormalization shift), subnormal results, overflow (to inf, and to DBL_MAX when
-  rounded to odd) and every triple of specials.
+  on the subnormal grid at every denormalization shift), results decided by a sticky bit alone (a carry into the next
+  binade, and products whose lowest bits only the alignment's sticky bit sees), subnormal results, overflow (to inf,
+  and to DBL_MAX when rounded to odd) and every triple of specials.
 """
 
 import math
@@ -294,6 +295,17 @@ def odd53(rng):
     return int(rng.integers(1 << 52, 1 << 53)) | 1
 
 
+# 53-bit significand pairs whose product is H * 2^76 + L (RUN) or H * 2^76 + 2^75 + L (TIE), 1 <= L <= 3: a run of
+# 74 zero bits (73 and a one for TIE) above the two lowest. Found as Mb = L / Ma mod 2^76 (Ma odd) below 2^53;
+# test_basalt_f64_mul_fma_div_vs_host checks the claim.
+RUN = [(0x1B5D11E09CEFBB, 0x101FC2C5367D73), (0x110B418C767F71, 0x1320303030C322), (0x19C09973F61FAD, 0x118A3A1D41384A),
+       (0x13E35659E33BDF, 0x1E455985F4C05D), (0x19C09973F61FAD, 0x1A4F572BE1D46F), (0x11186E6E05622B, 0x136835134E4C83),
+       (0x1B36C87C818151, 0x14F1035A1CCF62), (0x13527DA0291695, 0x177A95C820097A)]
+TIE = [(0x1A6409955206D9, 0x1B1592CC6032D2), (0x1CD41FF62F6D49, 0x1F00B42B5A29F2), (0x16B2537DF2BCD9, 0x12F129B99406D2),
+       (0x110B418C767F71, 0x1CB048484924B3), (0x1DB47C8A1C3901, 0x1E428D9194C701), (0x1DA4C9E7C0BB91, 0x1B948F829D6571),
+       (0x1B36C87C818151, 0x1F6985072B3713), (0x1E6188A3E3CDB5, 0x11CB0AFC26789D)]
+
+
 def h2_rows(rng):
     """The H.2 operand triples (uint64 bit patterns) by class."""
     n = 1 << 12
@@ -351,6 +363,29 @@ def h2_rows(rng):
     ec = rng.integers(200, 1901, n)
     one = np.array([0x3FEFFFFFFFFFFFFF, 0x3FF0000000000000, 0x3FF0000000000001], U64)
     rows["sum_ties"] = (sign(n) | ((ec - 53).astype(U64) << U64(52)), rng.choice(one, n), doubles(rng, ec))
+    # a carry into the next binade with only a sticky bit below: Ma = 2^52 + u and Mb = 2^53 - 2u give a * b = 2^105 -
+    # 2u^2 units, and c is 2u^2 units plus g of its ulps, which lie below the 128-bit grid's bit 1: the exact sum is
+    # 2^105 units plus a part that only the jam of the carry's one-bit shift keeps (rounded to odd: 2^105 units + ulp)
+    carry = []
+    for i in range(n):
+        u = int(rng.integers(1, 1 << 12))
+        ea, eb, sa, sb = int(rng.integers(823, 1224)), int(rng.integers(823, 1224)), i % 2 == 1, i % 4 > 1
+        c0 = f64_bits(math.ldexp(2 * u * u, ea + eb - 2150)) | (int(sa != sb) << 63)
+        g = int(rng.integers(1, 1 << (32 - (2 * u * u).bit_length())))
+        carry.append((dbl((1 << 52) + u, ea, sa), dbl((1 << 53) - 2 * u, eb, sb), c0 + g))
+    rows["carry"] = tuple(np.array(v, U64) for v in zip(*carry))
+    # RUN and TIE products, c larger with its ulp at 2^76 product units, added or subtracted: the two lowest bits lie
+    # past the alignment shift, and its sticky bit alone decides f64_fma_odd (RUN) or f64_fma's tie (TIE); c's
+    # significand Mc makes Mc +- H even, so the result is not the one the sticky bit's loss would give
+    for name, pairs in (("run", RUN), ("tie", TIE)):
+        trip = []
+        for i in range(64 * len(pairs)):
+            ma, mb = pairs[i // 2 % len(pairs)]
+            ea, eb, sa, sb = int(rng.integers(823, 1224)), int(rng.integers(823, 1224)), i % 3 == 1, i % 5 > 2
+            mc = int(rng.integers((1 << 52) + (1 << 31), (1 << 53) - (1 << 31)))
+            mc += (mc + ((ma * mb) >> 76)) & 1
+            trip.append((dbl(ma, ea, sa), dbl(mb, eb, sb), dbl(mc, ea + eb - 999, (sa != sb) != (i % 2 == 1))))
+        rows[name] = tuple(np.array(v, U64) for v in zip(*trip))
     # subnormal results: products at biased exponents -60 to 2, and subnormal a times 1 to 2^60; c +-0, subnormal,
     # in the two lowest binades, or near the product
     t, ea = rng.integers(-60, 3, 2 * n), rng.integers(1, 961, 2 * n)
@@ -440,6 +475,14 @@ def test_basalt_f64_mul_fma_div_vs_host():
     assert sum(v > 64 for v in drop) > 1000 and max(drop) > 100                       # the low word's normalization
     z = at["zeros"]
     assert np.all(fma[z] == 0) and np.all(odd[z] == 0) and np.all(got[z, 1:3] == 0)  # exact cancellation: +0
+    cy = at["carry"]
+    assert np.all((fma[cy] & FRAC) == 0) and np.array_equal(odd[cy], fma[cy] + U64(1))   # 2^k, and 2^k plus an ulp
+    assert {(x * y) % (1 << 76) for x, y in RUN} <= {1, 2, 3}
+    assert {(x * y) % (1 << 76) - (1 << 75) for x, y in TIE} <= {1, 2, 3}
+    r, t = at["run"], at["tie"]
+    step = np.abs((odd[r] & MAG).view(I64) - (fma[r] & MAG).view(I64))
+    assert np.all((fma[r] & U64(1)) == 0) and np.all(step == 1)   # inexact only by the sticky bit: odd is fma +- 1
+    assert np.all((fma[t] & U64(1)) == 1) and np.array_equal(fma[t], odd[t])   # a tie only the sticky bit breaks
     for case, name in [(mcase, "mul_ties"), (mcase, "sub_ties_mul"), (dcase, "sub_ties_div"), (fcase, "sum_ties")]:
         v = case[at[name]]
         assert np.count_nonzero(v == DOWN) > 100 and np.count_nonzero(v == UP) > 100, name   # ties, either way
