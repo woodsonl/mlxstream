@@ -61,7 +61,7 @@ from fractions import Fraction
 import numpy as np
 
 from monolith import kernels
-from tests.basalt_sampler_ref import nv_exp, nv_logf, philox_uniform, u2d
+from tests.basalt_sampler_ref import fma_exact, nv_exp, nv_logf, philox_uniform, u2d
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
 
@@ -473,7 +473,7 @@ def test_basalt_f64_mul_fma_div_vs_host():
     for x, y, z in zip(A.tolist(), B.tolist(), C.tolist()):
         fin = math.isfinite(x) and math.isfinite(y) and x != 0 and y != 0
         try:
-            host = f64_bits(math.fma(x, y, z))
+            host = f64_bits(math.fma(x, y, z) if hasattr(math, "fma") else fma_exact(x, y, z))   # fma: 3.13
         except OverflowError:
             host = INF_BITS                                             # its sign is not the host's to say
         except ValueError:

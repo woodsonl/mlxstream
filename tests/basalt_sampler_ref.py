@@ -64,9 +64,33 @@ def hexd(c): return u2d(c)
 def hexf(c): return np.float32(u2f(c))
 
 
+def fma_exact(a, b, c):
+    """IEEE's fma on Python floats, exactly, for Pythons without ``math.fma`` (before 3.13): a * b + c rounded once to
+    nearest even (an int quotient is correctly rounded, subnormals included), NaN for a NaN operand, inf * 0 or
+    inf - inf, the signed infinity on overflow; an exact zero is +0 unless the product is a zero and both it and c
+    are negative zeros."""
+    inf_p = math.isinf(a) or math.isinf(b)
+    if math.isnan(a) or math.isnan(b) or math.isnan(c) or (inf_p and (a == 0 or b == 0)):
+        return math.nan
+    ps = math.copysign(1.0, a) * math.copysign(1.0, b)
+    if inf_p:
+        return math.nan if math.isinf(c) and math.copysign(1.0, c) != ps else math.copysign(math.inf, ps)
+    if math.isinf(c):
+        return c
+    exact = Fraction(a) * Fraction(b) + Fraction(c)
+    if exact == 0:
+        return -0.0 if (a == 0 or b == 0) and ps < 0 and math.copysign(1.0, c) < 0 else 0.0
+    try:
+        return exact.numerator / exact.denominator
+    except OverflowError:
+        return math.inf if exact > 0 else -math.inf
+
+
 def fma64(a, b, c):
-    """fma.rn.f64: ``math.fma``, which raises where IEEE returns NaN (inf * 0, inf - inf) or a signed infinity (an
-    overflow)."""
+    """fma.rn.f64: ``math.fma`` (Python 3.13 and later), which raises where IEEE returns NaN (inf * 0, inf - inf) or a
+    signed infinity (an overflow); ``fma_exact`` before 3.13."""
+    if not hasattr(math, "fma"):
+        return fma_exact(a, b, c)
     try:
         return math.fma(a, b, c)
     except ValueError:
