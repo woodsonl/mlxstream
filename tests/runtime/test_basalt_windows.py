@@ -1,7 +1,8 @@
 """A .basalt file's tensors read on the GPU through the windows the emitter plans for them (compiler/emit.py
 ``basalt_windows``): a toy kernel copies each bound tensor, byte by byte from its binding, into an arena buffer, and
 every copy equals the file's bytes. The same in the copy test mode (one exact buffer per tensor, so shader validation
-bounds each read by its tensor), and with two programs over different entry sets sharing one buffer dict."""
+bounds each read by its tensor), and with two programs over different entry sets sharing one buffer dict. A window past
+the end of its file is refused when it is mapped."""
 
 import struct
 
@@ -10,10 +11,12 @@ import pytest
 from monolith.compiler import emit_program
 from monolith.compiler.emit import basalt_windows
 from monolith.core import Graph
+from monolith.formats.basalt_reader import BasaltFile
 from monolith.packs.basalt import BasaltSource
+from monolith.packs.packer import ALIGN
 from monolith.runtime import BufferSpec, Engine, KernelSpec, OpSpec
 from monolith.runtime import _native as nt
-from tests.contract.test_basalt_windows import BOUND, PROFILE, value, write
+from tests.contract.test_basalt_windows import BOUND, PROFILE, plan, value, write
 
 COPY = """
 #include <metal_stdlib>
@@ -90,3 +93,21 @@ def test_two_programs_share_one_buffer_dict(tmp_path):
     run_and_check(eng_a, src, names_a, "a", data)
     run_and_check(eng_b, src, names_b, "b", data)
     run_and_check(eng_a, src, names_a, "a", data)
+
+
+def test_a_window_past_the_end_of_its_file_is_refused(tmp_path):
+    """A source whose ``path`` is shorter than the file its tables describe plans a window past ``path``'s end. Mapping
+    it is refused from the file's own size: touching a page past the end would kill the process with SIGBUS. A window
+    that ends exactly at the end of the file maps."""
+    full = write(tmp_path)
+    mx = BasaltSource(full).entries["mtp/experts"].offset
+    short = tmp_path / "short.basalt"
+    short.write_bytes(full.read_bytes()[: mx + ALIGN])                 # ends one page into mtp/experts
+    buffers, _ = plan(BasaltSource(short, BasaltFile(full)), "mtp/experts")
+    (w,) = buffers.values()
+    assert (w.file_offset, w.nbytes) == (mx, 3 * ALIGN)
+    dev = nt.Device()
+    with pytest.raises(RuntimeError, match=rf"mmap window \[{mx}, {mx + 3 * ALIGN}\) runs past the end of "
+                                           rf".*short\.basalt \({mx + ALIGN} bytes\)"):
+        nt.Buffer.from_file(dev, w.file, w.file_offset, w.nbytes)
+    assert nt.Buffer.from_file(dev, w.file, mx, ALIGN).read(0, 64) == full.read_bytes()[mx: mx + 64]
