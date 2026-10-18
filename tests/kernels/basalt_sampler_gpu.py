@@ -1,6 +1,7 @@
 """Single-kernel runs of basalt's sampler family (kernels/common/basalt_sampler.metal) for the GPU tests: one wrapper
 per path, each running the path's dispatches in one command buffer on the family's bindings (the slot map at the top
-of the .metal file), as the handler emits them.
+of the .metal file), as the handler emits them; ``split_part`` runs the split path's first stage alone and returns
+its block lists.
 
 - The source is ``basalt_sampler_source()`` with StepState for ``t_max = T_MAX + 1`` spliced in after the prelude
   (``pending_tokens`` holds a 70-row probe's queries), compiled with STEP_STATE=1: the kernels read the window's row
@@ -20,6 +21,7 @@ import numpy as np
 from monolith import kernels
 from monolith.core.step_state import StepStateLayout
 from monolith.runtime import _native as nt
+from tests.basalt_sampler_ref import sampled_k
 from tests.kernels import basalt_gpu as gpu
 
 T_MAX = 70                                     # the widest window a test runs (the probe's, sampler_parity.cpp:398)
@@ -27,6 +29,7 @@ LAYOUT = StepStateLayout(t_max=T_MAX + 1)
 SOURCE = kernels.basalt_sampler_source().replace(kernels.PRELUDE, kernels.PRELUDE + LAYOUT.to_msl() + "\n", 1)
 AM_CTAS = 8                                    # bs_greedy_partial's threadgroups per row (basalt's kAmCtas)
 TOP_PROB_THREADS = 1024                        # bs_greedy_top_prob's threadgroup, exactly (basalt's kAmThreads)
+SPLIT_THREADS = 128                            # bs_split_part's threadgroup, exactly (basalt's kSplitWarps * 32)
 
 
 def pipeline(name):
@@ -53,8 +56,9 @@ def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, id_map=N
     """Run ``steps``, (pipeline, grid, threads) in order, on one window: ``logits`` (T, V) float32, ``p`` the request,
     ``hist`` the flat (T, hist_len) int32 history rows, ``bias`` (V,) float32, ``id_map`` (V,) int32 (flags MAP),
     ``position`` StepState's.
-    ``scratch``: {slot: bytes}, each starting as 0xFF. ``lbuf``: a buffer already holding ``logits``, bound in place
-    of a fresh upload (sampler_parity's DeviceRows, rows uploaded once and sampled many times: the test reads it back).
+    ``scratch``: {slot: a byte count, a fresh buffer starting as 0xFF; or an ``nt.Buffer`` the caller holds, to read
+    back}. ``lbuf``: a buffer already holding ``logits``, bound in place of a fresh upload (sampler_parity's
+    DeviceRows, rows uploaded once and sampled many times: the test reads it back).
     Every slot the family binds is bound, a 16-byte placeholder where the request has no such datum. Returns the T
     picks and the T probabilities' bits; asserts the extra row of each output untouched."""
     l = np.ascontiguousarray(logits, np.float32)
@@ -77,7 +81,7 @@ def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, id_map=N
              5: buf(4 * rows, fill), 6: buf(4 * rows, fill),
              7: buf(record(p, V, rows, hist_len, mode, bias is not None, id_map=id_map is not None)),
              11: buf(bytes(16) if id_map is None else np.ascontiguousarray(id_map, np.int32).tobytes()), 15: buf(st)}
-    slots.update({k: buf(n, 0xFF) for k, n in (scratch or {}).items()})
+    slots.update({k: n if isinstance(n, nt.Buffer) else buf(n, 0xFF) for k, n in (scratch or {}).items()})
     ds = []
     for pso, grid, tg in steps:
         d = nt.Dispatch().pipeline(pso)
@@ -132,6 +136,24 @@ def top_prob(logits, p, *, id_map=None, hist=None, hist_len=0, position=0, fill=
     return launch([(part, (AM_CTAS, rows), threads(part)), (prob, (rows,), TOP_PROB_THREADS)], logits, p, mode=0,
                   hist=hist, hist_len=hist_len, id_map=id_map, position=position, fill=fill,
                   scratch={8: rows * AM_CTAS * 8}, lbuf=lbuf)
+
+
+def split_part(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None):
+    """S-SPLIT's first stage alone, basalt's sampler_split_part_kernel: ``bs_split_part`` over (n_blocks, rows)
+    threadgroups of exactly 128 threads, in mode 2 whatever the request asks, each storing its 4,096-logit block's
+    top-k list (k = sampled_k(top_k, V)) to ``cand`` at (t * n_blocks + b) * k as (id, value bits). ``cand`` holds
+    exactly the rows' lists, starting as 0xFF bytes. Returns the T rows' lists, (T, n_blocks, k, 2) uint32; asserts
+    the extra row's untouched."""
+    pso = pipeline("bs_split_part")
+    T, V = np.shape(logits)
+    rows, nb, k = T + 1, -(-V // kernels.BS_BLOCK), sampled_k(p.top_k, V)
+    cand = nt.Buffer(gpu.device(), rows * nb * k * 8)
+    cand.fill(0xFF)
+    launch([(pso, (nb, rows), SPLIT_THREADS)], logits, p, mode=2, hist=hist, hist_len=hist_len, bias=bias,
+           position=position, fill=fill, scratch={9: cand}, lbuf=lbuf)
+    lists = np.frombuffer(cand.read(0, cand.nbytes), np.uint32).reshape(rows, nb, k, 2)
+    assert np.all(lists[T] == 0xFFFFFFFF), "the row past t_this_step was written"
+    return lists[:T].copy()
 
 
 def rows_alone(path, logits, p, *, hist=None, hist_len=0, position=0):

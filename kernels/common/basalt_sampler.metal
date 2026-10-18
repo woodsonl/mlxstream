@@ -176,6 +176,167 @@ static inline bool am_block(thread uint& bk, thread uint& bi, threadgroup uint* 
     return lane == 0u;
 }
 
+// ---- The sampled list: sampled_k, take_first, warp_first and the list merge (sampler.cu:327-360, :532-575) ---------
+//
+// The selection order (sampler.cu:327-333): (v, i) comes before (v', i') when v > v', or v == v' and i < i', on the
+// keys of the bits: a strict total order over non-NaN values, -0 and +0 tying and falling to the id. Every round
+// starts from -inf and takes on a strict >, so NaN and -inf are never picked; a round that finds nothing yields the
+// sentinel (-inf, vocab). A list entry is (id, value bits), x the id: the value's own bits, which the tail computes
+// with (okey merges -0 with +0, so it could not give them back).
+constant uint BS_SEL_MAX = 64u;                                        // kSelMax: the longest list
+constant uint BS_NINF_BITS = 0xff800000u;                              // -inf, the sentinel's value
+
+// top_k 1..63 as given, anything else 64, never more than the vocabulary (sampler.cu:339-342)
+static inline uint sampled_k(int top_k, uint nv) {
+    return min((top_k > 0 && top_k < int(BS_SEL_MAX)) ? uint(top_k) : BS_SEL_MAX, nv);
+}
+
+// (bb, bi) <- the first of (bb, bi) and (ob, oi) in the selection order (sampler.cu:344-347); neither value is NaN
+static inline void take_first(thread uint& bb, thread uint& bi, uint ob, uint oi) {
+    const uint kb = okey(bb), ko = okey(ob);
+    if (ko > kb || (ko == kb && oi < bi)) { bb = ob; bi = oi; }
+}
+
+// The first of the SIMD-group's 32 pairs, left in every lane (sampler.cu:349-359): the XOR butterfly at 16, 8, 4, 2,
+// 1. The first of two is associative and commutative under the strict order, and two lanes never hold different
+// pairs that compare equal (an id is in one lane at most, and every sentinel is the same pair), so every lane ends
+// with the winner's own bits.
+static inline void warp_first(thread uint& bb, thread uint& bi) {
+    for (ushort off = 16; off > 0; off >>= 1) {
+        const uint ob = simd_shuffle_xor(bb, off), oi = simd_shuffle_xor(bi, off);
+        take_first(bb, bi, ob, oi);
+    }
+}
+
+// warp_merge_lists (sampler.cu:532-575): the first k pairs of nl <= 64 lists of k pairs, list L at lists[L * stride],
+// each in the selection order and padded with sentinels. One template over the lists' pointer: threadgroup for the
+// part kernels' SIMD-group lists, device for the merges' block lists in cand. Lane owns lists lane and lane + 32:
+// merge_heads loads their heads, and each merge_lists call is one round, the first of every lane's heads, returned in
+// every lane as (id, value bits), whose list then advances to its next entry, or to the sentinel after its k-th
+// (exactly one head holds a real id: the lists cover disjoint ids; a sentinel round advances nothing). The caller runs
+// the k rounds and stores from lane 0. Loads stay inside lists[nl * stride]: only a list below nl advances, and its
+// position stays below k <= stride.
+struct BsHeads {
+    uint b[2], i[2], pos[2];
+};
+
+template <typename L>
+static inline BsHeads merge_heads(L lists, uint nl, uint stride, uint nv, uint lane) {
+    BsHeads h;
+    for (uint m = 0u; m < 2u; ++m) {
+        const uint li = lane + 32u * m;
+        h.pos[m] = 0u;
+        h.b[m] = BS_NINF_BITS;
+        h.i[m] = nv;
+        if (li < nl) {
+            const uint2 c = lists[li * stride];
+            h.i[m] = c.x;
+            h.b[m] = c.y;
+        }
+    }
+    return h;
+}
+
+template <typename L>
+static inline uint2 merge_lists(thread BsHeads& h, L lists, uint stride, uint k, uint nv, uint lane) {
+    uint bb = h.b[0], bi = h.i[0];
+    take_first(bb, bi, h.b[1], h.i[1]);
+    warp_first(bb, bi);
+    if (bi < nv) {
+        for (uint m = 0u; m < 2u; ++m) {
+            if (h.i[m] != bi) continue;
+            if (++h.pos[m] < k) {
+                const uint2 c = lists[(lane + 32u * m) * stride + h.pos[m]];
+                h.i[m] = c.x;
+                h.b[m] = c.y;
+            } else {
+                h.i[m] = nv;
+                h.b[m] = BS_NINF_BITS;
+            }
+        }
+    }
+    return uint2(bi, bb);
+}
+
+// ---- One block's top-k list: the split part and the coupled part (sampler.cu:577-661, :733-777) --------------------
+//
+// sampler_split_part_kernel's body and coupled_part_kernel's, one template so that the two lists cannot drift apart:
+// block blk's list from KWARPS SIMD-groups of KPER logits per lane, KWARPS * 32 * KPER ids from blo (4,096 in both),
+// into dst (the block's k entries). The caller's threadgroup is exactly KWARPS * 32 threads and wl holds KWARPS lists
+// of BS_SEL_MAX entries. Lane lane of SIMD-group sg holds s[j], the bits of logit lo + 32 j + lane (one coalesced
+// line per j), -inf past the vocabulary. PEN, the split part: the logit bias (biased) and the penalties of the window
+// hrow[0, hlen), which a logit takes when its bit is set in the block's 128-word bitmap bits (the window's ids in the
+// block): apply_penalties with the count over the whole window, a clear bit keeping the logit as a zero count does.
+// Without PEN (the coupled part, whose logits arrive penalised) bits, bias and hrow are not read.
+// The rounds (sampler.cu:630-652): round i takes the SIMD-group's (i + 1)-th pair, admitting only what comes after the
+// last pick (kp, pi) in the selection order: sampler.cu:491's filter on keys, NaN's key 0 below every pick's and
+// -inf's, so a NaN is never admitted and a -inf never beats the round's start. Each lane runs two chains, the even and
+// the odd j, each in ascending id with a strict >, so each keeps its first admitted pair; take_first and warp_first
+// then give every lane the SIMD-group's first. A round that finds nothing ends the rounds in every lane (the pick is
+// the same in each), and sentinels fill the rest of the list. SIMD-group 0 then merges the KWARPS lists into dst.
+template <uint KPER, uint KWARPS, bool PEN>
+static inline void part_list(device const uint* l, uint nv, uint k, uint blk, device uint2* dst, threadgroup uint2* wl,
+                             uint tid, uint lane, uint sg, threadgroup atomic_uint* bits = nullptr,
+                             device const float* bias = nullptr, bool biased = false, device const int* hrow = nullptr,
+                             uint hlen = 0u, float repeat = 1.0f, float freq = 0.0f, float present = 0.0f) {
+    const uint span = 32u * KPER, block = KWARPS * span, blo = blk * block, lo = blo + sg * span;
+    const bool use_bits = PEN && hlen > 0u;
+    if (use_bits) {                                                                       // :597-610
+        for (uint w = tid; w < block / 32u; w += KWARPS * 32u)
+            atomic_store_explicit(bits + w, 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < hlen; i += KWARPS * 32u) {                                 // bounded by hlen
+            const int h = hrow[i];
+            if (h >= 0 && uint(h) < nv && uint(h) >= blo && uint(h) - blo < block)
+                atomic_fetch_or_explicit(bits + ((uint(h) - blo) >> 5), 1u << ((uint(h) - blo) & 31u),
+                                         memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint s[KPER];                                                                         // :612-628
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < KPER; ++j) {
+        const uint v = lo + 32u * j + lane;
+        s[j] = v >= nv ? BS_NINF_BITS
+                       : ((PEN && biased) ? as_type<uint>(ieee_add(as_type<float>(l[v]), bias[v])) : l[v]);
+    }
+    if (use_bits) {
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < KPER; ++j) {
+            const uint v = lo + 32u * j + lane, b = v - blo;
+            if (v < nv && (atomic_load_explicit(bits + (b >> 5), memory_order_relaxed) & (1u << (b & 31u))) != 0u)
+                s[j] = apply_penalties(s[j], history_count(hrow, hlen, v), repeat, freq, present);
+        }
+    }
+    uint kp = okey(0x7f800000u);                                     // +inf and id -1: round 0 admits every logit
+    int pi = -1;
+    uint i = 0u;
+    for (; i < k; ++i) {                                                                  // bounded: k <= 64 rounds
+        uint b0 = BS_NINF_BITS, b1 = BS_NINF_BITS, i0 = nv, i1 = nv, k0 = BS_KEY_NINF, k1 = BS_KEY_NINF;
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < KPER; j += 2u) {
+            const uint v0 = lo + 32u * j + lane, v1 = v0 + 32u;
+            const uint x0 = fnan(s[j]) ? 0u : okey(s[j]), x1 = fnan(s[j + 1u]) ? 0u : okey(s[j + 1u]);
+            if ((x0 < kp || (x0 == kp && int(v0) > pi)) && x0 > k0) { b0 = s[j]; i0 = v0; k0 = x0; }
+            if ((x1 < kp || (x1 == kp && int(v1) > pi)) && x1 > k1) { b1 = s[j + 1u]; i1 = v1; k1 = x1; }
+        }
+        take_first(b0, i0, b1, i1);
+        warp_first(b0, i0);
+        if (i0 >= nv) break;                                         // in every lane: nothing left in this slice
+        if (lane == 0u) wl[sg * BS_SEL_MAX + i] = uint2(i0, b0);
+        kp = okey(b0);
+        pi = int(i0);
+    }
+    for (uint r = i + lane; r < k; r += 32u) wl[sg * BS_SEL_MAX + r] = uint2(nv, BS_NINF_BITS);   // the sentinels
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg != 0u) return;
+    BsHeads h = merge_heads(wl, KWARPS, BS_SEL_MAX, nv, lane);                            // :654-660
+    for (uint r = 0u; r < k; ++r) {                                                       // bounded: k rounds
+        const uint2 c = merge_lists(h, wl, BS_SEL_MAX, k, nv, lane);
+        if (lane == 0u) dst[r] = c;
+    }
+}
+
 #if STEP_STATE
 constant uint BS_AM_CTAS = 8u;                                         // kAmCtas: threadgroups per row
 
@@ -295,5 +456,33 @@ kernel void bs_greedy_top_prob(device const uint* logits [[buffer(0)]], device i
         probs[t] = 1.0f / tot;
         out[t] = (p.flags & BS_MAP) != 0u ? id_map[id] : int(id);
     }
+}
+
+constant uint BS_BLOCK = 4096u;                                        // kSplitBlockSpan: logits per split block
+constant uint BS_SPLIT_WARPS = 4u;                                     // kSplitWarps: bs_split_part's SIMD-groups
+
+// sampler_split_part_kernel (sampler.cu:582-661), mode 2: block b's top-k list of row t (grid (n_blocks, rows) of
+// basalt's 128 threads, four SIMD-groups of 32 logits per lane), k = sampled_k(top_k, vocab), after the logit bias
+// (flags BIAS) and the penalties of the row's window (bs_greedy_one_block's: the last min(penalty_last_n, hist_len)
+// slots of its history row), into cand at (t * n_blocks + b) * k as (id, value bits), padded with the sentinel
+// (vocab, -inf). A dispatch of any other width returns at once (the SIMD-groups' slices and wl's four lists are the
+// geometry's), and so does a block at or past n_blocks, whose entries would be the next row's.
+kernel void bs_split_part(device const uint* logits [[buffer(0)]], device const float* bias [[buffer(3)]],
+                          device const int* history [[buffer(4)]], constant BsSampleParams& p [[buffer(7)]],
+                          device uint2* cand [[buffer(9)]], device const StepState* st [[buffer(15)]],
+                          uint2 g [[threadgroup_position_in_grid]], uint2 tg [[threads_per_threadgroup]],
+                          uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup atomic_uint bits[BS_BLOCK / 32u];
+    threadgroup uint2 wl[BS_SPLIT_WARPS * BS_SEL_MAX];
+    const uint b = g.x, t = g.y;
+    if (st->done || t >= st->t_this_step || p.mode != 2u || b >= p.n_blocks || tg.x * tg.y != BS_SPLIT_WARPS * 32u)
+        return;
+    const uint nv = p.vocab, k = sampled_k(p.top_k, nv);
+    const uint hlen = uint(clamp(p.penalty_last_n, 0, int(p.hist_len)));                 // :590-596
+    device const int* hrow = history + ulong(t) * p.hist_len + (p.hist_len - hlen);      // the window is the tail
+    part_list<32u, BS_SPLIT_WARPS, true>(logits + ulong(t) * nv, nv, k, b, cand + (ulong(t) * p.n_blocks + b) * k, wl,
+                                         tid, lane, sg, bits, bias, (p.flags & BS_BIAS) != 0u, hrow, hlen,
+                                         p.penalty_repeat, p.penalty_freq, p.penalty_present);
 }
 #endif

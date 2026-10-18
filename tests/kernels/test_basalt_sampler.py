@@ -30,6 +30,8 @@ a greedy request with neither G-CL, and their ``forced`` cases run G-1B in G-CL'
 - TP.1, the port's addition (spec S§19.3): the drafter's greedy tail, ``top_prob`` (the cluster partials, then
   bs_greedy_top_prob), picks the host argmax, mapped, with the float64 softmax probability of the pick within
   q5k_head_parity's 1e-5.
+- PL.1, the port's building-block check of the split path's first stage (``split_part``, bs_split_part alone): each
+  4,096-logit block's list in the scratch equals mirror_select's over the block, ids and value bits.
 - W.1, invariant 1: each path's window, row for row, equals its rows run alone (the top-prob path's probabilities
   bit for bit too).
 """
@@ -43,7 +45,8 @@ import pytest
 from monolith import kernels
 from monolith.runtime import _native as nt
 from tests.basalt_sampler_ref import (SamplerParams, f32, fixture2_data, fixture4_data, fixture8_data, fixture12_data,
-                                      fixture13_data, greedy_pen, normal_rows, penalty_rows, reference_pick, window_of)
+                                      fixture13_data, fixture16_data, greedy_pen, normal_rows, penal_vec, penalty_rows,
+                                      reference_pick, sampled_k, select_vec, window_of)
 from tests.kernels import basalt_sampler_gpu as gpu
 from tests.kernels.basalt_gpu import device
 from tests.kernels.test_basalt_decode_cluster import PATTERNS, VOCABS, fill_logits, host_argmax
@@ -402,6 +405,86 @@ def test_basalt_sampler_greedy_top_prob_geometry():
     ids, bits = gpu.launch([(part, (gpu.AM_CTAS, rows), gpu.threads(part)), (prob, (rows,), 512)], l,
                            SamplerParams(greedy=True, temperature=0.0), mode=0, scratch={8: rows * gpu.AM_CTAS * 8})
     assert np.all(ids == -1) and np.all(bits == 0xFFFFFFFF), "a 512-thread dispatch wrote a pick or a probability"
+
+
+# ---- PL.1: the split path's block lists (the port's building-block check) -------------------------------------------
+
+def block_lists(l, hist, hist_len, p):
+    """The lists bs_split_part stores for the rows ``l`` (biased already): mirror_select's two stages as the kernel
+    splits them, the penalty over the row's whole window (penal_vec), then the selection over each 4,096-logit block's
+    slice (select_vec), the block's first id added; padded with the part's sentinel (V, -inf), which the merge's sink
+    turns into mirror_select's (0, -inf). (T, n_blocks, k, 2) uint32: (id, value bits)."""
+    T, V = l.shape
+    n = kernels.BS_BLOCK
+    nb, k = -(-V // n), sampled_k(p.top_k, V)
+    want = np.empty((T, nb, k, 2), np.uint32)
+    for t in range(T):
+        s = penal_vec(l[t], window_of(hist, hist_len, t, p.penalty_last_n), p)
+        for b in range(nb):
+            ids, lg = select_vec(s[b * n:(b + 1) * n], k)
+            lg = np.float32(lg)
+            want[t, b, :, 0] = np.where(lg == -np.inf, V, np.int64(ids) + b * n)
+            want[t, b, :, 1] = lg.view(np.uint32)
+    return want
+
+
+def pl1_fixture16(nv, top_k):
+    """Fixture 16's rows and 64-slot histories at nv (spec T§8.18: ties across lanes, SIMD-groups and blocks, signed
+    zeros, NaN, +inf, a row of 11 candidates whose other blocks are empty, window ids on the 1,024 and 4,096 edges,
+    repeated and outside the vocabulary), its base request at ``top_k``, and a fifth row without a window,
+    decode_cluster's subnormal pattern. No bias. Returns (l, bias, hist, hist_len, p)."""
+    l, hist = fixture16_data(nv)
+    l = np.vstack([l, fill_logits(np.random.RandomState([20261018, nv]), nv, "denormal")])
+    p = SamplerParams(top_k=top_k, top_p=1.0, min_p=0.0, temperature=0.8, seed=16, penalty_last_n=64,
+                      penalty_repeat=2.0, penalty_freq=0.25, penalty_present=0.5)
+    return l, None, np.concatenate([hist, np.full(64, -1, np.int32)]), 64, p
+
+
+def pl1_patterns(nv, top_k):
+    """decode_cluster's 12 argmax patterns at nv, a row each, with a sparse bias (-inf at five drawn ids, 8 at five,
+    the subnormal 1e-42 at five, 0 elsewhere) and 16 history slots per row whose last 12 are its window
+    (penalty_last_n 12; repeat 1.5, freq 0.25, present 0.5): the row's six largest biased ids, the first two counted
+    twice and the last three before the window; nv, nv + 77, -5, -1 and 0x7fffffff, outside the vocabulary; and two
+    drawn ids. Returns (l, bias, hist, hist_len, p)."""
+    rs = np.random.RandomState([20261019, nv])
+    l = np.stack([fill_logits(rs, nv, pattern) for pattern in PATTERNS])
+    bias = np.zeros(nv, np.float32)
+    for x in (-np.inf, 8.0, 1e-42):
+        bias[rs.randint(nv, size=5)] = x
+    hist = []
+    with np.errstate(invalid="ignore"):
+        biased = l + bias
+    for row in biased:
+        top = np.argsort(-np.where(np.isnan(row), -np.inf, row), kind="stable")[np.arange(6) % nv]
+        window = np.concatenate([top[[0, 0, 1, 1, 2]], [nv, nv + 77, -5, -1, 0x7FFFFFFF], rs.randint(nv, size=2)])
+        rs.shuffle(window)
+        hist.append(np.concatenate([top[3:], [-1], window]))
+    p = SamplerParams(top_k=top_k, penalty_last_n=12, penalty_repeat=1.5, penalty_freq=0.25, penalty_present=0.5)
+    return l, bias, np.concatenate(hist).astype(np.int32), 16, p
+
+
+PL1_CASES = ([("fixture16", nv, top_k) for nv in (248320, 100003, 262144, 1000) for top_k in (0, 1, 11)]
+             + [("patterns", nv, 0) for nv in VOCABS])
+
+
+@pytest.mark.parametrize("fixture,nv,top_k", PL1_CASES, ids=[f"{f}-{nv}-top_k{k}" for f, nv, k in PL1_CASES])
+def test_basalt_sampler_split_part_lists(fixture, nv, top_k):
+    """PL.1: every block's list in cand, read back after bs_split_part alone (gpu.split_part), equals mirror_select's
+    over the block (block_lists), ids and value bits, its sentinels included: on fixture 16 at 61, 25, 64 and 1
+    blocks with k 64, 1 and 11 (its sparse row's candidates), and on decode_cluster's patterns at each of its
+    vocabularies with a bias and a window (k = min(64, nv); partial last blocks, empty SIMD-group slices, lanes past
+    the vocabulary). Fixture 16's sparse row leaves empty blocks, all sentinels, wherever it has more than one block
+    or k is above 11; every fixture's window changes some block's first 64 pairs."""
+    l, bias, hist, hist_len, p = (pl1_fixture16 if fixture == "fixture16" else pl1_patterns)(nv, top_k)
+    got = gpu.split_part(l, p, hist=hist, hist_len=hist_len, bias=bias)
+    with np.errstate(invalid="ignore"):
+        rows = l if bias is None else l + bias
+    want = block_lists(rows, hist, hist_len, p)
+    top64 = replace(p, top_k=0)
+    assert not np.array_equal(block_lists(rows, hist, hist_len, top64), block_lists(rows, None, 0, top64)), \
+        "the fixture's window changes some block's first 64"
+    bad = [(t, b) for t in range(len(l)) for b in range(want.shape[1]) if not np.array_equal(got[t, b], want[t, b])]
+    assert not bad, f"each block's cand list equals mirror_select (T§3.6): (row, block) {bad[:8]} of {len(bad)} differ"
 
 
 # ---- W.1 (invariant 1) -----------------------------------------------------------------------------------------------
