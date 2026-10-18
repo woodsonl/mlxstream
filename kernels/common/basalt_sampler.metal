@@ -13,6 +13,11 @@
 //   5 token (T,) i32 | 6 qprob (T,) f32: the probe's probability, or the top-prob kernel's | 7 BsSampleParams
 //   8 part: the greedy partials, (key, id) per row and threadgroup | 9 cand | 10 bits
 //   11 map (V,) i32: the top-prob kernel's subset map | 15 StepState
+// and the coupled draft's kernels (one draft row of nv logits):
+//   0 the row, penalised in place | 5 the draft's token id (1,) i32 | 6 its probability (1,) f32
+//   7 the node's BsCoupledParams | 9 cand, 64 entries per block | 11 sub_to_id (nv,) i32 | 12 id_to_sub (id_vocab,) i32
+//   13 the round's BsCoupledSampler copy | 14 ring (cap + max_t,) i32 | 16 the host-staged BsCoupledSampler
+//   17 the host-staged history (cap,) i32 | 18 the draft's step record, its cell in word 0
 #pragma STDC FP_CONTRACT OFF
 #ifndef STEP_STATE
 #define STEP_STATE 0
@@ -443,6 +448,43 @@ static inline BsDraw sampled_tail(threadgroup const int* sel_ids, threadgroup co
     return d;
 }
 
+// ---- Coupled draft sampling's records (sampler.cu:684-688; include/basalt/core/coupled_draft.hpp) -----------------
+//
+// The drafter samples draft j of a round with the target's chain and the uniform the target draws for the row that
+// verifies it. As in basalt's captured round, every per-request and per-round value comes from device memory: the
+// request's SamplerParams image (the host stages it, bs_coupled_stage copies it, the draft kernels read the copy), the
+// token ring (the round's history base at [cap - h, cap), draft i at cap + i) and the draft's step record. A node's
+// own structure is its params record, BsCoupledParams, written at build.
+
+// basalt's SamplerParams (sampler.hpp:15-29) as its 72 bytes lie in memory (monolith/kernels.py's
+// basalt_coupled_params): the chain's nine 4-byte fields, padding, the seed at 40, the counter at 48, the greedy bool
+// at 56 (bytes 57-63 its padding, never read), the logit_bias pointer's slot at 64 (the drafter applies no bias).
+struct BsCoupledSampler {
+    int top_k;
+    float top_p, min_p, temperature;
+    int min_keep, penalty_last_n;
+    float penalty_repeat, penalty_freq, penalty_present;
+    uint pad0;
+    ulong seed, counter;
+    uchar greedy, pad1[7];
+    ulong logit_bias;
+};
+static_assert(sizeof(BsCoupledSampler) == 72, "basalt's SamplerParams image");
+
+// A coupled node's record (monolith/kernels.py's basalt_coupled_node): the draft row's nv logits (the draft head's
+// vocabulary subset, or the whole vocabulary), the id_vocab token ids, the ring's history capacity cap
+// (kCoupledHistCap in the engine), the draft's index j in the round, and flags: 1 ID_TO_SUB, 2 SUB_TO_ID, the subset's
+// maps bound at 12 and 11 (basalt's non-null id_to_sub and sub_to_id; without them a slot is its token id).
+struct BsCoupledParams {
+    uint nv, id_vocab, cap, j;
+    uint flags, pad0, pad1, pad2;
+};
+constant uint BS_ID_TO_SUB = 1u;
+constant uint BS_SUB_TO_ID = 2u;
+
+// coupled_hist_len (coupled_draft.hpp:71-73): the penalty window, min(penalty_last_n, cap), 0 when penalties are off
+static inline uint coupled_hist_len(int n, uint cap) { return n <= 0 ? 0u : min(uint(n), cap); }
+
 #if STEP_STATE
 constant uint BS_AM_CTAS = 8u;                                         // kAmCtas: threadgroups per row
 
@@ -718,5 +760,81 @@ kernel void bs_sample_one_block(device const uint* logits [[buffer(0)]], device 
     }
     if (sg != 0u) return;
     sample_row(sel_ids, sel_logit, k, p, st, ctr_base, nq, out, qprob, ex, t, lane);
+}
+
+// coupled_stage_kernel (sampler.cu:690-700), the round's first node: the request's image the host staged (mparams)
+// into the round's device copy (cparams), its 18 words bit for bit, padding and the pointer's slot included; then the
+// history base the host staged in mhist[cap - h, cap) into the ring, h = coupled_hist_len(penalty_last_n, cap) read
+// from the staged image, not the copy, so the two loops need no order. Words only, no float. basalt's 256 threads,
+// or any width (each word is copied by one thread).
+kernel void bs_coupled_stage(constant BsCoupledParams& c [[buffer(7)]], device BsCoupledSampler* cparams [[buffer(13)]],
+                             device int* ring [[buffer(14)]], device const StepState* st [[buffer(15)]],
+                             device const BsCoupledSampler* mparams [[buffer(16)]],
+                             device const int* mhist [[buffer(17)]],
+                             uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]]) {
+    if (st->done) return;
+    device const uint* s = reinterpret_cast<device const uint*>(mparams);
+    device uint* d = reinterpret_cast<device uint*>(cparams);
+    for (uint i = tid; i < sizeof(BsCoupledSampler) / 4u; i += tpg) d[i] = s[i];          // :694-696, 18 words
+    const uint h = coupled_hist_len(mparams->penalty_last_n, c.cap);                      // :697
+    for (uint i = c.cap - h + tid; i < c.cap; i += tpg) ring[i] = mhist[i];               // :698-699, h <= cap
+}
+
+constant uint BS_SEEN_WORDS = BS_SPLIT_MAX_BLOCKS * BS_BLOCK / 32u;    // 8,192: a bit per logit of the widest row
+
+// coupled_penalize_kernel (sampler.cu:701-726): draft j's penalties, in place on its row before the selection, as the
+// target applies them to the row that verifies the draft: the window ring[cap + j - h, cap + j) (coupled_hist_start:
+// the base, then drafts 0 .. j - 1), h = coupled_hist_len(penalty_last_n, cap) from the round's copy. A window id
+// outside [0, id_vocab), or whose slot (id_to_sub[id] with flags ID_TO_SUB, else the id) is outside [0, nv), has no
+// logit here. Each distinct slot is penalised once, by the thread whose atomic OR sets its bit in seen (the call
+// returns the old word): apply_penalties with the id's count over the whole window, the value any candidate thread
+// would write (an inverse map is injective). seen is a static 8,192 words, the widest row the coupled path takes and
+// this kernel's only threadgroup memory (D4); a wider record returns at once. The width is free (the result is
+// order-free), basalt's is 1,024.
+kernel void bs_coupled_penalize(device uint* logits [[buffer(0)]], constant BsCoupledParams& c [[buffer(7)]],
+                                device const int* id_to_sub [[buffer(12)]],
+                                device const BsCoupledSampler* cparams [[buffer(13)]],
+                                device const int* ring [[buffer(14)]], device const StepState* st [[buffer(15)]],
+                                uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]]) {
+    threadgroup atomic_uint seen[BS_SEEN_WORDS];
+    const uint nv = c.nv, words = (nv + 31u) / 32u;
+    if (st->done || words > BS_SEEN_WORDS) return;
+    const uint h = coupled_hist_len(cparams->penalty_last_n, c.cap);                      // :710-711
+    if (h == 0u) return;                                                                  // the same in every thread
+    device const int* hrow = ring + (c.cap + c.j - h);                                    // :712
+    for (uint w = tid; w < words; w += tpg) atomic_store_explicit(seen + w, 0u, memory_order_relaxed);   // :714-716
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float repeat = cparams->penalty_repeat, freq = cparams->penalty_freq, present = cparams->penalty_present;
+    for (uint i = tid; i < h; i += tpg) {                                                 // :717-725, bounded by h
+        const int v = hrow[i];
+        if (v < 0 || uint(v) >= c.id_vocab) continue;
+        const int s = (c.flags & BS_ID_TO_SUB) != 0u ? id_to_sub[v] : v;
+        if (s < 0 || uint(s) >= nv) continue;
+        const uint bit = 1u << (uint(s) & 31u);
+        if ((atomic_fetch_or_explicit(seen + (uint(s) >> 5), bit, memory_order_relaxed) & bit) != 0u) continue;
+        logits[s] = apply_penalties(logits[s], history_count(hrow, h, uint(v)), repeat, freq, present);
+    }
+}
+
+constant uint BS_CPL_WARPS = 16u;                                      // coupled_part_kernel<8, 16>: SIMD-groups
+constant uint BS_CPL_PER_LANE = 8u;                                    // and logits per lane, 4,096 per block
+
+// coupled_part_kernel<8, 16> (sampler.cu:727-777): block b's top-k list of the draft row, already penalised in place
+// (ceil(nv / 4,096) threadgroups of basalt's 512 threads, 16 SIMD-groups of 8 logits per lane), k = sampled_k(top_k,
+// nv) from the round's copy of the request, into cand at b * 64 as (id, value bits), padded with the sentinel (nv,
+// -inf): the stride the merge reads, k being known only on the device. part_list without PEN, the split part's
+// template, so the two lists cannot drift apart (spec S§14.6). A dispatch of any other width returns at once, as does
+// a block at or past the row's.
+kernel void bs_coupled_part(device const uint* logits [[buffer(0)]], constant BsCoupledParams& c [[buffer(7)]],
+                            device uint2* cand [[buffer(9)]], device const BsCoupledSampler* cparams [[buffer(13)]],
+                            device const StepState* st [[buffer(15)]],
+                            uint b [[threadgroup_position_in_grid]], uint tpg [[threads_per_threadgroup]],
+                            uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint2 wl[BS_CPL_WARPS * BS_SEL_MAX];
+    const uint nv = c.nv;
+    if (st->done || tpg != BS_CPL_WARPS * 32u || b >= (nv + BS_BLOCK - 1u) / BS_BLOCK) return;
+    part_list<BS_CPL_PER_LANE, BS_CPL_WARPS, false>(logits, nv, sampled_k(cparams->top_k, nv), b,
+                                                    cand + ulong(b) * BS_SEL_MAX, wl, tid, lane, sg);
 }
 #endif

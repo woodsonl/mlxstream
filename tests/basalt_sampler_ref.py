@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
-# adapted from basalt (jesdga95/basalt) src/kernels/sampler_parity.cpp and include/basalt/kernels/sampler.hpp
-# (penalty_rows) @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): its host references, fixtures
-# and pass criteria.
+# adapted from basalt (jesdga95/basalt) src/kernels/sampler_parity.cpp, include/basalt/kernels/sampler.hpp
+# (penalty_rows) and include/basalt/core/coupled_draft.hpp (the coupled_* helpers)
+# @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): its host references, fixtures and pass
+# criteria.
 # nv_exp and nv_logf: transcribed from NVIDIA libdevice's __nv_exp and __nv_logf as nvcc 13.0 (V13.0.48,
 # -arch=sm_120 -lineinfo -O3 -DNDEBUG) inlined them into basalt's sampler.cu; PTX listing and transcription:
 # docs/research/basalt-nvcc/sampler.md sections 2.5-2.6.
@@ -22,7 +23,9 @@ import ...``.
   ``reference_pick`` / ``reference_cut``; the sampled chain in llama.cpp's order, ``sampled_reference``, and its
   survivor count ``sampled_cut``; the kernels' own list and tail, ``mirror_select`` and ``mirror_pick``, with
   ``sampled_k`` and ``window_of``; the probe's probability, ``mirror_prob``; ``greedy_pen`` for the greedy references
-  local to its main; ``penalty_rows``, basalt's host builder of a verify window's history rows (sampler.hpp:86-97).
+  local to its main; ``penalty_rows``, basalt's host builder of a verify window's history rows (sampler.hpp:86-97);
+  the coupled draft's ``coupled_draft_cell``, ``coupled_draft_counter``, ``coupled_hist_len``,
+  ``coupled_hist_start`` and ``coupled_hist_base`` (coupled_draft.hpp:65-83).
   ``penal`` is their penalty, rounded as the device rounds it. ``sampled_reference``,
   ``sampled_cut`` and ``mirror_pick`` call ``nv_exp`` and ``nv_logf`` where basalt's host calls std::exp(double) and
   logf; ``reference_pick``, ``reference_cut`` and ``mirror_prob`` keep ``math.exp``: no kernel computes their sums,
@@ -718,6 +721,37 @@ def bench_rows(T, seed=20):
     for n in (1, 4, 8)[:(1, 4, 8).index(T) + 1]:
         l = _normal(rs, (n, 248320), 3.0)
     return l
+
+
+# ---- coupled draft sampling's host helpers (include/basalt/core/coupled_draft.hpp:65-83) ----------------------------
+
+COUPLED_HIST_CAP = 4096   # kCoupledHistCap: the longest penalty window the coupled drafter mirrors (serve's cap)
+
+
+def coupled_draft_cell(p, a, j):
+    """The MTP cell of chain step j after a window at position p with a drafts accepted."""
+    return p + a + j
+
+
+def coupled_draft_counter(cell):
+    """The draw counter of the verify row that checks the draft made at MTP cell ``cell``: cell + 1, as uint64."""
+    return (cell + 1) & (2**64 - 1)
+
+
+def coupled_hist_len(penalty_last_n, cap):
+    """The penalty window the draft layer and the target use: min(penalty_last_n, cap), 0 when penalties are off."""
+    return 0 if penalty_last_n <= 0 else min(penalty_last_n, cap)
+
+
+def coupled_hist_start(cap, j, h):
+    """Where draft j's penalty window starts in the ring (the base in [cap - h, cap), draft i at cap + i)."""
+    return cap + j - h
+
+
+def coupled_hist_base(tail, nxt, h):
+    """The ring's base on the host: the last h tokens of (tail, nxt), -1 padded in front, the h slots the host stages
+    in [cap - h, cap) (penalty_rows' row 0 for the one-token window [nxt]); empty when h <= 0."""
+    return penalty_rows(tail, [nxt], 1, h) if h > 0 else np.empty(0, np.int32)
 
 
 COUPLED_VOCABS = (106299, 40525, 4096, 4097, 300, 20, 7)

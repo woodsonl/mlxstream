@@ -568,6 +568,36 @@ def basalt_sampler_params(vocab: int, t_rows: int, n_blocks: int, hist_len: int,
                        temperature, min_keep, penalty_last_n, penalty_repeat, penalty_freq, penalty_present, 0)
 
 
+BS_COUPLED_IMAGE = struct.Struct("<ifffiifffIQQB7sQ")   # basalt's SamplerParams as it lies in memory: 72 bytes
+
+
+def basalt_coupled_params(*, top_k: int = 20, top_p: float = 0.95, min_p: float = 0.0, temperature: float = 1.0,
+                          min_keep: int = 1, penalty_last_n: int = 0, penalty_repeat: float = 1.0,
+                          penalty_freq: float = 0.0, penalty_present: float = 0.0, seed: int = 0, counter: int = 0,
+                          greedy: bool = False, pad0: int = 0, pad1: bytes = bytes(7), logit_bias: int = 0) -> bytes:
+    """The coupled draft's request, basalt's 72-byte SamplerParams image (sampler.hpp:15-29; basalt_sampler.metal's
+    BsCoupledSampler), with its defaults: the nine 4-byte chain fields, the padding word ``pad0``, the seed at 40, the
+    counter at 48 (the coupled merge draws with its step record's cell + 1 instead), greedy at 56 and its padding
+    ``pad1``, and the logit_bias pointer's slot at 64, which no coupled kernel reads (the drafter applies no bias).
+    Every per-request value is in it, so the host writes it to the staging buffer the round's stage node copies. min_p
+    above 1 is basalt's to accept."""
+    return BS_COUPLED_IMAGE.pack(top_k, top_p, min_p, temperature, min_keep, penalty_last_n, penalty_repeat,
+                                 penalty_freq, penalty_present, pad0, seed, counter, int(greedy), pad1, logit_bias)
+
+
+def basalt_coupled_node(nv: int, id_vocab: int, cap: int, j: int, *, id_to_sub: bool = False,
+                        sub_to_id: bool = False) -> bytes:
+    """A coupled draft node's 32-byte ``BsCoupledParams`` (basalt_sampler.metal), its structure, written at build: the
+    draft row's nv logits, the id_vocab token ids, the ring's history capacity cap (its first cap slots the round's
+    base, then the round's drafts) and the draft's index j in the round; flags 1 when the id_to_sub map is bound, 2
+    when sub_to_id is (basalt's non-null maps; without them a slot is its token id). Refuses what basalt's
+    coupled_draft_sample exits on (sampler.cu:1057-1060): no logits, or more blocks than the merge's 64."""
+    if nv <= 0 or -(-nv // BS_BLOCK) > BS_SPLIT_MAX_BLOCKS:
+        raise ValueError(f"basalt_coupled: {nv} logits need 1 to {BS_SPLIT_MAX_BLOCKS} blocks of {BS_BLOCK}")
+    flags = (1 if id_to_sub else 0) | (2 if sub_to_id else 0)
+    return struct.pack("<IIIIIIII", nv, id_vocab, cap, j, flags, 0, 0, 0)
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)

@@ -15,9 +15,13 @@ its block lists.
 - The probe (basalt's sample_tokens_probe, the sampled wrappers' ``query``): flags PROBE in the record, row t's query
   in StepState ``pending_tokens[t + 1]``, as the engine's draft tokens sit there, and the queried row count in the
   ``nq`` buffer.
+- The coupled draft's kernels (``coupled_stage``, ``coupled_draft``): one draft row; the request as basalt's 72-byte
+  SamplerParams image, the token ring and the step record in buffers, as basalt's captured round reads them; the
+  node's structure (nv, id_vocab, cap, j, the subset's maps) in its BsCoupledParams record.
 """
 
 import struct
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -229,3 +233,75 @@ def rows_alone(path, logits, p, *, hist=None, hist_len=0, query=None, nq=0, posi
         if any(b[t] != o[0] for b, o in zip(batch, one)):
             bad.append(t)
     return bad
+
+
+# ---- the coupled draft (basalt's coupled_draft_stage and coupled_draft_sample, sampler.cu:1040-1071) ----------------
+
+CPL_CAP, CPL_MAX_T = 256, 8           # coupled_parity's ring (:576): cap history slots, then max_t drafts
+CPL_PART_THREADS = 512                # bs_coupled_part's threadgroup, exactly (basalt's 16 warps)
+
+
+def coupled_image(p):
+    """The round's request: SamplerParams ``p``'s 72-byte image (kernels.basalt_coupled_params)."""
+    return kernels.basalt_coupled_params(
+        top_k=p.top_k, top_p=p.top_p, min_p=p.min_p, temperature=p.temperature, min_keep=p.min_keep,
+        penalty_last_n=p.penalty_last_n, penalty_repeat=p.penalty_repeat, penalty_freq=p.penalty_freq,
+        penalty_present=p.penalty_present, seed=p.seed, counter=p.counter, greedy=p.greedy)
+
+
+def coupled_run(steps, node, bufs):
+    """Run ``steps``, (kernel, threadgroups, threads) in order, in one command buffer on the coupled kernels' slots
+    (the map at the top of the .metal file): the node's record at 7, StepState at 15 (not done), ``bufs`` {slot: bytes,
+    or an ``nt.Buffer`` the caller reads back}, a 16-byte placeholder in every other slot."""
+    dev = gpu.device()
+    slots = {k: nt.Buffer(dev, bytes(16)) for k in (0, 5, 6, 9, 11, 12, 13, 14, 16, 17, 18)}
+    slots.update({k: b if isinstance(b, nt.Buffer) else nt.Buffer(dev, b) for k, b in bufs.items()})
+    slots.update({7: nt.Buffer(dev, node), 15: nt.Buffer(dev, LAYOUT.pack({}))})
+    ds = []
+    for name, grid, tg in steps:
+        d = nt.Dispatch().pipeline(pipeline(name))
+        for k, b in slots.items():
+            d = d.buffer(k, b)
+        ds.append(d.grid(grid).threadgroup(tg))
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+
+
+def coupled_stage(mparams, mhist, ring, cap, *, threads=256):
+    """basalt's coupled_draft_stage: ``bs_coupled_stage``, one threadgroup of ``threads`` (basalt's 256), copies the
+    host-staged image ``mparams`` (72 bytes) into the round's copy, which starts as 0xFF bytes, and the staged history
+    ``mhist`` (cap,) int32's slots [cap - h, cap) into ``ring`` (cap + max_t,) int32. Returns the copy's bytes and the
+    ring."""
+    dev = gpu.device()
+    cp, rb = nt.Buffer(dev, 72), nt.Buffer(dev, np.ascontiguousarray(ring, np.int32).tobytes())
+    cp.fill(0xFF)
+    coupled_run([("bs_coupled_stage", 1, threads)], kernels.basalt_coupled_node(1, 1, cap, 0),   # the stage reads cap
+                {13: cp, 14: rb, 16: bytes(mparams), 17: np.ascontiguousarray(mhist, np.int32).tobytes()})
+    return cp.read(0, 72), np.frombuffer(rb.read(0, rb.nbytes), np.int32).copy()
+
+
+def coupled_draft(logits, p, *, j, ring, cell=0, sub_to_id=None, id_to_sub=None, cap=CPL_CAP, threads=1024):
+    """basalt's coupled_draft_sample (sampler.cu:1052-1071) on one draft row, ``logits`` (nv,) float32, and the request
+    ``p``, whose image is the round's copy (coupled_parity uploads it there; no stage): ``bs_coupled_penalize``, one
+    threadgroup of ``threads`` (basalt's 1,024), penalises the row in place over draft j's window in ``ring`` (cap +
+    max_t,) int32; then ``bs_coupled_part``, ceil(nv / 4,096) + 1 threadgroups of exactly 512 (the extra one must exit
+    at the block guard), stores each block's list to cand at b * 64, which starts as 0xFF bytes. ``sub_to_id`` (nv,)
+    and ``id_to_sub`` (id_vocab,) int32: the subset's maps (the node's flags), or None; ``cell``: the step record's.
+    Returns .logits, the row's bits after the run, .cand, the (n_blocks, 64, 2) uint32 lists, and .ring; asserts the
+    extra block untouched."""
+    l = np.ascontiguousarray(logits, np.float32)
+    nv, dev = l.size, gpu.device()
+    nb = -(-nv // kernels.BS_BLOCK)
+    node = kernels.basalt_coupled_node(nv, nv if id_to_sub is None else len(id_to_sub), cap, j,
+                                       id_to_sub=id_to_sub is not None, sub_to_id=sub_to_id is not None)
+    bl, cand = nt.Buffer(dev, l.tobytes()), nt.Buffer(dev, (nb + 1) * kernels.BS_SEL_MAX * 8)
+    rb = nt.Buffer(dev, np.ascontiguousarray(ring, np.int32).tobytes())
+    cand.fill(0xFF)
+    bufs = {0: bl, 9: cand, 13: coupled_image(p), 14: rb, 18: np.int32(cell).tobytes()}
+    bufs.update({k: np.ascontiguousarray(m, np.int32).tobytes() for k, m in ((11, sub_to_id), (12, id_to_sub))
+                 if m is not None})
+    coupled_run([("bs_coupled_penalize", 1, threads), ("bs_coupled_part", nb + 1, CPL_PART_THREADS)], node, bufs)
+    lists = np.frombuffer(cand.read(0, cand.nbytes), np.uint32).reshape(nb + 1, kernels.BS_SEL_MAX, 2)
+    assert np.all(lists[nb] == 0xFFFFFFFF), "the block past the row's was written"
+    return SimpleNamespace(logits=np.frombuffer(bl.read(0, bl.nbytes), np.uint32).copy(), cand=lists[:nb].copy(),
+                           ring=np.frombuffer(rb.read(0, rb.nbytes), np.int32).copy())
