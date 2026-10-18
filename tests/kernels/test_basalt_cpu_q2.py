@@ -30,12 +30,13 @@ recorded nt = 1 column.
 Cases (the plan's section 7). A, ``act_quant_q8_1``: A1 the two caller widths, A2 an all-zero chunk, A3 +-0 and the
 maximum planted in each of the 32 positions, A4 the scale band's four regimes, A5 +-inf, A6 the NaN sweep over both
 reduction orders, A7 the half-away-from-zero rounding and the ``0.49999997f`` tie, A8 the saturation trap, A9 the
-contraction trap, A10 the reciprocal's witness. B, ``q2_0_gguf_rows_multi``: B1 both pack shapes, B2 nt = 1..8 token
-independence, B3 the row ranges and the absolute-index write, B4 stride padding, B5 the unread tail, B6 all 65,536
-fp16 block scales, B7 adversarial activations, B8 the independent float64 check, B9 determinism. C, the recorded
-x86 values: C1 the five end-to-end fixtures, C2 the quantizer's own outputs, C3 the nine site probes, C4 the
-per-site NaN tables, C5 those tables' rows through the kernel - signaling NaNs in scale and hx, the NaNs sites 1
-and 2 create, the acc tree's last three levels.
+contraction trap, A10 the reciprocal's witness, A11 the non-finite chunks' exact outputs. B,
+``q2_0_gguf_rows_multi``: B1 both pack shapes, B2 nt = 1..8 token independence, B3 the row ranges and the
+absolute-index write, B4 stride padding, B5 the unread tail, B6 all 65,536 fp16 block scales, B7 adversarial
+activations, B8 the independent float64 check, B9 determinism. C, the recorded x86 values: C1 the five end-to-end
+fixtures, C2 the quantizer's own outputs, C3 the nine site probes, C4 the per-site NaN tables, C5 those tables' rows
+through the kernel - signaling NaNs in scale and hx, the NaNs sites 1 and 2 create, the acc tree's last three
+levels.
 
 Fixtures are the repository's: ``random_rows`` (test_basalt_experts, basalt's own Q2_0 row fixture - random code
 bytes with a finite fp16 scale per block) for the bitwise cases, and ``quantize_q2_0`` (test_basalt_iq_parity,
@@ -379,6 +380,42 @@ def test_a10_the_reciprocal_is_one_over_s_not_127_over_amax():
     assert mutant != recip(scale[0]), "this witness no longer separates the two reciprocals"
     assert int(np.trunc(np.float64(F32(F32(x * mutant) + F32(0.5))))) == 40, "the mutant's code is 40 here"
     assert q[5] == 39, "1.f / s gives 39; 127.f / amax gives 40"
+
+
+def test_a11_a_non_finite_activation_writes_no_nan():
+    """A11. The exact outputs for a chunk holding a single +inf, a single NaN, and +inf with -inf, as basalt's
+    expert.cpp:352-367 computes them. A single +inf: amax = s = +inf and ``inv = 1.f / s = +0``, so the infinite
+    lane's ``t = inf * 0`` is a NaN, which VCVTTPS2DQ converts to INT_MIN and the clamp to -127, while every finite
+    lane's t is +-0 and its code 0: sum -127, scale +inf, ``hx = +inf * -127 = -inf``. A NaN lane gives -127 the same
+    way wherever it sits. Where it also reaches amax - position 19 alone, in GCC's tree (A6) - the ordered
+    ``amax > 0.f`` fails, so s = +0, every finite code is 0 and ``hx = +0 * -127 = -0.0``; elsewhere the tree
+    swallows it and the chunk scales by its finite peak. +inf with -inf: -127 twice, sum -254, hx -inf. No case
+    writes a NaN scale or hx. FCVTZS converts a NaN to 0, so a port on it would write q = 0, sum 0 and
+    ``hx = +inf * 0 = NaN`` for the first chunk."""
+    for p in range(QKA):                                             # a single +inf, at every position
+        x = np.full(QKA, F32(0.25), F32)
+        x[p] = F32(np.inf)
+        q, scale, total, hx, _ = check_act(x)
+        assert q[p] == -127 and np.count_nonzero(q) == 1 and total[0] == -127, f"+inf at {p}"
+        assert scale.view(np.uint32)[0] == 0x7F800000 and hx.view(np.uint32)[0] == 0xFF800000, f"+inf at {p}"
+
+    for p in range(QKA):                                             # a single NaN, at every position
+        x = np.full(QKA, F32(0.1), F32)
+        x[p] = F32(np.nan)
+        q, scale, total, hx, _ = check_act(x)
+        assert q[p] == -127, f"NaN at {p}: code {q[p]}"
+        if p == 19:                                                  # amax is the NaN: s = +0
+            assert np.count_nonzero(q) == 1 and total[0] == -127
+            assert scale.view(np.uint32)[0] == 0x00000000 and hx.view(np.uint32)[0] == 0x80000000
+        else:                                                        # swallowed: amax = 0.1, the other 31 codes 127
+            assert np.count_nonzero(q == 127) == QKA - 1 and total[0] == 3810, f"NaN at {p}"
+            assert scale.view(np.uint32)[0] == 0x3A4E69A0 and hx.view(np.uint32)[0] == 0x40400000, f"NaN at {p}"
+
+    x = np.full(QKA, F32(0.25), F32)                                 # +inf and -inf together
+    x[2], x[21] = F32(np.inf), F32(-np.inf)
+    q, scale, total, hx, _ = check_act(x)
+    assert q[2] == -127 and q[21] == -127 and np.count_nonzero(q) == 2 and total[0] == -254
+    assert scale.view(np.uint32)[0] == 0x7F800000 and hx.view(np.uint32)[0] == 0xFF800000
 
 
 # ---- B. q2_0_gguf_rows_multi -------------------------------------------------------------------------------------
