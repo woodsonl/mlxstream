@@ -52,13 +52,14 @@ def record(p, vocab, rows, hist_len, mode, bias=False, probe=False, id_map=False
 
 
 def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, id_map=None, position=0, fill=0xFF,
-           scratch=None, lbuf=None):
+           scratch=None, lbuf=None, queue=None):
     """Run ``steps``, (pipeline, grid, threads) in order, on one window: ``logits`` (T, V) float32, ``p`` the request,
     ``hist`` the flat (T, hist_len) int32 history rows, ``bias`` (V,) float32, ``id_map`` (V,) int32 (flags MAP),
     ``position`` StepState's.
     ``scratch``: {slot: a byte count, a fresh buffer starting as 0xFF; or an ``nt.Buffer`` the caller holds, to read
     back}. ``lbuf``: a buffer already holding ``logits``, bound in place of a fresh upload (sampler_parity's
-    DeviceRows, rows uploaded once and sampled many times: the test reads it back).
+    DeviceRows, rows uploaded once and sampled many times: the test reads it back). ``queue``: the ``nt.Queue`` to
+    run on (basalt's stream), else a new one.
     Every slot the family binds is bound, a 16-byte placeholder where the request has no such datum. Returns the T
     picks and the T probabilities' bits; asserts the extra row of each output untouched."""
     l = np.ascontiguousarray(logits, np.float32)
@@ -88,7 +89,7 @@ def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, id_map=N
         for k, b in slots.items():
             d = d.buffer(k, b)
         ds.append(d.grid(*grid).threadgroup(tg))
-    r = nt.Queue(dev).run(ds)
+    r = (nt.Queue(dev) if queue is None else queue).run(ds)
     assert not r.error, r.error
     token = np.frombuffer(slots[5].read(0, 4 * rows), np.int32)
     qbits = np.frombuffer(slots[6].read(0, 4 * rows), np.uint32)
@@ -156,7 +157,7 @@ def split_part(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=
     return lists[:T].copy()
 
 
-def split(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None):
+def split(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None, queue=None):
     """S-SPLIT, basalt's sampler_split_part_kernel then sampler_split_merge_kernel: ``bs_split_part`` as in
     ``split_part``, then ``bs_split_merge``, one SIMD-group per row, which merges the row's block lists from ``cand``
     and runs the sampled tail. Mode 2 whatever the request asks, without the cluster pair the engine runs first (it
@@ -167,7 +168,7 @@ def split(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF,
     rows, nb = T + 1, -(-V // kernels.BS_BLOCK)
     picks, qbits = launch([(part, (nb, rows), SPLIT_THREADS), (merge, (rows,), 32)], logits, p, mode=2, hist=hist,
                           hist_len=hist_len, bias=bias, position=position, fill=fill,
-                          scratch={9: rows * nb * sampled_k(p.top_k, V) * 8}, lbuf=lbuf)
+                          scratch={9: rows * nb * sampled_k(p.top_k, V) * 8}, lbuf=lbuf, queue=queue)
     assert np.all(qbits == np.frombuffer(bytes([fill]) * 4, np.uint32)[0]), "qprob was written without the probe"
     return picks
 

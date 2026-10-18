@@ -11,26 +11,38 @@ argmax as its partials and merge dispatches (basalt's G-CL, sampler_greedy_clust
 one-block greedy kernel forced on the same rows (G-1B, sampler_greedy_kernel; F.1: every greedy check also passes on
 G-1B). A penalised greedy check runs G-1B, the path basalt's dispatcher takes for a penalty window. The logit_bias
 checks route each launch as the dispatcher does (``sample``, by the mode rule): a bias or a penalty window takes G-1B,
-a greedy request with neither G-CL, and their ``forced`` cases run G-1B in G-CL's place (F.1). A sampled check takes
-its path from ``SAMPLED``, the sampled paths built so far: ``split``, the split part and merge (S-SPLIT,
-sampler_split_part_kernel then sampler_split_merge_kernel).
+a greedy request with neither G-CL, a sampled one S-SPLIT, and their ``forced`` cases run G-1B in G-CL's place (F.1).
+A sampled check takes its path from ``SAMPLED``, the sampled paths built so far: ``split``, the split part and merge
+(S-SPLIT, sampler_split_part_kernel then sampler_split_merge_kernel).
 
-- LB.1-6, logit_bias (the greedy sides): the bias added in the kernel picks what the host-biased rows pick, bans an id
-  at -inf and boosts one by 100, at 512 logits and at the engine's 248,320, and leaves the rows it reads unchanged.
+- LB.1-6, logit_bias (both sides): the bias added in the kernel picks what the host-biased rows pick (the sampled
+  penalised case also shows the order: bias, then penalties), bans an id at -inf and boosts one by 100, at 512 logits
+  and at the engine's 248,320 (61 split blocks, 60 of them empty after the ban), and leaves the rows it reads
+  unchanged.
 - M1.1, fixture 1: plain greedy over normal rows is the lowest-index argmax.
 - M2.2, fixture 2: greedy over the order fixture picks 0 in every row.
 - M3.1-2, fixture 3: greedy consumes no random number (two seeds, one pick) and is the argmax.
 - M4.2-3, fixture 4, with A1: the repeat penalty multiplies a negative logit, and the presence penalty is a boolean
-  (A1's rows are the ones on which that rule decides the pick).
+  (A1's rows are the ones on which that rule decides the pick, on G-1B and the sampled paths).
 - M5.1-3, fixture 5: temperature 0 (or -1) routes to the argmax whatever ``greedy`` says, and so does greedy at
   temperature 1 (the mode rule, ``basalt_sampler_mode``, chooses greedy; a NaN temperature samples); the pick is the
   argmax, never id 0, the row's worst.
+- M6.2, fixture 6: the penalties in the sampled chain turn its picks from [0, 0] to sampled_reference's [3, 2].
 - M7.2-4, fixture 7: min_p 0, 0.5 and 0.9 through the sampled chain pick sampled_reference's token.
 - M8.2, fixture 8: the penalty window is the tail of the history row.
-- M11.2, fixture 11: a stale history with penalty_last_n = 0 leaves the greedy pick the argmax.
-- M12.G, fixture 12: each row of a window counts its own history row (windows of 1 to 4,096 slots).
-- M13.1, fixture 13: history ids outside the vocabulary count nowhere.
+- M11.1-2, fixture 11: a stale history with penalty_last_n = 0 leaves the sampled pick the no-history reference's and
+  the greedy pick the argmax.
+- M12.G and M12.S, fixture 12: each row of a window counts its own history row (windows of 1 to 4,096 slots), greedy
+  and sampled.
+- M13.1-2, fixture 13: history ids outside the vocabulary count nowhere, greedy and sampled.
 - M14.1-4, fixture 14: top_k 64 as given, and 0, 100 and -3 meaning 64, pick the 64-wide reference's token.
+- M16.1-2, fixture 16: under NaN arithmetic the pick is the list's k-th entry, so top_k 0 to 64 read the whole list
+  (ties, signed zeros, NaN, +inf, the empty rounds' sentinel, penalised ties) at 61, 25, 64 and 1 split blocks.
+- M17.1, fixture 17: tie-heavy rows through the whole chain on two queues, against the mirror.
+- M18.2, fixture 18 (a): the split path on penalised rows at the engine's vocabulary, against the mirror.
+- A2-A4, A7 and A8, the port's additions (spec T§10.2): the sampled kernels' penalty window is the tail; the
+  temperature comes after the filters; min_keep 3 and 10 clamp the top_p cut; subnormal logits are ordered exactly;
+  min_p above 1 keeps nothing and picks the list's head.
 - TP.1, the port's addition (spec S§19.3): the drafter's greedy tail, ``top_prob`` (the cluster partials, then
   bs_greedy_top_prob), picks the host argmax, mapped, with the float64 softmax probability of the pick within
   q5k_head_parity's 1e-5.
@@ -48,10 +60,11 @@ import pytest
 
 from monolith import kernels
 from monolith.runtime import _native as nt
-from tests.basalt_sampler_ref import (SamplerParams, f32, fixture2_data, fixture4_data, fixture7_data, fixture8_data,
-                                      fixture12_data, fixture13_data, fixture16_data, greedy_pen, mirror_pick,
-                                      mirror_select, normal_rows, penal_vec, penalty_rows, reference_pick, sampled_k,
-                                      sampled_reference, select_vec, window_of)
+from tests.basalt_sampler_ref import (SamplerParams, f32, fixture2_data, fixture4_data, fixture6_data, fixture7_data,
+                                      fixture8_data, fixture12_data, fixture13_data, fixture16_data, fixture17_data,
+                                      fixture18_data, greedy_pen, mirror_pick, mirror_prob, mirror_select, normal_rows,
+                                      penal_vec, penalty_rows, reference_pick, sampled_k, sampled_reference, select_vec,
+                                      window_of)
 from tests.kernels import basalt_sampler_gpu as gpu
 from tests.kernels.basalt_gpu import device
 from tests.kernels.test_basalt_decode_cluster import PATTERNS, VOCABS, fill_logits, host_argmax
@@ -70,9 +83,11 @@ def run(path, logits, p, want, hist=None, hist_len=0):
 def sample(logits, p, *, hist=None, hist_len=0, bias=None, forced=False, lbuf=None):
     """sampler_parity's DeviceRows ``sample`` (:493-501) on the path basalt's dispatcher takes for ``p``
     (sampler.cu:988-1020), as the mode rule routes it: G-CL for a greedy request without a penalty window and a bias,
-    G-1B for one with either; ``forced``, G-1B in G-CL's place (F.1). ``lbuf``: the rows held in one buffer."""
+    G-1B for one with either, S-SPLIT for a sampled request (every sampled shape here fits it: at most 64 rows and
+    64 blocks); ``forced``, G-1B in G-CL's place (F.1). ``lbuf``: the rows held in one buffer."""
     mode = kernels.basalt_sampler_mode(p.greedy, p.temperature, p.penalty_last_n, bias is not None)
-    assert mode != 2, f"a sampled request, and no sampled path here: {p}"
+    if mode == 2:
+        return gpu.split(logits, p, hist=hist, hist_len=hist_len, bias=bias, lbuf=lbuf)
     if mode == 0 and not forced:
         return gpu.greedy_cl(logits, p, hist=hist, hist_len=hist_len, lbuf=lbuf)
     return gpu.greedy_1b(logits, p, hist=hist, hist_len=hist_len, bias=bias, lbuf=lbuf)
@@ -100,9 +115,10 @@ def bias_request(greedy, penalty):
 
 
 # (greedy, penalty, forced): fixture A's greedy cases, and the unpenalised one with G-1B forced for its launches
-# without the bias (the others take G-1B anyway)
-BIAS_CASES = [(True, False, False), (True, False, True), (True, True, False)]
-BIAS_IDS = ["greedy", "greedy-F", "greedy-penalty"]
+# without the bias (the others take G-1B anyway); then its sampled cases, S-SPLIT
+BIAS_CASES = [(True, False, False), (True, False, True), (True, True, False), (False, False, False),
+              (False, True, False)]
+BIAS_IDS = ["greedy", "greedy-F", "greedy-penalty", "sampled", "sampled-penalty"]
 
 
 def bias_launches(greedy, penalty, forced):
@@ -125,12 +141,21 @@ def bias_launches(greedy, penalty, forced):
 @pytest.mark.parametrize("greedy,penalty,forced", BIAS_CASES, ids=BIAS_IDS)
 def test_basalt_sampler_bias_matches_prebiased(greedy, penalty, forced):
     """LB.1 (:743-749): fixture A's request with the bias added in the kernel picks what it picks over the rows the
-    host biased (the same float32 add), and never the banned id 0. The port's host reference agrees: the argmax of
-    the host-biased rows after the penalty over each row's window (greedy_pen; spec T§8.1)."""
+    host biased (the same float32 add), and never the banned id 0. The port's host reference agrees (spec T§8.1):
+    over the host-biased rows with the penalty over each row's window, the argmax (greedy_pen), or the sampled
+    chain's pick (mirror_pick over mirror_select's 16). On the sampled penalised case that pick, [7, 116, 7, 7],
+    shows the order: the bias added after the penalties would pick 7 in every row."""
     want, got = bias_launches(greedy, penalty, forced)[:2]
-    _, _, adjusted, hist = bias_fixture_a()
+    l, bias, adjusted, hist = bias_fixture_a()
     p = bias_request(greedy, penalty)
-    host = [greedy_pen(adjusted[t], window_of(hist, 4, t, p.penalty_last_n), p) for t in range(4)]
+    windows = [window_of(hist, 4, t, p.penalty_last_n) for t in range(4)]
+    k = sampled_k(p.top_k, 512)
+    if greedy:
+        host = [greedy_pen(adjusted[t], windows[t], p) for t in range(4)]
+    else:
+        host = [mirror_pick(mirror_select(adjusted[t], 512, windows[t], p, k), k, p, t) for t in range(4)]
+        after = [mirror_pick(select_vec(penal_vec(l[t], windows[t], p) + bias, k), k, p, t) for t in range(4)]
+        assert not penalty or host != after, f"spec T§8.1: bias then penalties picks {host}, the reverse {after}"
     assert not (np.any(got != want) or 0 in got), \
         "if (got != want || std::find(got.begin(), got.end(), 0) != got.end()) {"
     assert list(got) == host, f"the host reference over the host-biased rows picks {host}, the kernel {list(got)}"
@@ -189,10 +214,11 @@ def bias_b_requests(greedy):
             for k, top_p, min_p, seed in itertools.product((0, 1, 20, 64), (1.0, 0.5), (0.0, 0.3), (1, 2, 3))]
 
 
-BIAS_B_CASES = [(True, False)]                     # (greedy, forced): fixture B's greedy side, G-1B (a bias)
+BIAS_B_CASES = [(True, False), (False, False)]     # (greedy, forced): fixture B's greedy side, G-1B (a bias); sampled
+BIAS_B_IDS = ["greedy", "sampled"]                 # side, S-SPLIT over 61 blocks, 60 of them without a finite logit
 
 
-@pytest.mark.parametrize("greedy,forced", BIAS_B_CASES, ids=["greedy"])
+@pytest.mark.parametrize("greedy,forced", BIAS_B_CASES, ids=BIAS_B_IDS)
 def test_basalt_sampler_bias_ban_at_vocab(greedy, forced):
     """LB.5 (:789-790): with every id but ``ONLY`` banned (100 + -inf), every setting picks ``ONLY``: the row's lowest
     logit (-50), and after the bias its only finite one."""
@@ -202,7 +228,7 @@ def test_basalt_sampler_bias_ban_at_vocab(greedy, forced):
                        'permitted token lost (k=%d greedy=%d)\\n", k, (int) greedy); ++bad; }')
 
 
-@pytest.mark.parametrize("greedy,forced", BIAS_B_CASES, ids=["greedy"])
+@pytest.mark.parametrize("greedy,forced", BIAS_B_CASES, ids=BIAS_B_IDS)
 def test_basalt_sampler_bias_boost_at_vocab(greedy, forced):
     """LB.6 (:791-792): ``ONLY`` boosted by 100 over normal(0, 1) rows, a margin of about 95, is every setting's
     pick."""
@@ -259,17 +285,20 @@ def test_basalt_sampler_penalty_repeat_on_negatives():
         'else bad += run("penalties: repeat on negatives", la, NT2, p, want_a, hist_a, 4);'
 
 
-def test_basalt_sampler_penalty_presence_boolean():
+@pytest.mark.parametrize("path", ["greedy_1b"] + SAMPLED)
+def test_basalt_sampler_penalty_presence_boolean(path):
     """M4.3 (:933-954) and A1 (spec T§10.2): fixture 4 B, token 0 at 5.0 counted twice and token 1 at 3.4, with
     present 1.5 and no freq: token 0 falls to 5.0 / 2 - 1.5 = 1.0 and token 1 wins. It would win as well under
     presence times count (-0.5) or no presence term (2.5), so M4.3 cannot see its name. A1 runs the rows with token 1
-    at 0.0 and at 1.5, where the boolean rule picks (0, 1), presence times count (1, 1) and no presence term (0, 0).
-    G-1B: a penalty window."""
+    at 0.0 and at 1.5, where the boolean rule picks (0, 1), presence times count (1, 1) and no presence term (0, 0):
+    on G-1B (a penalty window), and on the sampled paths with top_k 1, whose one-entry list is the penalised argmax,
+    so the pick is the rule's whatever the draw (mirror_pick). M4.3 is G-1B's."""
     _, _, lb, hist_b, p = fixture4_data()
     q = replace(p, penalty_present=1.5, penalty_freq=0.0)
-    want_b = [greedy_pen(lb[t], hist_b[4 * t:4 * t + 4], q) for t in range(2)]
-    assert run("greedy_1b", lb, q, want_b, hist_b, 4) == 0, \
-        'bad += run("penalties: presence is boolean", lb, NT2, q, want_b, hist_b, 4);'
+    if path == "greedy_1b":
+        want_b = [greedy_pen(lb[t], hist_b[4 * t:4 * t + 4], q) for t in range(2)]
+        assert run(path, lb, q, want_b, hist_b, 4) == 0, \
+            'bad += run("penalties: presence is boolean", lb, NT2, q, want_b, hist_b, 4);'
     rows = lb.copy()
     rows[:, 1] = 0.0, 1.5
     want = [greedy_pen(rows[t], hist_b[4 * t:4 * t + 4], q) for t in range(2)]           # the boolean rule
@@ -277,7 +306,11 @@ def test_basalt_sampler_penalty_presence_boolean():
     absent = [int(rows[t, 1] > f32(5.0) / f32(2.0)) for t in range(2)]
     assert (want, counted, absent) == ([0, 1], [1, 1], [0, 0]), \
         f"spec T§10.2 A1: the boolean rule picks {want}, presence times count {counted}, no presence term {absent}"
-    assert run("greedy_1b", rows, q, want, hist_b, 4) == 0, "A1: picks (0, 1) on the two presence rows"
+    if path in SAMPLED:
+        q = replace(q, greedy=False, top_k=1)
+        mirror = [mirror_pick(mirror_select(rows[t], 8, hist_b[4 * t:4 * t + 4], q, 1), 1, q, t) for t in range(2)]
+        assert mirror == want, f"the sampled chain's top_k 1 picks {mirror}, the boolean rule {want}"
+    assert run(path, rows, q, want, hist_b, 4) == 0, "A1: picks (0, 1) on the two presence rows"
 
 
 TEMPERATURE_ZERO = [                     # (greedy, temperature, gate): fixture 5's three settings, then the port's -1
@@ -302,6 +335,19 @@ def test_basalt_sampler_temperature_zero_is_argmax(path, greedy, temperature, ga
     l[:, 0] = -9.0
     want = 100 + np.arange(4)
     assert run(path, l, p, want) == 0, gate
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+def test_basalt_sampler_sampled_penalties(path):
+    """M6.2 (:986-1018): fixture 6's two rows (9.0, 4.5, 4.4, 4.3, then -8) through the sampled chain with top_k 5,
+    top_p 0.9 and temperature 0.8 at seed 9, under repeat 3, freq 0.2 and present 0.6 over 4-slot windows that count
+    token 0 once and twice: it falls to 2.2 and 2.0, and the picks are sampled_reference's [3, 2], where penalty-free
+    rows pick [0, 0] (M6.1)."""
+    l, hist, p = fixture6_data()
+    want = [sampled_reference(l[t], hist[4 * t:4 * t + 4], p, t) for t in range(2)]
+    assert want == [3, 2], f"spec T§8.7: sampled_reference picks {want}"
+    assert run(path, l, p, want, hist, 4) == 0, \
+        'else bad += run("sampled chain: penalties + top_k/p", l, NT2, p, want, hist, 4);'
 
 
 MIN_P_PICKS = {0.0: [2, 2], 0.5: [1, 1], 0.9: [0, 0]}     # fixture 7's sampled_reference picks (spec T§8.8)
@@ -332,15 +378,31 @@ def test_basalt_sampler_penalty_window_tail():
         'else bad += run("penalty window: tail only", {l.begin(), l.end()}, 1, p, {want}, hist, 8);'
 
 
+def fixture11():
+    """Fixture 11 (:1145-1155): normal(0, 1) rows (seed 11) with an 8-slot history each, left from a penalised request
+    (token 3 first, -1 after it), and the sampled request, top_k 20, top_p 0.95, temperature 0.8 at seed 5, whose
+    penalty_last_n is 0. Returns (l, hist, p)."""
+    hist = np.full(32, -1, np.int32)
+    hist[::8] = 3
+    return normal_rows(11), hist, SamplerParams(top_k=20, top_p=0.95, temperature=0.8, seed=5)
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+def test_basalt_sampler_stale_history_sampled(path):
+    """M11.1 (:1145-1161): fixture 11's sampled request over its rows with the stale history bound (hist_len 8,
+    penalty_last_n 0): no window is counted, so each pick is sampled_reference's without a history."""
+    l, hist, p = fixture11()
+    want = [sampled_reference(row, [], p, t) for t, row in enumerate(l)]
+    assert run(path, l, p, want, hist, 8) == 0, \
+        'bad += run("stale history, last_n=0 (sampled)", l, NT, p, want, hist, 8);'
+
+
 @pytest.mark.parametrize("path", GREEDY)
 def test_basalt_sampler_stale_history_greedy(path):
     """M11.2 (:1145-1169): fixture 11's rows with an 8-slot history left from a penalised request (token 3 first in
     each row) while this greedy request has penalty_last_n = 0: the history is bound and must not change the pick,
     reference_pick's argmax."""
-    l = normal_rows(11)
-    hist = np.full(32, -1, np.int32)
-    hist[::8] = 3
-    p = SamplerParams(top_k=20, top_p=0.95, temperature=0.8, seed=5)
+    l, hist, p = fixture11()
     gp = replace(p, greedy=True, top_k=0, top_p=1.0)
     assert kernels.basalt_sampler_mode(gp.greedy, gp.temperature, gp.penalty_last_n, False) == 0   # G-CL: no window
     gwant = [reference_pick(row, gp, False) for row in l]
@@ -365,6 +427,22 @@ def test_basalt_sampler_per_row_history_greedy(T, H):
         f'bad += run(name, l, T, gp, gwant, rows_int, H); (name "per-row history T={T} H={H} greedy")'
 
 
+@pytest.mark.parametrize("path", SAMPLED)
+@pytest.mark.parametrize("T,H", FX12_CASES, ids=[f"T{T}-H{H}" for T, H in FX12_CASES])
+def test_basalt_sampler_per_row_history_sampled(path, T, H):
+    """M12.S (:1171-1225): fixture 12's window of T rows and H-slot penalty_rows histories, sampled with top_k 20,
+    top_p 0.9 and temperature 0.7 at seed 1000 + H and counter 77, under penalty_last_n = H, presence 4 and repeat
+    1.1: each row's pick is sampled_reference over its own history row."""
+    tail, cases = fixture12_data()
+    window, l = next(c[2:] for c in cases if c[:2] == (T, H))
+    rows = penalty_rows(tail, window, T, H)
+    sp2 = SamplerParams(top_k=20, top_p=0.9, temperature=0.7, seed=1000 + H, counter=77, penalty_last_n=H,
+                        penalty_present=4.0, penalty_repeat=1.1)
+    swant = [sampled_reference(l[t], rows[t * H:(t + 1) * H], sp2, t) for t in range(T)]
+    assert run(path, l, sp2, swant, rows, H) == 0, \
+        f'bad += run(name, l, T, sp2, swant, rows_int, H); (name "per-row history T={T} H={H} sampled")'
+
+
 def test_basalt_sampler_history_ids_out_of_vocab_greedy():
     """M13.1 (:1234-1274): fixture 13's 16-slot histories hold ids outside the vocabulary in every third slot (512,
     1512, 0x7fffffff, -5, 1 << 20) beside drawn ids, one of them each row's favourite at 4.0: no window counts them
@@ -375,6 +453,19 @@ def test_basalt_sampler_history_ids_out_of_vocab_greedy():
     gwant = [greedy_pen(l[t], valid[16 * t:16 * (t + 1)], gp) for t in range(4)]
     assert run("greedy_1b", l, gp, gwant, hist, 16) == 0, \
         'bad += run("out-of-vocab history ids (greedy)", l, NT, gp, gwant, hist, H);'
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+def test_basalt_sampler_history_ids_out_of_vocab_sampled(path):
+    """M13.2 (:1234-1275): fixture 13's rows and junk-laden histories, sampled with top_k 20, top_p 0.95 and
+    temperature 0.8 at seed 13 under presence 3 over all 16 slots: each pick is sampled_reference's over the drawn ids
+    alone."""
+    l, hist, valid = fixture13_data()
+    sp2 = SamplerParams(greedy=False, temperature=0.8, top_k=20, top_p=0.95, seed=13, penalty_last_n=16,
+                        penalty_present=3.0)
+    swant = [sampled_reference(l[t], valid[16 * t:16 * (t + 1)], sp2, t) for t in range(4)]
+    assert run(path, l, sp2, swant, hist, 16) == 0, \
+        'bad += run("out-of-vocab history ids (sampled)", l, NT, sp2, swant, hist, H);'
 
 
 TOP_K_CONTRACT = [                    # (top_k, gate): fixture 14's four runs, each against the top_k = 64 reference
@@ -401,6 +492,209 @@ def test_basalt_sampler_top_k_contract(path, top_k, gate):
     assert w63 != want and w100 != want, \
         f"spec T§8.15: the 64-wide list decides the picks ({want}; 63 wide {w63}, 100 wide {w100})"
     assert run(path, l, replace(p64, top_k=top_k), want) == 0, gate
+
+
+FX16_BASE = SamplerParams(top_p=1.0, min_p=0.0, temperature=0.8, seed=16, penalty_last_n=64, penalty_repeat=2.0,
+                          penalty_freq=0.25, penalty_present=0.5)
+
+
+def fx16_requests():
+    """Fixture 16's 67 launches (:1426-1431), rewrites of one record: launch i asks top_k i, but 100 at i = 65 and -3
+    at 66 (0, 100 and -3 mean 64), top_p 0.5 at odd i, else 1 (the tail's two branches, under NaN arithmetic both),
+    counter i."""
+    return [replace(FX16_BASE, top_k=100 if i == 65 else -3 if i == 66 else i, top_p=0.5 if i & 1 else 1.0, counter=i)
+            for i in range(67)]
+
+
+def fx16_lists(l, hist, nv):
+    """Each row's 64-entry list under fixture 16's penalties over its window (mirror_select)."""
+    return [mirror_select(l[t], nv, window_of(hist, 64, t, 64), FX16_BASE, sampled_k(64, nv)) for t in range(4)]
+
+
+FX16_CASES = [("split", nv) for nv in (248320, 100003, 262144, 1000)]       # (path, nv): 61, 25, 64 and 1 blocks
+
+
+@pytest.mark.parametrize("path,nv", FX16_CASES, ids=[f"{path}-{nv}" for path, nv in FX16_CASES])
+def test_basalt_sampler_top_k_list_under_ties(path, nv):
+    """M16.1 (:1365-1449): fixture 16's four rows (ties across blocks, SIMD-groups and lanes, signed zeros, NaN, a row
+    of 11 candidates, penalised ties on window ids at the 1,024 and 4,096 edges, ids outside the vocabulary) hold a
+    +inf, so the tail's sums are NaN, no cut fires, no draw lands, and the pick is the list's last kept entry,
+    sel_ids[k - 1]: the 67 launches over the rows uploaded once read each row's list position by position, against
+    mirror_select's. Row 2's positions past its 11 candidates are the empty round's id 0, which the merge's sink makes
+    of the part's sentinel."""
+    l, hist = fixture16_data(nv)
+    lists = fx16_lists(l, hist, nv)
+    rows = nt.Buffer(device(), l.tobytes())
+    wrong = []
+    for p in fx16_requests():
+        k = sampled_k(p.top_k, nv)
+        got = getattr(gpu, path)(l, p, hist=hist, hist_len=64, lbuf=rows)
+        wrong += [(p.top_k, t, int(got[t]), lists[t].ids[k - 1]) for t in range(4) if got[t] != lists[t].ids[k - 1]]
+    assert not wrong, f"if (got[(size_t) t] != want) {{ ... ++wrong; }} ((top_k, row, got, want): {wrong[:8]})"
+
+
+@pytest.mark.parametrize("nv", (248320, 100003, 262144, 262145, 1000))
+def test_basalt_sampler_top_k_list_reaches_sentinel(nv):
+    """M16.2 (:1453-1456), structural: row 2 of fixture 16 holds 11 candidates, so its list is the empty round's
+    (id 0, -inf) from position 11 on, and 56 of the 67 launches read it there (k > 11): M16.1 gates the sentinel."""
+    l, hist = fixture16_data(nv)
+    ids, logit = fx16_lists(l, hist, nv)[2]
+    sentinels = sum(sampled_k(p.top_k, nv) > 11 for p in fx16_requests())
+    assert ids[11:] == [0] * 53 and np.all(np.float32(logit[11:]) == -np.inf) and np.isfinite(logit[1:11]).all(), \
+        "fixture 16's row 2 has 11 candidates"
+    assert sentinels == 56, "bad += wrong + (sentinels == 0);"
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+@pytest.mark.parametrize("pen", (0, 1))
+@pytest.mark.parametrize("nv", (248320, 512))
+def test_basalt_sampler_sampled_draws_under_ties(path, nv, pen):
+    """M17.1 (:1459-1526): fixture 17's 17 tie-heavy rows (half steps at 248,320, whole steps at 512) and 64-slot
+    histories (half on the row's head) through the whole chain at temperature 2.5, seed 17: top_k 1, 20 and 64 x
+    top_p 0.9 and 1 x min_p 0 and 0.05, each on two ``nt.Queue`` objects in turn (basalt's legacy and created
+    streams), with counter 1000 times the launch's number; ``pen`` 1 counts the windows (repeat 1.25, freq 0.25,
+    present 0.5), ``pen`` 0 binds them with penalty_last_n 0. Every pick is mirror_pick's over the row's 64-entry
+    list. Under shader validation this is T§9's two-queue test of the 17-row scratch."""
+    T, H = 17, 64
+    l, hist = fixture17_data(nv)
+    base = SamplerParams(temperature=2.5, seed=17, penalty_last_n=H if pen else 0, penalty_repeat=1.25,
+                         penalty_freq=0.25, penalty_present=0.5)
+    lists = [mirror_select(l[t], nv, window_of(hist, H, t, base.penalty_last_n), base, sampled_k(64, nv))
+             for t in range(T)]
+    rows = nt.Buffer(device(), l.tobytes())
+    queues = nt.Queue(device()), nt.Queue(device())
+    settings = itertools.product((1, 20, 64), (0.9, 1.0), (0.0, 0.05), queues)
+    wrong = []
+    for config, (top_k, top_p, min_p, queue) in enumerate(settings, start=24 * pen + 1):     # basalt's ++config
+        p = replace(base, top_k=top_k, top_p=top_p, min_p=min_p, counter=1000 * config)
+        k = sampled_k(top_k, nv)
+        got = getattr(gpu, path)(l, p, hist=hist, hist_len=H, lbuf=rows, queue=queue)
+        wrong += [(config, t) for t in range(T) if got[t] != mirror_pick(lists[t], k, p, t)]
+    assert not wrong, f"if (got[(size_t) t] != want) {{ ... ++wrong; }} ((config, row): {wrong[:8]})"
+
+
+def test_basalt_sampler_split_after_replay():
+    """M18.2 (:1537-1596): fixture 18 (a)'s three rows of 248,320 half steps and 64-slot windows, the request top_k
+    20, top_p 0.9, temperature 2.5, seed 18, counter 77 under repeat 1.25, freq 0.25 and present 0.5, on the split
+    path (basalt's stream after its capture): every pick is mirror_pick's. The recorded one-block launch it follows is
+    the program tier's M18.1."""
+    T, nv, H = 3, 248320, 64
+    l, hist = fixture18_data(nv, T, 1800)
+    p = SamplerParams(top_k=20, top_p=0.9, temperature=2.5, seed=18, counter=77, penalty_last_n=H, penalty_repeat=1.25,
+                      penalty_freq=0.25, penalty_present=0.5)
+    k = sampled_k(p.top_k, nv)
+    want = [mirror_pick(mirror_select(l[t], nv, window_of(hist, H, t, H), p, k), k, p, t) for t in range(T)]
+    got = gpu.split(l, p, hist=hist, hist_len=H)
+    wrong = int(np.count_nonzero(got != np.int32(want)))
+    assert wrong == 0, 'compare("same stream, uncaptured", rows.sample(p, cs), lists, k, p);'
+
+
+# ---- the port's additions on the sampled paths (spec T§10.2) --------------------------------------------------------
+
+@pytest.mark.parametrize("path", SAMPLED)
+def test_basalt_sampler_sampled_penalty_window_tail(path):
+    """A2: fixture 8's row and 8-slot history copied to 16 rows, sampled (top_k 8, top_p 1, temperature 1, seed 8,
+    counter 0) under fixture 8's penalties: penalty_last_n 4 counts the history's last four slots, so token 3 falls
+    and every pick is sampled_reference's 0, where the whole window would pick 3 on 9 of the 16 rows."""
+    l8, h8, p8 = fixture8_data()
+    l, hist = np.tile(l8, (16, 1)), np.tile(h8, 16)
+    p = replace(p8, greedy=False, top_k=8, seed=8, counter=0)
+    want = [sampled_reference(l[t], window_of(hist, 8, t, 4), p, t) for t in range(16)]
+    full = [sampled_reference(l[t], hist[8 * t:8 * t + 8], p, t) for t in range(16)]
+    assert want == [0] * 16 and full.count(3) == 9, f"spec T§10.2 A2: the tail picks {want}, the whole window {full}"
+    assert run(path, l, p, want, hist, 8) == 0, \
+        "A2: the 16 tail-window picks equal sampled_reference (all 0); the full window would differ"
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+def test_basalt_sampler_temperature_after_filters(path):
+    """A3: fixture 2's row (3.0, then 2.55 down to 2.25 at ids 1-7, -1000 elsewhere) on 256 rows, sampled with its
+    top_k 0, top_p 0.5 and temperature 0.5 at seed 2, counter 0, as four windows of 64 rows at positions 0, 64, 128 and
+    192 (row t's counter is t; the split takes 64 rows): top_p cuts the list at 4 before the temperature sharpens it,
+    so tokens 0-3 are drawn 122, 48, 54 and 32 times, where the temperature first would cut at 3 and never draw token
+    3 (138, 74, 44, 0). Every pick is sampled_reference's."""
+    l2, p2 = fixture2_data()
+    l = np.tile(l2[0], (256, 1))
+    p = replace(p2, greedy=False, seed=2)
+    want = [sampled_reference(l[t], [], p, t) for t in range(256)]
+    first = [sampled_reference(l[t] * (f32(1) / f32(p.temperature)), [], replace(p, temperature=1.0), t)
+             for t in range(256)]
+    counts = [[w.count(i) for i in range(4)] for w in (want, first)]
+    assert counts == [[122, 48, 54, 32], [138, 74, 44, 0]], f"spec T§10.2 A3: token counts {counts}"
+    got = np.concatenate([getattr(gpu, path)(l[w:w + 64], p, position=w) for w in range(0, 256, 64)])
+    wrong = int(np.count_nonzero(got != np.int32(want)))
+    assert wrong == 0, "A3: token 3 drawn; picks equal sampled_reference (counts 122/48/54/32 at seed 2)"
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+@pytest.mark.parametrize("min_keep", (3, 10))
+def test_basalt_sampler_min_keep(path, min_keep):
+    """A4: fixture 7's rows with top_p 0.1, whose cut keeps 1 (4.0's probability alone passes it), at min_keep 3
+    (keeps 3) and 10 (more than k = 6: keeps 6), the kept entries those mirror_prob gives a probability: each pick
+    is the mirror's, and the clamp decides them (min_keep 1 picks 0 in both rows)."""
+    l, base = fixture7_data()
+    p = replace(base, top_p=0.1, min_keep=min_keep)
+    sels = [mirror_select(l[t], 8, [], p, 6) for t in range(2)]
+    kept = [sum(mirror_prob(sel, 6, p, q) > 0 for q in sel.ids) for sel in sels]
+    want = [mirror_pick(sels[t], 6, p, t) for t in range(2)]
+    one = [mirror_pick(sels[t], 6, replace(p, min_keep=1), t) for t in range(2)]
+    assert kept == [min(min_keep, 6)] * 2 and one == [0, 0] and want != one, \
+        f"spec T§10.2 A4: min_keep {min_keep} keeps {kept} and picks {want}; min_keep 1 picks {one}"
+    assert run(path, l, p, want) == 0, "A4: min_keep 3 and 10 keep 3 and 6; picks equal the mirror"
+
+
+A7_BITS = (0x00000001, 0x00000002, 0x007FFFFF, 0x80000001, 0x80000002, 0x807FFFFF, 0x00000000, 0x80000000)
+
+
+def a7_rows(nv, T=64):
+    """A7's 64 rows: -inf, but 8 slots holding a per-row permutation of the distinct subnormals 2^-149, 2^-148 and
+    0x007fffff of both signs and the two zeros. The slots are ids 1-8 at nv = 512 (id 0 is left to the sentinel) and
+    1 + 7 * 4,096 j at 248,320, in 8 of the 61 blocks, so the merge orders them across blocks."""
+    rs = np.random.RandomState([20261021, nv])
+    slots = 1 + np.arange(8) * (1 if nv <= kernels.BS_BLOCK else 7 * kernels.BS_BLOCK)
+    l = np.full((T, nv), -np.inf, np.float32)
+    for t in range(T):
+        l[t, slots] = np.uint32(A7_BITS).view(np.float32)[rs.permutation(8)]
+    return l
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+@pytest.mark.parametrize("top_p", (1.0, 0.5))
+@pytest.mark.parametrize("nv", (512, 248320))
+def test_basalt_sampler_subnormal_order(path, nv, top_p):
+    """A7: a7_rows' subnormal-led rows, no penalties and no bias, top_k 0 (64), temperature 1, seed 21: the list is
+    the 8 values in their order (+0 and -0 tie, the lower id first), then sentinels; every exp of a difference is 1.0,
+    so each kept entry is drawn with the same probability, at top_p 1 all 8 and at 0.5 the first 4 (the lower-id
+    zero last). Every pick is the mirror's (numpy's compares order subnormals exactly); the draws reach every kept
+    position, and a compare that read the subnormals as zeros, as this GPU's do, would pick otherwise."""
+    l = a7_rows(nv)
+    p = SamplerParams(top_k=0, top_p=top_p, temperature=1.0, seed=21)
+    k = sampled_k(p.top_k, nv)
+    sels = [mirror_select(row, nv, [], p, k) for row in l]
+    want = [mirror_pick(sel, k, p, t) for t, sel in enumerate(sels)]
+    flushed = np.where(l == -np.inf, l, np.copysign(np.float32(0), l))
+    flush = [mirror_pick(mirror_select(row, nv, [], p, k), k, p, t) for t, row in enumerate(flushed)]
+    reached = {sel.ids.index(w) for sel, w in zip(sels, want)}
+    assert reached == set(range(8 if top_p == 1.0 else 4)) and flush != want, \
+        f"the draws reach list positions {sorted(reached)}; a flushing compare picks the same in " \
+        f"{sum(a == b for a, b in zip(flush, want))} of {len(want)} rows"
+    assert run(path, l, p, want) == 0, "A7: subnormal-led rows equal the mirror"
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+def test_basalt_sampler_empty_keep(path):
+    """A8: fixture 14's rows and request (top_k 64, top_p 1, temperature 1.5, seed 14) at min_p 2, which basalt's
+    callers never pass and its record takes: the threshold sel[0] + logf(2) lies above the list's head, the min_p cut
+    keeps nothing, and the tail picks sel_ids[0], each row's argmax (mirror_pick), where min_p 0 draws other tokens."""
+    l = normal_rows(14, scale=0.3)
+    p = SamplerParams(top_k=64, top_p=1.0, temperature=1.5, seed=14, min_p=2.0)
+    k = sampled_k(p.top_k, 512)
+    sels = [mirror_select(row, 512, [], p, k) for row in l]
+    want = [mirror_pick(sel, k, p, t) for t, sel in enumerate(sels)]
+    drawn = [mirror_pick(sel, k, replace(p, min_p=0.0), t) for t, sel in enumerate(sels)]
+    assert want == [int(np.argmax(row)) for row in l] and drawn != want, \
+        f"spec T§10.2 A8: min_p 2 picks {want}, min_p 0 {drawn}"
+    assert run(path, l, p, want) == 0, "A8: `min_p = 2.0`: pick `sel_ids[0]`"
 
 
 # ---- TP.1: the drafter's greedy tail (spec S§19.3) ------------------------------------------------------------------
