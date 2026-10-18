@@ -538,6 +538,7 @@ BS_BLOCK = 4096               # logits per block of the split path (sampler.cu:5
 BS_SEL_MAX = 64               # the longest top-k list
 BS_SPLIT_MAX_BLOCKS = 64      # the split path's widest vocabulary: 64 blocks, 262,144 logits
 BS_SPLIT_MAX_ROWS = 64        # and its most rows
+BS_AM_CTAS = 8                # bs_greedy_partial's threadgroups per row (basalt's kAmCtas)
 
 
 def basalt_sampler_mode(greedy: bool, temperature: float, penalty_last_n: int, bias: bool) -> int:
@@ -566,6 +567,15 @@ def basalt_sampler_params(vocab: int, t_rows: int, n_blocks: int, hist_len: int,
     flags = (1 if bias else 0) | (2 if probe else 0) | (4 if id_map else 0)
     return struct.pack("<IIIIIIifffiifffI", vocab, t_rows, n_blocks, hist_len, mode, flags, top_k, top_p, min_p,
                        temperature, min_keep, penalty_last_n, penalty_repeat, penalty_freq, penalty_present, 0)
+
+
+def basalt_sampler_path(t_max: int, vocab: int) -> str:
+    """The sampled path a program takes, chosen at build from its rows and vocabulary (sampler.cu:1007): ``"split"``
+    (bs_split_part, bs_split_merge) when the window has at most 64 rows and the vocabulary at most 64 blocks of 4,096
+    logits, else ``"one_block"`` (bs_sample_one_block). Both give the same bits."""
+    if -(-vocab // BS_BLOCK) <= BS_SPLIT_MAX_BLOCKS and t_max <= BS_SPLIT_MAX_ROWS:
+        return "split"
+    return "one_block"
 
 
 BS_COUPLED_IMAGE = struct.Struct("<ifffiifffIQQB7sQ")   # basalt's SamplerParams as it lies in memory: 72 bytes

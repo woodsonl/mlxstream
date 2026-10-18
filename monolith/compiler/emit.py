@@ -1227,6 +1227,62 @@ def _sample(ctx: _Ctx, op: Op) -> None:
                 "spec_residual_final", writes=[2])
 
 
+def _basalt_sample(ctx: _Ctx, op: Op) -> None:
+    """basalt's sampler on the target's window (ops/basalt_sample.py; basalt_sampler.metal's slot map): the cluster
+    argmax, then the one-block greedy kernel and the sampled path, which run only in their mode. Every dispatch
+    binds StepState (rows, seed, position, the probe's queries), static program or not, and the op's one record,
+    built at mode 0 for a request's writer to rewrite (kernels.basalt_sampler_params). Each scratch is written before
+    it is read in every step."""
+    has_bias, hist_len = bool(op.attrs.get("bias")), int(op.attrs.get("hist_len", 0))
+    if len(op.inputs) != 3 + has_bias + (hist_len > 0) or len(op.outputs) != 2 or hist_len < 0:
+        raise ValueError(f"basalt_sample: {len(op.inputs)} inputs and {len(op.outputs)} outputs do not match bias = "
+                         f"{has_bias}, hist_len = {hist_len}")
+    logits, ctr_base, nq = op.inputs[:3]
+    bias = op.inputs[3] if has_bias else None
+    history = op.inputs[-1] if hist_len > 0 else None
+    token, qprob = op.outputs
+    t_c, t_src = ctx.rows_of(op)
+    vocab = ctx.shape(logits)[-1]
+    want = [(logits, (t_c, vocab), DType.F32), (ctr_base, (2,), DType.U32), (nq, (1,), DType.U32),
+            (token, (t_c,), DType.I32), (qprob, (t_c,), DType.F32)]
+    want += [(bias, (vocab,), DType.F32)] if bias is not None else []
+    want += [(history, (t_c, hist_len), DType.I32)] if history is not None else []
+    bad = [f"{v.name} {ctx.shape(v)} {v.dtype.short}" for v, shape, dt in want if ctx.shape(v) != shape or v.dtype != dt]
+    if bad or t_src != ROW_SOURCE[T]:                                 # the kernels read their rows from t_this_step
+        raise ValueError(f"basalt_sample: needs T rows and the shapes of ops/basalt_sample.py; got rows from source "
+                         f"{t_src}, mismatched {bad}")
+    n_blocks = -(-vocab // kernels.BS_BLOCK)
+    src = kernels.basalt_sampler_source()
+
+    def kern(function: str) -> str:
+        return ctx.kernel("basalt_sampler", src, function, {"STEP_STATE": "1"})
+
+    prm = ctx.params("basalt_sample", kernels.basalt_sampler_params(vocab, t_c, n_blocks, hist_len))
+    part = ctx.scratch("bs.greedy_part", t_c * kernels.BS_AM_CTAS * 8, shared=True)
+    bits = ctx.scratch("bs.bits", t_c * -(-vocab // 32) * 4 if hist_len else 16, shared=True)   # no window: never touched
+    none = ctx.scratch("bs.none", 16, shared=True)                    # the slot of an absent bias or history: never read
+    st, lb, tok = ctx.program.step_state, ctx.buf(logits), ctx.buf(token)
+    chain = [(0, *lb), (3, *(ctx.buf(bias) if bias is not None else (none, 0))),
+             (4, *(ctx.buf(history) if history is not None else (none, 0))), (7, prm, 0), (15, st, 0)]
+    draw = [(1, *ctx.buf(ctr_base)), (2, *ctx.buf(nq)), (5, *tok), (6, *ctx.buf(qprob))]
+    # ponytail: 1,024 threads is the most each of these pipelines allows on the M3 Max (Apple9), ICB or not [M];
+    # a chip that allows fewer needs the width from the pipeline (any multiple of 32 gives the same bits)
+    ctx.add(kern("bs_greedy_partial"), [(0, *lb), (7, prm, 0), (8, part, 0), (15, st, 0)], (kernels.BS_AM_CTAS, t_c, 1),
+            (1024, 1, 1), op.kind, writes=[8])
+    ctx.add(kern("bs_greedy_merge"), [(5, *tok), (7, prm, 0), (8, part, 0), (15, st, 0)], (t_c, 1, 1), (32, 1, 1),
+            "bs_greedy_merge", writes=[5])
+    ctx.add(kern("bs_greedy_one_block"), chain + [(5, *tok), (10, bits, 0)], (t_c, 1, 1), (1024, 1, 1),
+            "bs_greedy_one_block", writes=[5, 10])
+    if kernels.basalt_sampler_path(t_c, vocab) == "split":            # basalt's fixed widths: 128 and 32 threads exactly
+        cand = ctx.scratch("bs.cand", t_c * n_blocks * kernels.BS_SEL_MAX * 8, shared=True)
+        ctx.add(kern("bs_split_part"), chain + [(9, cand, 0)], (n_blocks, t_c, 1), (128, 1, 1), "bs_split_part", writes=[9])
+        ctx.add(kern("bs_split_merge"), draw + [(7, prm, 0), (9, cand, 0), (15, st, 0)], (t_c, 1, 1), (32, 1, 1),
+                "bs_split_merge", writes=[5, 6])
+    else:
+        ctx.add(kern("bs_sample_one_block"), chain + draw + [(10, bits, 0)], (t_c, 1, 1), (1024, 1, 1),
+                "bs_sample_one_block", writes=[5, 6, 10])
+
+
 # ---- the DSpark round (design §5.8; issue #24) ------------------------------------------------------------------
 
 def _spec_ops(ctx: _Ctx) -> str:
@@ -1362,7 +1418,7 @@ def _moe_combine(ctx: _Ctx, op: Op) -> None:
 HANDLERS = {"embed": _embed, "rmsnorm_stat": _rmsnorm_stat, "norm_apply": _norm_apply_op, "gemv": _gemv, "lm_head": _gemv,
             "moe_route": _moe_route, "moe_gemv": _moe_gemv, "moe_combine": _moe_combine,
             "gqa_decode": _gqa, "gqa_merge": _gqa_merge, "gdn_mixer": _gdn, "gdn_commit": _gdn, "gdn_norm": _gdn_norm, "argmax": _argmax,
-            "sample": _sample,
+            "sample": _sample, "basalt_sample": _basalt_sample,
             "tap_concat": _tap_concat, "draft_attn": _draft_attn, "confidence": _confidence, "verify_select": _verify_select,
             "accept_scan": _accept_scan}
 
