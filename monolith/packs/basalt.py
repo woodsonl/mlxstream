@@ -73,7 +73,11 @@ class BasaltSource:
         self.refused: Dict[str, str] = {}          # IR name -> why a value cannot bind it
         if "meta" in f.sections and "gguf" in f.sections:
             for name in f.meta().get("tensors", {}):
-                t = f.tensor(name)
+                try:
+                    t = f.tensor(name)
+                except ValueError as err:                          # a tensor the reader refuses is refused alone
+                    self.refused[f"gguf/{name}"] = str(err)
+                    continue
                 self._add(f"gguf/{name}", t.offset, t.nbytes, t.type_id, tuple(reversed(t.ne)),
                           HC8 if held_as_hc8(name) else None)
         if "dense.index" in f.sections:

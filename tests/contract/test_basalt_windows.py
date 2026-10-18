@@ -62,8 +62,8 @@ def write(tmp_path, gguf=None, dense=None, name="model.basalt", mtp=None):
     noise = lambda n: rng.integers(0, 256, n, dtype=np.uint8).tobytes()          # noqa: E731
     meta = {"format": "basalt", "version": 1, "tensors": {
         k: {"type_id": t, "shape": ne, "offset": off,
-            "bytes": 64 if t not in GGML_TYPES else ggml_row_bytes(t, ne[0]) * int(np.prod(ne[1:], dtype=np.int64))}
-        for k, (t, ne, off) in gguf.items()}}
+            "bytes": nb[0] if nb else 64 if t not in GGML_TYPES else ggml_row_bytes(t, ne[0]) * int(np.prod(ne[1:], dtype=np.int64))}
+        for k, (t, ne, off, *nb) in gguf.items()}}                            # an optional fourth item states the bytes
     index = f"# dense index v3\n# align 64 pool 81920 tensors {len(dense)}\n" + "\n".join(dense) + "\n"
     path = tmp_path / name
     path.write_bytes(write_basalt({"meta": json.dumps(meta).encode(), "dense": noise(81920),
@@ -235,11 +235,18 @@ def test_refuses_a_hyper_connection_matrix_basalt_holds_only_as_8_bit_copies(tmp
         basalt_windows(src, g.values.values())
 
 
+def test_refuses_a_row_its_block_size_does_not_divide_alone(tmp_path):
+    """A Q8_0 tensor of 48 columns (its blocks hold 32) is refused by itself; every other entry stays bindable."""
+    src = BasaltSource(write(tmp_path, gguf={**GGUF, "u.weight": (8, [48, 1], 112640, 51)}))
+    assert src.refused["gguf/u.weight"] == "q8_0: a row of 48 values is not whole blocks of 32" and "gguf/u.weight" in src
+    assert set(BOUND) <= set(src.entries)
+
+
 def test_refuses_a_shape_whose_size_wraps_64_bits(tmp_path):
     """(274177 * 67280421310721) = 2^64 + 1, so a 64-bit product of the leading dimensions reads 1 and this header's
     64 bytes would pass for an F32 [274177, 67280421310721, 16]; the exact product refuses it."""
     src = BasaltSource(write(tmp_path, gguf={**GGUF, "w.weight": (0, [16, 67280421310721, 274177], 112640)}))
-    assert src.refused["gguf/w.weight"].startswith("64 bytes are not f32 [274177, 67280421310721, 16]")
+    assert src.refused["gguf/w.weight"].endswith("64 bytes do not match type 0 and shape [16, 67280421310721, 274177]")
 
 
 @pytest.mark.parametrize("declare, why", [
