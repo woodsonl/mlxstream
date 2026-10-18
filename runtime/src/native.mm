@@ -239,7 +239,9 @@ NB_MODULE(_native, m) {
 
   m.def("basalt_q2_0_gguf_rows_multi", [](U8In1 w, size_t row_bytes, int nblocks, I8In2 q, F32In2 scale, F32In2 hx,
                                           F32Out2 out, int r0, int r1) {
-    const int nt = (int)q.shape(0), nrows = (int)out.shape(1);
+    const int nt = (int)q.shape(0);
+    const size_t nrows = out.shape(1);        // full width: the row stride below, and a narrowing cast here would
+                                              // accept a shape whose low 32 bits look small and stride past it
     need(nt >= 1 && nt <= bc::MAXT, "basalt_q2_0_gguf_rows_multi: nt must be 1..8");
     need(scale.shape(0) == (size_t)nt && hx.shape(0) == (size_t)nt && out.shape(0) == (size_t)nt,
          "basalt_q2_0_gguf_rows_multi: q, scale, hx and out must agree on nt");
@@ -251,8 +253,8 @@ NB_MODULE(_native, m) {
     // to 0), which the kernel then reads past the ActQ arrays and past w.
     need(nblocks >= 1 && nblocks <= bc::H / bc::QK, "basalt_q2_0_gguf_rows_multi: nblocks must be 1..40");
     need(row_bytes >= (size_t)bc::BB * (size_t)nblocks, "basalt_q2_0_gguf_rows_multi: row_bytes is below 18 * nblocks");
-    need(r0 >= 0 && r1 >= r0 && r1 <= nrows, "basalt_q2_0_gguf_rows_multi: need 0 <= r0 <= r1 <= out.shape[1]");
-    need(nrows == 0 || row_bytes <= w.size() / (size_t)nrows, "basalt_q2_0_gguf_rows_multi: w is shorter than row_bytes * nrows");
+    need(r0 >= 0 && r1 >= r0 && (size_t)r1 <= nrows, "basalt_q2_0_gguf_rows_multi: need 0 <= r0 <= r1 <= out.shape[1]");
+    need(nrows == 0 || row_bytes <= w.size() / nrows, "basalt_q2_0_gguf_rows_multi: w is shorter than row_bytes * nrows");
     std::array<bc::ActQ, bc::MAXT> act{};
     const bc::ActQ* ap[bc::MAXT];
     float* op[bc::MAXT];
@@ -261,7 +263,7 @@ NB_MODULE(_native, m) {
       std::memcpy(act[t].scale, scale.data() + (size_t)t * bc::MAXC, bc::MAXC * sizeof(float));
       std::memcpy(act[t].hx, hx.data() + (size_t)t * bc::MAXC, bc::MAXC * sizeof(float));
       ap[t] = &act[t];                                                          // sum and nchunks stay zero: unread
-      op[t] = out.data() + (size_t)t * nrows;
+      op[t] = out.data() + (size_t)t * nrows;   // nrows is size_t: the stride is the row's real width
     }
     nb::gil_scoped_release unlock;
     bc::q2_0_gguf_rows_multi(w.data(), row_bytes, nblocks, ap, nt, op, r0, r1);

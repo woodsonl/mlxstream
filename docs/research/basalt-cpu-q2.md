@@ -100,4 +100,4 @@ measured at the exhaustive worst case in case A8. ARM's `FCVTZS` **saturates** i
 | `_mm512_dpbusd_epi32` | `vdotq_s32` | SDOT is signed by signed, VPDPBUSD unsigned by signed, equal here because codes are 0..3. NEON vector `j` lane `k` is the x86 dword lane `4j + k` |
 | `_mm512_multishift_epi64_epi8` | `vqtbl1q_u8`, `vshlq_u8`, `vandq_u8` | the port decodes the documented rule `code m = (qs[m / 4] >> 2 * (m % 4)) & 3` (`ggml/src/ggml-quants.c:220-222`), which is what VPMULTISHIFTQB produces |
 | `_mm256_cvtph_ps` | `vcvt_f32_f16` | both exact for every half including subnormals at the defaults of section 2 [M] |
-| `_mm512_cvtepi32_epi8`, `_mm512_reduce_add_epi32` | `vmovn_s32` with `vmovn_s16`, `vaddvq_s32` | exact after the clamp; the integer sum is order-independent (`|sum| <= 4064`) |
+| `_mm512_cvtepi32_epi8`, `_mm512_reduce_add_epi32` | `vmovn_s32` with `vmovn_s16`, `vaddvq_s32` | exact after the clamp; the integer sum is order-independent (`abs(sum) <= 4064`) |
