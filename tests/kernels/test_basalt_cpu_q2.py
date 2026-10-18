@@ -42,17 +42,20 @@ Fixtures are the repository's: ``random_rows`` (test_basalt_experts, basalt's ow
 bytes with a finite fp16 scale per block) for the bitwise cases, and ``quantize_q2_0`` (test_basalt_iq_parity,
 tools/gguf_writer.py's quantizer) for B8, which needs rows that mean something.
 
-The suite bites, checked by mutating the kernel: the saturating FCVTZS in place of the integer indefinite fails
-A4, A5, A6 and A8; Clang's operand order in ``reduce_max_ps`` fails A6 alone; ``inv = 127.f / amax`` in place of
-basalt's ``1.f / s`` fails A10 alone; a reversed unpack shift fails every B case; and the same reversed shift
-applied to the emulator as well - a misreading the kernel and its reference share - fails B8 alone, which is what
-B8 is for. Group C catches the third kind, where both sides move together: swapping the add tree's level-3
-operands in the *reference* fails C3's P2 probe, which no kernel-side mutation could have shown. And ``x86_row``'s
-NaN rules, mutated one site at a time - a wrong priority, an SNaN-first rule, the hardware's own NaN, a missing
-quieting, the default NaN for a created one, a swapped tree operand - fail a C case wherever the mutant can change
-``res``. Those that survive cannot: dd, P, acc, corr and the trees' sums are never SNaNs and D is never a NaN, a
-quieting skipped at one site is applied at the next, a NaN dd makes ``A`` a NaN, which outranks ``B`` whatever site 2
-picked, and the zero sign of a masked ``corr`` lane never reaches ``res``, because ``A`` is never -0.0.
+The suite bites, checked by mutating the kernel, with the same failures at -O0 and at the Release flags: the
+saturating FCVTZS in place of the integer indefinite fails A4, A5, A6, A8, A11 and C2's c3, d1, d2 and e64;
+Clang's operand order in ``reduce_max_ps`` fails A6, A11 and C2's d1 and d2; ``inv = 127.f / amax`` in place of
+basalt's ``1.f / s`` fails A10 alone; a reversed code shift in both of the kernel's decodes (the vector unpack and
+``x86_row``'s) fails B1 to B8; and the same reversed shift applied to the emulator as well - a misreading the kernel
+and its reference share - fails B8 alone, which is what B8 is for. Group C catches the third kind, where both sides
+move together: swapping the add tree's level-3 operands in the *reference* fails C3's P2 probe and C5's acc-tree
+case, which no kernel-side mutation could have shown. And ``x86_row``'s NaN rules, mutated one site at a time - a
+wrong priority, an SNaN-first rule, the hardware's own NaN, a missing quieting, the default NaN for a created one, a
+swapped tree operand - fail a case wherever the mutant can change ``res``: a C case, except where the trees take the
+default NaN or the hardware's own, which B6 and B7 catch. Those that survive cannot: dd, P, acc, corr and the
+trees' sums are never SNaNs and D is never a NaN, a quieting skipped at one site is applied at the next, a NaN dd
+makes ``A`` a NaN, which outranks ``B`` whatever site 2 picked, and the zero sign of a masked ``corr`` lane never
+reaches ``res``, because ``A`` is never -0.0.
 
 Run with ``-s`` for the A6 Clang-order table, the A8 pre-clamp margin and the B7 cancellation residue.
 """
