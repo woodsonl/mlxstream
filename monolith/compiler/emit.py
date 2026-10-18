@@ -1227,6 +1227,8 @@ def _sample(ctx: _Ctx, op: Op) -> None:
                 "spec_residual_final", writes=[2])
 
 
+# The dispatch order and grids are adapted from basalt (jesdga95/basalt) src/kernels/cuda/sampler.cu:887-922 and
+# :991-1019 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 def _basalt_sample(ctx: _Ctx, op: Op) -> None:
     """basalt's sampler on the target's window (ops/basalt_sample.py; basalt_sampler.metal's slot map): the cluster
     argmax, then the one-block greedy kernel and the sampled path, which run only in their mode. Every dispatch

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/sampler_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
-# (MIT; third_party/NOTICE): its fixtures, pre-fills and pass criteria.
+# (MIT; third_party/NOTICE): its fixtures, pre-fills and pass criteria, and TP.1's bound from
+# src/kernels/q5k_head_parity.cpp:145.
 """sampler_parity's GPU checks (basalt src/kernels/sampler_parity.cpp) on the Metal sampler family, through
 tests/kernels/basalt_sampler_gpu.py. Each check is its own test and asserts its own count is 0, with basalt's gate
 quoted in the message; the host references are tests/basalt_sampler_ref.py's.

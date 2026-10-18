@@ -526,6 +526,9 @@ def basalt_dense_tc_pair_grid(n_out0: int, n_out1: int) -> Tuple[int, int]:
 
 
 # ---- basalt's sampler (kernels/common/basalt_sampler.metal; docs/research/basalt-nvcc/sampler.md) ---------------
+# The launch rules and records below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/sampler.cu:172, :335,
+# :528-530, :981-1007 and :1057-1060 and include/basalt/kernels/sampler.hpp:15-29 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 
 def basalt_sampler_source() -> str:
     """basalt's sampler family: the shared helpers, the software binary64 (``basalt_f64.metal``), libdevice's ``exp``
