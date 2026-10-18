@@ -1475,8 +1475,9 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
             program.buffers[v.name] = BufferSpec(_value_bytes(v, t), None, "state")
         elif v.is_input:
             fld = "pending_tokens" if v.name == "tokens" else v.name
-            if fld not in layout.offsets:                             # not StepState-backed: a host-written arena buffer
-                program.buffers[v.name] = BufferSpec(max(_value_bytes(v, t), 16), None, "arena")
+            if fld not in layout.offsets:                             # not StepState-backed: a host-written arena buffer,
+                program.buffers[v.name] = BufferSpec(max(_value_bytes(v, t), 16), None,  # or the session's own
+                                                     "host" if v.is_host else "arena")
         elif not v.is_source:
             nbytes = _value_bytes(v, t)
             if v.name in hoisted:                                     # a hoisted statistic holds partials per token: re-sized by its producer (_size_stat)

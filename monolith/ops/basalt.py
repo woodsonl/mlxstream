@@ -1,7 +1,8 @@
-"""basalt's single-dispatch GEMVs and q8_1 quantizers (OI-013; docs/design/flash-next.md): one op kind per basalt host
-launcher, whose kernel and grid follow from the shape alone, as the launcher picks them. Each op is one dispatch of a
-merged kernel (``kernels/common/basalt_*.metal``); the emitter (``compiler/emit_basalt.py``) takes its macros, grid,
-threadgroup and params from ``monolith/kernels.py``'s builders only, never from the profile's crew or core count.
+"""basalt's GEMVs, q8_1 quantizers and Q5_K head (OI-013; docs/design/flash-next.md): one op kind per basalt host
+launcher, whose kernels and grids follow from the shape alone, as the launcher picks them. Each op is the launcher's
+dispatches of merged kernels (``kernels/common/basalt_*.metal``) in its order: one for a GEMV or a quantizer, two or
+more for the Q5_K head's (below); the emitter (``compiler/emit_basalt.py``) takes their macros, grids, threadgroups,
+params and scratch sizes from ``monolith/kernels.py``'s builders only, never from the profile's crew or core count.
 
 Values. A weight is the GGUF tensor as shipped, ``[n_out, n_in]`` values: a weight value whose format is the ggml type's
 name, or, for BF16 rows, a constant whose dtype is (a ``.basalt`` file's ``dense`` rows; ``packs/basalt.py``), never a
@@ -41,6 +42,39 @@ quantizers at 4 (``validate_pointer``, ``native_mmvq.cu:1471-1475``, called by e
 (``native_bf16.cu:167-171``), the multi-row one's activation at 8 (``:142-143``). The port adds the rest, which
 basalt's allocations meet unchecked: the IEEE quantizer's (``quantize_q8_1_rows`` checks none,
 ``iq_kernels.cu:2450-2455``), dense_tc's output, the pair's outputs, the multi-row BF16 GEMV's weight and output.
+
+The Q5_K head (``q5k_head.cu``). Its rows are Q5_K rows as stored: a ``q5_k`` weight ``[rows, n_in]`` (a ``.basalt``
+tensor: the verify head's ``output.weight``) or a host input ``u8 [rows, n_in / 256 * 176]`` (``Graph.input(...,
+host=True)``: the drafter's head rows, gathered for its draft vocabulary). An op reads the first n_out (n_rows) of them,
+as basalt passes a pointer and a row count: its draft head's tier 0 reads the leading ``n_tier1_`` of the gathered
+rows, tier 1 all of them (``mtp.cpp:1006``). A map is an i32 value of at least that many ids, negative for a row that
+holds no token (basalt's ``dvocab_``).
+
+* ``basalt_q5k_head`` (``q5k_head_mmvq``): ``(xq [T, n_in / 32 * 36], rows[, map])`` → ``y [T, n_out] F32``, the
+  logits of rows 0 .. n_out - 1, n_out the output's width; n_in a multiple of 256 of at most 64 blocks and T 1 .. 8
+  (``q5k_head_supported``). With a map, ``q5k_head_mask_unmapped`` follows on each column, as basalt masks the draft
+  head's logits (``mtp.cpp:1022-1023``): a row whose id is negative becomes -inf.
+* ``basalt_q5k_top1`` (``q5k_head_top1``): ``(xq [1, 2880], rows[, map])`` → ``(y [1, n_out] F32, id [1] I32,
+  prob [1] F32)``: n_in 2560 and one column, as basalt calls it (``q5k_head.cu:374``; ``mtp.cpp:1016``). The first
+  dispatch writes the logits and each threadgroup's partials, the merge the best row (its id through the map) and its
+  probability. Both take the grid basalt's rule gives on its 170 multiprocessors (``basalt_q5k_head_grid``), the
+  merge as its partial count: the probability sums in that order. Without a map a dummy buffer fills the map's slot.
+* ``basalt_q5k_proxy_top1`` (``q5k_proxy_top1``), attrs ``n_rows`` and ``n_cap``: ``(xq [1, 2880], proxy, rows, map)``
+  → ``(id [1] I32, prob [1] F32)``: the score over the first n_rows rows (1 <= n_rows <= n_cap) of the 2-bit copy, a
+  host input ``u8 [q5k_proxy_bytes(n_cap)]``, then the final dispatch, which rescores the candidates on the Q5_K rows.
+  n_in 2560 and one column (``mtp.cpp:1009-1014``); the map is required, as basalt's launcher requires it
+  (``q5k_head.cu:518``).
+
+The 2-bit copy's pack (``q5k_proxy_pack``) is no op: basalt runs it outside its graphs, at load over the copy's rows
+and again at every flush over the context rows just gathered (``mtp.cpp:680``, ``:1439-1452``). The session issues it
+as a direct dispatch and lets it complete before it submits a program that scores the copy; ``gather_rows``, the
+id-map copy and ``begin_request``'s reset are the session's too. basalt captures the draft head per tier and width
+(``round_exec_[tier][T]``), so each tier is a program of its own at each width, its n_out or n_rows compiled in, every
+one binding the same host buffers. A follow-up dispatch (each mask, the merge, the final) reads what the dispatch
+before it wrote, which its ``writes`` record declares, so the barrier pass gives it ``barrier_before``.
+
+Alignment, the port's own (basalt's head launchers check only for null pointers): 2 bytes for the Q5_K rows (16-bit
+loads), 16 for the 2-bit copy (read as uint4), 4 for every other binding.
 """
 
 from ..core.ir import OpClass
@@ -52,3 +86,9 @@ BASALT_MMVF = register_op(OpDef("basalt_mmvf", OpClass.MAP, "rows").bind("*", Ke
 BASALT_DENSE_TC = register_op(OpDef("basalt_dense_tc", OpClass.MAP, "rows").bind("*", KernelBinding("basalt_dense_tc")))
 BASALT_DENSE_TC_PAIR = register_op(OpDef("basalt_dense_tc_pair", OpClass.MAP, "rows")
                                    .bind("*", KernelBinding("basalt_dense_tc_pair")))
+BASALT_Q5K_HEAD = register_op(OpDef("basalt_q5k_head", OpClass.MAP, "rows")      # basalt_q5k_head (+ mask_unmapped)
+                              .bind("*", KernelBinding("basalt_q5k_head")))
+BASALT_Q5K_TOP1 = register_op(OpDef("basalt_q5k_top1", OpClass.REDUCE, "rows")    # basalt_q5k_head_top1 + _merge
+                              .bind("*", KernelBinding("basalt_q5k_top1")))
+BASALT_Q5K_PROXY_TOP1 = register_op(OpDef("basalt_q5k_proxy_top1", OpClass.REDUCE, "rows")  # proxy_score + _final
+                                    .bind("*", KernelBinding("basalt_q5k_proxy_top1")))
