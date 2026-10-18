@@ -14,6 +14,9 @@ import ...``.
   ``math.exp`` and ``math.log`` miss them; kernels/common/basalt_libdevice.metal is the kernels' transcription.
 - ``f32_rn``: a ``Fraction`` rounded to the nearest float32, ties to even (normal range); ``fma32``: the float32
   ``a * b + c`` rounded once through it.
+- ``philox_uniform``: basalt's host Philox (``host_philox_uniform``, sampler_parity.cpp:134-158), the kernel's draw
+  (sampler.cu:37-59) transcribed; basalt's own variant, not a library generator. The draw for row t is
+  ``philox_uniform(seed, (counter + t) mod 2^64)``.
 """
 
 import math
@@ -21,6 +24,9 @@ import struct
 from fractions import Fraction
 
 import numpy as np
+
+f32 = np.float32
+M = 0xFFFFFFFF
 
 
 def d2u(x): return struct.unpack("<Q", struct.pack("<d", x))[0]
@@ -108,3 +114,11 @@ def nv_logf(x):
         r = np.float32(float(xs) * math.inf + math.inf)
     if xs == 0: r = np.float32(-math.inf)
     return r
+
+
+def philox_uniform(seed, counter):
+    c0, c1, c2, c3 = counter & M, (counter >> 32) & M, seed & M, (seed >> 32) & M
+    for i in range(10):
+        p0, p1 = 0x9E3779B9 * c0, 0xBB67AE85 * c2
+        c0, c1, c2, c3 = ((p1 >> 32) ^ c1 ^ i) & M, p1 & M, ((p0 >> 32) ^ c3) & M, p0 & M
+    return f32(c0 >> 8) * f32(1.0 / 16777216.0)

@@ -3,7 +3,8 @@
 # adapted from basalt (jesdga95/basalt) src/kernels/elementwise_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
 # (MIT; third_party/NOTICE): the contraction check's pass criterion.
 """The platform facts the exact basalt port rests on, measured on this GPU in MTLMathModeSafe (the repository default):
-fp32 add, multiply, fma and division round to nearest even; how they treat subnormals; fp16 conversions; and that
+fp32 add, multiply, fma and division round to nearest even; how they and the compares treat subnormals; fp16
+conversions; and that
 ``#pragma STDC FP_CONTRACT OFF`` stops contraction in a runtime-compiled source, told apart the way basalt's
 elementwise_parity does (src/kernels/elementwise_parity.cpp:410: ``if (mismatches || guards || fma_diff == 0) ++bad;``
 - the kernel must match the unfused result, and the inputs must be ones where fusing would change it)."""
@@ -229,3 +230,42 @@ kernel void conv(device const ushort* h [[buffer(0)]], device const float* f [[b
     assert np.array_equal(got[finite].view(np.uint32), emu.h2f(h)[finite].view(np.uint32))   # exact, fp16 subnormals too
     assert np.array_equal(got[~finite], emu.h2f(h)[~finite], equal_nan=True)   # infinities exact; NaN stays NaN
     assert np.array_equal(np.frombuffer(fh.read(0, 2 * n), np.uint16), emu.half_bits(f))     # round to nearest even
+
+
+def test_compares_read_subnormals_as_zero():
+    """Measured: ``<``, ``>`` and ``==`` read a subnormal operand as the zero of its sign, so two subnormals, or a
+    subnormal and a zero, compare equal; NaN is unordered and -0 equals +0, as IEEE says. The model is IEEE's compare
+    of the flushed operands, on every row. CUDA's setp without .ftz orders subnormals exactly, so an IEEE-built basalt
+    kernel's compares are ported on order-preserving keys of the bits (kernels/common/basalt_sampler.metal's okey,
+    f_gt, f_lt)."""
+    dev = nt.Device()
+    src = kernels.PRELUDE + kernels.template("basalt_fp.metal") + """
+kernel void cmp(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                device uint* out [[buffer(2)]], constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const float x = a[i], y = b[i];
+  out[i] = uint(x < y) | (uint(x > y) << 1) | (uint(x == y) << 2);
+}
+"""
+    pso = nt.Pipeline(nt.Library(dev, src, {}), "cmp")
+    s, s2, m = 1.5e-39, 3e-39, 2.0 ** -126                  # subnormals s < s2; the smallest normal
+    nan, inf = np.nan, np.inf
+    planted = np.array([(s, 0), (0, s), (s, s2), (-s, 0), (s, -s), (-s, -0.0), (s2, -s2), (m, s), (s, m), (m, 0),
+                        (0, -0.0), (nan, nan), (nan, s), (s, nan), (inf, s), (-inf, -s)], F32)
+    rng = np.random.default_rng(5)
+    n = 1 << 16
+    low = lambda: normals(rng, n, 0, 3)                    # subnormals (or zeros) and the two lowest binades
+    a = np.r_[planted[:, 0], low(), rng.integers(0, 1 << 32, n, dtype=np.uint64).astype(np.uint32).view(F32)]
+    b = np.r_[planted[:, 1], low(), rng.integers(0, 1 << 32, n, dtype=np.uint64).astype(np.uint32).view(F32)]
+    out = nt.Buffer(dev, 4 * len(a))
+    d = nt.Dispatch().pipeline(pso).buffer(0, nt.Buffer(dev, a.tobytes())).buffer(1, nt.Buffer(dev, b.tobytes()))
+    d = d.buffer(2, out).bytes(3, np.uint32(len(a)).tobytes()).grid(-(-len(a) // 256)).threadgroup(256)
+    r = nt.Queue(dev).run([d])
+    assert not r.error, r.error
+    got = np.frombuffer(out.read(0, 4 * len(a)), np.uint32)
+    code = lambda x, y: (x < y).astype(np.uint32) | ((x > y).astype(np.uint32) << 1) | ((x == y).astype(np.uint32) << 2)
+    lt, gt, eq = 1, 2, 4
+    # the planted rows: subnormals are zeros of their sign to the compare; NaN unordered; -0 == +0; normals ordered
+    assert got[: len(planted)].tolist() == [eq, eq, eq, eq, eq, eq, eq, gt, lt, gt, eq, 0, 0, 0, gt, lt]
+    assert np.array_equal(got, code(emu.ftz(a), emu.ftz(b)))
+    assert np.count_nonzero(got != code(a, b)) > n // 16    # IEEE's compare of the same bits differs on many rows

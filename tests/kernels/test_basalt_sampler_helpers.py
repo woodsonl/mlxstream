@@ -40,6 +40,18 @@ pattern), against host references. Every comparison is bitwise.
   of the reduction's rounding, logf's subnormal, negative, above-1 and near-1 arguments, the edges of its binade split
   and the specials. A NaN result must be NaN: ``F64_NAN`` for ``nv_exp``; ``nv_logf``'s carries the hardware fma's
   payload. The references must also differ from ``math.exp`` and float32 ``math.log`` somewhere, by at most an ulp.
+- H.5: ``philox_uniform`` against the reference module's transcription of basalt's host Philox
+  (sampler_parity.cpp:134-158), on uniform (seed, counter) words, seeds above and below 2^32, counters near 2^64
+  (where a window's counter + t wraps) and about 2^32, position-like counters and every pair of edge words. Each row
+  also runs with the seed's high word changed and with the counter's, which must change the draw: c3 and c1 are used.
+- H.6: the keys and compares on bits, ``okey``, ``fnan``, ``f_gt``, ``f_lt`` and ``fmaxf_bits``, against numpy's
+  float32 (IEEE order, subnormals exact, NaN unordered, -0 equal to +0): the keys order every pair, and sort every
+  value, as numpy does; ``fmaxf_bits`` against ``std::fmax`` as the host references use it (sampler_parity.cpp:56: the
+  other operand when one is NaN, else the larger, the first on a tie), with 0x7fffffff for two NaNs. On uniform
+  patterns, subnormals and the lowest binades, adjacent, opposite and equal values and every pair of specials, many of
+  them ordered differently by the GPU's own compares (subnormals read as zero). Also ``expf_approx(-g)`` against
+  basalt_fp.metal's ``expf_neg(g)``, bit for bit (NaN by NaN-ness): one operation, equal even where ``ieee_mul`` keeps
+  a subnormal product that the plain multiply flushes (``fast::exp2`` gives 1.0 for both).
 """
 
 import math
@@ -49,7 +61,7 @@ from fractions import Fraction
 import numpy as np
 
 from monolith import kernels
-from tests.basalt_sampler_ref import nv_exp, nv_logf, u2d
+from tests.basalt_sampler_ref import nv_exp, nv_logf, philox_uniform, u2d
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
 
@@ -982,3 +994,128 @@ def test_basalt_nv_exp_nv_logf_vs_ref():
     lib = np.array([math.log(v) for v in Fl[t].tolist()], F64).astype(F32).view(U32)
     d = np.abs(wf[t].astype(I64) - lib.astype(I64))
     assert d.max() <= 1 and np.count_nonzero(d) > 100, ("logf", d.max(), np.count_nonzero(d))
+
+
+# ---- H.5: Philox ---------------------------------------------------------------------------------------------------
+
+H5 = """
+kernel void h5_philox(device const ulong* s [[buffer(0)]], device const ulong* c [[buffer(1)]],
+                      device uint* out [[buffer(2)]], constant uint& n [[buffer(3)]],
+                      uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  out[i] = as_type<uint>(philox_uniform(s[i], c[i]));
+}
+"""
+
+EDGE_WORDS = np.array([0, 1, (1 << 32) - 1, 1 << 32, (1 << 40) + 123, 1 << 63, (1 << 64) - 2, (1 << 64) - 1], U64)
+
+
+def h5_rows(rng):
+    """The H.5 (seed, counter) pairs (uint64) by class."""
+    n = 1 << 12
+    hi = lambda m: words(rng, m) | U64(1 << 32)                                  # seeds above 2^32
+    rows = {"uniform": (words(rng, 1 << 13), words(rng, 1 << 13)),
+            "top": (hi(n), U64((1 << 64) - 1) - rng.integers(0, 64, n).astype(U64)),   # the high word 0xffffffff
+            "carry": (hi(n), (np.int64(1 << 32) + rng.integers(-64, 64, n)).astype(U64)),   # about 2^32
+            "small": (words(rng, n) & U64(0xFFFFFFFF), np.arange(n, dtype=U64))}       # seeds below 2^32, positions
+    s, c = np.meshgrid(EDGE_WORDS, EDGE_WORDS)
+    rows["edges"] = (s.ravel(), c.ravel())
+    return rows
+
+
+def test_basalt_philox_uniform_vs_host():
+    rng = np.random.default_rng(25)
+    rows = h5_rows(rng)
+    s0, c0 = (np.concatenate([v[j] for v in rows.values()]) for j in range(2))
+    n = len(s0)
+    flip = lambda: (rng.integers(1, 1 << 32, n).astype(U64) << U64(32))          # a nonzero change of the high word
+    s, c = np.r_[s0, s0 ^ flip(), s0], np.r_[c0, c0, c0 ^ flip()]
+    assert s.dtype == c.dtype == U64
+    got = run_kernel(H5, "h5_philox", [s, c], 1, U32)[:, 0]
+    want = np.array([philox_uniform(x, y) for x, y in zip(s.tolist(), c.tolist())], F32).view(U32)
+    bad = np.flatnonzero(got != want)
+    assert bad.size == 0, (f"philox_uniform: {bad.size} of {len(s)} differ; first seed={s[bad[0]]:#018x} "
+                           f"counter={c[bad[0]]:#018x}: got {got[bad[0]]:#010x}, want {want[bad[0]]:#010x}")
+    u = got.view(F32).astype(F64)
+    assert np.all(u * 2.0 ** 24 == np.floor(u * 2.0 ** 24)) and u.min() >= 0 and u.max() <= 1 - 2.0 ** -24
+    # the seed's high word (c3) and the counter's (c1) each change the draw (two equal draws: 2^-24 per row)
+    base, seed_hi, ctr_hi = got[:n], got[n: 2 * n], got[2 * n:]
+    assert np.count_nonzero(seed_hi == base) <= 2 and np.count_nonzero(ctr_hi == base) <= 2
+
+
+# ---- H.6: keys, compares, fmaxf, the approximate exponential ------------------------------------------------------
+
+H6 = """
+kernel void h6_keys(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]],
+                    device uint* out [[buffer(2)]], constant uint& n [[buffer(3)]],
+                    uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const uint x = a[i], y = b[i];
+  device uint* o = out + 6 * i;
+  o[0] = okey(x);
+  o[1] = okey(y);
+  o[2] = uint(fnan(x)) | (uint(f_gt(x, y)) << 1) | (uint(f_lt(x, y)) << 2);
+  o[3] = fmaxf_bits(x, y);
+  o[4] = as_type<uint>(expf_approx(as_type<float>(x ^ 0x80000000u)));
+  o[5] = as_type<uint>(expf_neg(as_type<float>(x)));
+}
+"""
+
+
+def nan32(x):
+    return (x & U32(0x7FFFFFFF)) > U32(INF32)
+
+
+def h6_pairs(rng):
+    """The H.6 operand pairs (float32 bit patterns) by class."""
+    n = 1 << 13
+    k = np.arange(n)
+    low = lambda m: floats(rng, rng.choice([0, 0, 1, 2], m))                    # subnormals, the two lowest binades
+    pairs = {"uniform": (words(rng, 1 << 16, U32), words(rng, 1 << 16, U32)),
+             "subnormal": (low(2 * n), low(2 * n))}
+    # b a unit in the last place either side of a, or a itself; a's sign flipped; a quarter of them across 2^-126,
+    # an eighth from a signed zero
+    x = np.where(k % 2 == 0, low(n), floats(rng, rng.integers(0, 256, n)))
+    x = np.where(k % 4 == 1, (x & U32(SIGN32)) | U32(0x800000), x)
+    x = np.where(k % 8 == 3, x & U32(SIGN32), x)
+    pairs["adjacent"] = (np.r_[x, x], np.r_[offset32(x, rng.choice([-1, 0, 1], n)), x ^ U32(SIGN32)])
+    sp = np.r_[SPECIALS32, np.array([2, 0x800001, 0x7FFFFFFF], U32)]
+    sp = np.r_[sp, sp | U32(SIGN32)]
+    pa, pb = np.meshgrid(sp, sp)
+    pairs["specials"] = (pa.ravel(), pb.ravel())
+    return pairs
+
+
+def test_basalt_keys_compares_fmaxf_vs_numpy():
+    rng = np.random.default_rng(26)
+    pairs = h6_pairs(rng)
+    a, b = (np.concatenate([v[j] for v in pairs.values()]) for j in range(2))
+    assert a.dtype == b.dtype == U32
+    got = run_kernel(H6, "h6_keys", [a, b], 6, U32)
+    A, B = a.view(F32), b.view(F32)
+    na, nb = np.isnan(A), np.isnan(B)
+    flags = na.astype(U32) | ((A > B).astype(U32) << U32(1)) | ((A < B).astype(U32) << U32(2))
+    fmax = np.where(na & nb, U32(0x7FFFFFFF), np.where(na, b, np.where(nb, a, np.where(B > A, b, a))))
+    for col, name, want in [(2, "fnan | f_gt << 1 | f_lt << 2", flags), (3, "fmaxf_bits", fmax)]:
+        bad = np.flatnonzero(got[:, col] != want)
+        assert bad.size == 0, (f"{name}: {bad.size} of {len(a)} differ; first a={a[bad[0]]:#010x} b={b[bad[0]]:#010x}: "
+                               f"got {got[bad[0], col]:#x}, want {want[bad[0]]:#x}")
+    # okey orders every non-NaN pair as numpy does, and sorts every non-NaN value as numpy does
+    ka, kb, ok = got[:, 0], got[:, 1], ~na & ~nb
+    assert np.array_equal((ka < kb)[ok], (A < B)[ok]) and np.array_equal((ka == kb)[ok], (A == B)[ok])
+    v, key = np.r_[A[~na], B[~nb]], np.r_[ka[~na], kb[~nb]]
+    order = np.argsort(v, kind="stable")
+    v, key = v[order], key[order]
+    assert np.all(key[1:] >= key[:-1]) and np.array_equal(key[1:] == key[:-1], v[1:] == v[:-1])
+    # the rows are what they claim: the GPU's own compares (a subnormal read as zero) order many of them differently,
+    # and -0 meets +0
+    fa, fb = emu.ftz(A), emu.ftz(B)
+    assert np.count_nonzero(ok & (((fa > fb) != (A > B)) | ((fa < fb) != (A < B)))) > 5000
+    assert np.count_nonzero(ok & (A == B) & (a != b)) > 500
+    # expf_approx(-g) is expf_neg(g) bit for bit, also where ieee_mul keeps a subnormal product the plain one flushes
+    e1, e2 = got[:, 4], got[:, 5]
+    bad = np.flatnonzero((nan32(e1) != nan32(e2)) | (~nan32(e1) & (e1 != e2)))
+    assert bad.size == 0, (f"expf_approx(-g) != expf_neg(g): {bad.size} of {len(a)}; first g={a[bad[0]]:#010x}: "
+                           f"{e1[bad[0]]:#010x} against {e2[bad[0]]:#010x}")
+    p = np.abs(A[~na].astype(F64)) * float(np.uint32(0x3FB8AA3B).view(F32))
+    assert np.count_nonzero((p > 0) & (p < 2.0 ** -126)) > 5000
