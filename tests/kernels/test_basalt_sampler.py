@@ -11,7 +11,9 @@ argmax as its partials and merge dispatches (basalt's G-CL, sampler_greedy_clust
 one-block greedy kernel forced on the same rows (G-1B, sampler_greedy_kernel; F.1: every greedy check also passes on
 G-1B). A penalised greedy check runs G-1B, the path basalt's dispatcher takes for a penalty window. The logit_bias
 checks route each launch as the dispatcher does (``sample``, by the mode rule): a bias or a penalty window takes G-1B,
-a greedy request with neither G-CL, and their ``forced`` cases run G-1B in G-CL's place (F.1).
+a greedy request with neither G-CL, and their ``forced`` cases run G-1B in G-CL's place (F.1). A sampled check takes
+its path from ``SAMPLED``, the sampled paths built so far: ``split``, the split part and merge (S-SPLIT,
+sampler_split_part_kernel then sampler_split_merge_kernel).
 
 - LB.1-6, logit_bias (the greedy sides): the bias added in the kernel picks what the host-biased rows pick, bans an id
   at -inf and boosts one by 100, at 512 logits and at the engine's 248,320, and leaves the rows it reads unchanged.
@@ -23,17 +25,19 @@ a greedy request with neither G-CL, and their ``forced`` cases run G-1B in G-CL'
 - M5.1-3, fixture 5: temperature 0 (or -1) routes to the argmax whatever ``greedy`` says, and so does greedy at
   temperature 1 (the mode rule, ``basalt_sampler_mode``, chooses greedy; a NaN temperature samples); the pick is the
   argmax, never id 0, the row's worst.
+- M7.2-4, fixture 7: min_p 0, 0.5 and 0.9 through the sampled chain pick sampled_reference's token.
 - M8.2, fixture 8: the penalty window is the tail of the history row.
 - M11.2, fixture 11: a stale history with penalty_last_n = 0 leaves the greedy pick the argmax.
 - M12.G, fixture 12: each row of a window counts its own history row (windows of 1 to 4,096 slots).
 - M13.1, fixture 13: history ids outside the vocabulary count nowhere.
+- M14.1-4, fixture 14: top_k 64 as given, and 0, 100 and -3 meaning 64, pick the 64-wide reference's token.
 - TP.1, the port's addition (spec S§19.3): the drafter's greedy tail, ``top_prob`` (the cluster partials, then
   bs_greedy_top_prob), picks the host argmax, mapped, with the float64 softmax probability of the pick within
   q5k_head_parity's 1e-5.
 - PL.1, the port's building-block check of the split path's first stage (``split_part``, bs_split_part alone): each
   4,096-logit block's list in the scratch equals mirror_select's over the block, ids and value bits.
 - W.1, invariant 1: each path's window, row for row, equals its rows run alone (the top-prob path's probabilities
-  bit for bit too).
+  bit for bit too); the split's window is also the mirror's (mirror_select, then mirror_pick), row for row.
 """
 
 import itertools
@@ -44,14 +48,16 @@ import pytest
 
 from monolith import kernels
 from monolith.runtime import _native as nt
-from tests.basalt_sampler_ref import (SamplerParams, f32, fixture2_data, fixture4_data, fixture8_data, fixture12_data,
-                                      fixture13_data, fixture16_data, greedy_pen, normal_rows, penal_vec, penalty_rows,
-                                      reference_pick, sampled_k, select_vec, window_of)
+from tests.basalt_sampler_ref import (SamplerParams, f32, fixture2_data, fixture4_data, fixture7_data, fixture8_data,
+                                      fixture12_data, fixture13_data, fixture16_data, greedy_pen, mirror_pick,
+                                      mirror_select, normal_rows, penal_vec, penalty_rows, reference_pick, sampled_k,
+                                      sampled_reference, select_vec, window_of)
 from tests.kernels import basalt_sampler_gpu as gpu
 from tests.kernels.basalt_gpu import device
 from tests.kernels.test_basalt_decode_cluster import PATTERNS, VOCABS, fill_logits, host_argmax
 
 GREEDY = ["greedy_cl", "greedy_1b"]
+SAMPLED = ["split"]
 
 
 def run(path, logits, p, want, hist=None, hist_len=0):
@@ -298,6 +304,22 @@ def test_basalt_sampler_temperature_zero_is_argmax(path, greedy, temperature, ga
     assert run(path, l, p, want) == 0, gate
 
 
+MIN_P_PICKS = {0.0: [2, 2], 0.5: [1, 1], 0.9: [0, 0]}     # fixture 7's sampled_reference picks (spec T§8.8)
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+@pytest.mark.parametrize("mp", MIN_P_PICKS)
+def test_basalt_sampler_min_p_chain(path, mp):
+    """M7.2-4 (:1021-1058): fixture 7's two rows of 8 (4.0, 3.5, 3.2, 3.1, 2.0, then -8) through the sampled chain
+    with top_k 6, top_p 1 and temperature 0.9 at seed 77 (counter 0), at min_p 0, 0.5 and 0.9, which keep 6, 2 and
+    1 per row (M7.1): each row's pick is sampled_reference's, at its own counter t."""
+    l, base = fixture7_data()
+    q = replace(base, min_p=mp)
+    want = [sampled_reference(l[t], [], q, t) for t in range(2)]
+    assert want == MIN_P_PICKS[mp], f"spec T§8.8: sampled_reference picks {want} at min_p {mp}"
+    assert run(path, l, q, want) == 0, f'bad += run(name, l, NT3, q, want); (name "sampled chain: min_p={mp:.1f}")'
+
+
 def test_basalt_sampler_penalty_window_tail():
     """M8.2 (:1061-1093): fixture 8's 8-slot history with penalty_last_n 4, the file's one window shorter than its
     history: only the last four slots count, so token 3 (6.5, in all four) falls below token 0 (6.0, only in the
@@ -353,6 +375,32 @@ def test_basalt_sampler_history_ids_out_of_vocab_greedy():
     gwant = [greedy_pen(l[t], valid[16 * t:16 * (t + 1)], gp) for t in range(4)]
     assert run("greedy_1b", l, gp, gwant, hist, 16) == 0, \
         'bad += run("out-of-vocab history ids (greedy)", l, NT, gp, gwant, hist, H);'
+
+
+TOP_K_CONTRACT = [                    # (top_k, gate): fixture 14's four runs, each against the top_k = 64 reference
+    (64, 'bad += run("sampled top_k=64", l, NT, p64, want);'),
+    (0, 'bad += run("sampled top_k=0 means 64", l, NT, p0, want);'),
+    (100, 'bad += run("sampled top_k=100 means 64", l, NT, p100, want);'),
+    (-3, 'bad += run("sampled top_k=-3 means 64", l, NT, pneg, want);'),
+]
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+@pytest.mark.parametrize("top_k,gate", TOP_K_CONTRACT, ids=["M14.1", "M14.2", "M14.3", "M14.4"])
+def test_basalt_sampler_top_k_contract(path, top_k, gate):
+    """M14.1-4 (:1278-1298): fixture 14's flat rows (normal(0, 1) * 0.3, 4 x 512) sampled with top_p 1, temperature
+    1.5 and seed 14: top_k 64 as given, and 0, 100 and -3 meaning 64 (sampled_k), so every row's pick is the top_k = 64
+    sampled_reference's, every row written. The port's observability addition (spec T§8.15), on its own seed: the
+    63-wide reference and an uncapped 100-wide list (mirror_pick) give other picks on these rows, so the width 64
+    decides them."""
+    l = normal_rows(14, scale=0.3)
+    p64 = SamplerParams(top_k=64, top_p=1.0, temperature=1.5, seed=14)
+    want = [sampled_reference(l[t], [], p64, t) for t in range(4)]
+    w63 = [sampled_reference(l[t], [], replace(p64, top_k=63), t) for t in range(4)]
+    w100 = [mirror_pick(select_vec(l[t], 100), 100, p64, t) for t in range(4)]
+    assert w63 != want and w100 != want, \
+        f"spec T§8.15: the 64-wide list decides the picks ({want}; 63 wide {w63}, 100 wide {w100})"
+    assert run(path, l, replace(p64, top_k=top_k), want) == 0, gate
 
 
 # ---- TP.1: the drafter's greedy tail (spec S§19.3) ------------------------------------------------------------------
@@ -515,14 +563,40 @@ def w1_finite_rows():
     return l, SamplerParams(greedy=True, temperature=0.0), None, 0
 
 
+def w1_sampled():
+    """8 rows of normal(0, 3) at 248,320 logits (61 blocks), each with its own 16-slot window (its three largest ids,
+    the first twice, among drawn ones), sampled with top_k 40, top_p 0.6, min_p 0.25 and temperature 0.8 under
+    repeat 1.3, freq 0.1 and present 0.2, at a seed and a counter with high words. top_p keeps 11 to 18 of each row's
+    40 and min_p then fewer in four rows (3 of row 1's 11), and each stage decides picks: without top_p 4 rows would
+    pick otherwise, without min_p 2, without the penalties all 8. So every step of the tail runs, after the merge of
+    61 lists, with each row's own window and its draw at counter + t."""
+    rs = np.random.RandomState(20261020)
+    V = 248320
+    l = rs.standard_normal((8, V)).astype(np.float32) * np.float32(3)
+    hist = rs.randint(V, size=(8, 16)).astype(np.int32)
+    hist[:, :4] = np.argsort(-l, axis=1, kind="stable")[:, [0, 0, 1, 2]]
+    p = SamplerParams(top_k=40, top_p=0.6, min_p=0.25, temperature=0.8, penalty_last_n=16, penalty_repeat=1.3,
+                      penalty_freq=0.1, penalty_present=0.2, seed=(3 << 32) + 77, counter=(1 << 32) + 5)
+    return l, p, hist.ravel(), 16
+
+
 ROWS_ALONE = {"greedy_cl": w1_ties_across, "greedy_1b": w1_per_row_history,     # W.1's fixture for each path
-              "top_prob": w1_finite_rows}
+              "top_prob": w1_finite_rows, "split": w1_sampled}
 
 
 @pytest.mark.parametrize("path", ROWS_ALONE)
 def test_basalt_sampler_rows_alone(path):
     """W.1: the path's multi-row window, row for row, equals each row run alone as a one-row window at its own
-    position (gpu.rows_alone, bitwise)."""
+    position (gpu.rows_alone, bitwise). A sampled path's window must also be the mirror's, mirror_pick over
+    mirror_select's list with the row's window at counter + t, so that the check cannot pass on a tail that is wrong
+    in every row alike."""
     l, p, hist, hist_len = ROWS_ALONE[path]()
     assert gpu.rows_alone(path, l, p, hist=hist, hist_len=hist_len) == [], \
         "invariant 1: a row's output never depends on the window width T or its position in it"
+    if path in SAMPLED:
+        T, V = l.shape
+        k = sampled_k(p.top_k, V)
+        want = [mirror_pick(mirror_select(l[t], V, window_of(hist, hist_len, t, p.penalty_last_n), p, k), k, p, t)
+                for t in range(T)]
+        got = list(getattr(gpu, path)(l, p, hist=hist, hist_len=hist_len))
+        assert got == want, f"the window's picks {got} are mirror_pick's {want} (T§3.6)"

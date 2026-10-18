@@ -156,6 +156,22 @@ def split_part(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=
     return lists[:T].copy()
 
 
+def split(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None):
+    """S-SPLIT, basalt's sampler_split_part_kernel then sampler_split_merge_kernel: ``bs_split_part`` as in
+    ``split_part``, then ``bs_split_merge``, one SIMD-group per row, which merges the row's block lists from ``cand``
+    and runs the sampled tail. Mode 2 whatever the request asks, without the cluster pair the engine runs first (it
+    would hide a row the split never wrote); ``cand`` holds exactly the rows' lists. The probe is off, so ``qprob``
+    must keep its prefill (asserted). Returns the T picks."""
+    part, merge = pipeline("bs_split_part"), pipeline("bs_split_merge")
+    T, V = np.shape(logits)
+    rows, nb = T + 1, -(-V // kernels.BS_BLOCK)
+    picks, qbits = launch([(part, (nb, rows), SPLIT_THREADS), (merge, (rows,), 32)], logits, p, mode=2, hist=hist,
+                          hist_len=hist_len, bias=bias, position=position, fill=fill,
+                          scratch={9: rows * nb * sampled_k(p.top_k, V) * 8}, lbuf=lbuf)
+    assert np.all(qbits == np.frombuffer(bytes([fill]) * 4, np.uint32)[0]), "qprob was written without the probe"
+    return picks
+
+
 def rows_alone(path, logits, p, *, hist=None, hist_len=0, position=0):
     """W.1, invariant 1 (a row's output never depends on the window width T or its place in it): ``path``'s window
     against each row t run alone, a one-row window of its logits and history row at ``position + t``. Returns the

@@ -141,6 +141,7 @@ struct BsSampleParams {
     uint pad;
 };
 constant uint BS_BIAS = 1u;                                            // flags: add bias[v] to every logit first
+constant uint BS_PROBE = 2u;                                           // flags: the sampled tail writes qprob
 constant uint BS_MAP = 4u;                                             // flags: the top-prob pick goes through map
 
 // ---- The greedy argmax on (key, id) pairs: am_take, am_merge (sampler.cu:180-185) -----------------------------------
@@ -337,6 +338,111 @@ static inline void part_list(device const uint* l, uint nv, uint k, uint blk, de
     }
 }
 
+// ---- The sampled tail: sampled_tail_warp (sampler.cu:362-439) -------------------------------------------------------
+//
+// The chain after the top-k list, on one SIMD-group (docs/research/basalt-nvcc/sampler.md 2.4): top_p, then min_p on
+// its survivors, the temperature, and one draw. sel_ids and sel_logit (the list's ids and value bits, k entries in
+// the selection order) and ex (binary64 bits) are the caller's threadgroup arrays of BS_SEL_MAX; the chain's scalars
+// come as their bits, the draw's seed and counter (the row's own: basalt's p.counter + t) as words. Every lane computes
+// inv_t, the two maxima and the min_p cut from the same data; the lanes share the exps and the quotients (entries
+// lane and lane + 32); lane 0 alone runs the ordered sums, the top_p scan and the draw, and broadcasts the sums and
+// the cut. Each step is CUDA's IEEE operation with subnormals: the compares on bits (f_gt, f_lt, fmaxf_bits), the
+// binary32 arithmetic through ieee_div, ieee_mul and ieee_add, the binary64 in software (basalt_f64.metal), exp(double)
+// and logf as libdevice's (basalt_libdevice.metal). Returns, on lane 0: the pick; its probability's bits, (float)
+// ex[pi], or 1.0 when nothing is kept (min_p above 1; the coupled merge's prob_out); and with probe, those of id q's
+// probability, 0 outside the kept list (the probe's qprob[t]). The caller stores them.
+struct BsDraw {
+    int pick;
+    uint prob, qprob;
+};
+
+// __shfl_sync of a double: its two words
+static inline ulong broadcast_f64(ulong x) { return bits(simd_broadcast(lo(x), 0), simd_broadcast(hi(x), 0)); }
+
+static inline BsDraw sampled_tail(threadgroup const int* sel_ids, threadgroup const uint* sel_logit, uint k,
+                                  uint top_p, uint min_p, uint temperature, int min_keep, ulong seed, ulong counter,
+                                  bool probe, int q, threadgroup ulong* ex, uint lane) {
+    const float inv_t = f_gt(temperature, 0u) ? ieee_div(1.0f, as_type<float>(temperature)) : 0.0f;   // :374
+    int n_keep = int(k);
+    uint mx = sel_logit[0];
+    for (uint i = 1u; i < k; ++i) mx = fmaxf_bits(mx, sel_logit[i]);                     // :376-377
+    if (f_lt(top_p, 0x3f800000u)) {                                                       // :378-399
+        const ulong dm = f64_from_f32(mx);
+        for (uint i = lane; i < k; i += 32u) ex[i] = nv_exp(f64_sub(f64_from_f32(sel_logit[i]), dm));
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        ulong sum = 0ul;
+        if (lane == 0u)
+            for (uint i = 0u; i < k; ++i) sum = f64_add(sum, ex[i]);
+        sum = broadcast_f64(sum);
+        simdgroup_barrier(mem_flags::mem_threadgroup);                // lane 0 has read every ex before it changes
+        for (uint i = lane; i < k; i += 32u) ex[i] = f64_div(ex[i], sum);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        int cut = int(k);
+        if (lane == 0u) {
+            const ulong tp = f64_from_f32(top_p);
+            ulong cum = 0ul;
+            for (uint i = 0u; i < k; ++i) {
+                cum = f64_add(cum, ex[i]);
+                if (f64_ge(cum, tp)) {                                // ordered: a NaN never cuts
+                    cut = int(i) + 1;
+                    break;
+                }
+            }
+        }
+        cut = simd_broadcast(cut, 0);
+        if (cut < min_keep) cut = min_keep < int(k) ? min_keep : int(k);
+        n_keep = cut;
+        simdgroup_barrier(mem_flags::mem_threadgroup);                // ex is written again below
+    }
+    if (f_gt(min_p, 0u)) {                                                                // :402-406
+        const uint th = as_type<uint>(ieee_add(as_type<float>(sel_logit[0]), nv_logf(as_type<float>(min_p))));
+        for (int i = 0; i < n_keep; ++i)
+            if (f_lt(sel_logit[i], th)) {
+                n_keep = i;
+                break;
+            }
+    }
+    uint smx = as_type<uint>(ieee_mul(as_type<float>(sel_logit[0]), inv_t));              // :408-409
+    for (int i = 1; i < n_keep; ++i)
+        smx = fmaxf_bits(smx, as_type<uint>(ieee_mul(as_type<float>(sel_logit[i]), inv_t)));
+    const ulong ds = f64_from_f32(smx);
+    for (int i = int(lane); i < n_keep; i += 32)                                          // :410
+        ex[i] = nv_exp(f64_sub(f64_from_f32(as_type<uint>(ieee_mul(as_type<float>(sel_logit[i]), inv_t))), ds));
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    ulong sum = 0ul;
+    if (lane == 0u)
+        for (int i = 0; i < n_keep; ++i) sum = f64_add(sum, ex[i]);
+    sum = broadcast_f64(sum);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = int(lane); i < n_keep; i += 32) ex[i] = f64_div(ex[i], sum);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    BsDraw d = {0, 0u, 0u};
+    if (lane == 0u) {                                                                     // :419-437
+        const ulong u = f64_from_f32(as_type<uint>(philox_uniform(seed, counter)));
+        ulong cum = 0ul;
+        int pi = n_keep > 0 ? n_keep - 1 : 0;
+        d.pick = sel_ids[pi];
+        for (int i = 0; i < n_keep; ++i) {
+            cum = f64_add(cum, ex[i]);
+            if (f64_lt(u, cum)) {                                         // ordered: a NaN never picks
+                d.pick = sel_ids[i];
+                pi = i;
+                break;
+            }
+        }
+        d.prob = n_keep > 0 ? f32_from_f64(ex[pi]) : 0x3f800000u;
+        if (probe) {
+            for (int i = 0; i < n_keep; ++i)
+                if (sel_ids[i] == q) {
+                    d.qprob = f32_from_f64(ex[i]);
+                    break;
+                }
+            if (n_keep == 0 && sel_ids[0] == q) d.qprob = 0x3f800000u;
+        }
+    }
+    return d;
+}
+
 #if STEP_STATE
 constant uint BS_AM_CTAS = 8u;                                         // kAmCtas: threadgroups per row
 
@@ -484,5 +590,48 @@ kernel void bs_split_part(device const uint* logits [[buffer(0)]], device const 
     part_list<32u, BS_SPLIT_WARPS, true>(logits + ulong(t) * nv, nv, k, b, cand + (ulong(t) * p.n_blocks + b) * k, wl,
                                          tid, lane, sg, bits, bias, (p.flags & BS_BIAS) != 0u, hrow, hlen,
                                          p.penalty_repeat, p.penalty_freq, p.penalty_present);
+}
+
+constant uint BS_SPLIT_MAX_BLOCKS = 64u;                               // kSplitMaxBlocks: the lists one merge holds
+constant uint BS_PENDING = sizeof(StepState::pending_tokens) / sizeof(int);   // the probe's queries, t + 1 below it
+
+// sampler_split_merge_kernel (sampler.cu:663-682), mode 2: one SIMD-group per row (basalt's 32 threads) merges the
+// row's n_blocks block lists of k from cand, in place of basalt's copy into 32 KiB of shared memory (the same entries
+// read: the same list), into the row's top-k list, the sentinel's id vocab stored as 0, then runs the tail. The draw's
+// counter is ctr_base (two words, the request's) + position + t, its seed StepState's rng_hi:rng_lo. With flags PROBE,
+// row t < nq[0] also writes the probability of its query pending_tokens[t + 1] to qprob[t] (sampler.cu:430-436); no
+// other row or request writes qprob, and nq is read only then. A dispatch of another width returns at once (two
+// SIMD-groups would share the tail's arrays), as does a record of more blocks than the merge's 64 lists.
+kernel void bs_split_merge(device const uint* ctr_base [[buffer(1)]], device const uint* nq [[buffer(2)]],
+                           device int* out [[buffer(5)]], device uint* qprob [[buffer(6)]],
+                           constant BsSampleParams& p [[buffer(7)]], device const uint2* cand [[buffer(9)]],
+                           device const StepState* st [[buffer(15)]],
+                           uint t [[threadgroup_position_in_grid]], uint tpg [[threads_per_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup int sel_ids[BS_SEL_MAX];
+    threadgroup uint sel_logit[BS_SEL_MAX];
+    threadgroup ulong ex[BS_SEL_MAX];
+    if (st->done || t >= st->t_this_step || p.mode != 2u || tpg != 32u || p.n_blocks > BS_SPLIT_MAX_BLOCKS) return;
+    const uint nv = p.vocab, k = sampled_k(p.top_k, nv);
+    device const uint2* lists = cand + ulong(t) * p.n_blocks * k;                         // :674-679
+    BsHeads h = merge_heads(lists, p.n_blocks, k, nv, lane);
+    for (uint i = 0u; i < k; ++i) {                                                       // bounded: k rounds
+        const uint2 c = merge_lists(h, lists, k, k, nv, lane);
+        if (lane == 0u) {
+            sel_ids[i] = c.x < nv ? int(c.x) : 0;
+            sel_logit[i] = c.y;
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    const bool probe = (p.flags & BS_PROBE) != 0u && t < nq[0] && t + 1u < BS_PENDING;
+    const ulong seed = (ulong(st->rng_hi) << 32) | st->rng_lo;
+    const ulong counter = ((ulong(ctr_base[1]) << 32) | ctr_base[0]) + ulong(st->position) + ulong(t);
+    const BsDraw d = sampled_tail(sel_ids, sel_logit, k, as_type<uint>(p.top_p), as_type<uint>(p.min_p),
+                                  as_type<uint>(p.temperature), p.min_keep, seed, counter, probe,
+                                  probe ? st->pending_tokens[t + 1u] : 0, ex, lane);
+    if (lane == 0u) {
+        out[t] = d.pick;
+        if (probe) qprob[t] = d.qprob;
+    }
 }
 #endif
