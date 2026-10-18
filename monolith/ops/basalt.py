@@ -55,7 +55,9 @@ not require that.
 * ``basalt_q5k_head`` (``q5k_head_mmvq``): ``(xq [T, n_in / 32 * 36], rows[, map])`` → ``y [T, n_out] F32``, the
   logits of rows 0 .. n_out - 1, n_out the output's width; n_in a multiple of 256 of at most 64 blocks and T 1 .. 8
   (``q5k_head_supported``). With a map, ``q5k_head_mask_unmapped`` follows on each column, as basalt masks the draft
-  head's logits (``mtp.cpp:1022-1023``): a row whose id is negative becomes -inf.
+  head's logits (``mtp.cpp:1022-1023``): a row whose id is negative becomes -inf. basalt masks only when the draft
+  vocabulary has context rows (``n_xcap_ > 0``), whose ids are its only negative ones, so a lowering passes the head
+  the map exactly then.
 * ``basalt_q5k_top1`` (``q5k_head_top1``): ``(xq [1, 2880], rows[, map])`` → ``(y [1, n_out] F32, id [1] I32,
   prob [1] F32)``: n_in 2560 and one column, as basalt calls it (``q5k_head.cu:374``; ``mtp.cpp:1016``). The first
   dispatch writes the logits and each threadgroup's partials, the merge the best row (its id through the map) and its

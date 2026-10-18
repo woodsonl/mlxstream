@@ -51,8 +51,8 @@ def head(g, name, xq, rows, *mp, width=None, dtype=F32):
 
 
 def top1(g, name, x1, rows, *mp, width=None, dtypes=(F32, I32, F32)):
-    """``basalt_q5k_top1`` of the q8_1 column ``x1``: ``name.y`` (the logits), ``name.id``, ``name.p``."""
-    shapes = ((x1.shape[0], rows.shape[0] if width is None else width), (1,), (1,))
+    """``basalt_q5k_top1`` of the q8_1 column ``x1``: ``name.y`` (the logits of one column), ``name.id``, ``name.p``."""
+    shapes = ((1, rows.shape[0] if width is None else width), (1,), (1,))
     outs = [g.value(f"{name}.{s}", sh, dt) for s, sh, dt in zip(("y", "id", "p"), shapes, dtypes)]
     op(g, "basalt_q5k_top1", [x1, rows, *mp], outs)
     return outs
@@ -385,22 +385,23 @@ def _proxy_size(g, src, bad, tmp):
     return {}
 
 
-def _aligned(kind, slot, offset):
-    """``kind`` with the value of kernel slot ``slot`` (the rows 0, the q8_1 column 1, the map: the mask's 1, the
-    top-1's 3) read from a pack entry at byte 16 (valid) or ``offset``."""
+def _from_pack(kind, value, offset=16, extra=0):
+    """``kind`` over 64 rows (the proxy: n_rows = n_cap = 64) with the map, its ``value`` (``rows``: a q5_k weight;
+    ``xq``: the q8_1 column; ``map``) a pack entry at byte 16 holding exactly its bytes (valid), or at byte ``offset``
+    holding ``extra`` bytes more; the other values the program's and the session's inputs."""
     def build(g, src, bad, tmp):
-        at = offset if bad else 16
-        x1, (rows, mp, _) = g.input("x1", (1, QCOL), U8), draft_inputs(g)
-        if slot == 0:
-            rows = g.weight("p", (64, 2560), "q5_k")
-            nbytes, mp = 64 * ROW, None
-        elif slot == 1 and kind == "basalt_q5k_top1":
-            x1, nbytes = g.const("p", (1, QCOL), U8), QCOL
+        v, nbytes = {"rows": lambda: (g.weight("p", (64, 2560), "q5_k"), 64 * ROW),
+                     "xq": lambda: (g.const("p", (1, QCOL), U8), QCOL),
+                     "map": lambda: (g.const("p", (64,), I32), 4 * 64)}[value]()
+        x1 = v if value == "xq" else g.input("x1", (1, QCOL), U8)
+        rows = v if value == "rows" else g.input("dhead", (64, ROW), U8, host=True)
+        mp = v if value == "map" else g.input("dvocab", (64,), I32, host=True)
+        if kind == "basalt_q5k_proxy_top1":
+            proxy = g.input("proxy", (kernels.basalt_q5k_proxy_bytes(64),), U8, host=True)
+            proxy_top1(g, "y", x1, proxy, rows, mp, n_rows=64, n_cap=64)
         else:
-            mp, nbytes = g.const("p", (N_DVOCAB,), I32), 4 * N_DVOCAB
-        mps = [] if mp is None else [mp]
-        (head if kind == "basalt_q5k_head" else top1)(g, "y", x1, rows, *mps)
-        return {"packs": [pack(tmp, {"p": (at, nbytes)})]}
+            (head if kind == "basalt_q5k_head" else top1)(g, "y", x1, rows, mp)
+        return {"packs": [pack(tmp, {"p": (offset, nbytes + extra) if bad else (16, nbytes)})]}
     return build
 
 
@@ -432,10 +433,14 @@ REFUSALS = [
      rf"rows out of range \(row0 0, n 0, n_rows {N_CAP}, n_cap {N_CAP - 1}\)"),
     ("proxy top-1 copy not a host input", _proxy_not_host, "the 2-bit copy 'proxy2' is not a host input"),
     ("proxy top-1 copy of another size", _proxy_size, r"\(the 2-bit copy of n_cap rows\)"),
-    *[(f"{k} rows off 2 bytes", _aligned(k, 0, 1), "slot 0 needs 2-byte alignment") for k in KINDS[:2]],
-    ("top-1 q8_1 column off 4 bytes", _aligned("basalt_q5k_top1", 1, 2), "slot 1 needs 4-byte alignment"),
-    ("head map off 4 bytes", _aligned("basalt_q5k_head", 1, 2), "slot 1 needs 4-byte alignment"),
-    ("top-1 map off 4 bytes", _aligned("basalt_q5k_top1", 3, 2), "slot 3 needs 4-byte alignment"),
+    *[(f"{k} rows off 2 bytes", _from_pack(k, "rows", 1), "'p' binds at byte 1 of .*; slot 0 needs 2-byte alignment")
+      for k in KINDS],
+    *[(f"{k} q8_1 column off 4 bytes", _from_pack(k, "xq", 2), "'p' binds at byte 2 of .*; slot 1 needs 4-byte")
+      for k in KINDS],
+    *[(f"{k} map off 4 bytes", _from_pack(k, "map", 2), f"'p' binds at byte 2 of .*; slot {s} needs 4-byte")
+      for k, s in zip(KINDS, (1, 3, 2))],            # the mask's slot, the top-1's, the score's
+    *[(f"{k} rows entry a row short", _from_pack(k, "rows", extra=-ROW),
+       r"'p' is 112640 bytes of q5_k \[64, 2560\], but its pack entry holds 110880") for k in KINDS],
 ]
 
 
