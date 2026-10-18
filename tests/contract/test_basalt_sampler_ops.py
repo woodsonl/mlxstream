@@ -1,8 +1,9 @@
 """basalt's sampler as an op kind (monolith/ops/basalt_sample.py, the emitter's ``_basalt_sample``): its registration
 and the coverage guard; the programs the handler emits at basalt's vocabulary, static and dynamic, without and with
 the bias and history inputs (the kernels in order, their macros, StepState at slot 15, the slots, the grids, the
-scratch sizes, the one params record's bytes and the barriers that order the overwrites of ``token``); the sampled
-path the build chooses; the request packer's refusals, ``min_p = 2`` accepted, and the mode table. No GPU."""
+scratch sizes, the one params record's bytes and the barriers that order the overwrites of ``token``); the greedy-only
+build (attr ``greedy_only``); the sampled path the build chooses; the request packer's refusals, ``min_p = 2``
+accepted, and the mode table. No GPU."""
 
 import math
 import struct
@@ -28,7 +29,7 @@ def f32(x):
     return struct.unpack("<f", struct.pack("<f", x))[0]
 
 
-def graph(vocab=V, *, bias=False, hist_len=0, rows=T, logits_dtype=DType.F32, history_cols=None):
+def graph(vocab=V, *, bias=False, hist_len=0, rows=T, logits_dtype=DType.F32, history_cols=None, greedy_only=False):
     g = Graph()
     ins = [g.input("logits", (rows, vocab), logits_dtype), g.input("ctr_base", (2,), DType.U32),
            g.input("nq", (1,), DType.U32)]
@@ -37,8 +38,9 @@ def graph(vocab=V, *, bias=False, hist_len=0, rows=T, logits_dtype=DType.F32, hi
     if hist_len or history_cols:
         ins.append(g.input("history", (rows, history_cols or hist_len), DType.I32))
     token, qprob = g.value("token", (rows,), DType.I32), g.value("qprob", (rows,), DType.F32)
+    attrs = dict(greedy_only=True) if greedy_only else {}
     g.op("basalt_sample", ins, [token, qprob], domain=BlockDomain("span", 1), klass=OpClass.REDUCE, bias=bias,
-         hist_len=hist_len)
+         hist_len=hist_len, **attrs)
     return g
 
 
@@ -103,6 +105,25 @@ def test_basalt_sample_program_at_basalt_vocabulary(dynamic, inputs):
     assert prog.buffers[s[2][10][0]].nbytes == (8 * 7760 * 4 if inputs else 16)
     # the merge waits for the partials, and each overwrite of token for the one before it
     assert ops[1].barrier_before and ops[2].barrier_before and ops[4].barrier_before
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+def test_basalt_sample_greedy_only(dynamic):
+    """Attr greedy_only: the cluster pair alone, as the full program emits it (grids, slots, writes, the record at mode
+    0), and none of the gated dispatches' scratch; bias and history are refused (mode 0 takes neither)."""
+    kw = dict(dynamic_t=True) if dynamic else dict(t=8)
+    prog, full = emit(graph(greedy_only=True), **kw), emit(graph(), **kw)
+    assert functions(prog) == ["bs_greedy_partial", "bs_greedy_merge"]
+    for o, f in zip(prog.ops, full.ops):
+        assert (o.grid, o.threadgroup, o.meta["writes"], slots(o)) == (f.grid, f.threadgroup, f.meta["writes"], slots(f))
+    assert prog.ops[1].barrier_before
+    rec = slots(prog.ops[0])[7][0]
+    assert struct.unpack_from(RECORD, prog.buffers[rec].init) == (
+        V, 8, 61, 0, 0, 0, 20, f32(0.95), 0.0, 1.0, 1, 0, 1.0, 0.0, 0.0, 0)
+    assert not any(tag in name for name in prog.buffers for tag in (".bs.bits", ".bs.none", ".bs.cand"))
+    for bad in (dict(bias=True), dict(hist_len=H)):
+        with pytest.raises(ValueError, match="greedy_only"):
+            emit(graph(greedy_only=True, **bad), **kw)
 
 
 def test_basalt_sample_path_choice():

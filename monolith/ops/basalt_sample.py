@@ -16,6 +16,11 @@ its Philox draw, bit for bit basalt's.
   - Per request: the op's params record, ``BsSampleParams`` (``kernels.basalt_sampler_params``): ``mode``, flags and
     basalt's SamplerParams fields. The build writes mode 0, the greedy default; a request's writer rewrites it
     through the packer, which refuses what basalt's dispatcher exits on.
+  - Attr ``greedy_only=True``: a program that serves mode 0 alone, as basalt's captured window graph does (greedy, no
+    history, no bias): no ``bias`` or ``history`` input, and only the cluster pair is emitted, so no dispatch writes
+    ``qprob``. Its record stays at mode 0; the other modes need a program built without the attr. The three gated
+    dispatches it drops cost 5.6 to 5.7 µs a step at T = 1 and 7.9 to 10.2 µs at T = 8 on the M3 Max, over two runs of
+    ``tools/bench/basalt_sampler.py`` [M].
 * Dispatch order (every dispatch writes ``token`` after the ones before it, ordered by the barrier pass):
   1. ``bs_greedy_partial`` (8 threadgroups of 1,024 threads per row) then ``bs_greedy_merge``, always: the row's
      lowest id of its largest non-NaN logit above -inf, else 0 (basalt's cluster argmax).
@@ -35,7 +40,7 @@ its Philox draw, bit for bit basalt's.
   2     sampled                                                               the cluster pair, then the sampled path
   ====  ====================================================================  ======================================
 
-  The other dispatches return at their first instruction.
+  The other dispatches return at their first instruction (``greedy_only`` programs do not emit them).
 """
 
 from ..core.ir import OpClass

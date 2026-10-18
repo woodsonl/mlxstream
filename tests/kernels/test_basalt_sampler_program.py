@@ -20,6 +20,8 @@ pick from the cluster's.
 - DCP.2, decode_cluster_parity's graph case, argmax side (:245-306): one program of 5 rows at basalt's vocabulary
   (built at t = 5 and at t = 8), replayed 6 times over fresh logits written into the same buffer, against the
   one-block greedy kernel on the same logits.
+- The greedy-only build (attr ``greedy_only``, the cluster pair alone), the port's: its picks equal the full build's in
+  mode 0 and the host argmax, at t = 1 and 8.
 - MG.1, the port's: one penalised request in each mode, the record's ``mode`` deciding which dispatches run: mode 0
   the cluster pick, mode 1 the one-block greedy pick, mode 2 the sampled pick; the scratch of a dispatch its mode
   gates off keeps its 0xFF bytes. On the split and on the one-block path (forced).
@@ -50,17 +52,19 @@ SPLIT = ["bs_greedy_partial", "bs_greedy_merge", "bs_greedy_one_block", "bs_spli
 ONE_BLOCK = SPLIT[:3] + ["bs_sample_one_block"]
 
 
-def program(t, vocab=V, *, hist_len=0, advance=False, forced=False):
+def program(t, vocab=V, *, hist_len=0, advance=False, forced=False, greedy_only=False):
     """The graph emitted at ``t`` (StepState for t_max = max(8, t)) and instantiated: ``history`` (T, hist_len) when
     hist_len > 0; ``advance``, the step's advance on ``token`` as the program's tail; ``forced``, the one-block path
-    whatever the shape (F.2: the build's path choice overridden, the handler's dispatches otherwise)."""
+    whatever the shape (F.2: the build's path choice overridden, the handler's dispatches otherwise);
+    ``greedy_only``, the op's greedy-only build."""
     g = Graph()
     ins = [g.input("logits", (T, vocab), DType.F32), g.input("ctr_base", (2,), DType.U32),
            g.input("nq", (1,), DType.U32)]
     if hist_len:
         ins.append(g.input("history", (T, hist_len), DType.I32))
     token, qprob = g.value("token", (T,), DType.I32), g.value("qprob", (T,), DType.F32)
-    g.op("basalt_sample", ins, [token, qprob], domain=BlockDomain("span", 1), klass=OpClass.REDUCE, hist_len=hist_len)
+    g.op("basalt_sample", ins, [token, qprob], domain=BlockDomain("span", 1), klass=OpClass.REDUCE, hist_len=hist_len,
+         **(dict(greedy_only=True) if greedy_only else {}))
     with pytest.MonkeyPatch.context() as mp:
         if forced:
             mp.setattr(kernels, "basalt_sampler_path", lambda t_max, vocab: "one_block")
@@ -104,14 +108,17 @@ def request(eng, p, mode=None):
 
 def step(eng, rows):
     """One replay of the encoded step, ``token`` and ``qprob`` refilled with 0xFF bytes first. Returns ``token``'s
-    first ``rows`` rows and the run's report; asserts every later row of the buffer -1 and ``qprob`` untouched."""
-    for name in ("token", "qprob"):
+    first ``rows`` rows and the run's report; asserts every later row of the buffer -1 and ``qprob`` untouched. A
+    greedy-only program binds no ``qprob`` (no dispatch writes it), so it has no such buffer."""
+    probe = "qprob" in eng.buffers
+    for name in ("token", "qprob") if probe else ("token",):
         eng.buffers[name].fill(0xFF)
     r = eng.run(1, steps_per_cb=1, in_flight=1)
     assert r.steps == 1 and not r.done, r
     tok = np.frombuffer(eng.read("token"), np.int32)
     assert np.all(tok[rows:] == -1), "a row past t_this_step was written"
-    assert np.all(np.frombuffer(eng.read("qprob"), np.uint32) == 0xFFFFFFFF), "qprob was written without the probe"
+    if probe:
+        assert np.all(np.frombuffer(eng.read("qprob"), np.uint32) == 0xFFFFFFFF), "qprob was written without the probe"
     return tok[:rows].copy(), r
 
 
@@ -204,6 +211,27 @@ def test_basalt_decode_cluster_graph_replay(t):
         if d2 := int(np.count_nonzero(u != v)):
             fails.append((rep, d2))
     assert not fails, f"for (size_t i = 0; i < u.size(); ++i) d2 += u[i] != v[i]; if (d1 || d2) ++fails; ({fails})"
+
+
+@pytest.mark.parametrize("t", (1, 8))
+def test_basalt_sampler_greedy_only_program(t):
+    """The greedy-only build (attr greedy_only: the cluster pair alone) against the full build in mode 0, both at
+    t: over two replays of fresh logits (fill_logits' random pattern, then ties-across) each pick is the full
+    program's and the host argmax (the lowest index of the largest non-NaN value above -inf); the full program's
+    qprob keeps its 0xFF bytes, and the greedy-only one has no qprob buffer."""
+    rs = np.random.RandomState([20261018, t])
+    only, full = program(t, greedy_only=True), program(t)
+    assert functions(only) == SPLIT[:2] and "qprob" not in only.buffers and "qprob" in full.buffers
+    for eng in (only, full):
+        state(eng, t_this_step=t)
+    for rep in range(2):
+        l = np.stack([fill_logits(rs, V, "ties-across" if rep else "random") for _ in range(t)])
+        picks = []
+        for eng in (only, full):
+            eng.buffers["logits"].write(l.tobytes(), 0)
+            picks.append(step(eng, t)[0].tolist())
+        want = [host_argmax(row) for row in l]
+        assert picks[0] == picks[1] == want, f"replay {rep}: greedy_only {picks[0]}, full {picks[1]}, host {want}"
 
 
 # ---- MG.1: the mode word gates the dispatches ------------------------------------------------------------------------

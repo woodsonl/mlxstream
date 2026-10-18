@@ -1300,11 +1300,15 @@ def _basalt_sample(ctx: _Ctx, op: Op) -> None:
     argmax, then the one-block greedy kernel and the sampled path, which run only in their mode. Every dispatch
     binds StepState (rows, seed, position, the probe's queries), static program or not, and the op's one record,
     built at mode 0 for a request's writer to rewrite (kernels.basalt_sampler_params). Each scratch is written before
-    it is read in every step."""
+    it is read in every step. With attr ``greedy_only`` the program serves mode 0 alone and emits the cluster pair
+    only."""
     has_bias, hist_len = bool(op.attrs.get("bias")), int(op.attrs.get("hist_len", 0))
+    greedy_only = bool(op.attrs.get("greedy_only"))
     if len(op.inputs) != 3 + has_bias + (hist_len > 0) or len(op.outputs) != 2 or hist_len < 0:
         raise ValueError(f"basalt_sample: {len(op.inputs)} inputs and {len(op.outputs)} outputs do not match bias = "
                          f"{has_bias}, hist_len = {hist_len}")
+    if greedy_only and (has_bias or hist_len):
+        raise ValueError("basalt_sample: greedy_only serves mode 0, which takes no bias and no history")
     logits, ctr_base, nq = op.inputs[:3]
     bias = op.inputs[3] if has_bias else None
     history = op.inputs[-1] if hist_len > 0 else None
@@ -1327,18 +1331,20 @@ def _basalt_sample(ctx: _Ctx, op: Op) -> None:
 
     prm = ctx.params("basalt_sample", kernels.basalt_sampler_params(vocab, t_c, n_blocks, hist_len))
     part = ctx.scratch("bs.greedy_part", t_c * kernels.BS_AM_CTAS * 8, shared=True)
-    bits = ctx.scratch("bs.bits", t_c * -(-vocab // 32) * 4 if hist_len else 16, shared=True)   # no window: never touched
-    none = ctx.scratch("bs.none", 16, shared=True)                    # the slot of an absent bias or history: never read
     st, lb, tok = ctx.program.step_state, ctx.buf(logits), ctx.buf(token)
-    chain = [(0, *lb), (3, *(ctx.buf(bias) if bias is not None else (none, 0))),
-             (4, *(ctx.buf(history) if history is not None else (none, 0))), (7, prm, 0), (15, st, 0)]
-    draw = [(1, *ctx.buf(ctr_base)), (2, *ctx.buf(nq)), (5, *tok), (6, *ctx.buf(qprob))]
     # ponytail: 1,024 threads is the most each of these pipelines allows on the M3 Max (Apple9), ICB or not [M];
     # a chip that allows fewer needs the width from the pipeline (any multiple of 32 gives the same bits)
     ctx.add(kern("bs_greedy_partial"), [(0, *lb), (7, prm, 0), (8, part, 0), (15, st, 0)], (kernels.BS_AM_CTAS, t_c, 1),
             (1024, 1, 1), op.kind, writes=[8])
     ctx.add(kern("bs_greedy_merge"), [(5, *tok), (7, prm, 0), (8, part, 0), (15, st, 0)], (t_c, 1, 1), (32, 1, 1),
             "bs_greedy_merge", writes=[5])
+    if greedy_only:                       # mode 0 alone: the gated three cost 5.6-10.2 us a step [M] (tools/bench)
+        return
+    bits = ctx.scratch("bs.bits", t_c * -(-vocab // 32) * 4 if hist_len else 16, shared=True)   # no window: never touched
+    none = ctx.scratch("bs.none", 16, shared=True)                    # the slot of an absent bias or history: never read
+    chain = [(0, *lb), (3, *(ctx.buf(bias) if bias is not None else (none, 0))),
+             (4, *(ctx.buf(history) if history is not None else (none, 0))), (7, prm, 0), (15, st, 0)]
+    draw = [(1, *ctx.buf(ctr_base)), (2, *ctx.buf(nq)), (5, *tok), (6, *ctx.buf(qprob))]
     ctx.add(kern("bs_greedy_one_block"), chain + [(5, *tok), (10, bits, 0)], (t_c, 1, 1), (1024, 1, 1),
             "bs_greedy_one_block", writes=[5, 10])
     if kernels.basalt_sampler_path(t_c, vocab) == "split":            # basalt's fixed widths: 128 and 32 threads exactly
