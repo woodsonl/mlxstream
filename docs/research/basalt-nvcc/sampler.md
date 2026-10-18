@@ -102,9 +102,9 @@ following operations, one helper per operation at every site; the names are prop
   `basalt_libdevice.metal`, whose compares and conversions take and return bit patterns): `key32`, `nan32`, `gt32` and
   `lt32` are `okey`, `fnan`, `f_gt` and `f_lt`; `eq32`, `ge32`, `ne32` and the unordered forms have no helper, each site
   comparing `okey` keys (`am_merge`, `take_first`) or testing `fnan` (`gtu32(x, 0.0f)` is `fnan(x) || f_gt(x, 0)`);
-  `fmax32` is `fmaxf_bits`; `add32`, `mul32`, `div32`, `rcp32` and `fma32` are `ieee_add`, `ieee_mul`, `ieee_div`,
-  `ieee_div(1, x)` and `ieee_fma_count`, except that section 3.3's `rcp32(tot)` is a plain `1.0f / tot` (tot is at least
-  1), and `ex2_approx(mul32(x, 0x1.715476p+0f))` is `expf_approx(x)`; `dadd`, `dmul`, `dfma`, `ddiv`, `d_of_f32` and
+  `fmax32` is `fmaxf_bits`; `add32`, `mul32`, `div32`, `rcp32` and `fma32` are `ieee_add`, `ieee_mul`,
+  `ieee_div_any`, `ieee_div_any(1, x)` and `ieee_fma_count`, except that section 3.3's `rcp32(tot)` is a plain
+  `1.0f / tot` (tot is at least 1), and `ex2_approx(mul32(x, 0x1.715476p+0f))` is `expf_approx(x)`; `dadd`, `dmul`, `dfma`, `ddiv`, `d_of_f32` and
   `f32_of_d` are `f64_add` (`dadd(x, -y)` is `f64_sub(x, y)`), `f64_mul`, `f64_fma`, `f64_div`, `f64_from_f32` and
   `f32_from_f64`, `dge` and `dlt` are `f64_ge` and `f64_lt`, `dgt(a, b)` is `f64_lt(b, a)` and `dgeu(a, b)` is
   `!f64_lt(a, b)`, and `hi32` and `lo32` are `hi` and `lo`; `cuda_exp` and `cuda_logf` are `nv_exp` and `nv_logf`.

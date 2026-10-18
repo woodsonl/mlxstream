@@ -62,11 +62,12 @@ static inline uint fmaxf_bits(uint a, uint b) {
 // software binary64. A NaN from the software is 0x7fffffff, NVIDIA's canonical NaN; the hardware's NaN keeps its own
 // bits.
 
-// a / b, and ieee_div(1, x) for rcp.rn.f32: the binary64 quotient, rounded to nearest even and then to binary32. That
-// double rounding is the correctly rounded quotient: on the normal grid since 53 >= 2 * 24 + 2 (Figueroa), and on the
-// subnormal grid because a quotient of floats off a midpoint lies more than 2^-48 of itself from it, beyond binary64's
-// rounding, while one on a midpoint stays on it (H.3).
-static inline float ieee_div(float a, float b) {
+// a / b for any operands, and ieee_div_any(1, x) for rcp.rn.f32: the binary64 quotient, rounded to nearest even and
+// then to binary32. That double rounding is the correctly rounded quotient: on the normal grid since 53 >= 2 * 24 + 2
+// (Figueroa), and on the subnormal grid because a quotient of floats off a midpoint lies more than 2^-48 of itself
+// from it, beyond binary64's rounding, while one on a midpoint stays on it (H.3). (basalt_q8_1.metal's ieee_div
+// covers b >= 1 only.)
+static inline float ieee_div_any(float a, float b) {
     const float q = a / b;
     const uint ab = as_type<uint>(a), bb = as_type<uint>(b);
     if ((ab & 0x7f800000u) != 0u && (bb & 0x7f800000u) != 0u && !(fabs(q) < 0x1p-125f)) return q;
@@ -129,7 +130,7 @@ static inline uint history_count(device const int* h, uint n, uint v) {
 static inline uint apply_penalties(uint b, uint count, float repeat, float freq, float present) {
     if (count == 0u) return b;
     const float x = as_type<float>(b);
-    const float y = (fnan(b) || f_gt(b, 0u)) ? ieee_div(x, repeat) : ieee_mul(x, repeat);
+    const float y = (fnan(b) || f_gt(b, 0u)) ? ieee_div_any(x, repeat) : ieee_mul(x, repeat);
     return as_type<uint>(ieee_add(y, neg(ieee_fma_count(float(count), freq, present))));
 }
 
@@ -355,10 +356,10 @@ static inline void part_list(device const uint* l, uint nv, uint k, uint blk, de
 // inv_t, the two maxima and the min_p cut from the same data; the lanes share the exps and the quotients (entries
 // lane and lane + 32); lane 0 alone runs the ordered sums, the top_p scan and the draw, and broadcasts the sums and
 // the cut. Each step is CUDA's IEEE operation with subnormals: the compares on bits (f_gt, f_lt, fmaxf_bits), the
-// binary32 arithmetic through ieee_div, ieee_mul and ieee_add, the binary64 in software (basalt_f64.metal), exp(double)
-// and logf as libdevice's (basalt_libdevice.metal). Returns, on lane 0: the pick; its probability's bits, (float)
-// ex[pi], or 1.0 when nothing is kept (min_p above 1; the coupled merge's prob_out); and with probe, those of id q's
-// probability, 0 outside the kept list (the probe's qprob[t]). The caller stores them.
+// binary32 arithmetic through ieee_div_any, ieee_mul and ieee_add, the binary64 in software (basalt_f64.metal),
+// exp(double) and logf as libdevice's (basalt_libdevice.metal). Returns, on lane 0: the pick; its probability's bits,
+// (float) ex[pi], or 1.0 when nothing is kept (min_p above 1; the coupled merge's prob_out); and with probe, those of
+// id q's probability, 0 outside the kept list (the probe's qprob[t]). The caller stores them.
 struct BsDraw {
     int pick;
     uint prob, qprob;
@@ -370,7 +371,7 @@ static inline ulong broadcast_f64(ulong x) { return bits(simd_broadcast(lo(x), 0
 static inline BsDraw sampled_tail(threadgroup const int* sel_ids, threadgroup const uint* sel_logit, uint k,
                                   uint top_p, uint min_p, uint temperature, int min_keep, ulong seed, ulong counter,
                                   bool probe, int q, threadgroup ulong* ex, uint lane) {
-    const float inv_t = f_gt(temperature, 0u) ? ieee_div(1.0f, as_type<float>(temperature)) : 0.0f;   // :374
+    const float inv_t = f_gt(temperature, 0u) ? ieee_div_any(1.0f, as_type<float>(temperature)) : 0.0f;   // :374
     int n_keep = int(k);
     uint mx = sel_logit[0];
     for (uint i = 1u; i < k; ++i) mx = fmaxf_bits(mx, sel_logit[i]);                     // :376-377

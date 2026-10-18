@@ -22,7 +22,7 @@ pattern), against host references. Every comparison is bitwise.
   on the subnormal grid at every denormalization shift), results decided by a sticky bit alone (a carry into the next
   binade, and products whose lowest bits only the alignment's sticky bit sees), subnormal results, overflow (to inf,
   and to DBL_MAX when rounded to odd) and every triple of specials.
-- H.3: the binary32 operations with IEEE subnormals: ``ieee_add`` and ``ieee_mul`` (basalt_ieee.metal), ``ieee_div``
+- H.3: the binary32 operations with IEEE subnormals: ``ieee_add`` and ``ieee_mul`` (basalt_ieee.metal), ``ieee_div_any``
   and ``ieee_fma_count`` (basalt_sampler.metal), against each exact value as a ``Fraction`` rounded once to nearest
   even (``round32``, checked against the host's float32 add, multiply and divide and basalt_emu's fma), on uniform
   patterns and planted classes, more than half of the rows with a subnormal operand or result: every exponent field,
@@ -544,7 +544,7 @@ kernel void h3_ieee(device const uint* a [[buffer(0)]], device const uint* b [[b
   device uint* o = out + 4 * i;
   o[0] = as_type<uint>(ieee_add(x, y));
   o[1] = as_type<uint>(ieee_mul(x, y));
-  o[2] = as_type<uint>(ieee_div(x, y));
+  o[2] = as_type<uint>(ieee_div_any(x, y));
   o[3] = as_type<uint>(ieee_fma_count(x, y, z));
 }
 """
@@ -817,7 +817,7 @@ def test_basalt_ieee_add_mul_div_fma_vs_fraction():
     for col, h in enumerate(host):
         assert np.array_equal(np.isnan(h), nan[:, col]), col
         assert np.array_equal(h.view(U32)[~nan[:, col]], want[~nan[:, col], col]), col
-    for col, name in enumerate(["ieee_add", "ieee_mul", "ieee_div", "ieee_fma_count"]):
+    for col, name in enumerate(["ieee_add", "ieee_mul", "ieee_div_any", "ieee_fma_count"]):
         g = got[:, col]
         bad = np.flatnonzero(np.where(nan[:, col], (g & U32(0x7FFFFFFF)) <= U32(INF32), g != want[:, col]))
         assert bad.size == 0, (f"{name}: {bad.size} of {len(a)} differ; first a={a[bad[0]]:#010x} b={b[bad[0]]:#010x} "
