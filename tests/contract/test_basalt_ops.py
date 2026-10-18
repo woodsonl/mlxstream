@@ -31,9 +31,9 @@ QK = kernels.Q8_1_BLOCK_BYTES
 
 # The tensors (name: (ggml type id, n_out, n_in)): every native_mmvq type at basalt's 2560 inputs, Q8_0 at 640 (the
 # shared expert's down, fed by the SwiGLU quantizer), every dense_tc type in every summation order at basalt's defaults
-# (170 multiprocessors, an aligned weight; "tile" at 2721 rows where a row is whole 16-byte units, so the one order's
-# 170 tiles are passed), the pair's types, and Q4_K at 2048 x 336, which 170 multiprocessors run in the one order and
-# 20 (PROFILE's cores) in the tile order. BF16 rows (name: (n_out, n_in)) live in the dense section, as basalt's do.
+# (170 multiprocessors, an aligned weight; "tile" at 2721 rows, 171 tiles, where a row is whole 16-byte units and 170
+# tiles would take the one order), the pair's types, and Q4_K at 2048 x 336, which 170 multiprocessors run in the one
+# order and 20 (PROFILE's cores) in the tile order. BF16 rows (name: (n_out, n_in)) live in the dense section, as basalt's do.
 DTC_IN = {"one": 2048, "tile": 512, "s2": 22528, "s1": 23040}
 MMVQ = {f"mmvq.{t}": (t, 70, 2560) for t in kernels.MMVQ_TRAITS}
 MMVQ["mmvq.down"] = (8, 70, 640)
@@ -82,11 +82,8 @@ def src(tmp_path_factory):
 
 # ---- graph builders (the GPU test uses them too) -------------------------------------------------------------------
 
-def weight(g, name, src=None, shape=None, fmt=None):
-    """The value that declares a gguf tensor or a BF16 dense row exactly (``gguf/`` a weight, ``dense/`` a constant),
-    or, with ``shape`` and ``fmt``, a weight of that format (a pack entry)."""
-    if shape is not None:
-        return g.weight(name, shape, fmt)
+def weight(g, name, src):
+    """The value that declares a gguf tensor or a BF16 dense row exactly (``gguf/`` a weight, ``dense/`` a constant)."""
     e = src.entries[name]
     if name.startswith("dense/"):
         return g.const(name, e.shape, DType.BF16)
@@ -123,10 +120,6 @@ def specs(prog, kind):
     return [o for o in prog.ops if o.name.startswith(kind + ":")]
 
 
-def kernel_of(prog, o):
-    return prog.kernels[o.kernel]
-
-
 def spliced(source):
     """A builder's source as the emitter registers it: the StepState struct after the prelude (``_Ctx.kernel``)."""
     return source.replace(kernels.PRELUDE, kernels.PRELUDE + StepStateLayout().to_msl() + "\n", 1)
@@ -134,28 +127,21 @@ def spliced(source):
 
 def all_ops(g, src):
     """Every kind over every tensor: one native q8_1 per input width, the SwiGLU into the Q8_0 down, the IEEE rows on
-    their own; returns {output name: (kind, weights)}."""
+    their own."""
     widths = sorted({e[2] for e in GGUF.values()})
     xs = {n: g.input(f"x{n}", (T, n), F32) for n in widths}
     xq = {n: q8_1(g, f"xq{n}", [xs[n]]) for n in widths}
     gate, up = g.input("gate", (T, 640), F32), g.input("up", (T, 640), F32)
     hq = q8_1(g, "hq", [gate, up], "swiglu")
     q8_1(g, "xq_ieee", [xs[2560]], "ieee")
-    out = {}
-    for name, (t, n_out, n_in) in {**MMVQ, **DTC, "order.q4_k": GGUF["order.q4_k"]}.items():
+    for name, (_, _, n_in) in {**MMVQ, **DTC, "order.q4_k": GGUF["order.q4_k"]}.items():
         kind = "basalt_mmvq" if name.startswith("mmvq.") else "basalt_dense_tc"
-        w = weight(g, f"gguf/{name}", src)
-        gemv(g, kind, f"y.{name}", hq if name == "mmvq.down" else xq[n_in], w)
-        out[f"y.{name}"] = (kind, [w])
+        gemv(g, kind, f"y.{name}", hq if name == "mmvq.down" else xq[n_in], weight(g, f"gguf/{name}", src))
     for a, b in PAIRS:
-        ws = [weight(g, f"gguf/pair.{a}.{b}.{m}", src) for m in (0, 1)]
-        gemv(g, "basalt_dense_tc_pair", f"y.pair.{a}.{b}", xq[2560], *ws)
-        out[f"y.pair.{a}.{b}"] = ("basalt_dense_tc_pair", ws)
+        gemv(g, "basalt_dense_tc_pair", f"y.pair.{a}.{b}", xq[2560],
+             *[weight(g, f"gguf/pair.{a}.{b}.{m}", src) for m in (0, 1)])
     for name in BF16:
-        w = weight(g, f"dense/{name}", src)
-        gemv(g, "basalt_mmvf", f"y.{name}", xs[2560], w)
-        out[f"y.{name}"] = ("basalt_mmvf", [w])
-    return out
+        gemv(g, "basalt_mmvf", f"y.{name}", xs[2560], weight(g, f"dense/{name}", src))
 
 
 # ---- registration, and each dispatch against the builders ----------------------------------------------------------
@@ -185,9 +171,8 @@ def expected(gop, src, t):
         n = t * gop.inputs[0].shape[1]
         return (Q8_1_FUNCTIONS[gop.attrs["quantizer"]], {}, kernels.basalt_q8_1_source(), kernels.basalt_q8_1_params(n),
                 -(-n // 256), 256)
-    (t0, *rest), n_in = [(src.entries[w.name].type_id, src.entries[w.name].shape[0]) for w in gop.inputs[1:]], \
-        src.entries[gop.inputs[1].name].shape[1]
-    tid, n_out = t0
+    ws = [src.entries[w.name] for w in gop.inputs[1:]]
+    tid, (n_out, n_in) = ws[0].type_id, ws[0].shape
     if gop.kind == "basalt_mmvq":
         m = kernels.basalt_mmvq_macros(tid, n_in, t)
         return ("basalt_mmvq", m, kernels.basalt_mmvq_source(), kernels.basalt_mmvq_params(n_in, n_out),
@@ -197,7 +182,7 @@ def expected(gop, src, t):
         return ("basalt_dense_tc", m, kernels.basalt_dense_tc_source(), kernels.basalt_dense_tc_params(n_in, n_out, t),
                 *kernels.basalt_dense_tc_grid(m, n_out))
     if gop.kind == "basalt_dense_tc_pair":
-        (t1, n_out1), = rest
+        t1, n_out1 = ws[1].type_id, ws[1].shape[0]
         m = kernels.basalt_dense_tc_pair_macros(tid, t1, n_in)
         return ("basalt_dense_tc_pair", m, kernels.basalt_dense_tc_source(),
                 kernels.basalt_dense_tc_params(n_in, n_out, t, n_out1), *kernels.basalt_dense_tc_pair_grid(n_out, n_out1))
@@ -266,15 +251,19 @@ def test_q8_1_rows_reach_their_readers_behind_a_barrier(src):
 
 # ---- refusals: each case's valid input emits, and the same input with its one defect is refused by its own check ---
 
-def pack(directory, entries):
+def pack(directory, entries, slab=False):
     """A pack of zeros whose aux entries ``{name: (offset, nbytes)}`` sit at those offsets: the only route to a
-    misaligned binding (a .basalt entry binds at a multiple of 16, ``basalt_windows``; activations at whole rows)."""
+    misaligned binding (a .basalt entry binds at a multiple of 16, ``basalt_windows``; activations at whole rows).
+    ``slab``: the entries are block-lane-major bf16 slabs instead, one row-scale word each after the last."""
     directory.mkdir()
-    size = -(-max(o + n for o, n in entries.values()) // ALIGN) * ALIGN
+    end = max(o + n for o, n in entries.values())
+    size = -(-(end + 4 * len(entries)) // ALIGN) * ALIGN
     (directory / "weights.pack").write_bytes(bytes(size))
+    rows = [{"name": n, "offset": o, "nbytes": nb, "dtype": "U8", "shape": [nb]} for n, (o, nb) in entries.items()]
+    slabs = [dict(r, format="bf16", n=1, row_scales_offset=end + 4 * i) for i, r in enumerate(rows)] if slab else []
     (directory / "manifest.json").write_text(json.dumps({
-        "version": 2, "alignment": ALIGN, "pack": "weights.pack", "nbytes": size, "slabs": [],
-        "aux": [{"name": n, "offset": o, "nbytes": nb, "dtype": "U8", "shape": [nb]} for n, (o, nb) in entries.items()]}))
+        "version": 2, "alignment": ALIGN, "pack": "weights.pack", "nbytes": size, "slabs": slabs,
+        "aux": [] if slab else rows}))
     return PackFile(directory)
 
 
@@ -370,6 +359,13 @@ def _mmvf_x_width(g, src, bad, tmp):
     return {}
 
 
+def _blm_slab(g, src, bad, tmp):
+    """The same bytes as a pack's aux entry (rows as stored) or as its bf16 slab (re-laid-out lanes)."""
+    w = g.weight("p", (128, 2560), "bf16")
+    gemv(g, "basalt_mmvf", "y", g.input("x", (T, 2560), F32), w)
+    return {"packs": [pack(tmp, {"p": (0, 128 * 2560 * 2)}, slab=bad)]}
+
+
 def _aligned(kind, slot, offset):
     """``kind`` with the value of kernel slot ``slot`` read from a pack entry at byte 16 (valid) or ``offset``."""
     def build(g, src, bad, tmp):
@@ -408,7 +404,8 @@ REFUSALS = [
     ("mmvq rows of another input", _xq_width, r"is u8 \[2, 720\], not u8 \[2, 2880\] \(q8_1 rows of the weight's"),
     *[(f"{k} output wider than its rows", _out_width(k, 2), "contiguous columns of the weight's rows")
       for k in ("basalt_mmvq", "basalt_dense_tc", "basalt_dense_tc_pair", "basalt_mmvf")],
-    ("mmvf ldy < n_out", _out_width("basalt_mmvf", -1), r"would overlap \(ldy >= n_out\)"),
+    ("mmvf ldy < n_out", _out_width("basalt_mmvf", -1), r"holds 127 values a row .* so ldy >= n_out"),
+    ("mmvf on a BLM bf16 slab", _blm_slab, "is a block-lane-major pack slab, not rows as stored"),
     ("mmvf input wider than its weight", _mmvf_x_width, "contiguous columns of the weight's width"),
     ("pair over two input widths", _pair_inputs, "the pair reads one input"),
     ("q8_1 input off 4 bytes", _aligned("basalt_q8_1", 0, 2), "slot 0 needs 4-byte alignment"),

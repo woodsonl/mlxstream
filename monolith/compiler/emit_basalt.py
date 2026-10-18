@@ -37,12 +37,15 @@ def _expect(ctx: _Ctx, op: Op, v: Value, shape: Tuple[int, int], dtype: DType, w
 
 def _weight(ctx: _Ctx, op: Op, w: Value, types: Sequence[int]) -> Tuple[int, int, int]:
     """``(ggml type id, n_out, n_in)`` of a weight as shipped: a weight whose format, or a constant whose dtype, names a
-    ggml type in ``types``, ``[n_out, n_in]`` values."""
+    ggml type in ``types``, ``[n_out, n_in]`` values, and not a pack's block-lane-major slab (a ``bf16`` slab's rows
+    are re-laid-out; the kernels read rows as stored)."""
     name = w.format if w.is_weight else w.dtype.short if w.is_const else None
     shape = ctx.shape(w)
     if GGML_IDS.get(name) not in types or len(shape) != 2 or min(shape) < 1:
         raise ValueError(f"{op.kind}: the weight {w.name!r} ({name} {list(shape)}) is not a weight or constant "
                          f"[n_out, n_in] of ggml type {sorted(GGML_TYPES[t][0] for t in types)}")
+    if any(w.name in pk.slabs for pk in ctx.packs):
+        raise ValueError(f"{op.kind}: the weight {w.name!r} is a block-lane-major pack slab, not rows as stored")
     return GGML_IDS[name], shape[0], shape[1]
 
 
@@ -139,8 +142,8 @@ def _mmvf(ctx: _Ctx, op: Op) -> None:
     _, n_out, n_in = _weight(ctx, op, w, (GGML_IDS["bf16"],))
     ldy = ctx.shape(y)[-1]
     if ldy < n_out:                  # basalt never checks it: every call passes ldy == n_out
-        raise ValueError(f"basalt_mmvf: {y.name!r} rows hold {ldy} values and the weight has {n_out} rows; the rows "
-                         "of a multi-row call, at multiples of ldy, would overlap (ldy >= n_out)")
+        raise ValueError(f"basalt_mmvf: {y.name!r} holds {ldy} values a row and the weight has {n_out} rows; output "
+                         "row k starts at k * ldy, so ldy >= n_out")
     macros = kernels.basalt_mmvf_macros(n_in, n_out, t)
     _expect(ctx, op, x, (t, n_in), DType.F32, "contiguous columns of the weight's width")
     _expect(ctx, op, y, (t, n_out), DType.F32, "contiguous columns of the weight's rows")
