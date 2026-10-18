@@ -1,5 +1,6 @@
 // nanobind layer over metal_core: keeps Python free of Objective-C and the core free of Python.
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -10,7 +11,9 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <tuple>
+#include "basalt_cpu_expf.h"
 #include "metal_core.h"
 
 namespace nb = nanobind;
@@ -90,6 +93,19 @@ static int runner_clear(PyObject* self) {
 }
 static PyType_Slot callable_task_slots[] = {{Py_tp_traverse, (void*)callable_task_traverse}, {Py_tp_clear, (void*)callable_task_clear}, {0, nullptr}};
 static PyType_Slot runner_slots[] = {{Py_tp_traverse, (void*)runner_traverse}, {Py_tp_clear, (void*)runner_clear}, {0, nullptr}};
+
+// ---- basalt's CPU expf and SwiGLU (basalt_cpu_expf.h) ---------------------------------------------------------
+// Caller-owned float32 arrays, so the test can sweep a range in one call and so a bit pattern reaches the kernel
+// unchanged: a scalar argument would cross Python as a double, and float -> double -> float quiets a signalling
+// NaN on the way. nanobind refuses a wrong dtype, rank or layout (the arguments are .noconvert(), so it cannot
+// quietly write into a copy); the lengths are checked here, as a kernel writing through a raw pointer must be.
+namespace bc = monolith::basalt_cpu;
+using F32In1 = nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+using F32Out1 = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+
+static void need(bool ok, const char* what) {
+  if (!ok) throw std::invalid_argument(what);
+}
 
 NB_MODULE(_native, m) {
   m.doc() = "Metal runtime core (v0): device, buffers, runtime-compiled libraries, pipelines, timed dispatches";
@@ -196,4 +212,26 @@ NB_MODULE(_native, m) {
            nb::arg("points"), nb::arg("error_offset"), nb::arg("timeout_ms") = 20000, nb::arg("spin_us") = 20000)
       .def("host_tasks", &Runner::host_tasks, "the installed tasks, one per host point in program order")
       .def("drain", &Runner::drain);
+
+  m.def("basalt_expf", [](F32In1 x, F32Out1 out) {
+    need(out.shape(0) == x.shape(0), "basalt_expf: out must hold as many floats as x");
+    const size_t n = x.shape(0);
+    const float* xp = x.data();
+    float* op = out.data();
+    nb::gil_scoped_release unlock;
+    for (size_t i = 0; i < n; ++i) op[i] = bc::expf_glibc(xp[i]);
+  }, nb::arg("x").noconvert(), nb::arg("out").noconvert(),
+     "glibc's expf, element by element: out[i] = expf_glibc(x[i])");
+
+  m.def("basalt_swiglu", [](F32In1 g, F32In1 u, F32Out1 out) {
+    need(u.shape(0) == g.shape(0) && out.shape(0) == g.shape(0),
+         "basalt_swiglu: g, u and out must hold the same number of floats");
+    const size_t n = g.shape(0);
+    const float* gp = g.data();
+    const float* up = u.data();
+    float* op = out.data();
+    nb::gil_scoped_release unlock;
+    for (size_t i = 0; i < n; ++i) op[i] = bc::swiglu(gp[i], up[i]);
+  }, nb::arg("g").noconvert(), nb::arg("u").noconvert(), nb::arg("out").noconvert(),
+     "basalt's CPU SwiGLU (pool.cpp:434): out[i] = (g[i] / (1.f + expf_glibc(-g[i]))) * u[i]");
 }

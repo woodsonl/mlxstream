@@ -12,8 +12,12 @@ if(NOT NB_RC EQUAL 0)
 endif()
 list(APPEND CMAKE_PREFIX_PATH "${NB_DIR}")
 find_package(nanobind CONFIG REQUIRED)
-nanobind_add_module(_native NB_STATIC src/native.mm src/metal_core.mm)
+nanobind_add_module(_native NB_STATIC src/native.mm src/metal_core.mm src/basalt_cpu_expf.cpp)
 set_source_files_properties(src/native.mm src/metal_core.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+# The transcribed expf evaluates its polynomial as separate multiplies and adds, as the source it comes from does;
+# a contracted fma would be a different function, not a faster one (runtime/src/basalt_cpu_expf.cpp, WHAT MAY FUSE).
+# The Metal core keeps the default.
+set_source_files_properties(src/basalt_cpu_expf.cpp PROPERTIES COMPILE_FLAGS "-ffp-contract=off")
 target_include_directories(_native PRIVATE src)
 target_link_libraries(_native PRIVATE "-framework Metal" "-framework Foundation" "-framework IOKit")
 set(LITHOS_METAL_NATIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/monolith/runtime" CACHE PATH "Python extension output directory")
