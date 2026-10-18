@@ -17,7 +17,8 @@ case that drifts into a harmless regime would otherwise still pass.
 Group C is the answer to "both sides could be wrong together": golden constants recorded from basalt's own kernels
 running on an AVX-512 machine (a Xeon Platinum 8488C, GCC 14.3, basalt's Release flags), which depend on neither
 the port nor the numpy reference. They are cited as ``pr21-x86-ground-truth.md:<line>``, the PR #21 reviewer's
-measurement at ``.context/basalt-port/pr21-ground-truth/`` beside basalt's checkout.
+measurement at ``.context/basalt-port/pr21-ground-truth/`` beside basalt's checkout. C5's are that measurement's
+per-site rows composed through its lane model ``mo::row``, which matched basalt's kernel there bit for bit.
 
 Two values are compiler-dependent, and both are pinned here rather than hidden. ``amax`` when a chunk holds a NaN:
 ``_mm512_reduce_max_ps`` is header-defined, and GCC's first two levels pass the high half to MAXPS as SRC1 where
@@ -33,7 +34,8 @@ contraction trap, A10 the reciprocal's witness. B, ``q2_0_gguf_rows_multi``: B1 
 independence, B3 the row ranges and the absolute-index write, B4 stride padding, B5 the unread tail, B6 all 65,536
 fp16 block scales, B7 adversarial activations, B8 the independent float64 check, B9 determinism. C, the recorded
 x86 values: C1 the five end-to-end fixtures, C2 the quantizer's own outputs, C3 the nine site probes, C4 the
-per-site NaN tables.
+per-site NaN tables, C5 those tables' rows through the kernel - signaling NaNs in scale and hx, the NaNs sites 1
+and 2 create, the acc tree's last three levels.
 
 Fixtures are the repository's: ``random_rows`` (test_basalt_experts, basalt's own Q2_0 row fixture - random code
 bytes with a finite fp16 scale per block) for the bitwise cases, and ``quantize_q2_0`` (test_basalt_iq_parity,
@@ -44,7 +46,12 @@ A4, A5, A6 and A8; Clang's operand order in ``reduce_max_ps`` fails A6 alone; ``
 basalt's ``1.f / s`` fails A10 alone; a reversed unpack shift fails every B case; and the same reversed shift
 applied to the emulator as well - a misreading the kernel and its reference share - fails B8 alone, which is what
 B8 is for. Group C catches the third kind, where both sides move together: swapping the add tree's level-3
-operands in the *reference* fails C3's P2 probe, which no kernel-side mutation could have shown.
+operands in the *reference* fails C3's P2 probe, which no kernel-side mutation could have shown. And ``x86_row``'s
+NaN rules, mutated one site at a time - a wrong priority, an SNaN-first rule, the hardware's own NaN, a missing
+quieting, the default NaN for a created one, a swapped tree operand - fail a C case wherever the mutant can change
+``res``. Those that survive cannot: dd, P, acc, corr and the trees' sums are never SNaNs and D is never a NaN, a
+quieting skipped at one site is applied at the next, a NaN dd makes ``A`` a NaN, which outranks ``B`` whatever site 2
+picked, and the zero sign of a masked ``corr`` lane never reaches ``res``, because ``A`` is never -0.0.
 
 Run with ``-s`` for the A6 Clang-order table, the A8 pre-clamp margin and the B7 cancellation residue.
 """
@@ -580,9 +587,10 @@ def test_b10_a_bound_that_would_overflow_still_refuses(name, w_len, row_bytes, n
 
 # ---- C. the recorded x86 ground truth -----------------------------------------------------------------------------
 #
-# Every value below was measured by running basalt's own kernels on an AVX-512 machine (module docstring); none of
-# it comes from this port or from the numpy reference, which is the point of the group. Citations are lines of
-# ``pr21-x86-ground-truth.md``.
+# Every value in C1-C4 was measured by running basalt's own kernels, or the instructions they emit, on an AVX-512
+# machine (module docstring); C5's compose those measured rows through the reviewer's hardware-validated lane model.
+# None of it comes from this port or from the numpy reference, which is the point of the group. Citations are lines
+# of ``pr21-x86-ground-truth.md``.
 
 GT = "pr21-x86-ground-truth.md"
 PX, PY = 0x7FC000A1, 0x7FC000B1                  # the two planted payloads of the site probes (GT:307-309)
@@ -748,28 +756,31 @@ def probe(pat):
 
 
 @pytest.mark.parametrize(
-    "pat, golden, what",
-    [(0, PY, "add tree level 1, corr lanes 0 and 8: SRC1 is the high half"),
-     (1, PY, "add tree level 2, corr lanes 0 and 4: SRC1 is the high quarter"),
-     (2, PY, "add tree level 3, corr lanes 0 and 2: SRC1 is the shuffle, in every slot of every GCC (GT:342)"),
-     (3, PX, "add tree level 4, corr lanes 0 and 1: SRC1 is lane 0"),
-     (4, PY, "add tree level 1 on acc, lanes 0-7 against 8-15"),
-     (5, PX, "site 5, vsubss: the acc sum is SRC1 and outranks the corr sum"),
-     (6, PY, "site 2, vfmadd231ps corr, dd, hx: hx outranks the accumulated corr"),
-     (7, PY, "site 3, vfmadd231ps acc, P, D: P outranks the accumulator"),
-     (8, 0x7FC0A000, "site 1, vmulps: dd is SRC1 and outranks a QNaN scale")],
+    "pat, golden, cite, what",
+    [(0, PY, "313", "add tree level 1, corr lanes 0 and 8: SRC1 is the high half"),
+     (1, PY, "313", "add tree level 2, corr lanes 0 and 4: SRC1 is the high quarter"),
+     (2, PY, "313", "add tree level 3, corr lanes 0 and 2: SRC1 is the shuffle, in every slot of every GCC (GT:342)"),
+     (3, PX, "313", "add tree level 4, corr lanes 0 and 1: SRC1 is lane 0"),
+     (4, PY, "313", "add tree level 1 on acc, lanes 0-7 against 8-15"),
+     (5, PX, "351", "site 5, vsubss: the acc sum is SRC1 and outranks the corr sum"),
+     (6, PY, "231", "site 2, vfmadd231ps corr, dd, hx: hx outranks the accumulated corr"),
+     (7, PY, "251", "site 3, vfmadd231ps acc, P, D: P outranks the accumulator"),
+     (8, 0x7FC0A000, "209", "site 1, a QNaN dd against a QNaN scale in chunk 0 only: the one-token tree takes "
+                            "chunk 1's lanes, where dd meets 1.0, so C5 isolates site 1")],
 )
-def test_c3_the_site_probes(pat, golden, what):
+def test_c3_the_site_probes(pat, golden, cite, what):
     """C3. Each probe plants two payloads where one site decides between them, and the golden is x86's answer for
-    a ONE-token job (GT:313). That column is what the port pins for every token slot, so the same value is also
-    asserted at nt = 2 - where x86 itself would answer differently for P0, P1, P3 and P4 (GT:314), because GCC
-    reassigns the add tree's operands per token and basalt's own output there stops being the single-token job's
-    (pool.hpp:54-55). Pinning is the deliberate divergence; the fixed value is checked, not assumed."""
+    a ONE-token job (GT:313 for P0-P4; P5-P8 gave one answer in every slot, at the line each cites). That column is
+    what the port pins for every token slot, so the same value is also asserted at nt = 2 - where x86 itself would
+    answer differently for P0, P1, P3 and P4 (GT:314), because GCC reassigns the add tree's operands per token and
+    basalt's own output there stops being the single-token job's (pool.hpp:54-55). Pinning is the deliberate
+    divergence; the fixed value is checked, not assumed."""
     w, nblocks, act = probe(pat)
     for ntok in (1, 2):
         out = check_rows(w, BB * nblocks, nblocks, tiled(act, ntok), 1, what=f"C3 P{pat} nt={ntok}")
         got = out.view(np.uint32).reshape(-1)
-        assert np.all(got == golden), f"P{pat} ({what}) nt={ntok}: {[hex(int(v)) for v in got]} != {hex(golden)}"
+        assert np.all(got == golden), \
+            f"P{pat} ({what}) nt={ntok}: {[hex(int(v)) for v in got]} != {hex(golden)} ({GT}:{cite})"
 
 
 SITE1 = [(PZERO, INF, INDEF), (INF, PZERO, INDEF), (NZERO, INF, INDEF), (0x7FC02000, ONE, 0x7FC02000),
@@ -812,3 +823,62 @@ def test_c4_the_per_site_nan_tables():
     for half, want in HALVES:
         got = u32(emu.h2f(np.uint16(half)))
         assert got == want, f"vcvtph2ps ({GT}:142-146): h2f({hex(half)}) = {hex(got)} != {hex(want)}"
+
+
+SNAN2 = 0xFF80000E                               # a second SNaN, sign set: site 5's B below
+
+
+def planted(nblocks, plants, d0, zero_byte):
+    """The probes' shape: q = 1 everywhere, scale and hx +0.0 but for the plants, block 0's fp16 d = ``d0`` and every
+    other block's 1.0, code bytes 0x55 - except block 0's byte ``zero_byte``, whose four codes are 0, which leaves
+    acc lane ``zero_byte`` alone with a zero dot."""
+    q, scale, hx = np.ones(H, np.int8), np.zeros(MAXC, F32), np.zeros(MAXC, F32)
+    for arr, idx, bits in plants:
+        {"scale": scale, "hx": hx}[arr][idx] = f32(bits)
+    w = packed_row([(d0, 0x55)] + [(0x3C00, 0x55)] * (nblocks - 1))
+    if zero_byte is not None:
+        w[2 + zero_byte] = 0
+    return w, nblocks, (q, scale, hx)
+
+
+# id, nblocks, block 0's d, plants, block 0's zero code byte, golden, the rows that decide it
+MODEL_GOLDENS = [
+    ("s1-snan-scale", 1, 0x3C00, (("scale", 0, SNAN), ("scale", 1, SNAN)), None, 0x7FC0000D, "212"),
+    ("s1-qnan-dd-over-snan-scale", 1, 0x7E01, (("scale", 0, SNAN), ("scale", 1, SNAN)), None, 0x7FC02000, "142, 214"),
+    ("s1-snan-half-over-snan-scale", 1, 0x7D01, (("scale", 0, SNAN), ("scale", 1, SNAN)), None, 0x7FE02000,
+     "143, 215"),
+    ("s1-zero-times-inf", 1, 0x0000, (("scale", 0, INF), ("scale", 1, INF)), None, INDEF, "204"),
+    ("s2-snan-hx", 1, 0x3C00, (("hx", 0, SNAN),), None, 0x7FC0000D, "236"),
+    ("s2-snan-hx-over-qnan-corr", 9, 0x3C00, (("hx", 0, PX), ("hx", 16, SNAN)), None, 0x7FC0000D, "237"),
+    ("s2-zero-times-inf", 1, 0x0000, (("hx", 0, INF),), None, INDEF, "223"),
+    ("s3-quieted-snan-p-over-qnan-acc", 2, 0x3C00, (("scale", 0, PX), ("scale", 2, SNAN)), None, 0x7FC0000D,
+     "212, 251"),
+    ("s4-level-1-high-half", 8, 0x3C00, (("hx", 0, SNAN), ("hx", 8, PY)), None, PY, "236, 270"),
+    ("s4-acc-levels-2-to-4", 1, 0x3C00, (("scale", 0, PX), ("scale", 1, INF)), 14, INDEF, "247, 270"),
+    ("s5-quieted-snans-a-over-b", 1, 0x3C00, (("scale", 0, SNAN), ("hx", 0, SNAN2)), None, 0x7FC0000D, "212, 351"),
+]
+
+
+@pytest.mark.parametrize("name, nblocks, d0, plants, zero_byte, golden, cite", MODEL_GOLDENS,
+                         ids=[case[0] for case in MODEL_GOLDENS])
+def test_c5_the_site_rows_through_the_kernel(name, nblocks, d0, plants, zero_byte, golden, cite):
+    """C5. C4's rows through the kernel, where no recorded fixture or probe takes them: a signaling NaN in
+    ``scale`` or ``hx``, alone (its quieting) and against a QNaN at each site it meets; the indefinite that sites 1
+    and 2 create from ``+0 * +inf``; and the acc tree's levels 2-4, which the probes reach on the corr tree only
+    (lane 14's ``+inf * 0`` is the one indefinite among X's, so a swapped operand at level 2, 3 or 4 gives X).
+
+    These goldens were not recorded end to end. Each composes measured rows (cited) through ``mo::row``, the
+    reviewer's lane model, which matched basalt's kernel bit for bit on the AVX-512 host over 62,374 outputs
+    (GT:355-371), with GCC 14.3's one-token tree order - asserted at every nt, because the port pins that order for
+    every token slot (C3).
+
+    Each case fails a mutant of ``x86_row`` that picks the wrong NaN at its site, and the mutants the rest of the
+    suite let through fail here: an SNaN-first or SRC2-first ``vmulps`` and the hardware's own FMUL (the site 1 dd
+    cases), a missing quieting (the lone SNaNs), the default NaN 0x7fc00000 for a created one (the ``+0 * +inf``
+    cases), and a swapped operand at the acc tree's levels 2-4."""
+    w, nblocks, act = planted(nblocks, plants, d0, zero_byte)
+    for ntok in range(1, MAXT + 1):
+        out = check_rows(w, BB * nblocks, nblocks, tiled(act, ntok), 1, what=f"C5 {name} nt={ntok}")
+        got = out.view(np.uint32).reshape(-1)
+        assert np.all(got == golden), \
+            f"{name} nt={ntok}: {[hex(int(v)) for v in got]} != {hex(golden)} ({GT}:{cite} through mo::row)"
