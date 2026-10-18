@@ -55,8 +55,8 @@ def _weight(ctx: _Ctx, op: Op, w: Value, types: Sequence[int]) -> Tuple[int, int
     tid, (n_out, n_in) = GGML_IDS[name], shape
     aux = next((pk.aux[w.name] for pk in ctx.packs if w.name in pk.aux), None)
     if aux is not None and int(aux["nbytes"]) != (need := n_out * ggml_row_bytes(tid, n_in)):
-        raise ValueError(f"{op.kind}: the weight {w.name!r} is {need} bytes of {name} {list(shape)}, but its pack entry "
-                         f"holds {aux['nbytes']}")
+        raise ValueError(f"{op.kind}: the weight {w.name!r} is {need} bytes of {name} {list(shape)}, but its pack "
+                         f"entry holds {aux['nbytes']}")
     return tid, n_out, n_in
 
 

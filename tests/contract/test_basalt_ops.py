@@ -32,9 +32,9 @@ QK = kernels.Q8_1_BLOCK_BYTES
 # The tensors (name: (ggml type id, n_out, n_in)): every native_mmvq type at basalt's 2560 inputs, Q8_0 at 640 (the
 # shared expert's down, fed by the SwiGLU quantizer), every dense_tc type in every summation order at basalt's defaults
 # (170 multiprocessors, an aligned weight; "tile" at 2721 rows, 171 tiles, where a row is whole 16-byte units and 170
-# tiles would take the one order), the pair's types, and Q4_K at 2048 x 336, which 170 multiprocessors run in the one
-# order and 20 (PROFILE's cores) in the tile order. BF16 rows (name: (n_out, n_in)) live in the dense section, as
-# basalt's do.
+# tiles would take the one order), the pair's types, and Q4_K at 2048 x 2720, 170 tiles, which 170 multiprocessors run
+# in the one order and any fewer (PROFILE's 20, this M3 Max's 40) in the tile order. BF16 rows (name: (n_out, n_in))
+# live in the dense section, as basalt's do.
 DTC_IN = {"one": 2048, "tile": 512, "s2": 22528, "s1": 23040}
 MMVQ = {f"mmvq.{t}": (t, 70, 2560) for t in kernels.MMVQ_TRAITS}
 MMVQ["mmvq.down"] = (8, 70, 640)
@@ -42,7 +42,7 @@ DTC = {f"dtc.{t}.{o}": (t, 2721 if o == "tile" and DTC_IN[o] // 256 * sb % 16 ==
        for t, sb in kernels.DENSE_TC_SB.items() for o in DTC_IN}
 PAIRS = [(14, 23), (12, 11), (42, 13)]                  # (w0, w1) types at 2560 inputs, 35 and 18 rows
 PAIR = {f"pair.{a}.{b}.{m}": (ty, (35, 18)[m], 2560) for a, b in PAIRS for m, ty in enumerate((a, b))}
-GGUF = {**MMVQ, **DTC, **PAIR, "order.q4_k": (12, 336, 2048)}
+GGUF = {**MMVQ, **DTC, **PAIR, "order.q4_k": (12, 2720, 2048)}
 BF16 = {"mmvf.q": (128, 2560), "mmvf.gate": (1, 2560)}
 
 
@@ -481,18 +481,19 @@ def test_ieee_q8_1_takes_any_column_count(src):
 
 
 def test_dense_tc_order_is_basalts_not_this_gpus(src, tmp_path):
-    """Q4_K at 2048 x 336 (21 tiles): basalt's 170 multiprocessors run the one order, PROFILE's 20 cores would give the
-    tile order, and a weight off a 16-byte boundary the KS 2 order. The emitted order stays basalt's for the file's
-    weight and for the same shape bound at byte 8 of a pack (4-byte aligned, which dense_tc takes)."""
+    """Q4_K at 2048 x 2720 (170 tiles): basalt's 170 multiprocessors run the one order, any fewer cores would give the
+    tile order (PROFILE's 20, this M3 Max's 40, every Apple GPU's), and a weight off a 16-byte boundary the KS 1 order.
+    The emitted order stays basalt's for the file's weight and for the same shape bound at byte 8 of a pack (4-byte
+    aligned, which dense_tc takes)."""
     rule = kernels.basalt_dense_tc_variant
-    assert (rule(12, 2048, 336), rule(12, 2048, 336, sm_count=PROFILE.gpu_cores), rule(12, 2048, 336, aligned=False)) \
-        == ("one", "tile", "s2")
+    assert (rule(12, 2048, 2720), rule(12, 2048, 2720, aligned=False)) == ("one", "s1")
+    assert {rule(12, 2048, 2720, sm_count=n) for n in range(1, 170)} == {"tile"}
     for at in (None, 8):
         g = Graph("step")
         xq = q8_1(g, "xq", [g.input("x", (T, 2048), F32)])
-        w = weight(g, "gguf/order.q4_k", src) if at is None else g.weight("p", (336, 2048), "q4_k")
+        w = weight(g, "gguf/order.q4_k", src) if at is None else g.weight("p", (2720, 2048), "q4_k")
         gemv(g, "basalt_dense_tc", "y", xq, w)
-        prog = emit(g, src, 4, [] if at is None else [pack(tmp_path / "p", {"p": (at, 336 * 1152)})])
+        prog = emit(g, src, 4, [] if at is None else [pack(tmp_path / "p", {"p": (at, 2720 * 1152)})])
         (o,) = specs(prog, "basalt_dense_tc")
         assert o.bindings[0][2] % 16 == (0 if at is None else 8)
         assert prog.kernels[o.kernel].macros == {"DTC_TYPE": "12", "DTC_ORDER": "0"}
