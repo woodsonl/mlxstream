@@ -8,8 +8,8 @@ extends the per-site pages of `docs/research/basalt-nvcc/` (`docs/design/flash-n
 records of each store's last instruction.
 
 Basalt paths are relative to commit `b4c63b55754637f4c72ad53a0f791d425f71eb36`; `path:a-b` means lines a to b there,
-and a bare `:N` is a line of the file named last. Evidence tags as in `CLAUDE.md`: [M] measured by us, [S] a
-specification, [H] inferred.
+and a bare `:N` is a line of the file named last. Evidence tags on this page: [M] measured by us, [S] a
+vendor specification (here NVIDIA's PTX ISA; `CLAUDE.md` keeps [S] for Apple's), [H] inferred.
 
 ## Method
 
@@ -98,7 +98,7 @@ where a page records only an instruction pair and a count, the row says so.
 | Metal kernel: store | basalt | Last instruction on sm_120 | NaN reaches it | sm_120 | This GPU, unrewritten | Port |
 |---|---|---|---|---|---|---|
 | `native_quantize_q8_1`, `native_swiglu_quantize_q8_1`: codes | `native_mmvq.cu:157`, `:175` | `F2I.FTZ.TRUNC.NTZ` (`matvec.md` section 1) | never: a NaN quotient converts to 0 | 0 [S] (`cvt` rule) | 0 (`q8_1_code`) | no change |
-| the same: fp16 d and sum | `native_mmvq.cu:158`, `:176`; `q8_1_finite.hpp:29-31` | `F2FP.F16.F32.PACK_AB R13, R13, R0` of `FMUL.FTZ` (d) and `FADD.FTZ` (sum) through `FSEL` (section 1) | sum: a NaN lane, or +inf and −inf in one block (`FADD.FTZ` butterfly); d: every lane NaN (`FMNMX.FTZ` of NaNs, then `FMUL.FTZ`); the SwiGLU's value is NaN for a NaN gate, a −inf gate (`__fdividef(−inf, inf)` is −inf · `MUFU.RCP`(inf) = −inf · 0) or a NaN up | 0x7fff [H] (`F2FP` row; the NaN in is `FMUL.FTZ`'s or `FADD.FTZ`'s 0x7fffffff) | 0x7e00 | `cuda_nan_f16` in `q8_1_put` |
+| the same: fp16 d and sum | `native_mmvq.cu:158`, `:176`; `q8_1_finite.hpp:29-31` | `F2FP.F16.F32.PACK_AB R13, R13, R0` of `FMUL.FTZ` (d) and `FADD.FTZ` (sum) through `FSEL` (section 1) | sum: a NaN lane, or +inf and −inf in one block (`FADD.FTZ` butterfly); d: every lane NaN (`FMNMX.FTZ` of NaNs, then `FMUL.FTZ`); the SwiGLU's value is NaN for a NaN gate, a −inf gate (`__fdividef(−inf, inf)` is −inf · `MUFU.RCP`(inf) = −inf · 0), a NaN up, or inf · 0 in the `__fmul_rn` product (`native_mmvq.cu:170`) | 0x7fff [H] (`F2FP` row; the NaN in is `FMUL.FTZ`'s or `FADD.FTZ`'s 0x7fffffff) | 0x7e00 | `cuda_nan_f16` in `q8_1_put` |
 | `quantize_q8_1`: codes | `iq_kernels.cu:1892` | `F2I.TRUNC.NTZ` (section 3) | never | 0 [S] (`cvt` rule) | 0 | no change |
 | `quantize_q8_1`: fp16 d and sum | `iq_kernels.cu:1893` | `F2FP.F16.F32.PACK_AB` of the `div.rn.f32` sequence (d) and `FADD` (sum) (section 3 records no registers) | as above; d = NaN / 127 for an all-NaN block | 0x7fff [H] (`F2FP` row; the NaN in is `div.rn.f32`'s or `FADD`'s 0x7fffffff) | 0x7e00 | `cuda_nan_f16` in `q8_1_put` |
 | `basalt_mmvq`: y, one and several columns | `native_mmvq.cu:281`, `:347`, `:435`, `:517`, `:615`, `:689`, `:800`, `:878`, `:1148` | `SHFL.BFLY` + `FADD.FTZ` ×5, the last add stored (`matvec.md` sections 4, 6 record the pair, no register line) | a weight's fp16 d or dmin inf against a zero integer dot or a zero d8, or NaN; a NaN d8, or a NaN s8 in Q4_0 and Q5_0 | 0x7fffffff [H] (`FADD` row) | 0x7fc00000 | `cuda_nan` |
@@ -124,14 +124,14 @@ where a page records only an instruction pair and a count, the row says so.
 | `basalt_q5k_proxy_score`: cand score | `head_proxy.cuh:164` | a score's bits through `SHFL` and `FSEL` (`FSETP.GEU.FTZ` / `FSETP.NEU.FTZ`, section 4.2): `FADD.FTZ R4, R4, R7` (`:146`) or the constant −inf (`:147`) | a NaN score: no compare selects a NaN over a number, and lane 0 keeps its own NaN | 0x7fffffff [H] (`FADD` row; `FSEL` keeps the bits) | 0x7fc00000 | `cuda_nan` |
 | `basalt_q5k_proxy_score`: cand row | `head_proxy.cuh:164` | an int's bits | not a float value | | | no change |
 | `basalt_q5k_proxy_final`: out_prob | `head_proxy.cuh:194`, `:236-238` | the constant 1, or `MUFU.RCP` of `FMNMX.FTZ(sum, one)`, one 0 or 1 (section 4.3) | never: `FMNMX` drops a NaN sum | | | no change |
-| `basalt_s2_gu`, `basalt_s2_swiglu`, `basalt_s2_down`: gate/up, out | `s2_expert_grouped.cu:963-964`, `:170`, `:1022-1023` | `FADD`, `FMUL` (`s2_experts.md`) | `s2_experts.md`, Summary | 0x7fffffff | 0x7fc00000 | `cuda_nan` (PR #18) |
-| `basalt_quantize_q8_0_scaled`: fp32 scale, fp16 d, codes | `quantize_act.cu:91-100` | `div.rn.f32` under `amax > 0`; `f16_from_f32` (integer); `F2I.TRUNC.NTZ` | never: s is 0 for an all-NaN block (`s2_experts.md` section 1) | | | no change |
+| `basalt_s2_gu`, `basalt_s2_swiglu`, `basalt_s2_down`: gate/up, out | `s2_expert_grouped.cu:963-964`, `:170`, `:1022-1023` | `FADD`, `FMUL` (`s2_experts.md`) | `s2_experts.md`, Summary | 0x7fffffff [H] (`FADD`, `FMUL` rows) | 0x7fc00000 | `cuda_nan` (PR #18) |
+| `basalt_quantize_q8_0_scaled`: fp32 scale, fp16 d, codes | `quantize_act.cu:91-100` | `div.rn.f32` under `amax > 0`; `f16_from_f32` (integer); `F2I.TRUNC.NTZ` | scale and d: never, s is 0 for an all-NaN block (`s2_experts.md` section 1); codes: a NaN x, which converts to 0 | codes 0 [S] (`cvt` rule) | codes 0 (`q8_1_code`) | no change |
 
 The integer outputs (token ids, the head's and the proxy's `out_id`, the experts' plans) carry no float encoding.
 
 **A forward note on `f16_from_f32`.** basalt's software fp16 conversion (`include/basalt/kernels/f16_bits.hpp:36-65`)
-maps a NaN to `sign | 0x7E00`, which is neither the hardware's 0x7fff nor this GPU's `half()` (0x7e00, the sign
-dropped). `f16_bits` stands for it in the drafter quantizer, where no NaN arrives. A port of the fp16 KV append
+maps a NaN to `sign | 0x7E00`: for the positive canonical NaN sm_120's arithmetic makes, 0x7E00, the bits this GPU's
+`half()` gives and not the hardware conversion's 0x7fff; for a negative NaN, 0xFE00, where `half()` drops the sign. `f16_bits` stands for it in the drafter quantizer, where no NaN arrives. A port of the fp16 KV append
 (`src/kernels/cuda/qsa.cu:134-135`), which writes K and V through `f16_from_f32`, stores a NaN; that port needs
 `sign | 0x7E00` there.
 

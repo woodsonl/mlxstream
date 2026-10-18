@@ -141,10 +141,13 @@ ones this pack runs.
    library `expf`, the Metal result can therefore differ from CUDA's last bits. Basalt's tolerances accept that, and
    invariant 1 still holds, because each Metal kernel rounds the same way at every window width. A stored NaN carries
    sm_120's canonical encoding: the `FADD`, `FMUL`, `FFMA`, `MUFU` and division sequences that make or pass a NaN give
-   0x7fffffff, and its fp16 conversion gives 0x7fff, where this GPU's arithmetic gives 0x7fc00000 and its `half()`
-   0x7e00 (`nan.md`; measured on sm_75, inferred for sm_120, whose PTX ISA leaves the single-precision NaN
-   unspecified). So every store a NaN can reach rewrites it with `cuda_nan` (fp32) or `cuda_nan_f16` (fp16,
-   `kernels/common/basalt_fp.metal`), integer operations that leave every other value's bits unchanged.
+   0x7fffffff, and its hardware fp16 conversion (`__float2half`) gives 0x7fff, where this GPU's arithmetic gives
+   0x7fc00000 and its `half()` 0x7e00 (`nan.md`; measured on sm_75, inferred for sm_120, whose PTX ISA leaves the
+   single-precision NaN unspecified). So every store a NaN can reach rewrites it with `cuda_nan` (fp32) or, where basalt
+   converts with `__float2half`, `cuda_nan_f16` (fp16, `kernels/common/basalt_fp.metal`), integer operations that leave
+   every other value's bits unchanged. basalt's software conversion `f16_from_f32` maps a NaN to `sign | 0x7E00`
+   instead, so a port that stores through it, as the fp16 KV append does, keeps that encoding (`nan.md`, the note on
+   `f16_from_f32`).
 
 ### How this departs from the repository-wide contract
 
