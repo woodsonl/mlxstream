@@ -391,6 +391,23 @@ def _aligned(kind, slot, offset):
     return build
 
 
+def _entry_rows(kind, rows):
+    """``kind`` whose weight (the pair's second) is a pack entry at byte 16 holding exactly its rows (valid), or
+    ``rows`` rows more (-1: a row short, which the kernel would read past). ``emit_program``'s constant check refuses
+    a short BF16 constant before the handler runs, so the BF16 GEMV's case is a row long."""
+    def build(g, src, bad, tmp):
+        x, more = g.input("x", (T, 2560), F32), rows if bad else 0
+        if kind == "basalt_mmvf":
+            gemv(g, kind, "y", x, g.const("p", (128, 2560), DType.BF16))
+            return {"packs": [pack(tmp, {"p": (16, (128 + more) * 2560 * 2)})]}
+        ws = [weight(g, f"gguf/pair.14.23.{m}", src) for m in (0, 1)][: 2 if kind == "basalt_dense_tc_pair" else 1]
+        e = src.entries[ws[-1].name]
+        ws[-1] = g.weight("p", e.shape, GGML_TYPES[e.type_id][0])
+        gemv(g, kind, "y", q8_1(g, "xq", [x]), *ws)
+        return {"packs": [pack(tmp, {"p": (16, e.nbytes + more * e.nbytes // e.shape[0])})]}
+    return build
+
+
 REFUSALS = [
     *[(f"dynamic-T {k}", _dynamic(k), "a dynamic-T program cannot run them") for k in KINDS],
     ("native q8_1 of 16 columns", _q8_1_columns("native"), "16 columns; basalt quantizes 1 to 8"),
@@ -420,6 +437,10 @@ REFUSALS = [
     ("pair rows off 4 bytes", _aligned("basalt_dense_tc_pair", 2, 2), "slot 2 needs 4-byte alignment"),
     ("mmvf input off 8 bytes", _aligned("basalt_mmvf", 0, 4), "slot 0 needs 8-byte alignment"),
     ("mmvf weight off 4 bytes", _aligned("basalt_mmvf", 1, 2), "slot 1 needs 4-byte alignment"),
+    *[(f"{k} weight entry a row short", _entry_rows(k, -1), r"bytes of \w+ \[\d+, 2560\], but its pack entry holds")
+      for k in ("basalt_mmvq", "basalt_dense_tc", "basalt_dense_tc_pair")],
+    ("mmvf weight entry a row long", _entry_rows("basalt_mmvf", 1),
+     r"'p' is 655360 bytes of bf16 \[128, 2560\], but its pack entry holds 660480"),
 ]
 
 

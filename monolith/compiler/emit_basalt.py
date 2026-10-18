@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Dict, Sequence, Tuple
 from .. import kernels
 from ..core.dtypes import DType
 from ..core.ir import Op, Value
-from ..formats.gguf import GGML_TYPES
+from ..formats.gguf import GGML_TYPES, ggml_row_bytes
 
 if TYPE_CHECKING:
     from .emit import _Ctx
@@ -38,7 +38,8 @@ def _expect(ctx: _Ctx, op: Op, v: Value, shape: Tuple[int, int], dtype: DType, w
 def _weight(ctx: _Ctx, op: Op, w: Value, types: Sequence[int]) -> Tuple[int, int, int]:
     """``(ggml type id, n_out, n_in)`` of a weight as shipped: a weight whose format, or a constant whose dtype, names a
     ggml type in ``types``, ``[n_out, n_in]`` values, and not a pack's block-lane-major slab (a ``bf16`` slab's rows
-    are re-laid-out; the kernels read rows as stored)."""
+    are re-laid-out; the kernels read rows as stored). A pack's aux entry holds exactly those rows, as a ``.basalt``
+    entry does (``BasaltSource.bind``): the kernels read every row, and a shorter entry would send them past it."""
     name = w.format if w.is_weight else w.dtype.short if w.is_const else None
     shape = ctx.shape(w)
     if GGML_IDS.get(name) not in types or len(shape) != 2 or min(shape) < 1:
@@ -46,7 +47,12 @@ def _weight(ctx: _Ctx, op: Op, w: Value, types: Sequence[int]) -> Tuple[int, int
                          f"[n_out, n_in] of ggml type {sorted(GGML_TYPES[t][0] for t in types)}")
     if any(w.name in pk.slabs for pk in ctx.packs):
         raise ValueError(f"{op.kind}: the weight {w.name!r} is a block-lane-major pack slab, not rows as stored")
-    return GGML_IDS[name], shape[0], shape[1]
+    tid, (n_out, n_in) = GGML_IDS[name], shape
+    aux = next((pk.aux[w.name] for pk in ctx.packs if w.name in pk.aux), None)
+    if aux is not None and int(aux["nbytes"]) != (need := n_out * ggml_row_bytes(tid, n_in)):
+        raise ValueError(f"{op.kind}: the weight {w.name!r} is {need} bytes of {name} {list(shape)}, but its pack entry "
+                         f"holds {aux['nbytes']}")
+    return tid, n_out, n_in
 
 
 def _bind(ctx: _Ctx, op: Op, slot: int, v: Value, align: int) -> Tuple[int, str, int]:
