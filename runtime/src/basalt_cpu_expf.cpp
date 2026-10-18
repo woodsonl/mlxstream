@@ -9,13 +9,15 @@
 //
 // WHICH BUILD OF ARM'S SOURCE THIS IS. The file has knobs; glibc picks these, and they are the ones transcribed.
 //   * The `#else` of TOINT_INTRINSICS: `kd = z + SHIFT; ki = asuint64(kd); kd -= SHIFT`, which rounds to nearest
-//     EVEN. x86-64 glibc compiles that branch (TOINT_INTRINSICS needs HAVE_FAST_ROUND), and `round`/`lround`,
-//     which the other branch uses, take a tie away from zero instead. No float32 argument reaches a tie, as it
-//     happens: over all 2^32 patterns on which the main path runs, `InvLn2N * (double) x` is never exactly
-//     k + 0.5 [M, swept here], so the two branches agree at every input and an aarch64 glibc, which takes the
-//     other one, cannot differ from an x86-64 glibc on this account.
+//     EVEN. glibc leaves TOINT_INTRINSICS at the 0 its own header defaults it to, and defines it nowhere else, so
+//     every architecture's glibc compiles that branch [M, glibc 2.39's single sysdeps/ieee754/flt-32/math_config.h,
+//     lines 40-44]. `round`/`lround`, which the other branch uses, take a tie away from zero instead, and that
+//     branch would be the same function here anyway: over all 2^32 patterns on which the main path runs,
+//     `InvLn2N * (double) x` is never exactly k + 0.5 [M, swept here], so no argument reaches a tie.
 //   * WANT_ERRNO_UFLOW = 1, which glibc derives from WANT_ROUNDING && WANT_ERRNO: x in
-//     [-0x1.9fe368p6, -0x1.9d1d9ep6) returns (0x1.4p-75f)^2 = 0x00000001 rather than +0.
+//     [-0x1.9fe368p6, -0x1.9d1d9ep6) returns (0x1.4p-75f)^2 rather than taking the main path. Under round to
+//     nearest that changes errno and not the result: the main path computes 0x00000001 at all 90,854 arguments of
+//     the band [M, swept here], which is what the branch returns. It is transcribed because glibc has it.
 //   * `poly_scaled` and `invln2_scaled`, the N = 32 rows; `poly` and `shift_scaled` belong to exp2f and powf.
 // `eval_as_double` and `eval_as_float` are Arm's no-ops for FLT_EVAL_METHOD == 0, which is arm64 and x86-64 SSE2;
 // the casts are written out instead, and `unlikely` on the special-case branch, a hint with no arithmetic in it,
@@ -45,9 +47,11 @@
 // WHERE NaN BITS COME FROM. x86 writes the floating-point indefinite 0xffc00000, sign bit set, where AArch64
 // writes the default NaN 0x7fc00000 ([S] Intel SDM Vol. 1 4.8.3.7; [S] Arm ARM A1.5.3), and an SSE scalar
 // operation that is handed a NaN returns the first of its sources that is one, quieted. expf itself needs no
-// helper - its NaN return is `x + x`, which quiets the argument's payload and sign on both architectures - but
-// the SwiGLU's add, divide and multiply all reach the indefinite from finite or infinite inputs, so they are
-// written below as the x86 instructions basalt's codegen emits rather than as C operators.
+// helper - its NaN return is `x + x`, which quiets the argument's payload and sign on both architectures - and
+// neither does the SwiGLU's add, whose only invalid form is inf + -inf and whose `e` is never negative [M: swept
+// here, expf_glibc returns no negative value at any of the 2^32 arguments]. The divide and the multiply do reach
+// the indefinite from finite or infinite inputs. All three are written below as the x86 instructions basalt's
+// codegen emits rather than as C operators, the add for fidelity to what basalt executes.
 
 #include "basalt_cpu_expf.h"
 
@@ -156,8 +160,8 @@ inline float quiet(float x) { return std::bit_cast<float>(std::bit_cast<uint32_t
 /// the emitted instructions have them and not the order pool.cpp:434 reads in
 /// (docs/research/basalt-cpu-expf.md section 3).
 ///
-/// ponytail: `runtime/src/basalt_cpu.cpp` carries the same three helpers for the Q2_0 kernels. One shared header
-/// serves both once they sit in the same tree.
+/// ponytail: the Q2_0 CPU kernels carry the same three helpers, on the branch they are arriving on. One shared
+/// header serves both once they sit in the same tree.
 inline float x86_src1_first(float src1, float src2, float computed) {
     if (is_nan(src1)) return quiet(src1);
     if (is_nan(src2)) return quiet(src2);

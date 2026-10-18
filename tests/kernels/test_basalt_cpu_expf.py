@@ -9,8 +9,13 @@ expert pool performs itself.
 with glibc and a token's output has to be the same number whichever tier produced it. Group A is the acceptance
 oracle and it is exhaustive: A1 the six values read straight out of a running glibc, and A2 the 4,226 recorded
 (g, u, res) triples of basalt's own line; B4 carries the rest, glibc's ``expf`` at every one of the 4,294,967,296
-float32 arguments as 4,096 block digests. Nothing about the transcription can be wrong anywhere without showing
-up in one of them (``docs/research/basalt-cpu-expf.md``, ``tests/kernels/fixtures/``).
+float32 arguments as 4,096 block digests. No value ``expf_glibc`` returns, and no SwiGLU result at a recorded
+argument pair, can be wrong without showing up in one of them (``docs/research/basalt-cpu-expf.md``,
+``tests/kernels/fixtures/``).
+
+One rule sits outside that: SSE takes the FIRST source operand that is a NaN, where an AArch64 instruction
+prefers a signalling NaN wherever it sits. The two part only when `src1` is a quiet NaN and `src2` a signalling
+one, and no recorded row has that pair, so D3 asserts it against the manual rather than against a measurement.
 
 The other cases say what each part of the result is, which a digest cannot: group B holds the transcription to
 the 0.502 ulp Arm records for this algorithm, against a float64 reference, over the SwiGLU's reachable range, and
@@ -31,20 +36,24 @@ C3 NaN (quiet and signalling), C4 the overflow threshold and the largest argumen
 two underflow thresholds and the ``may_uflow`` band, C6 the subnormal results. **D**, the SwiGLU: D1 its order
 against basalt's expression, D2 that the order is load-bearing, D3 the NaN rule at each instruction.
 
-The suite bites, measured by mutating the kernel and rebuilding: ``poly`` in place of ``poly_scaled`` fails A1, B1,
-B2, B3, C4 and C6; the platform's ``expf`` fails B1, B2, B3 and C6 - it exceeds the 0.502 ulp this algorithm holds
-to, and differs from the transcription at 1,930,130 of the 2,218,786,818 float32 arguments in [-40, 40] (measured
-here), though not at any of the recorded six, so A1 alone would miss it; the rounding step written as ``z + SHIFT``
-and ``z - kd`` instead of the two ``fma()`` calls fails B3 and B4, and B4 at exactly the two blocks the fixture's
-trailer records ``__expf_sse2`` digests for, 0x420 and 0xc27, with those digests exactly - the unfused build is
-``__expf_sse2`` over those 2,097,152 arguments; and the SwiGLU as ``g * (1 / (1 + e)) * u`` fails D1.
+The suite bites, measured by mutating the kernel and rebuilding: ``poly`` in place of ``poly_scaled`` fails A1,
+A2, B1, B2, B3, B4, C4 and C6; the platform's ``expf`` fails A2, B1, B2, B3, B4 and C6 - it exceeds the 0.502 ulp
+this algorithm holds to, and differs from the transcription at 1,930,129 of the 2,218,786,818 float32 arguments in
+[-40, 40] (measured here against this machine's own libm, so the count is a property of Apple's ``expf`` and moves
+with macOS), though not at any of the recorded six, so A1 alone would miss it; the rounding step written as
+``z + SHIFT`` and ``z - kd`` instead of the two ``fma()`` calls fails A2, B3 and B4, and B4 at exactly the two
+blocks the fixture's trailer records ``__expf_sse2`` digests for, 0x420 and 0xc27, with those digests exactly - the
+unfused build is ``__expf_sse2`` over those 2,097,152 arguments; and the SwiGLU as ``g * (1 / (1 + e)) * u``
+fails D1.
 
 The three x86 NaN rules are not alike there. Dropping the divide's for the C operator fails A2, D1 and D3;
-dropping the multiply's fails A2 alone, since only a NaN on both sides of it tells the two apart and D3's row for
-that is the one A2 already holds. Dropping the add's fails nothing: ``1.f`` is never a NaN and the only other
-source is ``expf``'s own return, which quiets the same way on both architectures, so the instruction's source
-order cannot reach the result. It is written as the add anyway, because the transcription is of what basalt
-executes and not of what a test can catch.
+dropping the multiply's fails A2 and D3, on the four recorded rows where the multiply itself creates the NaN from
+``0 * inf`` and the C operator writes AArch64's sign (rows 122, 123, 126 and 127), not on the row with a NaN on
+both sides, where this machine's own operand order happens to give x86's answer anyway. Dropping the add's fails
+nothing: ``1.f`` is never a NaN, and the only other source is ``expf``'s own return, which is never negative and
+quiets the same way on both architectures, so neither the add's source order nor its created NaN is reachable. It
+is written as the add anyway, because the transcription is of what basalt executes and not of what a test can
+catch.
 
 Two mutations fail nothing, and both are findings rather than gaps. ``round``/``lround`` for the rounding - Arm's
 other branch, the one glibc compiles on aarch64 - passes, because no float32 argument makes ``InvLn2N * x`` an
@@ -245,7 +254,8 @@ def test_c2_infinities():
 
 def test_c3_nan():
     """C3. A NaN reaches `x + x`, which quiets a signalling NaN and leaves a quiet one alone, payload included.
-    glibc's own NaN bits are not in the recorded corpus, so this pins the port's rule, not glibc's."""
+    B4's blocks 0x7f8-0x7ff and 0xff8-0xfff are glibc's own output at all 16,777,214 NaN arguments, so the bits
+    are pinned there; this case names the rule they follow."""
     got = bits_of(expf(f32([0x7FC00001, 0xFFC00001, 0x7F800001])))
     assert list(got) == [0x7FC00001, 0xFFC00001, 0x7FC00001]
 
@@ -271,7 +281,7 @@ def test_c5_underflow_boundaries_and_the_band():
     assert MAY_UFLOW == bits_of(F32(-float.fromhex("0x1.9d1d9ep6")))
     assert bits_of(expf(f32([UFLOW])))[0] == 0x00000001          # the comparison is strict: this one computes
     assert bits_of(expf(f32([UFLOW + 1])))[0] == 0x00000000      # and one float further down underflows
-    band = f32(np.arange(MAY_UFLOW, UFLOW + 1, dtype=U32))       # the whole may_uflow band, 7,397 arguments
+    band = f32(np.arange(MAY_UFLOW, UFLOW + 1, dtype=U32))       # the whole may_uflow band, 90,854 arguments
     assert (bits_of(expf(band)) == 0x00000001).all()
     assert (bits_of(expf(band)) == bits_of(correctly_rounded(band))).all()
     below = f32(np.arange(UFLOW + 1, UFLOW + 0x4000, dtype=U32))
@@ -338,10 +348,13 @@ def test_d3_swiglu_specials():
     """D3. The specials basalt's expression itself produces, as bits. An operation that creates a NaN writes x86's
     floating-point indefinite 0xffc00000, where an AArch64 instruction writes 0x7fc00000; a NaN that arrives as an
     operand comes back quieted with its payload, from whichever source of the instruction is the first NaN, which
-    is `g` at the divide and the quotient at the multiply. A2's recorded vectors cover every row here; this case
-    says which rule each one is."""
-    g = f32([0x7F800000, 0xFF800000, 0x00000000, 0x80000000, 0x7F812345, 0x3F800000, 0x7F812345])
-    u = f32([0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000, 0x7F812345, 0x7FC54321])
+    is `g` at the divide and the quotient at the multiply. A2's recorded vectors carry every rule this case names,
+    though not every row: the last two rows below are not among them, and the last is the one place this suite
+    asserts against the manual rather than against a measurement."""
+    g = f32([0x7F800000, 0xFF800000, 0x00000000, 0x80000000, 0x7F812345, 0x3F800000, 0x7F812345, 0x00000000,
+             0x7FC12345])
+    u = f32([0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000, 0x7F812345, 0x7FC54321, 0x7F800000,
+             0x7FA54321])
     got = bits_of(swiglu(g, u))
     assert got[0] == 0x7F800000                                  # inf / (1 + 0) * 1
     assert got[1] == 0xFFC00000                                  # -inf / inf, an indefinite the divide creates
@@ -349,6 +362,11 @@ def test_d3_swiglu_specials():
     assert got[4] == 0x7FC12345                                  # a NaN g, quieted, through both instructions
     assert got[5] == 0x7FC12345                                  # a NaN u, the multiply's SRC1 being finite
     assert got[6] == 0x7FC12345                                  # both NaN: the multiply keeps the quotient's
+    assert got[7] == 0xFFC00000                                  # 0 * inf, an indefinite the multiply creates
+    # The one assertion with no measurement behind it [S, Intel SDM Vol. 1 4.8.3.7 against Arm ARM A1.5.3]: the
+    # quotient is a quiet NaN and `u` a signalling one, so SSE returns the first source, 0x7fc12345, where an
+    # AArch64 multiply would prefer the signalling second and give 0x7fe54321. No recorded row holds this pair.
+    assert got[8] == 0x7FC12345
 
 
 # ---- the binding's own checks ------------------------------------------------------------------------------------
@@ -367,5 +385,7 @@ def test_binding_refuses_mismatched_lengths_and_dtypes():
         _nt.basalt_expf(np.zeros(16, F32)[::2], np.zeros(8, F32))          # not contiguous
     with pytest.raises(ValueError, match="past 2\\^32"):
         _nt.basalt_expf_digest(0xFFFFFFFF, 2)                              # a range that would wrap
-    assert _nt.basalt_expf_digest(0xFFFFFFFF, 1) == _nt.basalt_expf_digest(0xFFFFFFFF, 1)
+    # the top of the range is accepted and digests 0xFFFFFFFF itself rather than wrapping to 0: that pattern is a
+    # quiet NaN, which `x + x` returns unchanged, so the digest is one FNV step over its own bits
+    assert _nt.basalt_expf_digest(0xFFFFFFFF, 1) == (0xCBF29CE484222325 ^ 0xFFFFFFFF) * 0x100000001B3 % (1 << 64)
     assert _nt.basalt_expf_digest(0, 0) == 0xCBF29CE484222325              # the empty digest is the seed

@@ -12,9 +12,10 @@ Evidence tags: [M] measured, [S] vendor specification, [R] third-party report.
 ## 1. Which `expf`
 
 basalt runs on Linux, so `std::exp` of a float at pool.cpp:434 is glibc's `expf`. Apple's is a different
-implementation; neither is correctly rounded, and the two differ at 1,930,130 of the 2,218,786,818 float32
-arguments in [-40, 40] [M, this repository, Apple clang 21.0.0 on an M3 Max], so calling the platform's cannot be
-bit-exact and the algorithm is transcribed instead.
+implementation; neither is correctly rounded, and the two differ at 1,930,129 of the 2,218,786,818 float32
+arguments in [-40, 40] [M, this repository against this machine's own libm, Apple clang 21.0.0 on an M3 Max, so
+the count is a property of Apple's `expf` and moves with macOS], so calling the platform's cannot be bit-exact and
+the algorithm is transcribed instead.
 
 glibc's generic `expf` has been Arm's `optimized-routines` `math/expf.c` since 2017
 (`sysdeps/ieee754/flt-32/e_expf.c`) [R]. That source is MIT, where glibc's copy is LGPL-2.1-or-later, so the
@@ -37,9 +38,11 @@ subtracts it from the rounded `z` and is itself exact. `__expf_fma` fuses them; 
 the correctly rounded value there [M, the same hosts with `GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX2,-FMA`]. The port
 writes those two steps as explicit `std::fma` so that `-ffp-contract` cannot decide which function it is.
 
-Arm's other rounding branch, the `round`/`lround` one that aarch64 glibc compiles, is the same function at every
-float32 argument: `InvLn2N * (double) x` is never exactly a tie [M, swept over all 2^32], so it cannot explain a
-divergence either.
+Arm's other rounding branch, the `round`/`lround` one, is not glibc's anywhere: glibc 2.39 carries a single
+`sysdeps/ieee754/flt-32/math_config.h`, which defaults `TOINT_INTRINSICS` to 0 and defines it nowhere else, so
+every architecture's glibc compiles the shift branch the port transcribes [M, lines 40-44 of that file]. It would
+be the same function here in any case: `InvLn2N * (double) x` is never exactly a tie at any float32 argument
+[M, swept over all 2^32], so no argument reaches the one place the two branches round differently.
 
 ## 2. The Codegen For Line 434
 
@@ -76,6 +79,9 @@ returns the first of its sources that is one, quieted, and otherwise the indefin
 creates one. So:
 
 * `g` = -inf gives `e` = +inf, `d` = +inf and `-inf / inf` at the divide: `0xffc00000`.
+* The add never creates one. Its only invalid form is `inf + -inf`, and `e` is `expf`'s own return, which is
+  never negative at any of the 2^32 arguments [M]. It is written as the instruction for fidelity to what basalt
+  executes, and the recorded vectors cannot tell it from the C operator.
 * `0 * inf` and `inf * 0` at the multiply: `0xffc00000`. Several recorded rows reach it, including
   `g` = `0xc2b17218` (just past the overflow threshold, where `g / inf` is a signed zero) with `u` = +inf.
 * A NaN argument comes back quieted with its payload and sign: `expf` returns `x + x`, which quiets on both
@@ -84,6 +90,11 @@ creates one. So:
 
 `expf` itself needs no help, since `x + x` is the same on both. The add, the divide and the multiply are written
 as the x86 instructions rather than as C operators (`x86_add`, `x86_div`, `x86_mul` in the kernel).
+
+One corner of the SSE rule is outside the recorded corpus. SSE returns the first source operand that is a NaN,
+where an AArch64 instruction prefers a signalling NaN wherever it sits; the two part only when SRC1 is a quiet NaN
+and SRC2 a signalling one, and no recorded row holds that pair. Case D3 asserts it [S] against the two manuals
+rather than against a measurement, and says so.
 
 ## 4. The Fixtures
 
@@ -110,7 +121,8 @@ section 1. Test case B4 holds every block, through `_native.basalt_expf_digest`.
 
 * All 4,096 blocks of `expf_digests.txt`, so `expf_glibc` is `__expf_fma` at every float32 argument.
 * All 4,226 rows of `swiglu_vectors.txt`, including every NaN row, and the digest of its own `res` column is
-  `dfdc90ecf37deba2`.
+  `dfdc90ecf37deba2`. Blocks 0x7f8-0x7ff and 0xff8-0xfff of the digest sweep are `expf`'s own output at all
+  16,777,214 NaN arguments, so glibc's NaN bits are pinned too.
 * Built with the rounding step unfused instead, it fails exactly blocks `0x420` and `0xc27`, and its digests at
   those two blocks are the trailer's `__expf_sse2` digests exactly. The port is therefore either variant, and the
   only thing that separates them is the two `std::fma` calls.
