@@ -178,6 +178,22 @@ def test_copy_mode_binds_an_exact_buffer_per_tensor(tmp_path):
         plan(BasaltSource(path, copy=True), "gguf/tail.weight")
 
 
+def test_copy_mode_reads_the_file_the_windows_map(tmp_path):
+    """A source over ``b`` whose tables come from ``a``, a file of the same size that differs only inside e: the copy
+    mode serves ``b``'s bytes, as the windows do, and refuses a ``b`` that ends inside a tensor."""
+    a = write(tmp_path, name="a.basalt")
+    e = BasaltSource(a).entries["gguf/e.weight"]
+    data = bytearray(a.read_bytes())
+    data[e.offset: e.offset + e.nbytes] = bytes(255 - x for x in data[e.offset: e.offset + e.nbytes])
+    b = tmp_path / "b.basalt"
+    b.write_bytes(bytes(data))
+    buffers, bound = plan(BasaltSource(b, BasaltFile(a), copy=True), "gguf/e.weight")
+    assert buffers[bound["gguf/e.weight"][0]].init == bytes(data[e.offset: e.offset + e.nbytes])
+    b.write_bytes(bytes(data[: e.offset + e.nbytes - 1]))
+    with pytest.raises(ValueError, match="ends inside 'gguf/e.weight' \\(255 of its 256 bytes\\)"):
+        plan(BasaltSource(b, BasaltFile(a), copy=True), "gguf/e.weight")
+
+
 @pytest.mark.parametrize("name, why", [
     ("dense/g.weight", "its bytes are in gguf: bind gguf/g.weight"),
     ("dense/p.weight", "kind 1 has no ggml type to declare"),

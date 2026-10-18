@@ -41,7 +41,8 @@ DENSE_KINDS = {2: 0, 4: 30, 5: 1}                 # dense.index kinds copied as 
 
 class BasaltSource:
     """The bindable tensors of a ``.basalt`` file. ``file`` is the opened file (``BasaltFile(path)`` by default; any
-    ``BasaltFile`` over the same bytes works, such as a range reader); ``path`` is the file the windows map."""
+    ``BasaltFile`` over the same bytes works, such as a range reader); ``path`` is the file a program reads: the
+    windows map it, and the copy mode reads each tensor from it, so both modes serve the same bytes."""
 
     slabs: Dict[str, dict] = {}                    # no block-lane-major slabs and no pack aux: the emitter's pack paths
     aux: Dict[str, dict] = {}                      # find nothing here, and only its window planner reads a source
@@ -107,4 +108,10 @@ class BasaltSource:
         return e
 
     def read(self, e: BasaltEntry) -> bytes:
-        return bytes(self.file.data[e.offset: e.offset + e.nbytes])
+        """``e``'s bytes from ``path``; refuses a file that ends inside them."""
+        with open(self.path, "rb") as fh:
+            fh.seek(e.offset)
+            data = fh.read(e.nbytes)
+        if len(data) != e.nbytes:
+            raise ValueError(f"{self.path} ends inside {e.name!r} ({len(data)} of its {e.nbytes} bytes)")
+        return data
