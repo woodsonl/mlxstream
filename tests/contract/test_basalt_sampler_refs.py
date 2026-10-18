@@ -1,9 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/sampler_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
-# (MIT; third_party/NOTICE): the min_p values its fixtures pass and its references' host arithmetic.
+# (MIT; third_party/NOTICE): its fixtures, its host-only checks and their pass criteria, the min_p values its fixtures
+# pass and its references' host arithmetic.
 """Host-only checks of the sampler family's references (tests/basalt_sampler_ref.py); no GPU.
 
+sampler_parity's host-only checks (spec T§11's rows marked H), each with basalt's criterion verbatim and the numbers
+spec T§8 pins:
+- M2.1, M4.1, M6.1, M7.1, M8.1: the fixture's host references see the rule its kernel check gates (the top_p cut moves
+  with the order, the repeat penalty's sign rule, the sampled penalties, the min_p threshold, the window's tail).
+- M9.1 and M10.1: the reference's draws on fixtures 9 and 10 (Philox only: 832 zeros, counts 115/83/58/0).
+- M12.O and M17.2, asserted on the port's own seeds: per-row histories change some drafted row's pick, and some
+  sampled pick ties with another entry of its list.
+- M15.1-2: ``penalty_rows`` lays out each row as the last h tokens of the tail and the window, against the plain
+  definition and the old single-row staging.
+
+The reference checks of the port's own:
 - ``nv_logf`` (CUDA's logf) of the seven ``min_p`` values sampler_parity's fixtures pass is the correctly rounded
   logarithm's float, so the min_p threshold the references compute is the exact one. The table gives each value's
   correctly rounded logf and the exact logarithm's distance from it in ulps: 0.3f and 0.9f lie within 0.07 and 0.09
@@ -21,16 +33,21 @@
 """
 
 import hashlib
+import itertools
 import math
 import types
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
-from tests.basalt_sampler_ref import (NINF, SamplerParams, bench_rows, coupled_cases, f2u, f32, fixture12_data,
-                                      fixture13_data, fixture16_data, fixture17_data, fixture18_data, mirror_pick,
-                                      mirror_prob, mirror_select, mirror_select_scalar, normal_rows, nv_logf,
-                                      probe_rows, sampled_k, sampled_reference, u2f)
+from tests.basalt_sampler_ref import (NINF, SamplerParams, bench_rows, coupled_cases, f2u, f32, fixture2_data,
+                                      fixture4_data, fixture6_data, fixture7_data, fixture8_data, fixture9_data,
+                                      fixture10_data, fixture12_data, fixture13_data, fixture16_data, fixture17_data,
+                                      fixture18_data, greedy_pen, mirror_pick, mirror_prob, mirror_select,
+                                      mirror_select_scalar, normal_rows, nv_logf, penal, penalty_rows,
+                                      philox_uniform, probe_rows, reference_cut, reference_pick, sampled_cut,
+                                      sampled_k, sampled_reference, u2f, window_of)
 
 # min_p (float bits), its correctly rounded logf (float bits), the exact logarithm's offset from that float (ulps)
 MIN_P_LOGF = [(0x3D4CCCCD, 0xC03FBA14, 0.205), (0x3DCCCCCD, 0xC0135D8E, 0.197), (0x3E4CCCCD, 0xBFCE0210, 0.377),
@@ -109,7 +126,7 @@ def test_basalt_sampler_ref_mirror_pick_matches_sampled_reference():
 @pytest.mark.parametrize("temperature, want", [(1.0, [4 / 9, 3 / 9, 2 / 9]), (0.5, [16 / 29, 9 / 29, 4 / 29])])
 def test_basalt_sampler_ref_mirror_prob_cuts_then_scales(temperature, want):
     p = SamplerParams(top_k=4, top_p=0.75, min_p=0.3, temperature=temperature)
-    row = np.array([nv_logf(f32(x)) for x in (0.4, 0.3, 0.2, 0.1)] + [-30.0] * 4, np.float32)
+    row = fixture10_data()[0][0]
     sel = mirror_select(row, 8, [], p, 4)
     got = [mirror_prob(sel, 4, p, q) for q in range(8)]
     assert sel.ids == [0, 1, 2, 3] and max(abs(g - w) for g, w in zip(got, want + [0.0] * 5)) < 1e-6, \
@@ -150,3 +167,167 @@ def _digest(x, h):
 def test_basalt_sampler_ref_generators_deterministic(block):
     a, b = (_digest(GENERATORS[block](), hashlib.sha256()) for _ in range(2))
     assert a == b, f"{block}: two calls with the same seed gave other bytes"
+
+
+# ---- sampler_parity's host-only checks (spec T§11's rows marked H), in its order -----------------------------------
+
+FX2_HEAD = [3.0, 2.549999952316284, 2.5, 2.4499998092651367, 2.3999998569488525, 2.3499999046325684, 2.299999952316284,
+            2.25]
+
+
+def test_basalt_sampler_order_fixture_observable():
+    """M2.1 (:833-843): fixture 2's top_p cut depends on the order, temperature after the cut (4 survivors per row) or
+    first (3), though its greedy pick does not (0 under both)."""
+    l, p = fixture2_data()
+    spec, alt = [reference_cut(r, p, False) for r in l], [reference_cut(r, p, True) for r in l]
+    cut_spec, cut_alt = sum(spec), sum(alt)
+    assert cut_spec != cut_alt, ("`const bool distinguishable = (cut_spec != cut_alt);` ... "
+                                 f"`if (!distinguishable) ++bad;`: survivors {cut_spec} under both orders")
+    head, picks = [float(x) for x in l[0, :8]], [reference_pick(r, p, tf) for tf in (False, True) for r in l]
+    assert (spec, alt, head, picks) == ([4] * 4, [3] * 4, FX2_HEAD, [0] * 8), \
+        f"spec T§8.3: cuts per row {spec} / {alt} (want 4 / 3), head {head}, picks {picks} (want 0)"
+
+
+def test_basalt_sampler_penalty_fixture_observable():
+    """M4.1 (:926-930): on fixture 4 A's negative logits the repeat penalty's rule decides the greedy pick: multiplying
+    token 0's -1.0 (to -2.0) lets token 1 win, dividing it (to -0.5) would keep token 0."""
+    la, hist_a, _, _, p = fixture4_data()
+    want_a = [greedy_pen(la[t], hist_a[4 * t:4 * t + 4], p) for t in range(2)]
+    alt_a = [greedy_pen(la[t], hist_a[4 * t:4 * t + 4], p, divide_unconditionally=True) for t in range(2)]
+    assert want_a[0] != alt_a[0], ("`const bool A_visible = want_a[0] != alt_a[0];` ... `if (!A_visible) ++bad;`: "
+                                   f"both rules pick {want_a[0]}")
+    assert (want_a, alt_a) == ([1, 1], [0, 0]), f"spec T§8.5: multiply-rule picks {want_a} (want 1), divide-always " \
+                                                f"{alt_a} (want 0)"
+
+
+def test_basalt_sampler_sampled_penalty_observable():
+    """M6.1 (:1013-1017): with fixture 6's penalties on, token 0 (9.0, penalised to 2.2 and 2.0) loses the sampled
+    picks it wins penalty-free."""
+    l, hist, p = fixture6_data()
+    clean_p = replace(p, penalty_last_n=0, penalty_repeat=1.0, penalty_freq=0.0, penalty_present=0.0)
+    want = [sampled_reference(l[t], hist[4 * t:4 * t + 4], p, t) for t in range(2)]
+    clean = [sampled_reference(l[t], hist[4 * t:4 * t + 4], clean_p, t) for t in range(2)]
+    assert want[0] != clean[0] or want[1] != clean[1], ("`const bool visible = want[0] != clean[0] || want[1] != "
+                                                        f"clean[1];` ... `if (!visible) ++bad;`: {want}, {clean}")
+    u = [f"{philox_uniform(p.seed, t):.7g}" for t in range(2)]
+    assert (want, clean, u) == ([3, 2], [0, 0], ["0.9025966", "0.6366587"]), \
+        f"spec T§8.7: penalised {want} (want [3, 2]), clean {clean} (want [0, 0]), draws {u}"
+
+
+def test_basalt_sampler_min_p_observable():
+    """M7.1 (:1043-1046): fixture 7's survivor count falls with min_p 0, 0.5 and 0.9 (6, 2 and 1 per row: thresholds
+    3.307 and 3.895 against 3.2 and 3.5), and min_p 0.9 keeps one per row."""
+    l, base = fixture7_data()
+    qs = [replace(base, min_p=mp) for mp in (0.0, 0.5, 0.9)]
+    c0, c05, c09 = (sum(sampled_cut(r, [], q) for r in l) for q in qs)
+    NT3 = len(l)
+    assert c0 > c05 and c05 > c09 and c09 >= NT3, \
+        f"`const bool visible = c0 > c05 && c05 > c09 && c09 >= NT3;` ... `if (!visible) ++bad;`: {c0}, {c05}, {c09}"
+    picks = [[sampled_reference(r, [], q, t) for t, r in enumerate(l)] for q in qs]
+    assert ((c0, c05, c09), picks) == ((12, 4, 2), [[2, 2], [1, 1], [0, 0]]), \
+        f"spec T§8.8: survivors {(c0, c05, c09)} (want 12, 4, 2), picks {picks} (want [2, 2], [1, 1], [0, 0])"
+
+
+def test_basalt_sampler_penalty_window_observable():
+    """M8.1 (:1087-1091): counting only the last penalty_last_n = 4 of fixture 8's 8 slots changes the greedy pick:
+    token 3 falls to 0.4666667 and token 0 keeps 6.0; all 8 would drop token 0 to 0.29999995 and keep token 3."""
+    l, hist, p = fixture8_data()
+    want, unclamped = greedy_pen(l[0], hist[4:], p), greedy_pen(l[0], hist, p)
+    assert want != unclamped, f"`const bool visible = want != unclamped;` ... `if (!visible) ++bad;`: both pick {want}"
+    vals = (penal(l[0, 3], 4, p), penal(l[0, 0], 4, p))
+    assert (want, unclamped, vals) == (0, 3, (f32(0.4666667), f32(0.29999995))), \
+        f"spec T§8.9: clamped pick {want} (want 0), full-history pick {unclamped} (want 3), penalised {vals}"
+
+
+def test_basalt_sampler_one_penalty_stage_share():
+    """M9.1 (:1113-1117): the reference's share of token 0 on fixture 9's 8,000 rows is near 1 / (1 + exp(1.5 / 0.7))
+    = 0.105, what one penalties stage gives (a second one after the temperature would give 0.0255): 832 draws,
+    Philox only."""
+    l, hist, p = fixture9_data()
+    want = [sampled_reference(l[t], hist[t:t + 1], p, t) for t in range(len(l))]
+    zeros = want.count(0)
+    expect, share = 1.0 / (1.0 + math.exp(1.5 / 0.7)), zeros / len(l)
+    assert abs(share - expect) < 0.014, ("`const bool near = std::fabs(share - expect) < 0.014;` ... "
+                                         f"`if (!near) ++bad;`: share {share:.4f}, expected {expect:.4f}")
+    assert zeros == 832, f"spec T§8.10: token 0 drawn {zeros} times of {len(l)} (want 832)"
+
+
+def test_basalt_sampler_top_p_before_min_p_observable():
+    """M10.1 (:1139-1141): top_p before min_p keeps three of fixture 10's 0.4 / 0.3 / 0.2 / 0.1, so token 2 is drawn;
+    min_p first would keep two and never draw it. Philox only: counts 115, 83, 58, 0."""
+    l, p = fixture10_data()
+    want = [sampled_reference(r, [], p, t) for t, r in enumerate(l)]
+    twos = want.count(2)
+    assert twos != 0, f"`if (twos == 0) ++bad;`: token 2 never drawn in {len(l)} rows"
+    counts = [want.count(i) for i in range(4)]
+    assert counts == [115, 83, 58, 0], f"spec T§8.11: tokens 0-3 drawn {counts} times (want [115, 83, 58, 0])"
+
+
+def test_basalt_sampler_per_row_history_observable():
+    """M12.O (:1228-1231): with row 0's ``penalty_rows`` history in place of its own, some drafted row (t > 0) of
+    fixture 12's 16 (T, H) cases picks otherwise under greedy_pen; asserted on the port's seed (12)."""
+    tail, cases = fixture12_data()
+    observable = rows_checked = 0
+    for T, H, window, l in cases:
+        rows = penalty_rows(tail, window, T, H)
+        gp = SamplerParams(greedy=True, temperature=0.0, top_k=0, top_p=1.0, penalty_last_n=H, penalty_present=4.0)
+        for t in range(T):
+            gwant = greedy_pen(l[t], rows[t * H:(t + 1) * H], gp)
+            observable += t > 0 and greedy_pen(l[t], rows[:H], gp) != gwant
+            rows_checked += 1
+    assert rows_checked == 60, f"spec T§8.13: {rows_checked} rows checked (want 60)"
+    assert observable != 0, f"`if (observable == 0) ++bad;`: no drafted row of {rows_checked} picks differently"
+
+
+def test_basalt_penalty_rows_layout():
+    """M15.1-2 (:1300-1334): for every (n_tail, T, h) of 7 x 3 x 4, ``penalty_rows`` into slots pre-filled 12345 gives
+    each row t the last h tokens of tail + window[0..t], -1 padded in front (M15.1), and row 0 the old single-row
+    staging, the consumed tail then the fed-back head last (M15.2): 420 rows."""
+    wrong1 = wrong2 = cases = 0
+    for n_tail, T, h in itertools.product((0, 1, 5, 63, 64, 65, 300), (1, 3, 8), (1, 4, 64, 100)):
+        tail, window = list(range(1000, 1000 + n_tail)), list(range(5000, 5000 + T))
+        rows = penalty_rows(tail, window, T, h, np.full(T * h, 12345, np.int32)).tolist()
+        for t in range(T):
+            seq = tail + window[:t + 1]
+            take = min(h, len(seq))
+            expect = [-1] * (h - take) + seq[len(seq) - take:]
+            wrong1 += rows[t * h:(t + 1) * h] != expect
+            cases += 1
+        take0 = min(h, n_tail + 1)
+        old = [-1] * h
+        for j in range(take0 - 1): old[h - take0 + j] = tail[n_tail - (take0 - 1) + j]
+        old[h - 1] = window[0]
+        wrong2 += rows[:h] != old
+        cases += 1
+    assert cases == 420, f"spec T§8.16: {cases} rows checked (want 420)"
+    assert wrong1 == 0, ("`if (!std::equal(expect.begin(), expect.end(), rows.begin() + (size_t) t * h)) ++wrong;`: "
+                         f"{wrong1} of {cases - 84} rows differ")
+    assert wrong2 == 0, f"`if (!std::equal(old.begin(), old.end(), rows.begin())) ++wrong;`: {wrong2} of 84 rows differ"
+
+
+def test_basalt_sampler_sampled_draws_tie_observable():
+    """M17.2 (:1532-1534): some of the mirror's 1,632 sampled picks on fixture 17's tie-heavy rows tie with another
+    entry of their top_k list, so M17.1's equality gates the tie rule; asserted on the port's seeds (1700 + nv)."""
+    T, H = 17, 64
+    draws = tied = 0
+    for nv in (248320, 512):
+        l, hist = fixture17_data(nv)
+        config = 0
+        for pen in (0, 1):
+            base = SamplerParams(temperature=2.5, seed=17, penalty_last_n=H if pen else 0, penalty_repeat=1.25,
+                                 penalty_freq=0.25, penalty_present=0.5)
+            lists = [mirror_select(l[t], nv, window_of(hist, H, t, base.penalty_last_n), base, sampled_k(64, nv))
+                     for t in range(T)]
+            # basalt's last axis is the stream (the legacy one, a created one): each launch takes its own counter
+            for top_k, top_p, min_p, _ in itertools.product((1, 20, 64), (0.9, 1.0), (0.0, 0.05), range(2)):
+                config += 1
+                p = replace(base, top_k=top_k, top_p=top_p, min_p=min_p, counter=1000 * config)
+                k = sampled_k(top_k, nv)
+                for t, sl in enumerate(lists):
+                    want = mirror_pick(sl, k, p, t)
+                    same = next((sum(sl.logit[j] == sl.logit[i] for j in range(k))
+                                 for i in range(k) if sl.ids[i] == want), 0)
+                    tied += same > 1
+                    draws += 1
+    assert draws == 1632, f"spec T§8.19: {draws} draws (want 1632)"
+    assert tied != 0, f"`bad += wrong + (tied == 0);`: none of {draws} picks ties with another kept token"

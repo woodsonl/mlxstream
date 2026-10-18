@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
-# adapted from basalt (jesdga95/basalt) src/kernels/sampler_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
-# (MIT; third_party/NOTICE): its host references, fixtures and pass criteria.
+# adapted from basalt (jesdga95/basalt) src/kernels/sampler_parity.cpp and include/basalt/kernels/sampler.hpp
+# (penalty_rows) @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): its host references, fixtures
+# and pass criteria.
 # nv_exp and nv_logf: transcribed from NVIDIA libdevice's __nv_exp and __nv_logf as nvcc 13.0 (V13.0.48,
 # -arch=sm_120 -lineinfo -O3 -DNDEBUG) inlined them into basalt's sampler.cu; PTX listing and transcription:
 # docs/research/basalt-nvcc/sampler.md sections 2.5-2.6.
@@ -21,12 +22,15 @@ import ...``.
   ``reference_pick`` / ``reference_cut``; the sampled chain in llama.cpp's order, ``sampled_reference``, and its
   survivor count ``sampled_cut``; the kernels' own list and tail, ``mirror_select`` and ``mirror_pick``, with
   ``sampled_k`` and ``window_of``; the probe's probability, ``mirror_prob``; ``greedy_pen`` for the greedy references
-  local to its main. ``penal`` is their penalty, rounded as the device rounds it. ``sampled_reference``,
+  local to its main; ``penalty_rows``, basalt's host builder of a verify window's history rows (sampler.hpp:86-97).
+  ``penal`` is their penalty, rounded as the device rounds it. ``sampled_reference``,
   ``sampled_cut`` and ``mirror_pick`` call ``nv_exp`` and ``nv_logf`` where basalt's host calls std::exp(double) and
   logf; ``reference_pick``, ``reference_cut`` and ``mirror_prob`` keep ``math.exp``: no kernel computes their sums,
   and ``mirror_prob`` is the independent check of the kernel's probability.
 - The vectorized forms the large fixtures need: ``penal_vec``, ``select_vec`` and ``mirror_select`` itself, equal
   bit for bit to basalt's loop, ``mirror_select_scalar``.
+- The exact fixtures of its main, which draw nothing (spec T§8): ``fixture2_data``, ``fixture4_data``,
+  ``fixture6_data`` to ``fixture10_data``, each basalt's rows, history and base parameters.
 - The fixture generators, one per random block of sampler_parity (spec T§4): ``normal_rows`` for the plain fills,
   ``fixture12_data``, ``fixture13_data``, ``fixture16_data``, ``fixture17_data``, ``fixture18_data``, ``probe_rows``,
   ``bench_rows`` and ``coupled_cases``; ``raw32`` gives basalt's ``rng()`` draws and ``roundf`` C's rounding.
@@ -454,6 +458,23 @@ def window_of(hist, hist_len, t, last_n):
     return hist[t * hist_len + hist_len - h:(t + 1) * hist_len]
 
 
+def penalty_rows(tail, window, T, h, out=None):
+    """basalt's penalty_rows (sampler.hpp:86-97): the penalty-history rows of a verify window, T rows of h slots, flat
+    int32, written into ``out`` (every slot) or a new array. Row t is the last h tokens of ``tail`` followed by
+    window[0..t], most recent last, -1 in the unused front slots: ``tail`` is what the state consumed before the
+    window, window[0] the fed-back token and window[1..] the drafts, so row t is the history plain decode counts when
+    it picks the token after window[t]."""
+    tail = np.asarray(tail, np.int32)
+    seq = np.concatenate([tail, np.asarray(window, np.int32)[:T]])  # (tail, window)
+    out = np.empty(T * h, np.int32) if out is None else out
+    for t in range(T):
+        avail = len(tail) + t + 1                                     # tail + window[0..t]
+        take = min(h, avail)
+        out[t * h:t * h + h - take] = -1
+        out[t * h + h - take:(t + 1) * h] = seq[avail - take:avail]
+    return out
+
+
 # ---- the greedy references local to main ---------------------------------------------------------------------------
 
 def greedy_pen(l, hist, p, divide_unconditionally=False):
@@ -474,6 +495,79 @@ def greedy_pen(l, hist, p, divide_unconditionally=False):
             s = penal(l[v], c, p)
         if v == 0 or s > bv: best, bv = v, s
     return best
+
+
+# ---- the exact fixtures of main (spec T§8) -------------------------------------------------------------------------
+# They draw nothing, so spec T§8 pins their host results. Each returns basalt's rows ((rows, nv) float32), its history
+# (flat int32, as window_of reads it) where it has one, and its base SamplerParams; a check's variants are
+# dataclasses.replace of them.
+
+def fixture2_data():
+    """Fixture 2, the order fixture (:810-846): 4 rows of 512 at -1000 but 3.0 at id 0 and 2.6f - 0.05f * v at ids
+    1-7 (the float32 product rounded, then the difference); greedy, top_k 0, top_p 0.5, temperature 0.5."""
+    l = np.full((4, 512), -1000, np.float32)
+    l[:, 0] = 3.0
+    l[:, 1:8] = f32(2.6) - f32(0.05) * np.arange(1, 8, dtype=np.float32)
+    return l, SamplerParams(top_k=0, top_p=0.5, temperature=0.5, min_keep=1, greedy=True)
+
+
+def fixture4_data():
+    """Fixture 4, greedy penalties (:881-955): two cases of 2 rows of 8 at -8, with 4-slot histories. A: -1.0 at id 0
+    and -1.2 at id 1, history [0, -1, -1, -1]. B: 5.0 at id 0 and 3.4 at id 1, history [0, 0, -1, -1], run with
+    ``replace(p, penalty_present=1.5, penalty_freq=0.0)``. Greedy, top_k 0, top_p 1, penalty_last_n 4, repeat 2.
+    Returns (la, hist_a, lb, hist_b, p)."""
+    la, lb = np.full((2, 8), -8, np.float32), np.full((2, 8), -8, np.float32)
+    la[:, :2] = -1.0, -1.2
+    lb[:, :2] = 5.0, 3.4
+    hist_a, hist_b = np.tile(np.int32([0, -1, -1, -1]), 2), np.tile(np.int32([0, 0, -1, -1]), 2)
+    p = SamplerParams(top_k=0, top_p=1.0, temperature=1.0, greedy=True, penalty_last_n=4, penalty_repeat=2.0)
+    return la, hist_a, lb, hist_b, p
+
+
+def fixture6_data():
+    """Fixture 6, penalties in the sampled chain (:986-1019): 2 rows of 8 at -8 but 9.0, 4.5, 4.4, 4.3 at ids 0-3;
+    4-slot histories [0, -1, -1, -1] and [0, 0, -1, -1] (token 0 once in row 0, twice in row 1); top_k 5, top_p 0.9,
+    temperature 0.8, seed 9, counter 0, penalty_last_n 4, repeat 3, freq 0.2, present 0.6."""
+    l = np.full((2, 8), -8, np.float32)
+    l[:, :4] = 9.0, 4.5, 4.4, 4.3
+    return l, np.int32([0, -1, -1, -1, 0, 0, -1, -1]), SamplerParams(
+        top_k=5, top_p=0.9, temperature=0.8, seed=9, counter=0, penalty_last_n=4, penalty_repeat=3.0,
+        penalty_freq=0.2, penalty_present=0.6)
+
+
+def fixture7_data():
+    """Fixture 7, min_p (:1021-1059): 2 rows of 8 at -8 but 4.0, 3.5, 3.2, 3.1, 2.0 at ids 0-4; top_k 6, top_p 1,
+    temperature 0.9, seed 77 (its checks set min_p 0, 0.5 and 0.9)."""
+    l = np.full((2, 8), -8, np.float32)
+    l[:, :5] = 4.0, 3.5, 3.2, 3.1, 2.0
+    return l, SamplerParams(top_k=6, top_p=1.0, temperature=0.9, seed=77)
+
+
+def fixture8_data():
+    """Fixture 8, the penalty window is the tail (:1061-1093): one row of 8 at -8 but 6.0 at id 0 and 6.5 at id 3; the
+    8-slot history [0, 0, 0, 0, 3, 3, 3, 3]; greedy, top_k 0, top_p 1, penalty_last_n 4 (the last four slots count),
+    repeat 3, freq 0.3, present 0.5."""
+    l = np.full((1, 8), -8, np.float32)
+    l[0, 0], l[0, 3] = 6.0, 6.5
+    return l, np.int32([0, 0, 0, 0, 3, 3, 3, 3]), SamplerParams(
+        top_k=0, top_p=1.0, temperature=1.0, greedy=True, penalty_last_n=4, penalty_repeat=3.0, penalty_freq=0.3,
+        penalty_present=0.5)
+
+
+def fixture9_data():
+    """Fixture 9, one penalties stage (:1095-1119): 8,000 rows of two logits at 0.0, each with the 1-slot history [0];
+    top_k 2, top_p 1, min_p 0, temperature 0.7, seed 53, counter 0, penalty_last_n 1, repeat 1, freq 0, present
+    1.5."""
+    return np.zeros((8000, 2), np.float32), np.zeros(8000, np.int32), SamplerParams(
+        top_k=2, top_p=1.0, min_p=0.0, temperature=0.7, seed=53, counter=0, penalty_last_n=1, penalty_repeat=1.0,
+        penalty_freq=0.0, penalty_present=1.5)
+
+
+def fixture10_data():
+    """Fixture 10, top_p before min_p (:1121-1143): 256 rows of 8, logf(0.4f), logf(0.3f), logf(0.2f), logf(0.1f)
+    (``nv_logf``), then -30 four times; top_k 4, top_p 0.75, min_p 0.3, temperature 1, seed 10, counter 0."""
+    row = np.array([nv_logf(f32(x)) for x in (0.4, 0.3, 0.2, 0.1)] + [-30.0] * 4, np.float32)
+    return np.tile(row, (256, 1)), SamplerParams(top_k=4, top_p=0.75, min_p=0.3, temperature=1.0, seed=10, counter=0)
 
 
 # ---- fixture generators (spec T§4) ---------------------------------------------------------------------------------
