@@ -43,6 +43,15 @@ def pipeline(name):
     return gpu.pipeline(SOURCE, name, (("STEP_STATE", "1"),))
 
 
+def without_cuda_nan():
+    """``SOURCE`` with ``cuda_nan`` taken out of the sampler's kernels (basalt_fp.metal, which defines it, unchanged):
+    the NaN tests' negative control (test_basalt_nan.py's), whose stores keep this GPU's NaN. A test swaps it in for
+    ``SOURCE`` (monkeypatch), and ``pipeline`` compiles it."""
+    body = kernels.template("basalt_sampler.metal")
+    assert SOURCE.count(body) == 1 and "cuda_nan(" in body
+    return SOURCE.replace(body, body.replace("cuda_nan(", "("))
+
+
 def threads(pso, n=1024):
     """basalt's ``n`` threads, or the widest multiple of 32 the pipeline allows (the kernel's result does not depend
     on it)."""

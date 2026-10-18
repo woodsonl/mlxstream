@@ -60,7 +60,7 @@ probe on (+Q, sample_tokens_probe: each queried row also writes its query's prob
   with the probe the head's probability 1.0.
 - TP.1, the port's addition (spec S§19.3): the drafter's greedy tail, ``top_prob`` (the cluster partials, then
   bs_greedy_top_prob), picks the host argmax, mapped, with the float64 softmax probability of the pick within
-  q5k_head_parity's 1e-5.
+  q5k_head_parity's 1e-5; a NaN probability is stored as sm_120's (invariant 5; docs/research/basalt-nvcc/nan.md).
 - The one-block geometry, the port's (spec S§16.3 (c)): S-1B at 32 and 96 threads per row reads fixture 16's lists
   as M16.1 does, so the 1,024 threads this GPU runs it at are not what makes its list.
 - PL.1, the port's building-block check of the split path's first stage (``split_part``, bs_split_part alone): each
@@ -88,6 +88,7 @@ from tests.basalt_sampler_ref import (M, SamplerParams, f32, fixture2_data, fixt
 from tests.kernels import basalt_sampler_gpu as gpu
 from tests.kernels.basalt_gpu import device
 from tests.kernels.test_basalt_decode_cluster import PATTERNS, VOCABS, fill_logits, host_argmax
+from tests.kernels.test_basalt_nan import check as nan_check
 
 GREEDY = ["greedy_cl", "greedy_1b"]
 SAMPLED = ["split", "one_block"]
@@ -1031,6 +1032,27 @@ def test_basalt_sampler_greedy_top_prob_geometry():
     ids, bits = gpu.launch([(part, (gpu.AM_CTAS, rows), gpu.threads(part)), (prob, (rows,), 512)], l,
                            SamplerParams(greedy=True, temperature=0.0), mode=0, scratch={8: rows * gpu.AM_CTAS * 8})
     assert np.all(ids == -1) and np.all(bits == 0xFFFFFFFF), "a 512-thread dispatch wrote a pick or a probability"
+
+
+def test_basalt_sampler_greedy_top_prob_nan(monkeypatch):
+    """Invariant 5's NaN at bs_greedy_top_prob's store (docs/research/basalt-nvcc/nan.md): basalt's rcp.rn.f32 of a
+    NaN tot stores sm_120's 0x7fffffff (sampler.cu:318), this GPU's division 0x7fc00000, so the kernel stores
+    cuda_nan(1.0f / tot). tot is NaN on a row with a NaN beside a finite pick, a +inf pick (inf - inf at the pick), a
+    row of -inf (pick 0, -inf - -inf) and a NaN row; a row of normal logits keeps its probability. test_basalt_nan.py's
+    check: the planted rows store sm_120's NaN, the control (cuda_nan taken out of the sampler's kernels) another NaN,
+    and every other bit and the picks are the same in both runs."""
+    l = np.random.RandomState(31).standard_normal((5, 5000)).astype(np.float32)
+    l[0, 4097] = np.nan
+    l[1, 123] = np.inf
+    l[2] = -np.inf
+    l[3] = np.nan
+    p = SamplerParams(greedy=True, temperature=0.0)
+    ids, bits = gpu.top_prob(l, p)
+    with monkeypatch.context() as m:
+        m.setattr(gpu, "SOURCE", gpu.without_cuda_nan())
+        cids, cbits = gpu.top_prob(l, p)
+    assert np.array_equal(ids, cids) and list(ids[1:3]) == [123, 0]
+    assert nan_check(bits, cbits, np.array([True, True, True, True, False])) == 4
 
 
 # ---- PL.1: the split path's block lists (the port's building-block check) -------------------------------------------

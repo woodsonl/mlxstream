@@ -591,8 +591,9 @@ constant uint BS_TOP_PROB_THREADS = 1024u;                             // kAmThr
 // i sums logits i, i + 1,024, ... in ascending order, then the XOR butterfly at 16, 8, 4, 2, 1, then thread 0 sums
 // the 32 SIMD-groups' sums in order from +0. __expf is expf_approx (invariant 5); every add and subtraction around it
 // is CUDA's IEEE one, subnormals kept, so the butterfly is ieee_add's, not basalt_fp.metal's plain-add warp_sum.
-// probs = 1.0f / tot, correctly rounded: tot is at least 1 (the pick's own term, exp2(0)) or NaN. out is the pick, or
-// map[pick] with flags MAP (an empty row's pick 0 maps to map[0]).
+// probs = 1.0f / tot, correctly rounded: tot is at least 1 (the pick's own term, exp2(0)) or NaN, stored with
+// sm_120's NaN (cuda_nan; docs/research/basalt-nvcc/nan.md). out is the pick, or map[pick] with flags MAP (an empty
+// row's pick 0 maps to map[0]).
 kernel void bs_greedy_top_prob(device const uint* logits [[buffer(0)]], device int* out [[buffer(5)]],
                                device float* probs [[buffer(6)]], constant BsSampleParams& p [[buffer(7)]],
                                device const uint2* part [[buffer(8)]], device const int* id_map [[buffer(11)]],
@@ -623,7 +624,7 @@ kernel void bs_greedy_top_prob(device const uint* logits [[buffer(0)]], device i
     if (tid == 0u) {                                                                      // :315-320
         float tot = 0.0f;
         for (uint w = 0u; w < BS_TOP_PROB_THREADS / 32u; ++w) tot = ieee_add(tot, wsum[w]);
-        probs[t] = 1.0f / tot;
+        probs[t] = cuda_nan(1.0f / tot);
         out[t] = (p.flags & BS_MAP) != 0u ? id_map[id] : int(id);
     }
 }
@@ -794,7 +795,8 @@ constant uint BS_SEEN_WORDS = BS_SPLIT_MAX_BLOCKS * BS_BLOCK / 32u;    // 8,192:
 // returns the old word): apply_penalties with the id's count over the whole window, the value any candidate thread
 // would write (an inverse map is injective). seen is a static 8,192 words, the widest row the coupled path takes and
 // this kernel's only threadgroup memory (D4); a wider record returns at once. The width is free (the result is
-// order-free), basalt's is 1,024.
+// order-free), basalt's is 1,024. A NaN logit in the window is stored as sm_120's NaN (cuda_nan; nan.md), as basalt's
+// div.rn.f32 and FADD give it.
 kernel void bs_coupled_penalize(device uint* logits [[buffer(0)]], constant BsCoupledParams& c [[buffer(7)]],
                                 device const int* id_to_sub [[buffer(12)]],
                                 device const BsCoupledSampler* cparams [[buffer(13)]],
@@ -816,7 +818,8 @@ kernel void bs_coupled_penalize(device uint* logits [[buffer(0)]], constant BsCo
         if (s < 0 || uint(s) >= nv) continue;
         const uint bit = 1u << (uint(s) & 31u);
         if ((atomic_fetch_or_explicit(seen + (uint(s) >> 5), bit, memory_order_relaxed) & bit) != 0u) continue;
-        logits[s] = apply_penalties(logits[s], history_count(hrow, h, uint(v)), repeat, freq, present);
+        const uint y = apply_penalties(logits[s], history_count(hrow, h, uint(v)), repeat, freq, present);
+        logits[s] = as_type<uint>(cuda_nan(as_type<float>(y)));
     }
 }
 

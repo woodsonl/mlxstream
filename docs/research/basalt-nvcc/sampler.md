@@ -400,7 +400,9 @@ the contract (`flash-next.md`, approximate operations in IEEE-built kernels).
   threadgroup of 1,024 threads per row, thread i summing elements i, i + 1,024, ... in order, then the five
   butterfly steps and the serial finish over 32 partials from +0.
 - **Rows without a finite maximum.** For an all-NaN or all -inf row, or a +inf pick, `l[id] - m` is NaN at the
-  pick, so CUDA writes a NaN probability. Whether `fast::exp2` propagates NaN is [H]; the following `add32` does.
+  pick, so CUDA writes a NaN probability, as it does for a NaN logit anywhere in the row. `fast::exp2` returns
+  0x7fc00000 for a NaN on this GPU (`nan.md`, measured), and the following `add32` propagates it. The store carries
+  sm_120's NaN, 0x7fffffff (`cuda_nan`, invariant 5; `nan.md`).
 
 ### 3.4 `sampler_one_block_kernel` (`sampler.cu:446-518`)
 
@@ -496,6 +498,8 @@ comes `__cuda_sm3x_div_rn_noftz_f32_slowpath`, attributed to `:726`.
   the division's operand order differs from section 2.1's copy without changing a bit. The draft logit gets the
   target's penalised value only if both use one `apply_penalties` helper. Which thread wins `atomicOr` decides only
   which thread writes; every candidate writer computes the same value.
+- **A NaN reaches the row.** A counted NaN logit, or a counted +inf less an infinite frequency or presence term,
+  leaves `FADD` as sm_120's 0x7fffffff; the Metal store rewrites this GPU's 0x7fc00000 to it (`cuda_nan`; `nan.md`).
 
 ### 3.9 `coupled_part_kernel<8, 16>` (`sampler.cu:733-777`)
 

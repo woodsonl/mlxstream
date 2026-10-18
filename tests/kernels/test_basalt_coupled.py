@@ -30,6 +30,8 @@ from it with the verify row's counter cell + 1, mapped through the subset, and k
   nothing else, at basalt's 256 threads and at 32, at coupled_parity's cap and the engine's 4,096.
 - A8 (``test_basalt_sampler_empty_keep``; its sampled and probed paths are test_basalt_sampler.py's): min_p 2 keeps
   nothing, and the draft is the list's head with probability 1.0.
+- NaN (``test_basalt_coupled_penalize_nan``): a counted NaN logit, and a counted +inf less an infinite presence term,
+  are stored as sm_120's NaN (invariant 5; docs/research/basalt-nvcc/nan.md).
 """
 
 import functools
@@ -42,8 +44,9 @@ import pytest
 from monolith import kernels
 from tests.basalt_sampler_ref import (COUPLED_HIST_CAP, COUPLED_VOCABS, coupled_cases, coupled_draft_counter,
                                       coupled_hist_base, coupled_hist_len, coupled_hist_start, mirror_pick,
-                                      mirror_select, penal_vec, raw32, sampled_k)
+                                      mirror_select, penal_vec, raw32, sampled_k, SamplerParams)
 from tests.kernels import basalt_sampler_gpu as gpu
+from tests.kernels.test_basalt_nan import check as nan_check
 from tests.kernels.test_basalt_sampler import block_lists, kernel_qprob
 
 CAP = gpu.CPL_CAP
@@ -312,3 +315,31 @@ def test_basalt_sampler_empty_keep(nv):
             bad.append(case.c)
     assert drawn, "the case's own min_p draws another token than the head on some case"
     assert not bad, f"A8: `min_p = 2.0`: pick `sel_ids[0]`, prob 1.0 (cases {bad} of 60 differ)"
+
+
+def test_basalt_coupled_penalize_nan(monkeypatch):
+    """Invariant 5's NaN at bs_coupled_penalize's in-place store (docs/research/basalt-nvcc/nan.md): a counted NaN
+    logit is divided by repeat (setp.gtu) and then less the count term, and a counted +inf less an infinite presence
+    term is inf - inf; basalt's div.rn.f32 and FADD store sm_120's 0x7fffffff (sampler.cu:724), this GPU's division
+    and add 0x7fc00000, so the kernel stores the penalised value through cuda_nan. One row of nv = 5,000 normal
+    logits without a subset: case 1 counts NaN logits at ids 30 and 31, case 2 a +inf logit at id 40 with presence
+    +inf (every other counted logit becomes -inf). test_basalt_nan.py's check: the planted ids store sm_120's NaN, the
+    control (cuda_nan taken out of the sampler's kernels) another NaN, and every other logit, the draft's id and its
+    probability are the same in both runs."""
+    nv = 5000
+    ring = np.full(CAP + gpu.CPL_MAX_T, -1, np.int32)
+    ring[CAP - 64:CAP] = np.arange(64) % 20 + 25                        # ids 25 .. 44, counted 3 or 4 times
+    base = SamplerParams(temperature=0.6, seed=7, penalty_last_n=64, penalty_repeat=1.1, penalty_freq=0.05,
+                         penalty_present=0.1)
+    for planted, p in (({30: np.nan, 31: np.nan}, base), ({40: np.inf}, replace(base, penalty_present=float("inf")))):
+        l = np.random.RandomState(9).standard_normal(nv).astype(np.float32)
+        for i, v in planted.items():
+            l[i] = v
+        r = gpu.coupled_draft(l, p, j=0, ring=ring)
+        with monkeypatch.context() as m:
+            m.setattr(gpu, "SOURCE", gpu.without_cuda_nan())
+            c = gpu.coupled_draft(l, p, j=0, ring=ring)
+        at = np.zeros(nv, bool)
+        at[list(planted)] = True
+        assert (r.id, r.prob) == (c.id, c.prob)
+        assert nan_check(r.logits, c.logits, at) == len(planted)
