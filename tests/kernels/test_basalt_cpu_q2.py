@@ -853,7 +853,7 @@ MODEL_GOLDENS = [
     ("s2-zero-times-inf", 1, 0x0000, (("hx", 0, INF),), None, INDEF, "223"),
     ("s3-quieted-snan-p-over-qnan-acc", 2, 0x3C00, (("scale", 0, PX), ("scale", 2, SNAN)), None, 0x7FC0000D,
      "212, 251"),
-    ("s4-level-1-high-half", 8, 0x3C00, (("hx", 0, SNAN), ("hx", 8, PY)), None, PY, "236, 270"),
+    ("s4-level-1-high-half", 8, 0x3C00, (("hx", 0, SNAN), ("hx", 8, PY)), None, PY, "236, 270, 307-313"),
     ("s4-acc-levels-2-to-4", 1, 0x3C00, (("scale", 0, PX), ("scale", 1, INF)), 14, INDEF, "247, 270"),
     ("s5-quieted-snans-a-over-b", 1, 0x3C00, (("scale", 0, SNAN), ("hx", 0, SNAN2)), None, 0x7FC0000D, "212, 351"),
 ]
