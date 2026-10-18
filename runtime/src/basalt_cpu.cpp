@@ -69,6 +69,18 @@
 //     build-dependent value beside amax below - a basalt built by another GCC, or run with nt > 1, may hold
 //     different bits in this case alone.
 //
+// THE SUPPORTED INPUT RANGE, a decision of the engineering review. basalt's act_quant_q8_1 writes no NaN scale or
+// hx for any float input (expert.cpp:352-367): a NaN amax fails amax > 0.f, so s = +0 (:353) and hx = +0 * sum is
+// a zero (:367); a finite amax gives a finite s, so hx is finite or overflows to an infinity; and amax = +inf needs
+// an infinite lane, whose t = inf * (1.f / s) = inf * 0 (:354, :356) is a NaN that VCVTTPS2DQ converts to INT_MIN
+// and the clamp to -127, while every finite lane's t = +-0 gives 0 (:357-361), so sum <= -127 (:364) and
+// hx = +inf * sum = -inf. Case A11 asserts the exact outputs for a single +inf, a single NaN and +inf with -inf.
+// A NaN therefore enters a row only through a NaN fp16 block scale in the weights, which a valid model file does
+// not hold: the pinned GCC 14.3 single-token rule above decides only rows of a corrupt weight file and test inputs,
+// and every NaN generated from non-NaN inputs, an infinite activation's included, is 0xffc00000 under every build
+// measured - basalt's under GCC 12.5, 13.4, 14.3 and 15.2 (ground-truth:375-378), this port's at -O0 and at the
+// Release flags.
+//
 // THE TWO COMPILER-DEPENDENT VALUES. The first is amax. _mm512_reduce_max_ps is header-defined and basalt pins
 // no compiler (README.md:33-35, CMakeLists.txt:43-46). GCC 14's gcc/config/i386/avx512fintrin.h:16339-16350 (used by
 // _mm512_reduce_max_ps at :16359-16364) passes the HIGH half as SRC1 at the first two levels; Clang 21's

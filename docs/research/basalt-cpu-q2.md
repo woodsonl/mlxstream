@@ -262,3 +262,22 @@ The port in that form reproduces the reviewer's lane-level model — the one val
 with 0 mismatches in 62,374 outputs — bit for bit on all three activation kinds, at `-O0`, `-O2` and `-O3` [M], and
 matches every recorded fixture and probe at `nt = 1` (`tests/kernels/test_basalt_cpu_q2.py`, group C). What remains
 different from a particular basalt binary is only case 2 at `nt > 1`, or under a GCC other than 14.3/14.4.
+
+## 7. The supported input range
+
+A decision of the engineering review. basalt's `act_quant_q8_1` writes no NaN `scale` or `hx` for any float input
+(**Inference** from `expert.cpp:352-367`). A NaN `amax` fails the ordered `amax > 0.f`, so `s = +0` (`:353`) and
+`hx = +0 * sum` is a zero (`:367`). A finite `amax` gives a finite `s`, so `hx` is finite or overflows to an infinity.
+`amax = +inf` needs an infinite lane, whose `t = inf * (1.f / s) = inf * 0` (`:354`, `:356`) is a NaN that `VCVTTPS2DQ`
+and the clamp take to −127 while every finite lane's `t = ±0` gives 0 (`:357-361`, section 4), so `sum <= -127` (`:364`)
+and `hx = +inf * sum = -inf`. Case A11 asserts the exact outputs [M]: a single `+inf` gives `scale = +inf`,
+`sum = -127`, `hx = -inf` at every position; a single NaN gives −127 at its own position, and where it also reaches
+`amax` (position 19 alone, under GCC's tree) `scale = +0`, `sum = -127`, `hx = -0.0`; `+inf` with `-inf` gives
+`sum = -254` and `hx = -inf`. The port at `-O0` and at the Release flags wrote no NaN `scale` or `hx` over 3,681,564
+chunks drawn with NaN, ±inf, huge, subnormal and zero elements, and every `+inf` scale came with `sum <= -127` and
+`hx = -inf` [M]. A NaN therefore enters a row only through a NaN fp16 block scale in the weights, which a valid model
+file does not hold. The pinned GCC 14.3 single-token rule of section 6's case 2 decides only rows of a corrupt weight
+file and test inputs (a NaN block scale, or a NaN planted in `scale` or `hx` through the binding); every NaN generated
+from non-NaN inputs, an infinite activation's included, is `0xffc00000` under every build measured — basalt's under GCC
+12.5, 13.4, 14.3 and 15.2 [M] `GT:375-378`, the port's at `-O0` and at the Release flags, all 316,278 NaN outputs of
+316,366 from rows with no NaN block scale fed those activations [M].
