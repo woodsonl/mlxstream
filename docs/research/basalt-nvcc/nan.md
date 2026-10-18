@@ -21,9 +21,10 @@ specification, [H] inferred.
   `make_half2(__float2half(a), __float2half(b))` (basalt's `q8_1_ds`) and `roundf`. Its inputs come from device
   memory so nothing folds: made NaNs (inf − inf, inf · 0, fma(inf, 0, 1), 0 / 0) and passed ones (0x7fc00000, the
   signaling 0x7fa5a5a5, 0x7fd2d2d2, the negative 0xffc00001, 0x7fffffff, 0xffffffff, 0x7f800001; the fp16 NaNs 0x7e00,
-  0x7d55, 0xfe01, 0x7fff). Built with NVCC 13.3.0 (`nvcc133`, `-O3`) and run there; the same source built for sm_120
-  with basalt's flags (`--generate-code=arch=compute_120,code=[compute_120,sm_120]`) gives the SASS each instruction
-  becomes on basalt's target. A host program prints NVIDIA's own NaN constants and the host-side fp16 conversion.
+  0x7d55, 0xfe01, 0x7fff). Built with NVCC 13.3.0 (`nvcc133`, `-O3`, code for sm_75 and sm_120) and run there; the
+  same source built for sm_120 alone with basalt's flags (`--generate-code=arch=compute_120,code=[compute_120,sm_120]`)
+  gives the SASS each instruction becomes on basalt's target. A host program prints NVIDIA's own NaN constants and the
+  host-side fp16 conversion.
 - **This GPU.** The same operations in MSL, `MTLMathModeSafe` (the repository default), on the M3 Max (Apple family
   9, macOS 27.0.1), with `basalt_fp.metal`'s helpers.
 - **The stores.** Each store's value is traced back through basalt's source to the instruction that wrote it, as the
@@ -93,14 +94,14 @@ weight scale comes only from a damaged file, in an activation only from upstream
 | Metal kernel: store | basalt | Last instruction on sm_120 | NaN reaches it | sm_120 | This GPU, unrewritten | Port |
 |---|---|---|---|---|---|---|
 | `native_quantize_q8_1`, `native_swiglu_quantize_q8_1`: codes | `native_mmvq.cu:157`, `:175` | `F2I.FTZ.TRUNC.NTZ` (`matvec.md` section 1) | never: a NaN quotient converts to 0 | 0 | 0 (`q8_1_code`) | no change |
-| the same: fp16 d and sum | `native_mmvq.cu:158`, `:176`; `q8_1_finite.hpp:29-31` | `F2FP.F16.F32.PACK_AB R13, R13, R0` of `FMUL.FTZ` (d) and `FADD.FTZ` (sum) through `FSEL` (section 1) | sum: a NaN lane, or +inf and −inf in one block (`FADD.FTZ` butterfly); d: every lane NaN (`FMNMX.FTZ` of NaNs, then `FMUL.FTZ`); the SwiGLU's value is NaN for a NaN or −inf gate (−inf · 0 in `g / (1 + e)`) or a NaN up | 0x7fff | 0x7e00 | `cuda_nan_f16` in `q8_1_put` |
+| the same: fp16 d and sum | `native_mmvq.cu:158`, `:176`; `q8_1_finite.hpp:29-31` | `F2FP.F16.F32.PACK_AB R13, R13, R0` of `FMUL.FTZ` (d) and `FADD.FTZ` (sum) through `FSEL` (section 1) | sum: a NaN lane, or +inf and −inf in one block (`FADD.FTZ` butterfly); d: every lane NaN (`FMNMX.FTZ` of NaNs, then `FMUL.FTZ`); the SwiGLU's value is NaN for a NaN gate, a −inf gate (`__fdividef(−inf, inf)` is −inf · `MUFU.RCP`(inf) = −inf · 0) or a NaN up | 0x7fff | 0x7e00 | `cuda_nan_f16` in `q8_1_put` |
 | `quantize_q8_1`: codes | `iq_kernels.cu:1892` | `F2I.TRUNC.NTZ` (section 3) | never | 0 | 0 | no change |
 | `quantize_q8_1`: fp16 d and sum | `iq_kernels.cu:1893` | `F2FP.F16.F32.PACK_AB` of the `div.rn.f32` sequence (d) and `FADD` (sum) (section 3) | as above; d = NaN / 127 for an all-NaN block | 0x7fff | 0x7e00 | `cuda_nan_f16` in `q8_1_put` |
 | `basalt_mmvq`: y, one and several columns | `native_mmvq.cu:281`, `:347`, `:435`, `:517`, `:615`, `:689`, `:800`, `:878`, `:1148` | `FADD.FTZ`, the butterfly's last step (`matvec.md` sections 4, 6) | a weight's fp16 d or dmin inf against a zero integer dot or a zero d8, or NaN; a NaN d8, or a NaN s8 in Q4_0 and Q5_0 | 0x7fffffff | 0x7fc00000 | `cuda_nan` |
 | `basalt_dequant_f32`: y | `iq_kernels.cu:2020-2021`, `:2043`, `:2054-2055`, `:2067` | `FMUL` (`dequant.md`) | the block's d NaN, or inf times a zero factor: Q2_0's code 1, Q3_K's code 0 or scale 32, IQ4_XS's scale 32 (IQ4_NL's codebook has no 0) | 0x7fffffff | 0x7fc00000 | `cuda_nan` |
 | `basalt_expert_gu`: gate and up, `GU2` 1 | `gu2.cuh:296-297` | `FADD`, `warp_sum`'s last step (`experts.md` section 1) | a gate or up row's d2 inf against a zero sumi or d8, or NaN; a NaN d8 | 0x7fffffff | 0x7fc00000 | `cuda_nan` |
 | `basalt_expert_gu`: gate and up, `GU2` 0 | `iq_kernels.cu:1153`, `:1158`, `:1167` | `FADD` (section 1) | as above | 0x7fffffff | 0x7fc00000 | `cuda_nan` |
-| `basalt_expert_swiglu_q8_1`: codes, fp16 d and sum | `gu2.cuh:388`; `iq_kernels.cu:1892-1893` | as `quantize_q8_1` (`experts.md` section 2) | a NaN gate or up (a NaN row), a gate of −inf, inf · 0 in the product | codes 0; halves 0x7fff | codes 0; halves 0x7e00 | `cuda_nan_f16` in `q8_1_put` |
+| `basalt_expert_swiglu_q8_1`: codes, fp16 d and sum | `gu2.cuh:388`; `iq_kernels.cu:1892-1893` | as `quantize_q8_1` (`experts.md` section 2) | a NaN gate or up (a NaN row), a gate of −inf (`div.rn.f32` of −inf by inf), inf · 0 in the product | codes 0; halves 0x7fff | codes 0; halves 0x7e00 | `cuda_nan_f16` in `q8_1_put` |
 | `basalt_expert_down`: out, `SUB16` 1 | `iq_kernels.cu:1803`, `:1808`, `:1817` | `FADD`, the 16-lane butterfly's last step (`experts.md` section 3) | a down row's d2 inf or NaN; a NaN q8_1 d of the intermediate | 0x7fffffff | 0x7fc00000 | `cuda_nan` |
 | `basalt_expert_down`: out, `SUB16` 0 | `iq_kernels.cu:1874` | `FADD` (section 3) | as above | 0x7fffffff | 0x7fc00000 | `cuda_nan` |
 | `basalt_mmvf`: y | `native_bf16.cu:72`, `:121` | `FADD.FTZ`, the block butterfly's last step (`bf16.md` sections 1, 2) | a NaN weight or activation; inf · 0; inf − inf | 0x7fffffff | 0x7fc00000 | `cuda_nan` |
@@ -114,7 +115,7 @@ weight scale comes only from a damaged file, in an activation only from upstream
 | `basalt_q5k_head_top1_merge`: out_prob | `q5k_head.cu:332` | `MUFU.RCP` of the merged s (`q5k_head.md` section 2) | the merged s NaN | 0x7fffffff | 0x7fc00000 | `cuda_nan` |
 | `basalt_q5k_proxy_pack`: fp16 scale | `head_proxy.cuh:86` | `F2FP.F16.F32.PACK_AB R0, RZ, R40` (`q5k_head.md` section 4.1) | never: amax starts at 1e-9 and `FMNMX.FTZ` drops a NaN weight (`:44-45`), so amax and s = amax · fl(1/1.5) · fl(1 − 0.1t) (a positive factor) are finite or +inf | | | no change |
 | `basalt_q5k_proxy_pack`: levels | `head_proxy.cuh:76-85` | `F2I.FTZ.FLOOR.NTZ`, integer clamp | never: a NaN level converts to 0 | 0 | 0 (`px_level`) | no change |
-| `basalt_q5k_proxy_score`: part m | `head_proxy.cuh:154` | `FMNMX.FTZ` butterfly (`q5k_head.md` section 4.2) | every lane's score NaN | 0x7fffffff | the operand's 0x7fc00000 | `cuda_nan` |
+| `basalt_q5k_proxy_score`: part m | `head_proxy.cuh:154` | `FMNMX.FTZ` butterfly (`q5k_head.md` section 4.2) | every lane's score NaN | 0x7fffffff | an operand's 0x7fc00000 | `cuda_nan` |
 | `basalt_q5k_proxy_score`: part e | `head_proxy.cuh:154` | `FADD.FTZ` butterfly (section 4.2) | a +inf score (`__expf(inf − inf)`) | 0x7fffffff | 0x7fc00000 | `cuda_nan` |
 | `basalt_q5k_proxy_score`: cand score | `head_proxy.cuh:164` | a score's bits through `SHFL` and `FSEL`: `FADD.FTZ` (`:146`) or the constant −inf (`:147`) | a NaN score: no compare selects a NaN over a number, and lane 0 keeps its own NaN | 0x7fffffff | 0x7fc00000 | `cuda_nan` |
 | `basalt_q5k_proxy_score`: cand row | `head_proxy.cuh:164` | an int's bits | not a float value | | | no change |
