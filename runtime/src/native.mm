@@ -234,4 +234,28 @@ NB_MODULE(_native, m) {
     for (size_t i = 0; i < n; ++i) op[i] = bc::swiglu(gp[i], up[i]);
   }, nb::arg("g").noconvert(), nb::arg("u").noconvert(), nb::arg("out").noconvert(),
      "basalt's CPU SwiGLU (pool.cpp:434): out[i] = (g[i] / (1.f + expf_glibc(-g[i]))) * u[i]");
+
+  // The acceptance oracle sweeps all 2^32 float32 arguments, which no Python loop can hash in reasonable time and
+  // which would be 16 GB as an array. The digest runs here instead, over one range of bit patterns per call: the
+  // FNV-1a of the result bits in increasing argument order, the rule tests/kernels/fixtures/expf_digests.txt
+  // records glibc's own output under.
+  m.def("basalt_expf_digest", [](uint32_t first_bits, uint32_t count) {
+    // Refused rather than wrapped: a range that runs off the end of the bit patterns would silently digest a
+    // different set of arguments than the caller named.
+    need(uint64_t(first_bits) + count <= (uint64_t(1) << 32),
+         "basalt_expf_digest: first_bits + count must not run past 2^32");
+    uint64_t h = 0xCBF29CE484222325ull;
+    nb::gil_scoped_release unlock;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t bits = first_bits + i;
+      float x;
+      std::memcpy(&x, &bits, sizeof x);
+      const float y = bc::expf_glibc(x);
+      uint32_t yb;
+      std::memcpy(&yb, &y, sizeof yb);
+      h = (h ^ yb) * 0x100000001B3ull;
+    }
+    return h;
+  }, nb::arg("first_bits"), nb::arg("count"),
+     "FNV-1a over the result bits of expf_glibc at `count` consecutive float32 bit patterns from `first_bits`");
 }

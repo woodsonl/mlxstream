@@ -19,8 +19,8 @@ namespace monolith::basalt_cpu {
 /// nearest, not correctly rounded. Every input is valid, specials included.
 float expf_glibc(float x);
 
-/// basalt's SwiGLU, `(g / (1.f + std::exp(-g))) * u` (pool.cpp:434) - the divide, the add and the multiply in that
-/// order, which is part of the result.
+/// basalt's SwiGLU, `(g / (1.f + std::exp(-g))) * u` (pool.cpp:434) - the add, the divide and the multiply in the
+/// order gcc emits them, each with the NaN x86 writes, which are both part of the result.
 float swiglu(float g, float u);
 
 }  // namespace monolith::basalt_cpu

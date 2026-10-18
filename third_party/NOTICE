@@ -219,6 +219,9 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `src/kernels/cpu/pool.cpp:434` (MIT): the CPU expert pool's SwiGLU, `(g / (1.f + std::exp(-g))) * u`, in its
   order of operations, which is the only arithmetic the pool itself performs. License:
   `third_party/BASALT-LICENSE`.
+- `tests/kernels/fixtures/swiglu_vectors.txt` — the recorded output of `src/kernels/cpu/pool.cpp:425-434` (MIT),
+  built as basalt builds it and run on x86-64: measured values, not source. License:
+  `third_party/BASALT-LICENSE`.
 - `tests/kernels/test_basalt_platform.py` — the contraction check's pass criterion of
   `src/kernels/elementwise_parity.cpp` (MIT). License: `third_party/BASALT-LICENSE`.
 - `tests/kernels/basalt_emu.py` — adapted from `src/kernels/cuda/native_mmvq.cu`, `src/kernels/cuda/iq_kernels.cu`,

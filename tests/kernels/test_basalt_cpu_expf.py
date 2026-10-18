@@ -5,35 +5,46 @@
 """``expf_glibc`` and the SwiGLU of ``runtime/src/basalt_cpu_expf.cpp``, the one piece of arithmetic basalt's CPU
 expert pool performs itself.
 
-**What is pinned and what is only bounded.** The function must return glibc's bits, because basalt runs on Linux
-with glibc and a token's output has to be the same number whichever tier produced it. Six glibc values have been
-recorded so far, on a Xeon Platinum 8375C running glibc 2.39
-(``.context/basalt-port/expf-ground-truth/raw/probe_run1.txt``); group A asserts those six, bit for bit, and they
-are the only inputs at which this suite knows glibc's answer. The fuller corpus is still being produced. Everywhere
-else the suite does what can be done without it: group B holds the transcription to the 0.502 ulp Arm records for
-this algorithm, against a float64 reference, over the SwiGLU's reachable range; group C pins the specials and the
-three thresholds against that same reference; group D pins the SwiGLU's order of operations. A transcription that
-passed B, C and D could still differ from glibc somewhere - only the corpus can close that - but it could not
-differ by much, and not in the shape of the usual transcription mistake.
+**What the bits are held against.** The function must return glibc's bits, because basalt runs on Linux
+with glibc and a token's output has to be the same number whichever tier produced it. Group A is the acceptance
+oracle and it is exhaustive: A1 the six values read straight out of a running glibc, and A2 the 4,226 recorded
+(g, u, res) triples of basalt's own line; B4 carries the rest, glibc's ``expf`` at every one of the 4,294,967,296
+float32 arguments as 4,096 block digests. Nothing about the transcription can be wrong anywhere without showing
+up in one of them (``docs/research/basalt-cpu-expf.md``, ``tests/kernels/fixtures/``).
+
+The other cases say what each part of the result is, which a digest cannot: group B holds the transcription to
+the 0.502 ulp Arm records for this algorithm, against a float64 reference, over the SwiGLU's reachable range, and
+names the two arguments at which glibc's own two x86-64 variants part; group C pins the specials and the three
+thresholds against that same reference; group D pins the SwiGLU's order of operations and the NaN each of its
+three instructions writes.
 
 The float64 reference is ``np.exp`` in double, which carries 29 bits more than the float32 result and is itself
 accurate to well under 2^-29 of a float32 ulp. Its own error is therefore invisible at the 10^-3 ulp the group B
 assertions turn on. Where a case asserts the *correctly rounded* value it is written ``np.float32(np.exp(x64))``:
 one rounding, from the double to the float.
 
-Cases. **A**, the recorded glibc bits: A1 the six values. **B**, the error bound: B1 a stratified sample of
-[-40, 40] - the SwiGLU's reachable range, with most of its mass near zero - B2 the measured worst case and the
-window around it, and B3 the two arguments a contracted multiply-add would move. **C**, the specials: C1 both
-zeros, C2 both infinities, C3 NaN (quiet and signalling), C4 the overflow threshold and the largest argument with
-a finite result, C5 the two underflow thresholds and the ``may_uflow`` band, C6 the subnormal results. **D**, the
-SwiGLU: D1 its order against basalt's expression, D2 that the order is load-bearing, D3 its specials.
+Cases. **A**, the recorded x86 bits: A1 the six ``expf`` values, A2 the 4,226 SwiGLU vectors. **B**, the error
+bound and the exhaustive sweep: B1 a stratified sample of [-40, 40] - the SwiGLU's reachable range, with most of
+its mass near zero - B2 the measured worst case and the window around it, B3 the two arguments the rounding
+step's fusion moves, and B4 all 4,096 block digests. **C**, the specials: C1 both zeros, C2 both infinities,
+C3 NaN (quiet and signalling), C4 the overflow threshold and the largest argument with a finite result, C5 the
+two underflow thresholds and the ``may_uflow`` band, C6 the subnormal results. **D**, the SwiGLU: D1 its order
+against basalt's expression, D2 that the order is load-bearing, D3 the NaN rule at each instruction.
 
 The suite bites, measured by mutating the kernel and rebuilding: ``poly`` in place of ``poly_scaled`` fails A1, B1,
 B2, B3, C4 and C6; the platform's ``expf`` fails B1, B2, B3 and C6 - it exceeds the 0.502 ulp this algorithm holds
 to, and differs from the transcription at 1,930,130 of the 2,218,786,818 float32 arguments in [-40, 40] (measured
 here), though not at any of the recorded six, so A1 alone would miss it; the rounding step written as ``z + SHIFT``
-and ``z - kd`` instead of the two ``fma()`` calls fails B3 and nothing else, which is what B3 is for; and the
-SwiGLU as ``g * (1 / (1 + e)) * u`` fails D1.
+and ``z - kd`` instead of the two ``fma()`` calls fails B3 and B4, and B4 at exactly the two blocks the fixture's
+trailer records ``__expf_sse2`` digests for, 0x420 and 0xc27, with those digests exactly - the unfused build is
+``__expf_sse2`` over those 2,097,152 arguments; and the SwiGLU as ``g * (1 / (1 + e)) * u`` fails D1.
+
+The three x86 NaN rules are not alike there. Dropping the divide's for the C operator fails A2, D1 and D3;
+dropping the multiply's fails A2 alone, since only a NaN on both sides of it tells the two apart and D3's row for
+that is the one A2 already holds. Dropping the add's fails nothing: ``1.f`` is never a NaN and the only other
+source is ``expf``'s own return, which quiets the same way on both architectures, so the instruction's source
+order cannot reach the result. It is written as the add anyway, because the transcription is of what basalt
+executes and not of what a test can catch.
 
 Two mutations fail nothing, and both are findings rather than gaps. ``round``/``lround`` for the rounding - Arm's
 other branch, the one glibc compiles on aarch64 - passes, because no float32 argument makes ``InvLn2N * x`` an
@@ -45,6 +56,8 @@ the only thing it changes.
 Run with ``-s`` for the measured worst ulp and its argument.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -52,9 +65,11 @@ from monolith.runtime import _native as _nt
 
 F32, U32 = np.float32, np.uint32
 
-# probe_run1.txt:"parent expf(...)" and "child expf(...)": glibc 2.39, Xeon Platinum 8375C, with the ifunc dispatch
-# intact and again with GLIBC_TUNABLES disabling AVX2 and FMA. The two agree on these six, which is why no variant
-# is named; the sweep that would extend that agreement ran in the parent alone, so it holds for these six only.
+FIXTURES = Path(__file__).parent / "fixtures"      # the recorded x86 corpus, docs/research/basalt-cpu-expf.md
+
+# Read out of a running glibc 2.39 on a Xeon Platinum 8375C, with the ifunc dispatch intact and again with
+# GLIBC_TUNABLES disabling AVX2 and FMA (docs/research/basalt-cpu-expf.md section 1). The two variants agree on
+# these six, which is why no variant is named here; B4's digests carry the arguments where they do not.
 GLIBC_SIX = (
     (0x3F000000, 0x3FD3094C),      # 0.5
     (0xBF800000, 0x3EBC5AB2),      # -1
@@ -93,6 +108,20 @@ def swiglu(g, u):
     return out
 
 
+def _recorded(name, ncols):
+    """The hex columns of a fixture, as uint32 arrays. Comment and short lines are skipped, which drops the
+    trailing __expf_sse2 block of expf_digests.txt with them."""
+    cols = [[] for _ in range(ncols)]
+    for line in (FIXTURES / name).read_text().splitlines():
+        parts = line.split()
+        if line.startswith("#") or len(parts) != ncols:
+            continue
+        for c, part in zip(cols, parts):
+            c.append(int(part, 16))
+    assert cols[0], f"{name} holds no {ncols}-column rows"
+    return [np.array(c, dtype=np.uint64 if max(c) > 0xFFFFFFFF else U32) for c in cols]
+
+
 def ulp_error(x):
     """|expf(x) - exp(x)| in units of the float32 ulp at the exact value, which is 2^-149 below 2^-126."""
     ref = np.exp(np.asarray(x, dtype=F32).astype(np.float64))
@@ -108,15 +137,31 @@ def correctly_rounded(x):
         return np.exp(np.asarray(x, dtype=F32).astype(np.float64)).astype(F32)
 
 
-# ---- A: the recorded glibc bits ----------------------------------------------------------------------------------
+# ---- A: the recorded x86 bits ------------------------------------------------------------------------------------
 
 def test_a1_recorded_glibc_values():
-    """A1. The six values recorded from glibc 2.39, bit for bit. These are the only inputs at which this suite
-    knows glibc's answer; everything below bounds the error instead of pinning the bits."""
+    """A1. Six values read straight out of a running glibc 2.39, bit for bit - the only ones in this suite that
+    came from a call rather than from a recorded sweep, and the case that says the sweep's own harness was
+    measuring the same function."""
     arg, want = zip(*GLIBC_SIX)
     got = bits_of(expf(f32(arg)))
     for a, w, g in zip(arg, want, got):
-        assert g == w, f"expf({a:#010x}) = {g:#010x}, glibc 2.39 gives {w:#010x} (probe_run1.txt)"
+        assert g == w, f"expf({a:#010x}) = {g:#010x}, glibc 2.39 gives {w:#010x}"
+
+
+def test_a2_recorded_swiglu_vectors():
+    """A2. basalt's own line, recorded: 4,226 (g, u, res) triples from pool.cpp:425-434 compiled as basalt compiles
+    it (x86-64 gcc 14.3, -std=c++20 -O3 -DNDEBUG, no -m flags) and run on a Xeon 8375C and a Xeon 8488C under
+    glibc 2.39-0ubuntu8.9, six runs agreeing. 57 special g against two u, 16 special-u pairs, and 4,096 random
+    pairs with |g| < 40. This is the case that pins the whole expression - the variant of expf, the order gcc
+    emits, and the NaN each instruction writes - rather than any part of it."""
+    g_bits, u_bits, want = _recorded("swiglu_vectors.txt", 3)
+    assert len(want) == 4226, f"expected 4,226 recorded vectors, read {len(want)}"
+    got = bits_of(swiglu(f32(g_bits), f32(u_bits)))
+    bad = np.nonzero(got != want)[0]
+    assert len(bad) == 0, (f"{len(bad)} of {len(want)} rows differ, first at row {bad[0]}: "
+                           f"g={g_bits[bad[0]]:#010x} u={u_bits[bad[0]]:#010x} "
+                           f"{got[bad[0]]:#010x} against the recorded {want[bad[0]]:#010x}")
 
 
 # ---- B: the error bound against a float64 reference --------------------------------------------------------------
@@ -164,6 +209,25 @@ def test_b3_the_two_arguments_contraction_would_move():
     which are the correctly rounded ones. basalt runs the fused variant, so the port is wrong when it agrees with
     the correctly rounded answer here."""
     assert list(bits_of(expf(f32([0x4202422F, 0xC27C65D9])))) == [0x56FC9F1C, 0x11FA2993]
+
+
+def test_b4_every_block_of_the_recorded_sweep():
+    """B4. glibc's own output at every one of the 4,294,967,296 float32 arguments, as 4,096 digests over blocks of
+    2^20, measured on a Xeon 8375C and a Xeon 8488C under glibc 2.39-0ubuntu8.9 with the ifunc resolving to
+    __expf_fma. Block k covers bit patterns k << 20 .. (k << 20) | 0xfffff in order; the digest is the FNV-1a of
+    the result bits, h = 0xcbf29ce484222325 then h = (h ^ bits) * 0x100000001b3 mod 2^64 per argument, which
+    ``_native.basalt_expf_digest`` computes. This is what closes the gap A1's six values leave: nothing about the
+    transcription can be wrong anywhere without showing up in a block.
+
+    The trailer of the fixture carries the two blocks __expf_sse2 digests differently, 0x420 and 0xc27, which hold
+    the two arguments of B3; those are the blocks the unfused rounding step fails."""
+    block, _first, _last, want = _recorded("expf_digests.txt", 4)
+    assert len(want) == 4096, f"expected 4,096 block digests, read {len(want)}"
+    bad = [(int(k), int(w)) for k, w in zip(block, want)
+           if _nt.basalt_expf_digest(int(k) << 20, 1 << 20) != int(w)]
+    assert not bad, (f"{len(bad)} of 4,096 blocks differ, first block {bad[0][0]:#x} "
+                     f"({_nt.basalt_expf_digest(bad[0][0] << 20, 1 << 20):#018x} "
+                     f"against the recorded {bad[0][1]:#018x})")
 
 
 # ---- C: the specials ---------------------------------------------------------------------------------------------
@@ -244,16 +308,21 @@ def _swiglu_sample():
 
 
 def test_d1_swiglu_is_basalts_expression():
-    """D1. `(g / (1.f + std::exp(-g))) * u` (pool.cpp:434): the divide, then the add, then the multiply, each in
-    float32. The order is part of the result, so the check is bitwise against that expression and nothing looser."""
+    """D1. `(g / (1.f + std::exp(-g))) * u` (pool.cpp:434): the add, then the divide, then the multiply, each in
+    float32. The order is part of the result, so the check is bitwise against that expression and nothing looser.
+    Where the expression creates a NaN the two sides hold different bits by construction, numpy writing the
+    AArch64 default NaN and the kernel x86's indefinite; those rows are A2's and D3's, and are excluded here so
+    that this case says one thing."""
     g, u = _swiglu_sample()
     with np.errstate(invalid="ignore"):                       # -inf / inf is a NaN on both sides, not an error
         want = (g / (F32(1.0) + expf(-g))) * u
     got = swiglu(g, u)
-    bad = np.flatnonzero(bits_of(got) != bits_of(want))
+    created_nan = np.isnan(want) & ~np.isnan(g) & ~np.isnan(u)
+    bad = np.flatnonzero((bits_of(got) != bits_of(want)) & ~created_nan)
     assert bad.size == 0, (f"{bad.size} of {g.size} differ, first at g={bits_of(g)[bad[0]]:#010x} "
                            f"u={bits_of(u)[bad[0]]:#010x}: {bits_of(got)[bad[0]]:#010x} vs "
                            f"{bits_of(want)[bad[0]]:#010x}")
+    assert (bits_of(got)[created_nan] == 0xFFC00000).all()    # and those rows are x86's indefinite, every one
 
 
 def test_d2_the_order_is_load_bearing():
@@ -266,15 +335,20 @@ def test_d2_the_order_is_load_bearing():
 
 
 def test_d3_swiglu_specials():
-    """D3. The specials basalt's expression itself produces: +inf passes through, -inf gives -inf/inf = NaN, and a
-    NaN on either side propagates. Pinned as values, since a port that quietly guarded them would still pass D1."""
-    g = f32([0x7F800000, 0xFF800000, 0x00000000, 0x80000000, 0x7FC00001])
-    u = f32([0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000])
+    """D3. The specials basalt's expression itself produces, as bits. An operation that creates a NaN writes x86's
+    floating-point indefinite 0xffc00000, where an AArch64 instruction writes 0x7fc00000; a NaN that arrives as an
+    operand comes back quieted with its payload, from whichever source of the instruction is the first NaN, which
+    is `g` at the divide and the quotient at the multiply. A2's recorded vectors cover every row here; this case
+    says which rule each one is."""
+    g = f32([0x7F800000, 0xFF800000, 0x00000000, 0x80000000, 0x7F812345, 0x3F800000, 0x7F812345])
+    u = f32([0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000, 0x7F812345, 0x7FC54321])
     got = bits_of(swiglu(g, u))
     assert got[0] == 0x7F800000                                  # inf / (1 + 0) * 1
-    assert (got[1] & 0x7FFFFFFF) > 0x7F800000                    # -inf / inf = NaN
+    assert got[1] == 0xFFC00000                                  # -inf / inf, an indefinite the divide creates
     assert got[2] == 0x00000000 and got[3] == 0x80000000         # +-0 keep their sign
-    assert (got[4] & 0x7FFFFFFF) > 0x7F800000
+    assert got[4] == 0x7FC12345                                  # a NaN g, quieted, through both instructions
+    assert got[5] == 0x7FC12345                                  # a NaN u, the multiply's SRC1 being finite
+    assert got[6] == 0x7FC12345                                  # both NaN: the multiply keeps the quotient's
 
 
 # ---- the binding's own checks ------------------------------------------------------------------------------------
@@ -291,3 +365,7 @@ def test_binding_refuses_mismatched_lengths_and_dtypes():
         _nt.basalt_expf(np.zeros((2, 4), F32), np.zeros((2, 4), F32))
     with pytest.raises(TypeError):
         _nt.basalt_expf(np.zeros(16, F32)[::2], np.zeros(8, F32))          # not contiguous
+    with pytest.raises(ValueError, match="past 2\\^32"):
+        _nt.basalt_expf_digest(0xFFFFFFFF, 2)                              # a range that would wrap
+    assert _nt.basalt_expf_digest(0xFFFFFFFF, 1) == _nt.basalt_expf_digest(0xFFFFFFFF, 1)
+    assert _nt.basalt_expf_digest(0, 0) == 0xCBF29CE484222325              # the empty digest is the seed

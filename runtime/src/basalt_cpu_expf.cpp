@@ -22,24 +22,32 @@
 // is dropped. errno is not set - ERANGE is all glibc adds there, nothing in this tree reads it, and the returned
 // bits are the contract.
 //
-// WHAT MAY FUSE, AND WHAT MUST NOT. Arm writes every multiply-add with operators and leaves contraction to the
-// compiler. The sites are the three of the polynomial - `C[0]*r + C[1]`, `C[2]*r + 1`, `z*r2 + y` - and, once
+// WHICH VARIANT, AND WHAT FUSES IN IT. Arm writes every multiply-add with operators and leaves contraction to the
+// compiler, so the source alone does not say what the function is. glibc's x86-64 multiarch holds __expf_fma,
+// this same source compiled with -mfma -mavx2, and an ifunc picks it on any host with FMA and AVX2 - every host
+// that can run basalt's AVX-512 expert kernels. That is the variant basalt runs and the one transcribed here. The
+// contraction sites are the three of the polynomial - `C[0]*r + C[1]`, `C[2]*r + 1`, `z*r2 + y` - and, once
 // `z = InvLn2N * xd` is substituted, `z + SHIFT` and `z - kd`; `r2 = r*r` and `y = y*s` have nothing to fuse into.
-// This file is built with -ffp-contract=off (runtime/CMakeLists.txt), so none of them do. It matters where, and
-// only where, it was measured to: both orders were built here and swept over all 2^32 float inputs [M, Apple
-// clang 21.0.0, -O2].
+// Both orders were built here and swept over all 2^32 float inputs [M, Apple clang 21.0.0, -O2]:
 //   * The three polynomial sites: `std::fma` at all three returns the identical bits at every one of the 2^32
 //     inputs. The double carries 29 bits more than the float it is rounded back to, which is why fusing a double
-//     rounding this far from the boundary cannot be seen.
-//   * `z + SHIFT` and `z - kd`: fusing those two as well changes 2 of the 2^32 - 0x4202422f (32.5646324), where
-//     unfused gives 0x56fc9f1b and fused 0x56fc9f1c, and 0xc27c65d9 - because the fused form subtracts kd from
-//     the unrounded product, where `z - kd` as written subtracts it from the rounded z and is itself exact. A
-//     different r is a different function, so those are the two that must not fuse, whatever a host's FMA.
-// So the build flag pins the arithmetic without having to settle which glibc variant basalt's hosts run: glibc's
-// x86-64 multiarch holds __expf_fma, this same source compiled with -mfma -mavx2, and its ifunc picks it on a host
-// with FMA and AVX2 - every host that can run basalt's AVX-512 expert kernels - and on the sweep above that choice
-// does not reach the returned bits. The six recorded glibc values agree across both variants in any case
-// (.context/basalt-port/expf-ground-truth/raw/probe_run1.txt, and .context/oi007/04-cpu-pool.md open question 5).
+//     rounding this far from the boundary cannot be seen. Written as Arm writes them, left to the build flag.
+//   * `z + SHIFT` and `z - kd`: fusing those two changes 2 of the 2^32 - 0x4202422f (32.5646324), where unfused
+//     gives 0x56fc9f1b and fused 0x56fc9f1c, and 0xc27c65d9 - because the fused form subtracts kd from the
+//     unrounded product, where `z - kd` as written subtracts it from the rounded z and is itself exact. A
+//     different r is a different function, and this is the one place the two glibc variants part: __expf_fma
+//     fuses them and __expf_sse2 does not [M, Xeon Platinum 8375C, glibc 2.39-0ubuntu8.9, the ifunc intact and
+//     again with GLIBC_TUNABLES disabling AVX2 and FMA]. They are written as explicit `std::fma` below so that
+//     -ffp-contract cannot decide which function this is.
+// The file is still built with -ffp-contract=off (runtime/CMakeLists.txt): that pins the polynomial, where Arm's
+// operators stand, and the two explicit calls stand over it.
+//
+// WHERE NaN BITS COME FROM. x86 writes the floating-point indefinite 0xffc00000, sign bit set, where AArch64
+// writes the default NaN 0x7fc00000 ([S] Intel SDM Vol. 1 4.8.3.7; [S] Arm ARM A1.5.3), and an SSE scalar
+// operation that is handed a NaN returns the first of its sources that is one, quieted. expf itself needs no
+// helper - its NaN return is `x + x`, which quiets the argument's payload and sign on both architectures - but
+// the SwiGLU's add, divide and multiply all reach the indefinite from finite or infinite inputs, so they are
+// written below as the x86 instructions basalt's codegen emits rather than as C operators.
 
 #include "basalt_cpu_expf.h"
 
@@ -137,6 +145,40 @@ float expf_glibc(float x) {
     return (float) y;
 }
 
-float swiglu(float g, float u) { return (g / (1.f + expf_glibc(-g))) * u; }
+namespace {
+
+inline bool is_nan(float x) { return x != x; }
+inline float quiet(float x) { return std::bit_cast<float>(std::bit_cast<uint32_t>(x) | 0x00400000u); }
+
+/// An SSE scalar arithmetic instruction's NaN: the first source operand that is a NaN, quieted, and otherwise the
+/// floating-point indefinite 0xffc00000 when the operation itself creates one ([S] Intel SDM Vol. 1 4.8.3.7).
+/// SRC1 is the destination register in Intel syntax, which is why each call below names its operands in the order
+/// the emitted instructions have them and not the order pool.cpp:434 reads in
+/// (docs/research/basalt-cpu-expf.md section 3).
+///
+/// ponytail: `runtime/src/basalt_cpu.cpp` carries the same three helpers for the Q2_0 kernels. One shared header
+/// serves both once they sit in the same tree.
+inline float x86_src1_first(float src1, float src2, float computed) {
+    if (is_nan(src1)) return quiet(src1);
+    if (is_nan(src2)) return quiet(src2);
+    return is_nan(computed) ? std::bit_cast<float>(0xFFC00000u) : computed;
+}
+inline float x86_add(float src1, float src2) { return x86_src1_first(src1, src2, src1 + src2); }
+inline float x86_div(float src1, float src2) { return x86_src1_first(src1, src2, src1 / src2); }
+inline float x86_mul(float src1, float src2) { return x86_src1_first(src1, src2, src1 * src2); }
+
+}  // namespace
+
+float swiglu(float g, float u) {
+    // gcc 14.3 at -O3 compiles pool.cpp:434 to a sign flip, one scalar `call expf`, `addss` 1.0f, `divss`, `mulss`
+    // and a store [M, docs/research/basalt-cpu-expf.md section 2]. The add takes `e` as
+    // SRC1 and the constant as SRC2, which is the source's operands swapped and exact, since 1.f is never a NaN;
+    // the divide takes `g`, which does not commute; the multiply takes the quotient, which is why a NaN `g` with
+    // a NaN `u` returns the quotient's payload and not `u`'s.
+    const float e = expf_glibc(-g);
+    const float d = x86_add(e, 1.f);
+    const float q = x86_div(g, d);
+    return x86_mul(q, u);
+}
 
 }  // namespace monolith::basalt_cpu
