@@ -55,12 +55,16 @@
 
 #include "basalt_cpu_expf.h"
 
+#include "basalt_x86.h"
+
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 
 namespace monolith::basalt_cpu {
+
+using namespace x86;
 namespace {
 
 constexpr int EXP2F_TABLE_BITS = 5;
@@ -149,34 +153,10 @@ float expf_glibc(float x) {
     return (float) y;
 }
 
-namespace {
-
-inline bool is_nan(float x) { return x != x; }
-inline float quiet(float x) { return std::bit_cast<float>(std::bit_cast<uint32_t>(x) | 0x00400000u); }
-
-/// An SSE scalar arithmetic instruction's NaN: the first source operand that is a NaN, quieted, and otherwise the
-/// floating-point indefinite 0xffc00000 when the operation itself creates one ([S] Intel SDM Vol. 1 4.8.3.7).
-/// SRC1 is the destination register in Intel syntax, which is why each call below names its operands in the order
-/// the emitted instructions have them and not the order pool.cpp:434 reads in
-/// (docs/research/basalt-cpu-expf.md section 3).
-///
-/// ponytail: the Q2_0 CPU kernels carry the same three helpers, on the branch they are arriving on. One shared
-/// header serves both once they sit in the same tree.
-inline float x86_src1_first(float src1, float src2, float computed) {
-    if (is_nan(src1)) return quiet(src1);
-    if (is_nan(src2)) return quiet(src2);
-    return is_nan(computed) ? std::bit_cast<float>(0xFFC00000u) : computed;
-}
-inline float x86_add(float src1, float src2) { return x86_src1_first(src1, src2, src1 + src2); }
-inline float x86_div(float src1, float src2) { return x86_src1_first(src1, src2, src1 / src2); }
-inline float x86_mul(float src1, float src2) { return x86_src1_first(src1, src2, src1 * src2); }
-
-}  // namespace
-
 float swiglu(float g, float u) {
     // gcc 14.3 at -O3 compiles pool.cpp:434 to a sign flip, one scalar `call expf`, `addss` 1.0f, `divss`, `mulss`
-    // and a store [M, docs/research/basalt-cpu-expf.md section 2]. The add takes `e` as
-    // SRC1 and the constant as SRC2, which is the source's operands swapped and exact, since 1.f is never a NaN;
+    // and a store [M, docs/research/basalt-cpu-expf.md section 2]. The add takes `e` as SRC1 and the constant as
+    // SRC2, which is the source's operands swapped and exact, since 1.f is never a NaN;
     // the divide takes `g`, which does not commute; the multiply takes the quotient, which is why a NaN `g` with
     // a NaN `u` returns the quotient's payload and not `u`'s.
     const float e = expf_glibc(-g);
