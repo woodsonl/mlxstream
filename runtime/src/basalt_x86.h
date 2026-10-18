@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Jesús Gulfo (MIT)
-//
 // x86's scalar NaN rules, applied lane-exact on ARM. basalt's CPU tier runs on x86-64, and two of its pieces have
 // to return the same bits here: the Q2_0 expert kernels (basalt_cpu.cpp) and the expert pool's own SwiGLU
 // (basalt_cpu_expf.cpp). Both reach the same two rules, so they share them.
