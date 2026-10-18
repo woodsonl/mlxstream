@@ -30,7 +30,7 @@ compiler builds basalt. Both candidates were read, and both were cross-compiled 
 
 - **GCC** `gcc/config/i386/avx512fintrin.h` (`releases/gcc-14`): the float `__MM512_REDUCE_OP` at `:16297-16306`,
   used by `_mm512_reduce_add_ps` at `:16308-16312`, and the max form at `:16339-16350`, used by
-  `_mm512_reduce_max_ps` at `:16359-16362` [S].
+  `_mm512_reduce_max_ps` at `:16359-16364` [S].
 - **Clang** `avx512fintrin.h:9448-9450` and `:9579-9581`: `__builtin_ia32_reduce_fadd_ps512(-0.0f, __W)` and
   `__builtin_ia32_reduce_fmax_ps512(__V)` [S], which lower to the same shape.
 
@@ -119,7 +119,7 @@ below [M], measured at the exhaustive worst case in case A8. ARM's `FCVTZS` **sa
 | `_mm512_cvttps_epi32` | `vbslq_s32(vcagtq_f32(2^31, r), vcvtq_s32_f32(r), INT32_MIN)` | section 4 |
 | `_mm512_dpbusd_epi32` | `vdotq_s32` | SDOT is signed by signed, VPDPBUSD unsigned by signed, equal here because codes are 0..3. NEON vector `j` lane `k` is the x86 dword lane `4j + k` |
 | `_mm512_multishift_epi64_epi8` | `vqtbl1q_u8`, `vshlq_u8`, `vandq_u8` | the port decodes the documented rule `code m = (qs[m / 4] >> 2 * (m % 4)) & 3` (`ggml/src/ggml-quants.c:220-222`), which is what VPMULTISHIFTQB produces |
-| `_mm256_cvtph_ps` | `vcvt_f32_f16` | both exact for every half including subnormals at the defaults of section 2 [M] |
+| `_mm256_cvtph_ps` | `vcvt_f32_f16` | both exact for every half including subnormals at the defaults of section 3 [M] |
 | `_mm512_cvtepi32_epi8`, `_mm512_reduce_add_epi32` | `vmovn_s32` with `vmovn_s16`, `vaddvq_s32` | exact after the clamp; the integer sum is order-independent (`abs(sum) <= 4064`) |
 
 ## 6. Which NaN each site returns, and where x86 and AArch64 part

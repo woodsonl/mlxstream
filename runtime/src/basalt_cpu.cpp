@@ -82,7 +82,7 @@
 // Release flags.
 //
 // THE TWO COMPILER-DEPENDENT VALUES. The first is amax. _mm512_reduce_max_ps is header-defined and basalt pins
-// no compiler (README.md:33-35, CMakeLists.txt:43-46). GCC 14's gcc/config/i386/avx512fintrin.h:16339-16350 (used by
+// no compiler (README.md:35-43, CMakeLists.txt:45-46). GCC 14's gcc/config/i386/avx512fintrin.h:16339-16350 (used by
 // _mm512_reduce_max_ps at :16359-16364) passes the HIGH half as SRC1 at the first two levels; Clang 21's
 // avx512fintrin.h:9580 lowers __builtin_ia32_reduce_fmax_ps512 with the LOW half as SRC1. Levels 3 and 4 agree.
 // MAXPS returns SRC2 on an unordered compare, so the two orders swallow different lanes and a chunk containing a
