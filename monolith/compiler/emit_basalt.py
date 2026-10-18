@@ -86,6 +86,11 @@ def _q8_1(ctx: _Ctx, op: Op) -> None:
         if other:
             raise ValueError(f"basalt_q8_1 ieee: {y.name!r} is read by {other}; basalt's IEEE rows feed only the "
                              f"routed experts ({', '.join(IEEE_READERS)})")
+        shared = [y.view_of[0]] if y.view_of else [v.name for v in ctx.values.values() if v.view_of and
+                                                   v.view_of[0] == y.name]
+        if shared:                   # a view's readers are not the base's consumers, nor the base's the view's
+            raise ValueError(f"basalt_q8_1 ieee: {y.name!r} shares its buffer with {shared}; basalt's IEEE rows are a "
+                             "buffer of their own, read only by the routed experts")
     n = t * n_in
     k = ctx.kernel("basalt_q8_1", kernels.basalt_q8_1_source(), Q8_1_KERNELS[kind], {})
     prm = ctx.params("basalt_q8_1", kernels.basalt_q8_1_params(n))

@@ -323,6 +323,19 @@ def _ieee_reader(g, src, bad, tmp):
     return {}
 
 
+def _ieee_view(written):
+    """A native GEMV over rows a quantizer writes through a view (``written``) or the GEMV reads through one; the
+    rows are native (valid) or IEEE, which then reach the GEMV past the readers check."""
+    def build(g, src, bad, tmp):
+        rows = g.value("rows", (2, 2880), U8)
+        view = g.view("rows_v", rows, 0, 2)
+        op(g, "basalt_q8_1", [g.input("x", (2, 2560), F32)], [view if written else rows],
+           quantizer="ieee" if bad else "native")
+        gemv(g, "basalt_mmvq", "y", rows if written else view, weight(g, "gguf/mmvq.8", src), rows=2)
+        return {}
+    return build
+
+
 def _weight_type(kind, good, other):
     def build(g, src, bad, tmp):
         x = g.input("x", (T, 2560), F32)
@@ -417,6 +430,8 @@ REFUSALS = [
     ("q8_1 rows for other columns", _q8_1_rows, r"'x' is f32 \[2, 64\], not f32 \[1, 64\] \(the quantized columns\)"),
     ("q8_1 quantizer unknown", _q8_1_quantizer, "attr quantizer must be one of"),
     ("IEEE q8_1 rows read by a GEMV", _ieee_reader, r"is read by \['basalt_mmvq'\]; basalt's IEEE rows feed only"),
+    ("IEEE q8_1 rows written to a view", _ieee_view(True), r"'rows_v' shares its buffer with \['rows'\]"),
+    ("IEEE q8_1 rows read through a view", _ieee_view(False), r"'rows' shares its buffer with \['rows_v'\]"),
     ("mmvq on a BF16 matrix", _weight_type("basalt_mmvq", "gguf/mmvq.8", "dense/mmvf.q"), "of ggml type"),
     ("dense_tc on a Q8_0 matrix", _weight_type("basalt_dense_tc", "gguf/mmvq.12", "gguf/mmvq.8"), "of ggml type"),
     ("mmvf on a Q8_0 matrix", _weight_type("basalt_mmvf", "dense/mmvf.q", "gguf/mmvq.8"), r"of ggml type \['bf16'\]"),

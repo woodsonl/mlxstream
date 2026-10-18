@@ -18,7 +18,7 @@ is refused (it binds StepState, which none of these kernels reads).
   ``swiglu`` (``native_swiglu_quantize_q8_1``) ``(gate, up [T, n_in] F32)`` → the q8_1 rows of their SwiGLU;
   ``ieee`` (``quantize_q8_1_rows``) ``(x)`` → ``xq`` in nvcc's IEEE arithmetic. n_in is a multiple of 32. The native
   and SwiGLU kinds refuse more than 8 columns (basalt's ``validate_shape``); the IEEE rows feed only the routed experts
-  (basalt's F4), so any other reader is refused.
+  (basalt's F4), so any other reader is refused, and they are a buffer of their own: neither a view nor viewed.
 * ``basalt_mmvq`` (``native_mmvq``): ``(xq, w [n_out, n_in])`` → ``y [T, n_out] F32``, w of a type of ``MMVQ_TRAITS``.
 * ``basalt_dense_tc`` (``dense_tc``): the same values, w of a type of ``DENSE_TC_SB``, n_in a multiple of 512. The
   summation order is the one basalt's variant rule picks on its 170 multiprocessors for a 16-byte-aligned weight
