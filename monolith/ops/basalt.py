@@ -48,7 +48,9 @@ tensor: the verify head's ``output.weight``) or a host input ``u8 [rows, n_in / 
 host=True)``: the drafter's head rows, gathered for its draft vocabulary). An op reads the first n_out (n_rows) of them,
 as basalt passes a pointer and a row count: its draft head's tier 0 reads the leading ``n_tier1_`` of the gathered
 rows, tier 1 all of them (``mtp.cpp:1006``). A map is an i32 value of at least that many ids, negative for a row that
-holds no token (basalt's ``dvocab_``).
+holds no token (basalt's ``dvocab_``). The session rewrites the map with the rows (at load, at every flush, and at a
+request's start), so it passes it as a host input as well; the kernels read it alike from any buffer, so an op does
+not require that.
 
 * ``basalt_q5k_head`` (``q5k_head_mmvq``): ``(xq [T, n_in / 32 * 36], rows[, map])`` → ``y [T, n_out] F32``, the
   logits of rows 0 .. n_out - 1, n_out the output's width; n_in a multiple of 256 of at most 64 blocks and T 1 .. 8

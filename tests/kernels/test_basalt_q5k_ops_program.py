@@ -88,9 +88,11 @@ def runs_twice(eng, inputs, read):
 
 
 def workspace(prog, function, slot):
-    """The buffer a dispatch of ``function`` binds at ``slot`` (the partials or the proxy's scratch) and its size."""
+    """(buffer, size) a dispatch of ``function`` binds at ``slot``: the top-1's partials or the proxy's scratch, read
+    whole (the contract tier checks the sizes against the builders)."""
     o = next(o for o in prog.ops if prog.kernels[o.kernel].function == function)
-    return o.bindings[[b[0] for b in o.bindings].index(slot)][1]
+    name = o.bindings[[b[0] for b in o.bindings].index(slot)][1]
+    return name, prog.buffers[name].nbytes
 
 
 # ---- the verify head and the plain top-1, over the file -------------------------------------------------------------
@@ -118,10 +120,9 @@ def file_runs(request, data, tmp_path_factory):
     xq = data["xq"]
     for t in WIDTHS:
         out[t] = runs_twice(engines[t], {"xq": xq[: t * QCOL].tobytes()}, {"y": 4 * t * N_VOCAB})
-    grid = kernels.basalt_q5k_head_grid(N_VOCAB)
-    part = workspace(progs["top1"], "basalt_q5k_head_top1", 4)
+    part, part_bytes = workspace(progs["top1"], "basalt_q5k_head_top1", 4)
     out["top1"] = runs_twice(engines["top1"], {"x1": xq[:QCOL].tobytes()},
-                             {"t.y": 4 * N_VOCAB, "t.id": 4, "t.p": 4, part: 12 * grid})
+                             {"t.y": 4 * N_VOCAB, "t.id": 4, "t.p": 4, part: part_bytes})
     return {"src": src, "progs": progs, "engines": engines, "out": out, "part": part}
 
 
@@ -170,11 +171,8 @@ def draft_reads(prog, tier, t):
     if t > 1:
         return {"y": 4 * t * (N_CAP, N_DVOCAB)[tier]}
     if tier == 0:
-        return {"p.id": 4, "p.p": 4,
-                workspace(prog, "basalt_q5k_proxy_score", 3): kernels.basalt_q5k_proxy_scratch_bytes(N_CAP)}
-    grid = kernels.basalt_q5k_head_grid(N_DVOCAB)
-    return {"t.y": 4 * N_DVOCAB, "t.id": 4, "t.p": 4,
-            workspace(prog, "basalt_q5k_head_top1", 4): kernels.basalt_q5k_top1_part_bytes(grid)}
+        return dict([("p.id", 4), ("p.p", 4), workspace(prog, "basalt_q5k_proxy_score", 3)])
+    return dict([("t.y", 4 * N_DVOCAB), ("t.id", 4), ("t.p", 4), workspace(prog, "basalt_q5k_head_top1", 4)])
 
 
 @pytest.fixture(scope="module")
@@ -219,7 +217,7 @@ def test_proxy_top1_is_the_harness(data, draft_runs, state):
     s = draft_runs["states"][state]
     got = s["out"][0, 1][0]
     tid, p, cand, part = gpu.q5k_proxy_top1(s["proxy"], s["dhead"], data["xq"][:QCOL], N_CAP, N_CAP, s["dvocab"])
-    scratch = got[workspace(draft_runs["progs"][0, 1], "basalt_q5k_proxy_score", 3)]
+    scratch = got[workspace(draft_runs["progs"][0, 1], "basalt_q5k_proxy_score", 3)[0]]
     t = kernels.basalt_q5k_proxy_tiles(N_CAP)            # n_rows = n_cap: the candidates, then the tiles' partials
     assert (scratch[: 32 * t], scratch[32 * t: 40 * t]) == (cand.tobytes(), part.tobytes())
     assert np.frombuffer(got["p.id"], np.int32)[0] == tid and got["p.p"] == p.tobytes()
@@ -233,7 +231,7 @@ def test_top1_with_the_map_is_the_harness(data, draft_runs, state):
     s = draft_runs["states"][state]
     got = s["out"][1, 1][0]
     y, tid, p, part = gpu.q5k_top1(s["dhead"], data["xq"][:QCOL], N_DVOCAB, s["dvocab"])
-    part_name = workspace(draft_runs["progs"][1, 1], "basalt_q5k_head_top1", 4)
+    part_name = workspace(draft_runs["progs"][1, 1], "basalt_q5k_head_top1", 4)[0]
     assert (got["t.y"], got["t.p"], got[part_name]) == (y.tobytes(), p.tobytes(), part.tobytes())
     assert np.frombuffer(got["t.id"], np.int32)[0] == tid
     assert np.all(np.isneginf(y[s["dvocab"] < 0])) and np.all(np.isfinite(y[s["dvocab"] >= 0]))
