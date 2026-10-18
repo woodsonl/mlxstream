@@ -5,7 +5,17 @@
 //
 // basalt's sampler family on Metal. Needs basalt_fp.metal, basalt_ieee.metal, basalt_f64.metal and
 // basalt_libdevice.metal ahead of it (monolith/kernels.py's basalt_sampler_source()).
+//
+// The entry points need STEP_STATE=1 and the StepState struct (the emitter splices it in): every one returns at its
+// first instruction when st->done or its row is at or past st->t_this_step. Without STEP_STATE only the helpers
+// compile. Their bindings, one slot per buffer across the family:
+//   0 logits (T, V) f32 | 1 ctr_base (2,) u32 | 2 nq (1,) u32 | 3 bias (V,) f32 | 4 history (T, H) i32
+//   5 token (T,) i32 | 6 qprob (T,) f32 | 7 BsSampleParams | 8 part: the greedy partials, (key, id) per row and
+//   threadgroup | 9 cand | 10 bits | 15 StepState
 #pragma STDC FP_CONTRACT OFF
+#ifndef STEP_STATE
+#define STEP_STATE 0
+#endif
 
 // ---- Keys and compares on the bits ----------------------------------------------------------------------------------
 //
@@ -87,3 +97,80 @@ static inline float philox_uniform(ulong seed, ulong counter) {
     }
     return float(c0 >> 8) * 0x1p-24f;
 }
+
+// ---- The request's record (monolith/kernels.py's basalt_sampler_params) ---------------------------------------------
+//
+// basalt's SamplerParams without its per-step words: the seed is StepState's rng_lo / rng_hi, row t's counter
+// ctr_base + st->position + t. vocab, t_rows, n_blocks and hist_len are the program's; the rest the request's. mode:
+// 0 greedy (the cluster argmax alone), 1 greedy with a penalty window or a bias (the one-block greedy kernel after
+// it), 2 sampled. flags: 1 BIAS, 2 PROBE.
+struct BsSampleParams {
+    uint vocab, t_rows, n_blocks, hist_len;
+    uint mode, flags;
+    int top_k;
+    float top_p, min_p, temperature;
+    int min_keep, penalty_last_n;
+    float penalty_repeat, penalty_freq, penalty_present;
+    uint pad;
+};
+
+// ---- The greedy argmax on (key, id) pairs: am_take, am_merge (sampler.cu:180-185) -----------------------------------
+//
+// CUDA's s > bv and ov > bv || (ov == bv && oi < best) on the keys of the bits. A thread starts at (-inf, vocab), so
+// a NaN or -inf logit is never taken, and every pair a tree meets is a taken value or that sentinel: over them the
+// merge is a strict total order (the larger value, the lower id on equal values, -0 equal to +0), which makes the
+// pick the row's lowest id of its largest non-NaN value above -inf whatever the partition, else vocab
+// (sampler.cu:163-167).
+constant uint BS_KEY_NINF = 0x007fffffu;                               // okey(-inf)
+
+static inline void am_take(uint s, uint v, thread uint& bk, thread uint& bi) {
+    if (!fnan(s) && okey(s) > bk) { bk = okey(s); bi = v; }
+}
+static inline void am_merge(uint ok, uint oi, thread uint& bk, thread uint& bi) {
+    if (ok > bk || (ok == bk && oi < bi)) { bk = ok; bi = oi; }
+}
+// __shfl_down_sync at 16, 8, 4, 2, 1: lane 0 ends with the SIMD-group's first pair
+static inline void am_tree(thread uint& bk, thread uint& bi) {
+    for (ushort off = 16; off > 0; off >>= 1) am_merge(simd_shuffle_down(bk, off), simd_shuffle_down(bi, off), bk, bi);
+}
+
+#if STEP_STATE
+constant uint BS_AM_CTAS = 8u;                                         // kAmCtas: threadgroups per row
+
+// sampler_greedy_cluster_kernel (sampler.cu:188-244) up to its cluster exchange: threadgroup r of row t (grid
+// (8, rows), basalt's 1,024 threads) scans v = r * tpg + tid + m * 8 * tpg in ascending order, runs the SIMD-group and
+// threadgroup trees, and stores its pair to part[t * 8 + r].
+kernel void bs_greedy_partial(device const uint* logits [[buffer(0)]], constant BsSampleParams& p [[buffer(7)]],
+                              device uint2* part [[buffer(8)]], device const StepState* st [[buffer(15)]],
+                              uint2 g [[threadgroup_position_in_grid]], uint2 tg [[threads_per_threadgroup]],
+                              uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                              uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup uint sk[32], si[32];
+    const uint r = g.x, t = g.y, tpg = tg.x;
+    if (st->done || t >= st->t_this_step || r >= BS_AM_CTAS) return;     // r: the store's slot stays in row t
+    const uint nv = p.vocab;
+    device const uint* l = logits + ulong(t) * nv;
+    uint bk = BS_KEY_NINF, bi = nv;
+    for (uint v = r * tpg + tid; v < nv; v += BS_AM_CTAS * tpg) am_take(l[v], v, bk, bi);   // bounded by nv
+    am_tree(bk, bi);
+    if (lane == 0u) { sk[sg] = bk; si[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg != 0u) return;
+    bk = lane < nsg ? sk[lane] : BS_KEY_NINF;
+    bi = lane < nsg ? si[lane] : nv;
+    am_tree(bk, bi);
+    if (lane == 0u) part[ulong(t) * BS_AM_CTAS + r] = uint2(bk, bi);
+}
+
+// The cluster kernel's CTA-0 merge (sampler.cu:233-238): one SIMD-group per row over its 8 partials.
+kernel void bs_greedy_merge(device int* out [[buffer(5)]], constant BsSampleParams& p [[buffer(7)]],
+                            device const uint2* part [[buffer(8)]], device const StepState* st [[buffer(15)]],
+                            uint t [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    if (st->done || t >= st->t_this_step) return;
+    const uint nv = p.vocab;
+    const uint2 c = lane < BS_AM_CTAS ? part[ulong(t) * BS_AM_CTAS + lane] : uint2(BS_KEY_NINF, nv);
+    uint bk = c.x, bi = c.y;
+    am_tree(bk, bi);
+    if (lane == 0u) out[t] = bi < nv ? int(bi) : 0;
+}
+#endif

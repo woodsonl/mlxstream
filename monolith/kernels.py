@@ -534,6 +534,40 @@ def basalt_sampler_source() -> str:
             + template("basalt_libdevice.metal") + template("basalt_sampler.metal"))
 
 
+BS_BLOCK = 4096               # logits per block of the split path (sampler.cu:529-530)
+BS_SEL_MAX = 64               # the longest top-k list
+BS_SPLIT_MAX_BLOCKS = 64      # the split path's widest vocabulary: 64 blocks, 262,144 logits
+BS_SPLIT_MAX_ROWS = 64        # and its most rows
+
+
+def basalt_sampler_mode(greedy: bool, temperature: float, penalty_last_n: int, bias: bool) -> int:
+    """The ``mode`` word of a request (sampler.cu:988-1011): 0 greedy, the cluster argmax alone; 1 greedy with a
+    penalty window or a logit bias, the one-block greedy kernel after it; 2 sampled. Greedy is basalt's
+    ``p.greedy || p.temperature <= 0.0f`` on the float32 the record holds, so a NaN temperature samples."""
+    if greedy or struct.unpack("<f", struct.pack("<f", temperature))[0] <= 0.0:
+        return 1 if penalty_last_n > 0 or bias else 0
+    return 2
+
+
+def basalt_sampler_params(vocab: int, t_rows: int, n_blocks: int, hist_len: int, *, mode: int = 0, bias: bool = False,
+                          probe: bool = False, top_k: int = 20, top_p: float = 0.95, min_p: float = 0.0,
+                          temperature: float = 1.0, min_keep: int = 1, penalty_last_n: int = 0,
+                          penalty_repeat: float = 1.0, penalty_freq: float = 0.0, penalty_present: float = 0.0) -> bytes:
+    """The 64-byte ``BsSampleParams`` (basalt_sampler.metal): the program's vocab, rows, split blocks and history
+    width, then the request's mode, flags (1 bias, 2 probe) and basalt's SamplerParams fields, with its defaults.
+    Refuses what basalt's dispatcher exits on (sampler.cu:981-987): no rows or vocabulary, and a penalty window
+    without a history; min_p above 1 is basalt's to accept."""
+    if vocab <= 0 or t_rows <= 0:
+        raise ValueError(f"basalt_sampler: vocab and t_rows must be positive, got {vocab}, {t_rows}")
+    if mode not in (0, 1, 2):
+        raise ValueError(f"basalt_sampler: mode must be 0, 1 or 2, got {mode}")
+    if penalty_last_n > 0 and hist_len <= 0:
+        raise ValueError(f"basalt_sampler: penalty_last_n = {penalty_last_n} needs a history (hist_len = {hist_len})")
+    flags = (1 if bias else 0) | (2 if probe else 0)
+    return struct.pack("<IIIIIIifffiifffI", vocab, t_rows, n_blocks, hist_len, mode, flags, top_k, top_p, min_p,
+                       temperature, min_keep, penalty_last_n, penalty_repeat, penalty_freq, penalty_present, 0)
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
