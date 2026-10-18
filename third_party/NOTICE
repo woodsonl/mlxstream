@@ -249,9 +249,9 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
 - `tests/kernels/test_basalt_platform.py` — the contraction check's pass criterion of
   `src/kernels/elementwise_parity.cpp` (MIT). License: `third_party/BASALT-LICENSE`.
 - `tests/basalt_sampler_ref.py`, `tests/kernels/test_basalt_sampler.py`, `tests/kernels/test_basalt_sampler_helpers.py`,
-  `tests/kernels/test_basalt_sampler_program.py`, `tests/kernels/test_basalt_coupled.py` and
-  `tests/contract/test_basalt_sampler_refs.py` — adapted from `src/kernels/sampler_parity.cpp` (MIT): its references,
-  fixtures, pre-fills and pass criteria; the reference module also takes `include/basalt/kernels/sampler.hpp:86-97`
+  `tests/kernels/test_basalt_sampler_program.py`, `tests/kernels/test_basalt_coupled.py`,
+  `tests/contract/test_basalt_sampler_refs.py` and `tools/bench/basalt_sampler.py` — adapted from
+  `src/kernels/sampler_parity.cpp` (MIT): its references, fixtures, pre-fills, pass criteria and benchmarks; the reference module also takes `include/basalt/kernels/sampler.hpp:86-97`
   (`penalty_rows`) and `include/basalt/core/coupled_draft.hpp:65-83` (the `coupled_*` helpers), the program test
   `src/kernels/decode_cluster_parity.cpp`'s graph case (its argmax side, `:245-306`), and TP.1 the bound of
   `src/kernels/q5k_head_parity.cpp:145`. License: `third_party/BASALT-LICENSE`.
