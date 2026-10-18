@@ -42,7 +42,7 @@ def _mirror_cases():
     """The rows of the vectorized-against-scalar check, drawn in order from one RandomState(12).
     - 40 rows of 512 normal logits, every fourth on quarter steps (ties). Each has a window of 0, 1, 16 or 64 ids in
       [-3, 515), so some fall outside the vocabulary, top_k 1, 5, 20 or 64, and penalties repeat 1.1, freq 0.25,
-      present 0.5. top_p, min_p and the seed are drawn too, though the list does not read them.
+      present 0.5. top_p and min_p are drawn too (seed = case, counter 77), though the list reads none of them.
     - Four rows of 1,000 on quarter steps, at top_k 64 with repeat 2, freq 0.25, present 0.5. They are modelled on
       basalt's fixture 16 (:1365-1457) with fixed ids, without its spread() or its 6.25/6.0 band:
       - row 0: the quarter steps alone;
