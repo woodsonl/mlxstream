@@ -677,18 +677,21 @@ def test_a_second_concurrent_run_fails_at_once():
             assert release.wait(5.0)
 
     eng = Engine(_program(_base_buffers(10), [_tick()], [HostPoint("hold", 1, 1)]), host_tasks={"hold": hold})
-    first = threading.Thread(target=eng.run, args=(3,))
+    report = []
+    first = threading.Thread(target=lambda: report.append(eng.run(3)))
     first.start()
     try:
         assert entered.wait(5.0)                                          # the first run holds the runner
-        with pytest.raises(RuntimeError, match="Runner.run: already running on another thread"):
-            eng.run(1)
+        for call in (lambda: eng.run(1), lambda: eng.runner.run(1, 1, 1, False, 0)):
+            with pytest.raises(RuntimeError, match="Runner.run: already running on another thread"):
+                call()
         with pytest.raises(RuntimeError, match="set_host_points: already running on another thread"):
             eng.runner.set_host_points([], LAYOUT.offset("error"), 1000)
     finally:
         release.set()
         first.join(10.0)
     assert not first.is_alive() and eng.state()["step"] == 3
+    assert report[0].tokens == list(range(3))                             # the refused run took none of them
 
 
 def test_a_task_that_calls_its_own_runner_is_refused():
@@ -696,16 +699,76 @@ def test_a_task_that_calls_its_own_runner_is_refused():
 
     def reenter(step, point):
         if step == 1:
-            for call in (lambda: eng.run(1), lambda: eng.runner.set_host_points([], LAYOUT.offset("error"), 1000)):
+            for call in (lambda: eng.run(1), lambda: eng.runner.run(1, 1, 1, False, 0),
+                         lambda: eng.runner.set_host_points([], LAYOUT.offset("error"), 1000)):
                 with pytest.raises(RuntimeError) as refused:
                     call()
                 errors.append(str(refused.value))
+
 
     eng = Engine(_program(_base_buffers(5), [_tick()], [HostPoint("reenter", 1, 1)]), host_tasks={"reenter": reenter})
     rep = eng.run(5)
     assert rep.steps == 5 and rep.tokens == list(range(5))
     assert errors == ["Runner.run: called from one of the runner's own host tasks",
+                      "Runner.run: called from one of the runner's own host tasks",
                       "set_host_points: called from one of the runner's own host tasks"]
+
+
+def test_a_task_serves_one_runner():
+    """A task carries one exception slot, so a second runner may not install it: the two runs would overwrite each
+    other's cause. The task is free again once the runner that held it is gone."""
+    import gc
+
+    task = nt.CallableTask(lambda step, point: None)
+    first = Engine(_program(_base_buffers(10), [_tick()]))
+    second = Engine(_program(_base_buffers(10), [_tick()]))
+    points = [(1, 1, task)]
+    first.runner.set_host_points(points, LAYOUT.offset("error"), 1000)
+    with pytest.raises(RuntimeError, match="this task is installed on another runner"):
+        second.runner.set_host_points(points, LAYOUT.offset("error"), 1000)
+    first.runner.set_host_points(points, LAYOUT.offset("error"), 1000)   # the runner that holds it may reinstall it
+    del first
+    gc.collect()                                                         # the runner that held it is gone
+    second.runner.set_host_points(points, LAYOUT.offset("error"), 1000)  # so the next runner takes it
+    assert second.run(3).steps == 3
+
+
+def test_a_task_at_two_points_is_released_once():
+    """A schedule may hold one task at several points, so its release runs once per point; a release gives back only
+    what this runner still holds, or the second one would take the task from the runner that claimed it meanwhile."""
+    task = nt.CallableTask(lambda step, point: None)
+    first = Engine(_program(_base_buffers(10), [_tick(), _tick()]))
+    second = Engine(_program(_base_buffers(10), [_tick()]))
+    first.runner.set_host_points([(1, 1, task), (2, 2, task)], LAYOUT.offset("error"), 1000)
+    first.runner.set_host_points([], LAYOUT.offset("error"), 1000)       # both points release the one task
+    second.runner.set_host_points([(1, 1, task)], LAYOUT.offset("error"), 1000)
+    with pytest.raises(RuntimeError, match="this task is installed on another runner"):
+        first.runner.set_host_points([(1, 1, task)], LAYOUT.offset("error"), 1000)
+    assert second.run(2).steps == 2
+
+
+def test_a_refused_task_leaves_the_runner_as_it_was():
+    """The refusal comes before the schedule is swapped in, and the points of the same call that were free before it
+    are free again."""
+    free, held = nt.CallableTask(lambda step, point: None), nt.CallableTask(lambda step, point: None)
+    first = Engine(_program(_base_buffers(10), [_tick()]))
+    second = Engine(_program(_base_buffers(10), [_tick()]))
+    first.runner.set_host_points([(1, 1, held)], LAYOUT.offset("error"), 1000)
+    with pytest.raises(RuntimeError, match="this task is installed on another runner"):
+        second.runner.set_host_points([(1, 1, free), (1, 1, held)], LAYOUT.offset("error"), 1000)
+    assert second.runner.host_tasks() == []                             # nothing was installed
+    second.runner.set_host_points([(1, 1, free)], LAYOUT.offset("error"), 1000)   # and `free` was given back
+    assert second.run(2).steps == 2
+
+
+def test_a_run_reports_the_tokens_it_took():
+    """The run reads the ring's tokens while it still owns the runner, so its own stats carry them whatever another
+    thread does next; drain() still hands the same tokens to a caller that takes them that way."""
+    eng = Engine(_program(_base_buffers(1000), [_tick()]))
+    st = eng.runner.run(4, 8, 3, False, 0)                                # the pump's own stats, not Engine's report
+    assert list(st.tokens) == list(range(4))
+    assert eng.runner.drain() == list(range(4))                           # the ring's own view, for the callers of it
+    assert eng.run(2).tokens == [4, 5]                                    # the next run starts from an empty list
 
 
 def test_plain_runs_between_host_step_runs_keep_the_step_count():
@@ -754,6 +817,48 @@ def test_handoff_gaps_measure_each_handoff():
 def test_profile_refuses_a_program_with_host_points():
     with pytest.raises(RuntimeError, match="host points"):
         _Exchange().engine(10).profile(1)                                 # its ops would run without their tasks
+
+
+def test_profile_refuses_tasks_installed_on_the_runner():
+    eng = Engine(_program(_base_buffers(10), [_tick()]))
+    eng.runner.set_host_points([(1, 1, nt.CallableTask(lambda s, k: None))], LAYOUT.offset("error"), 1000)
+    with pytest.raises(RuntimeError, match="host points"):
+        eng.profile(1)
+
+
+def test_a_task_that_drains_does_not_defeat_max_tokens():
+    """max_tokens counts the tokens taken from the ring during the run, also those a task drained itself."""
+    drained, eng = [], None
+
+    def take(step, point):
+        drained.extend(eng.runner.drain())
+
+    eng = Engine(_program(_base_buffers(100), [_tick()], [HostPoint("take", 1, 1)]), host_tasks={"take": take})
+    rep = eng.run(50, max_tokens=2)
+    assert rep.steps <= 3 and drained + rep.tokens == list(range(rep.steps))
+
+
+def test_a_task_cannot_write_weights_through_an_alias():
+    dev = nt.Device()
+    shared = nt.Buffer(dev, 16384)
+    program = _validation_program([HostPoint("t", 1, 1, writes=["staging"])])
+    with pytest.raises(ValueError, match=r"writes 'staging', which reaches the read-only weights buffer 'w'"):
+        Engine(program, dev, buffers={"staging": shared, "w": shared}, host_tasks={"t": lambda s, k: None})
+
+
+def test_a_zero_step_run_reports_an_earlier_host_failure():
+    ex = _Exchange(fail_at=2)
+    eng = ex.engine(100)
+    with pytest.raises(RuntimeError, match="task failed at step 2"):
+        eng.run(10)
+    eng.runner.set_host_points([], LAYOUT.offset("error"), 1000)          # the plain pump
+    with pytest.raises(RuntimeError, match="a host step failed in an earlier run"):
+        eng.run(0)
+
+
+def test_host_steps_report_commit_time():
+    rep = _Exchange().engine(100).run(10)
+    assert rep.commit_ms > 0 and rep.encode_ms > 0
 
 
 def _validation_program(points, **overrides):

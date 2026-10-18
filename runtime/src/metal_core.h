@@ -5,6 +5,7 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -145,6 +146,9 @@ class HostTask {
   // boundary on are committed after it returns. Returns false with `error` set to stop the run. A task bounds its own
   // duration (its I/O carries timeouts): the runner cannot interrupt it.
   virtual bool run(const HostCall& call, std::string& error) = 0;
+  // The runner the task is installed on. A task serves one runner, because what it carries out of a failed run (a
+  // Python task's exception) is one slot; set_host_points refuses a task another runner holds.
+  std::atomic<const void*> owner{nullptr};
 };
 
 struct HostPoint {
@@ -165,8 +169,15 @@ struct RunnerStats {
   bool done = false;          // StepState.done was observed
   std::string error;          // the first failed command buffer's error and validation reports; stops the pump (Engine.run raises it)
   int32_t failed_task = -1;   // the host point whose task failed the run (-1: none did)
+  std::shared_ptr<HostTask> failed;      // that point's task itself: the caller reads its exception without resolving
+                                         // the index against a list another thread may have replaced meanwhile. A
+                                         // Python task's exception is the runner's to keep, so read it while the
+                                         // runner lives (Engine.run reads it inside the call that returns these stats)
   std::vector<double> handoff_gaps_ms;   // per command buffer committed once a host point's task returned: its GPU start
                                          // minus the GPU end of the one before it, the GPU's idle time at that handoff
+  std::vector<int32_t> tokens;           // the tokens the ring held when the run ended, read while the run still owned
+                                         // the runner: a run on another thread cannot clear them first. drain() still
+                                         // hands the same tokens to a caller that takes them that way
 };
 
 class Runner {

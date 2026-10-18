@@ -17,7 +17,8 @@ namespace nb = nanobind;
 using namespace monolith;
 
 // A host task written in Python: fn(step, point). run() is called with the GIL released, so the call takes it; an
-// exception fails the run with its message and stays on the task (take_exception) for the caller to raise.
+// exception fails the run with its message and stays on the task (take_exception) for the caller to raise. The slot is
+// the task's own, so a task serves one runner: Engine wraps each callable in a CallableTask of its own.
 struct CallableTask : HostTask {
   nb::callable fn;
   nb::object exception;
@@ -173,7 +174,8 @@ NB_MODULE(_native, m) {
       .def_ro("gpu_ms", &RunnerStats::gpu_ms).def_ro("wall_ms", &RunnerStats::wall_ms).def_ro("host_busy_ms", &RunnerStats::host_busy_ms)
       .def_ro("encode_ms", &RunnerStats::encode_ms).def_ro("commit_ms", &RunnerStats::commit_ms).def_ro("wait_ms", &RunnerStats::wait_ms)
       .def_ro("done", &RunnerStats::done).def_ro("error", &RunnerStats::error)
-      .def_ro("failed_task", &RunnerStats::failed_task).def_ro("handoff_gaps_ms", &RunnerStats::handoff_gaps_ms);
+      .def_ro("failed_task", &RunnerStats::failed_task).def_ro("failed", &RunnerStats::failed).def_ro("handoff_gaps_ms", &RunnerStats::handoff_gaps_ms)
+      .def_ro("tokens", &RunnerStats::tokens);
 
   nb::class_<Runner>(m, "Runner", nb::type_slots(runner_slots))
       .def("__init__", [](Runner* self, const Device& d, const Icb& icb, const std::vector<Dispatch>& ops, std::vector<const Buffer*> resources,

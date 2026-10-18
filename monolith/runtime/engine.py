@@ -141,17 +141,17 @@ class Engine:
         StepReport, its tokens included, as ``report``; the exception a Python task raised is its cause, except that a
         task's KeyboardInterrupt or SystemExit is raised as it was."""
         st = self.runner.run(max_steps, steps_per_cb, in_flight, reencode, max_tokens)
-        report = StepReport(st.steps_submitted, st.command_buffers, st.gpu_ms, st.wall_ms, st.host_busy_ms, st.done, self.runner.drain(),
+        report = StepReport(st.steps_submitted, st.command_buffers, st.gpu_ms, st.wall_ms, st.host_busy_ms, st.done, list(st.tokens),
                             st.encode_ms, st.commit_ms, st.wait_ms, list(st.handoff_gaps_ms))
-        code = int(self.state()["error"]) if st.done else 0
+        code = int(self.state()["error"]) if st.done or st.steps_submitted == 0 else 0
         message = st.error or {3: "Megakernel: bounded worker barrier timed out",
                                4: "a host step failed in an earlier run; the program's state is unusable"}.get(code)
         if not message:
             return report
         cause = None
-        if st.failed_task >= 0:                               # the failing task's own: an older one left elsewhere stays out
-            task = self.runner.host_tasks()[st.failed_task]
-            cause = task.take_exception() if isinstance(task, nt.CallableTask) else None
+        task = st.failed                                      # the failing task itself: an older one left elsewhere stays out
+        if isinstance(task, nt.CallableTask):
+            cause = task.take_exception()
         if cause is not None and not isinstance(cause, Exception):
             raise cause                                       # KeyboardInterrupt, SystemExit
         error = RuntimeError(message)
@@ -162,7 +162,7 @@ class Engine:
         """Per-dispatch GPU (start, end) ms for ``steps`` re-encoded steps (one encoder per op with timestamp counter
         samples, so the numbers carry encoder-boundary gaps the ICB replay does not have — use them for the shares
         and the per-op durations, not for the step total)."""
-        if self.program.host_points:
+        if self.program.host_points or self.runner.host_tasks():
             raise RuntimeError("profile() dispatches the ops without their tasks; a program with host points runs only through run()")
         q = nt.Queue(self.dev)
         return [q.profile(self.ops) for _ in range(steps)]
