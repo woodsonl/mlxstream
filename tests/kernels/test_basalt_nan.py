@@ -92,8 +92,9 @@ def test_q8_1_halves(hw, kind):
 @pytest.mark.parametrize("type_id", sorted(SCALES))
 def test_mmvq(hw, type_id):
     """Row 1's first block: its fp16 scales +inf against a first superblock of zero activations (inf * 0, a NaN made);
-    row 2's: NaN (a NaN passed). One and three columns, at a small K (4 or 2 rows a threadgroup) and a large one."""
-    for n_in in (512, 2048):
+    row 2's: NaN (a NaN passed). One and three columns, at a small K (4 or 2 rows a threadgroup) and a large one (at
+    4096 every type has at least BPI blocks a row: one row a threadgroup)."""
+    for n_in in (512, 4096):
         rng = np.random.default_rng(type_id)
         n_out = 16
         w = weights(type_id, n_in, n_out, rng)
