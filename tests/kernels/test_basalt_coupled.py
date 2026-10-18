@@ -136,6 +136,7 @@ def test_basalt_coupled_stage(cap, last_n, threads):
     copy, got = gpu.coupled_stage(image, mhist, ring, cap, threads=threads)
     want = ring.copy()
     want[cap - h:cap] = mhist[cap - h:]
-    assert copy == bytes(image), f"the round's copy is the staged image, 72 bytes: {copy.hex()} != {bytes(image).hex()}"
+    crit = "params and ring base copied, h = coupled_hist_len(penalty_last_n, cap)"
+    assert copy == bytes(image), f"{crit}: the round's copy {copy.hex()} is not the staged image {bytes(image).hex()}"
     assert np.array_equal(got, want), \
-        f"the ring is the staged history in [cap - h, cap) = [{cap - h}, {cap}) and unchanged elsewhere"
+        f"{crit}: the ring is not the staged history in [{cap - h}, {cap}) and its own words elsewhere"
