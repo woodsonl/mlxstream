@@ -27,7 +27,11 @@ a greedy request with neither G-CL, and their ``forced`` cases run G-1B in G-CL'
 - M11.2, fixture 11: a stale history with penalty_last_n = 0 leaves the greedy pick the argmax.
 - M12.G, fixture 12: each row of a window counts its own history row (windows of 1 to 4,096 slots).
 - M13.1, fixture 13: history ids outside the vocabulary count nowhere.
-- W.1, invariant 1: each path's window, row for row, equals its rows run alone.
+- TP.1, the port's addition (spec S§19.3): the drafter's greedy tail, ``top_prob`` (the cluster partials, then
+  bs_greedy_top_prob), picks the host argmax, mapped, with the float64 softmax probability of the pick within
+  q5k_head_parity's 1e-5.
+- W.1, invariant 1: each path's window, row for row, equals its rows run alone (the top-prob path's probabilities
+  bit for bit too).
 """
 
 import itertools
@@ -42,7 +46,7 @@ from tests.basalt_sampler_ref import (SamplerParams, f32, fixture2_data, fixture
                                       fixture13_data, greedy_pen, normal_rows, penalty_rows, reference_pick, window_of)
 from tests.kernels import basalt_sampler_gpu as gpu
 from tests.kernels.basalt_gpu import device
-from tests.kernels.test_basalt_decode_cluster import fill_logits
+from tests.kernels.test_basalt_decode_cluster import PATTERNS, VOCABS, fill_logits, host_argmax
 
 GREEDY = ["greedy_cl", "greedy_1b"]
 
@@ -348,6 +352,58 @@ def test_basalt_sampler_history_ids_out_of_vocab_greedy():
         'bad += run("out-of-vocab history ids (greedy)", l, NT, gp, gwant, hist, H);'
 
 
+# ---- TP.1: the drafter's greedy tail (spec S§19.3) ------------------------------------------------------------------
+
+def softmax_top(row, pick):
+    """The float64 softmax probability of ``pick``, the row's maximum: 1 / sum_i exp(l[i] - l[pick])."""
+    r = np.asarray(row, np.float64)
+    return 1.0 / float(np.sum(np.exp(r - r[pick])))
+
+
+@pytest.mark.parametrize("nv", VOCABS)
+def test_basalt_sampler_greedy_top_prob_vs_host(nv):
+    """TP.1: sample_greedy_top_prob (sampler.cu:930-972), which basalt runs only as q5k_head_parity's reference
+    (q5k_head_parity.cpp:111, :130), against the host on a window of one row per decode_cluster_parity argmax pattern
+    (ties, -0 against +0, subnormals, NaN, +-inf, empty rows) at each of its vocabularies, without the map and with
+    it (map[i] = 3 i + 7: never i, and never -1, which the prefill reads). Each id is the host argmax (the lowest
+    index of the largest non-NaN value above -inf, else 0), mapped, so an empty row gives map[0]. On a row of finite
+    logits the probability is within 1e-5 relative of the float64 softmax of the pick (q5k_head_parity's bound, a
+    non-finite probability counting as a failure); on a row with a NaN or an infinity only the id is checked. The
+    map is applied last, so the probabilities' bits are the same with it and without."""
+    rs = np.random.RandomState([20261017, nv])
+    l = np.stack([fill_logits(rs, nv, pattern) for pattern in PATTERNS])
+    id_map = np.arange(nv, dtype=np.int32) * 3 + 7
+    p = SamplerParams(greedy=True, temperature=0.0)
+    ids, bits = gpu.top_prob(l, p)
+    mapped, mapped_bits = gpu.top_prob(l, p, id_map=id_map)
+    hb = np.int32([host_argmax(row) for row in l])
+    id_bad = int(np.count_nonzero(ids != hb)) + int(np.count_nonzero(mapped != id_map[hb]))
+    prob = bits.view(np.float32)
+    finite = [t for t in range(len(l)) if np.isfinite(l[t]).all()]
+    rel = {PATTERNS[t]: abs(float(prob[t]) - softmax_top(l[t], hb[t])) / max(1e-30, softmax_top(l[t], hb[t]))
+           for t in finite}
+    nonfinite = [PATTERNS[t] for t in finite if not np.isfinite(prob[t])]
+    over = {k: r for k, r in rel.items() if not r <= 1e-5}
+    max_rel = max((r for r in rel.values() if r == r), default=float("nan"))
+    assert id_bad == 0, "if (logit_bad || id_bad || max_rel > 1e-5) fail = 1; (id_bad: the host argmax, mapped)"
+    assert not nonfinite, f"non-finite probabilities on finite rows count as failures: {nonfinite}"
+    assert not over, f"if (logit_bad || id_bad || max_rel > 1e-5) fail = 1; ({over}, max_rel {max_rel:.2e})"
+    assert np.array_equal(bits, mapped_bits), "the map is applied last: the probabilities do not depend on it"
+
+
+def test_basalt_sampler_greedy_top_prob_geometry():
+    """The probability's sums are basalt's only at 1,024 threads (spec S§7, S§16.3 (c)): the pipeline must run them
+    (``gpu.top_prob`` refuses one that cannot), and a dispatch of 512 threads per row returns at once, leaving every
+    pick and probability its prefill instead of a probability over half the row's sums."""
+    part, prob = gpu.pipeline("bs_greedy_partial"), gpu.pipeline("bs_greedy_top_prob")
+    assert prob.max_threads_per_threadgroup >= gpu.TOP_PROB_THREADS
+    l = normal_rows(7)
+    rows = len(l) + 1
+    ids, bits = gpu.launch([(part, (gpu.AM_CTAS, rows), gpu.threads(part)), (prob, (rows,), 512)], l,
+                           SamplerParams(greedy=True, temperature=0.0), mode=0, scratch={8: rows * gpu.AM_CTAS * 8})
+    assert np.all(ids == -1) and np.all(bits == 0xFFFFFFFF), "a 512-thread dispatch wrote a pick or a probability"
+
+
 # ---- W.1 (invariant 1) -----------------------------------------------------------------------------------------------
 
 def w1_ties_across():
@@ -368,7 +424,16 @@ def w1_per_row_history():
     return l, p, penalty_rows(tail, window, T, H), H
 
 
-ROWS_ALONE = {"greedy_cl": w1_ties_across, "greedy_1b": w1_per_row_history}   # W.1's fixture for each path
+def w1_finite_rows():
+    """5 rows at 248,320 of decode_cluster_parity's random, ties and signed-zero patterns, all finite, so the
+    top-prob path's probabilities are sums of 248,320 terms, compared bit for bit."""
+    rs = np.random.RandomState(20261018)
+    l = np.stack([fill_logits(rs, 248320, pattern) for pattern in ("random", "ties", "signed-zero", "random", "ties")])
+    return l, SamplerParams(greedy=True, temperature=0.0), None, 0
+
+
+ROWS_ALONE = {"greedy_cl": w1_ties_across, "greedy_1b": w1_per_row_history,     # W.1's fixture for each path
+              "top_prob": w1_finite_rows}
 
 
 @pytest.mark.parametrize("path", ROWS_ALONE)

@@ -550,20 +550,20 @@ def basalt_sampler_mode(greedy: bool, temperature: float, penalty_last_n: int, b
 
 
 def basalt_sampler_params(vocab: int, t_rows: int, n_blocks: int, hist_len: int, *, mode: int = 0, bias: bool = False,
-                          probe: bool = False, top_k: int = 20, top_p: float = 0.95, min_p: float = 0.0,
-                          temperature: float = 1.0, min_keep: int = 1, penalty_last_n: int = 0,
+                          probe: bool = False, id_map: bool = False, top_k: int = 20, top_p: float = 0.95,
+                          min_p: float = 0.0, temperature: float = 1.0, min_keep: int = 1, penalty_last_n: int = 0,
                           penalty_repeat: float = 1.0, penalty_freq: float = 0.0, penalty_present: float = 0.0) -> bytes:
     """The 64-byte ``BsSampleParams`` (basalt_sampler.metal): the program's vocab, rows, split blocks and history
-    width, then the request's mode, flags (1 bias, 2 probe) and basalt's SamplerParams fields, with its defaults.
-    Refuses what basalt's dispatcher exits on (sampler.cu:981-987): no rows or vocabulary, and a penalty window
-    without a history; min_p above 1 is basalt's to accept."""
+    width, then the request's mode, flags (1 bias, 2 probe, 4 the top-prob kernel's subset map) and basalt's
+    SamplerParams fields, with its defaults. Refuses what basalt's dispatcher exits on (sampler.cu:981-987): no rows
+    or vocabulary, and a penalty window without a history; min_p above 1 is basalt's to accept."""
     if vocab <= 0 or t_rows <= 0:
         raise ValueError(f"basalt_sampler: vocab and t_rows must be positive, got {vocab}, {t_rows}")
     if mode not in (0, 1, 2):
         raise ValueError(f"basalt_sampler: mode must be 0, 1 or 2, got {mode}")
     if penalty_last_n > 0 and hist_len <= 0:
         raise ValueError(f"basalt_sampler: penalty_last_n = {penalty_last_n} needs a history (hist_len = {hist_len})")
-    flags = (1 if bias else 0) | (2 if probe else 0)
+    flags = (1 if bias else 0) | (2 if probe else 0) | (4 if id_map else 0)
     return struct.pack("<IIIIIIifffiifffI", vocab, t_rows, n_blocks, hist_len, mode, flags, top_k, top_p, min_p,
                        temperature, min_keep, penalty_last_n, penalty_repeat, penalty_freq, penalty_present, 0)
 

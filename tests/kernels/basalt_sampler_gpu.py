@@ -26,6 +26,7 @@ T_MAX = 70                                     # the widest window a test runs (
 LAYOUT = StepStateLayout(t_max=T_MAX + 1)
 SOURCE = kernels.basalt_sampler_source().replace(kernels.PRELUDE, kernels.PRELUDE + LAYOUT.to_msl() + "\n", 1)
 AM_CTAS = 8                                    # bs_greedy_partial's threadgroups per row (basalt's kAmCtas)
+TOP_PROB_THREADS = 1024                        # bs_greedy_top_prob's threadgroup, exactly (basalt's kAmThreads)
 
 
 def pipeline(name):
@@ -38,18 +39,20 @@ def threads(pso, n=1024):
     return min(n, pso.max_threads_per_threadgroup // 32 * 32)
 
 
-def record(p, vocab, rows, hist_len, mode, bias=False, probe=False):
+def record(p, vocab, rows, hist_len, mode, bias=False, probe=False, id_map=False):
     """``BsSampleParams`` for ``p`` (SamplerParams) on a window of ``rows`` grid rows."""
     return kernels.basalt_sampler_params(
-        vocab, rows, -(-vocab // kernels.BS_BLOCK), hist_len, mode=mode, bias=bias, probe=probe, top_k=p.top_k,
-        top_p=p.top_p, min_p=p.min_p, temperature=p.temperature, min_keep=p.min_keep, penalty_last_n=p.penalty_last_n,
-        penalty_repeat=p.penalty_repeat, penalty_freq=p.penalty_freq, penalty_present=p.penalty_present)
+        vocab, rows, -(-vocab // kernels.BS_BLOCK), hist_len, mode=mode, bias=bias, probe=probe, id_map=id_map,
+        top_k=p.top_k, top_p=p.top_p, min_p=p.min_p, temperature=p.temperature, min_keep=p.min_keep,
+        penalty_last_n=p.penalty_last_n, penalty_repeat=p.penalty_repeat, penalty_freq=p.penalty_freq,
+        penalty_present=p.penalty_present)
 
 
-def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, scratch=None,
-           lbuf=None):
+def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, id_map=None, position=0, fill=0xFF,
+           scratch=None, lbuf=None):
     """Run ``steps``, (pipeline, grid, threads) in order, on one window: ``logits`` (T, V) float32, ``p`` the request,
-    ``hist`` the flat (T, hist_len) int32 history rows, ``bias`` (V,) float32, ``position`` StepState's.
+    ``hist`` the flat (T, hist_len) int32 history rows, ``bias`` (V,) float32, ``id_map`` (V,) int32 (flags MAP),
+    ``position`` StepState's.
     ``scratch``: {slot: bytes}, each starting as 0xFF. ``lbuf``: a buffer already holding ``logits``, bound in place
     of a fresh upload (sampler_parity's DeviceRows, rows uploaded once and sampled many times: the test reads it back).
     Every slot the family binds is bound, a 16-byte placeholder where the request has no such datum. Returns the T
@@ -72,7 +75,8 @@ def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, position
              3: buf(bytes(16) if bias is None else np.ascontiguousarray(bias, np.float32).tobytes()),
              4: buf(bytes(16) if hist is None else np.ascontiguousarray(hist, np.int32).tobytes()),
              5: buf(4 * rows, fill), 6: buf(4 * rows, fill),
-             7: buf(record(p, V, rows, hist_len, mode, bias is not None)), 15: buf(st)}
+             7: buf(record(p, V, rows, hist_len, mode, bias is not None, id_map=id_map is not None)),
+             11: buf(bytes(16) if id_map is None else np.ascontiguousarray(id_map, np.int32).tobytes()), 15: buf(st)}
     slots.update({k: buf(n, 0xFF) for k, n in (scratch or {}).items()})
     ds = []
     for pso, grid, tg in steps:
@@ -112,6 +116,22 @@ def greedy_1b(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0
     bits = rows * -(-V // 32) * 4 if p.penalty_last_n > 0 and hist_len > 0 else 16
     return launch([(pso, (rows,), threads(pso))], logits, p, mode=1, hist=hist, hist_len=hist_len, bias=bias,
                   position=position, fill=fill, scratch={10: bits}, lbuf=lbuf)[0]
+
+
+def top_prob(logits, p, *, id_map=None, hist=None, hist_len=0, position=0, fill=0xFF, lbuf=None):
+    """basalt's sampler_greedy_top_prob_cluster_kernel (the drafter's greedy tail) as two dispatches:
+    ``bs_greedy_partial``, as in ``greedy_cl``, then ``bs_greedy_top_prob``, one threadgroup of exactly 1,024 threads
+    per row: the merge, the pick's probability and, with ``id_map`` (V,) int32, the map. The request's parameters
+    are not read (the kernel has no mode gate); a history, if given, is bound and never read. Refuses a pipeline that
+    cannot run 1,024 threads, whose sums would not be basalt's. Returns the T picks and the probabilities' bits."""
+    part, prob = pipeline("bs_greedy_partial"), pipeline("bs_greedy_top_prob")
+    if prob.max_threads_per_threadgroup < TOP_PROB_THREADS:
+        raise RuntimeError(f"bs_greedy_top_prob runs at most {prob.max_threads_per_threadgroup} threads per "
+                           f"threadgroup; its probability needs exactly {TOP_PROB_THREADS}")
+    rows = len(logits) + 1
+    return launch([(part, (AM_CTAS, rows), threads(part)), (prob, (rows,), TOP_PROB_THREADS)], logits, p, mode=0,
+                  hist=hist, hist_len=hist_len, id_map=id_map, position=position, fill=fill,
+                  scratch={8: rows * AM_CTAS * 8}, lbuf=lbuf)
 
 
 def rows_alone(path, logits, p, *, hist=None, hist_len=0, position=0):

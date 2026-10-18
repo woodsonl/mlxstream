@@ -10,8 +10,9 @@
 // first instruction when st->done or its row is at or past st->t_this_step. Without STEP_STATE only the helpers
 // compile. Their bindings, one slot per buffer across the family:
 //   0 logits (T, V) f32 | 1 ctr_base (2,) u32 | 2 nq (1,) u32 | 3 bias (V,) f32 | 4 history (T, H) i32
-//   5 token (T,) i32 | 6 qprob (T,) f32 | 7 BsSampleParams | 8 part: the greedy partials, (key, id) per row and
-//   threadgroup | 9 cand | 10 bits | 15 StepState
+//   5 token (T,) i32 | 6 qprob (T,) f32: the probe's probability, or the top-prob kernel's | 7 BsSampleParams
+//   8 part: the greedy partials, (key, id) per row and threadgroup | 9 cand | 10 bits
+//   11 map (V,) i32: the top-prob kernel's subset map | 15 StepState
 #pragma STDC FP_CONTRACT OFF
 #ifndef STEP_STATE
 #define STEP_STATE 0
@@ -129,7 +130,7 @@ static inline uint apply_penalties(uint b, uint count, float repeat, float freq,
 // basalt's SamplerParams without its per-step words: the seed is StepState's rng_lo / rng_hi, row t's counter
 // ctr_base + st->position + t. vocab, t_rows, n_blocks and hist_len are the program's; the rest the request's. mode:
 // 0 greedy (the cluster argmax alone), 1 greedy with a penalty window or a bias (the one-block greedy kernel after
-// it), 2 sampled. flags: 1 BIAS, 2 PROBE.
+// it), 2 sampled. flags: 1 BIAS, 2 PROBE, 4 MAP (the top-prob kernel's subset map, the program's).
 struct BsSampleParams {
     uint vocab, t_rows, n_blocks, hist_len;
     uint mode, flags;
@@ -140,6 +141,7 @@ struct BsSampleParams {
     uint pad;
 };
 constant uint BS_BIAS = 1u;                                            // flags: add bias[v] to every logit first
+constant uint BS_MAP = 4u;                                             // flags: the top-prob pick goes through map
 
 // ---- The greedy argmax on (key, id) pairs: am_take, am_merge (sampler.cu:180-185) -----------------------------------
 //
@@ -247,5 +249,51 @@ kernel void bs_greedy_one_block(device const uint* logits [[buffer(0)]], device 
                                 p.penalty_present), v, bk, bi);
     }
     if (am_block(bk, bi, sk, si, lane, sg, nsg, nv)) out[t] = bi < nv ? int(bi) : 0;     // :135-156
+}
+
+constant uint BS_TOP_PROB_THREADS = 1024u;                             // kAmThreads: the probability's geometry
+
+// sampler_greedy_top_prob_cluster_kernel (sampler.cu:249-325) after the cluster argmax bs_greedy_partial ran: CTA 0's
+// merge of the row's 8 pairs (bs_greedy_merge's), then the pick's softmax probability with row_top_prob_kernel's
+// arithmetic in its order (verify_kernels.cu:580-596), then the subset map. The partial sums are part of the bits, so
+// the threadgroup is exactly 1,024 threads (a dispatch of any other width returns at once and writes nothing): thread
+// i sums logits i, i + 1,024, ... in ascending order, then the XOR butterfly at 16, 8, 4, 2, 1, then thread 0 sums
+// the 32 SIMD-groups' sums in order from +0. __expf is expf_approx (invariant 5); every add and subtraction around it
+// is CUDA's IEEE one, subnormals kept, so the butterfly is ieee_add's, not basalt_fp.metal's plain-add warp_sum.
+// probs = 1.0f / tot, correctly rounded: tot is at least 1 (the pick's own term, exp2(0)) or NaN. out is the pick, or
+// map[pick] with flags MAP (an empty row's pick 0 maps to map[0]).
+kernel void bs_greedy_top_prob(device const uint* logits [[buffer(0)]], device int* out [[buffer(5)]],
+                               device float* probs [[buffer(6)]], constant BsSampleParams& p [[buffer(7)]],
+                               device const uint2* part [[buffer(8)]], device const int* id_map [[buffer(11)]],
+                               device const StepState* st [[buffer(15)]],
+                               uint t [[threadgroup_position_in_grid]], uint tpg [[threads_per_threadgroup]],
+                               uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                               uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float wsum[BS_TOP_PROB_THREADS / 32u];
+    threadgroup uint pick;
+    if (st->done || t >= st->t_this_step || tpg != BS_TOP_PROB_THREADS) return;
+    const uint nv = p.vocab;
+    if (sg == 0u) {                                                                       // :299-305
+        const uint2 c = lane < BS_AM_CTAS ? part[ulong(t) * BS_AM_CTAS + lane] : uint2(BS_KEY_NINF, nv);
+        uint bk = c.x, bi = c.y;
+        am_tree(bk, bi);
+        if (lane == 0u) pick = bi < nv ? bi : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                      // :306
+    const uint id = pick;
+    device const uint* l = logits + ulong(t) * nv;
+    const float m = as_type<float>(l[id]);                                                // :309
+    float s = 0.0f;
+    for (uint i = tid; i < nv; i += BS_TOP_PROB_THREADS)                                  // :311, bounded by nv
+        s = ieee_add(s, expf_approx(ieee_add(as_type<float>(l[i]), neg(m))));
+    for (ushort o = 16; o > 0; o >>= 1) s = ieee_add(s, shfl_xor(s, o));                 // :312
+    if (lane == 0u) wsum[sg] = s;                                                         // :313
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {                                                                      // :315-320
+        float tot = 0.0f;
+        for (uint w = 0u; w < BS_TOP_PROB_THREADS / 32u; ++w) tot = ieee_add(tot, wsum[w]);
+        probs[t] = 1.0f / tot;
+        out[t] = (p.flags & BS_MAP) != 0u ? id_map[id] : int(id);
+    }
 }
 #endif
