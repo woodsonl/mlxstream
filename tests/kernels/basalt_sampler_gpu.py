@@ -46,12 +46,14 @@ def record(p, vocab, rows, hist_len, mode, bias=False, probe=False):
         penalty_repeat=p.penalty_repeat, penalty_freq=p.penalty_freq, penalty_present=p.penalty_present)
 
 
-def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, scratch=None):
+def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, scratch=None,
+           lbuf=None):
     """Run ``steps``, (pipeline, grid, threads) in order, on one window: ``logits`` (T, V) float32, ``p`` the request,
     ``hist`` the flat (T, hist_len) int32 history rows, ``bias`` (V,) float32, ``position`` StepState's.
-    ``scratch``: {slot: bytes}, each starting as 0xFF. Every slot the family binds is bound, a 16-byte placeholder
-    where the request has no such datum. Returns the T picks and the T probabilities' bits; asserts the extra row
-    of each output untouched."""
+    ``scratch``: {slot: bytes}, each starting as 0xFF. ``lbuf``: a buffer already holding ``logits``, bound in place
+    of a fresh upload (sampler_parity's DeviceRows, rows uploaded once and sampled many times: the test reads it back).
+    Every slot the family binds is bound, a 16-byte placeholder where the request has no such datum. Returns the T
+    picks and the T probabilities' bits; asserts the extra row of each output untouched."""
     l = np.ascontiguousarray(logits, np.float32)
     T, V = l.shape
     rows = T + 1
@@ -65,7 +67,8 @@ def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, position
 
     st = LAYOUT.pack({"t_this_step": T, "position": position, "rng_lo": p.seed & 0xFFFFFFFF,
                       "rng_hi": (p.seed >> 32) & 0xFFFFFFFF})
-    slots = {0: buf(l.tobytes()), 1: buf(struct.pack("<Q", p.counter & (2 ** 64 - 1))), 2: buf(bytes(16)),
+    slots = {0: buf(l.tobytes()) if lbuf is None else lbuf, 1: buf(struct.pack("<Q", p.counter & (2 ** 64 - 1))),
+             2: buf(bytes(16)),
              3: buf(bytes(16) if bias is None else np.ascontiguousarray(bias, np.float32).tobytes()),
              4: buf(bytes(16) if hist is None else np.ascontiguousarray(hist, np.int32).tobytes()),
              5: buf(4 * rows, fill), 6: buf(4 * rows, fill),
@@ -86,7 +89,7 @@ def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, position
     return token[:T].copy(), qbits[:T].copy()
 
 
-def greedy_cl(logits, p, *, hist=None, hist_len=0, position=0, fill=0xFF):
+def greedy_cl(logits, p, *, hist=None, hist_len=0, position=0, fill=0xFF, lbuf=None):
     """G-CL, basalt's sampler_greedy_cluster_kernel as two dispatches: ``bs_greedy_partial`` over (8, rows)
     threadgroups of 1,024 threads, each storing its (key, id) pair, then ``bs_greedy_merge``, one SIMD-group per row
     over its 8 pairs. Mode 0, the greedy request without a penalty window or a bias; a history, if given, is bound and
@@ -94,10 +97,10 @@ def greedy_cl(logits, p, *, hist=None, hist_len=0, position=0, fill=0xFF):
     part, merge = pipeline("bs_greedy_partial"), pipeline("bs_greedy_merge")
     rows = len(logits) + 1
     return launch([(part, (AM_CTAS, rows), threads(part)), (merge, (rows,), 32)], logits, p, mode=0, hist=hist,
-                  hist_len=hist_len, position=position, fill=fill, scratch={8: rows * AM_CTAS * 8})[0]
+                  hist_len=hist_len, position=position, fill=fill, scratch={8: rows * AM_CTAS * 8}, lbuf=lbuf)[0]
 
 
-def greedy_1b(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF):
+def greedy_1b(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None):
     """G-1B, basalt's sampler_greedy_kernel: ``bs_greedy_one_block`` alone, one threadgroup of up to 1,024 threads
     per row, in mode 1 whatever the request asks (the forced runs; the engine runs it after the cluster pair, which
     would hide a G-1B that never wrote). Its bitmap scratch is sized as basalt sizes its shared one: ceil(V / 32)
@@ -108,7 +111,7 @@ def greedy_1b(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0
     rows = T + 1
     bits = rows * -(-V // 32) * 4 if p.penalty_last_n > 0 and hist_len > 0 else 16
     return launch([(pso, (rows,), threads(pso))], logits, p, mode=1, hist=hist, hist_len=hist_len, bias=bias,
-                  position=position, fill=fill, scratch={10: bits})[0]
+                  position=position, fill=fill, scratch={10: bits}, lbuf=lbuf)[0]
 
 
 def rows_alone(path, logits, p, *, hist=None, hist_len=0, position=0):
