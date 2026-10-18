@@ -110,6 +110,11 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   copied, `get_scale_min_k4` of `ggml/src/ggml-quants.c`, the q8_1 rule of `ggml/src/ggml-cuda/quantize.cu` and the
   MMVF accumulation and reductions of `ggml/src/ggml-cuda/mmvf.cu`, re-implemented in numpy (MIT). License:
   `third_party/GGML-LICENSE`.
+- `kernels/common/basalt_sampler.metal`, `tests/basalt_sampler_ref.py` — through basalt's `src/kernels/cuda/sampler.cu`
+  and `src/kernels/sampler_parity.cpp` (below), whose penalty stage and its host reference transcribe
+  `src/llama-sampler.cpp`'s `llama_sampler_penalties_apply` (MIT): the repeat penalty that multiplies a non-positive
+  logit and divides any other, then subtracts the count times the frequency penalty plus the presence penalty for a
+  counted token (`apply_penalties`, `penal`). License: `third_party/GGML-LICENSE`.
 
 ## basalt (jesdga95/basalt @ `b4c63b55754637f4c72ad53a0f791d425f71eb36`, MIT)
 

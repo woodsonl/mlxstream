@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2023-2026 The ggml authors
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/sampler_parity.cpp, include/basalt/kernels/sampler.hpp
 # (penalty_rows) and include/basalt/core/coupled_draft.hpp (the coupled_* helpers)
 # @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): its host references, fixtures and pass
-# criteria.
+# criteria; its penalty reference (penal) is basalt's transcription of ggml-org/llama.cpp src/llama-sampler.cpp
+# (llama_sampler_penalties_apply) @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
 # nv_exp and nv_logf: transcribed from NVIDIA libdevice's __nv_exp and __nv_logf as nvcc 13.0 (V13.0.48,
 # -arch=sm_120 -lineinfo -O3 -DNDEBUG) inlined them into basalt's sampler.cu; PTX listing and transcription:
 # docs/research/basalt-nvcc/sampler.md sections 2.5-2.6.
