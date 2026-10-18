@@ -53,7 +53,7 @@
 // two nd() calls in reduce_max_ps. _mm512_reduce_add_ps needs no such choice: float addition is bitwise commutative
 // on non-NaN operands, so R(acc) - R(corr) has the same bits under either toolchain.
 //
-// WHERE THE SPECIFICATION (.context/oi007/01-cpu-kernels.md) AND basalt's SOURCE DISAGREE - the source governs:
+// WHERE THE RESEARCH (docs/research/basalt-cpu-q2.md) AND basalt's SOURCE DISAGREE - the source governs:
 //   - Step 6's "inv = +inf when s < 2^-128" (:155) is off by one value: 1.f / 2^-128 is already +inf, so the band
 //     is s <= 2^-128. The source is a plain 1.f / s and that is what this file computes. A subnormal s ABOVE
 //     2^-128 has a finite inv and ordinary codes.
@@ -71,6 +71,7 @@
 
 #include <arm_neon.h>
 
+#include <cassert>
 #include <climits>
 #include <cstring>
 
@@ -184,6 +185,7 @@ inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nt, int 
 }  // namespace
 
 void act_quant_q8_1(const float* x, int n, ActQ& a) {
+    assert(n > 0 && n % QKA == 0 && n <= H);   // the header's precondition: q[0, n) and the chunk arrays must fit
     a.nchunks = n / QKA;
     const float32x4_t half = vdupq_n_f32(0.5f), mhalf = vdupq_n_f32(-0.5f), zero = vdupq_n_f32(0.0f);
     const int32x4_t lo = vdupq_n_s32(-127), hi = vdupq_n_s32(127);
@@ -223,6 +225,11 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
 
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                           float* const* out, int r0, int r1) {
+    // The accumulators below are MAXT wide and the ActQ reads run to 64 * nblocks of an H-element array, so a
+    // caller past either bound writes or reads off the end. basalt bounds nt by instantiating q2g_rows<8> for
+    // every nt above 8 (expert.cpp:554); here it is a precondition the header states and this holds a C++ caller to.
+    assert(nt >= 1 && nt <= MAXT);
+    assert(nblocks >= 1 && nblocks <= H / QK);
     float res[MAXT];
     for (int r = r0; r < r1; ++r) {
         q2g_row_multi(w + (size_t) r * row_bytes, a, nt, nblocks, res);

@@ -30,9 +30,7 @@ Fixtures are the repository's: ``random_rows`` (test_basalt_experts, basalt's ow
 bytes with a finite fp16 scale per block) for the bitwise cases, and ``quantize_q2_0`` (test_basalt_iq_parity,
 tools/gguf_writer.py's quantizer) for B8, which needs rows that mean something.
 
-NO KERNEL, BINDING OR REFERENCE CHANGE WAS NEEDED: every case below passed against runtime/src/basalt_cpu.cpp,
-its binding in runtime/src/native.mm and tests/kernels/basalt_cpu_emu.py as the preceding change wrote them. The
-suite was checked to bite by mutating the kernel: the saturating FCVTZS in place of the integer indefinite fails
+The suite bites, checked by mutating the kernel: the saturating FCVTZS in place of the integer indefinite fails
 A4, A5, A6 and A8; Clang's operand order in ``reduce_max_ps`` fails A6 alone; a reversed unpack shift fails every
 B case; and the same reversed shift applied to the emulator as well - a misreading the kernel and its reference
 share - fails B8 alone, which is what B8 is for.
@@ -52,7 +50,7 @@ from tests.kernels.test_basalt_iq_parity import quantize_q2_0
 
 F32 = np.float32
 H, MAXC, QKA, QK, BB, MAXT = emu.H, emu.MAXC, emu.QKA, emu.QK, emu.BB, emu.MAXT
-TWO_M128 = F32(2.0) ** -128                  # s <= this gives inv = +inf (plan section 1, correction 1)
+TWO_M128 = F32(2.0) ** -128                  # s <= this gives inv = +inf (docs/research/basalt-cpu-q2.md, 3)
 TWO_M149 = F32(2.0) ** -149                  # the smallest positive float32
 
 
@@ -172,7 +170,7 @@ def test_a4_the_scale_band():
     """A4. The four regimes of ``s = amax / 127`` and ``inv = 1 / s``, at the boundaries the plan measured:
 
     (a) ``amax = 127 * 2^-128`` puts s exactly on 2^-128, where ``1.f / s`` is already +inf (the specification's
-        "s < 2^-128" at 01-cpu-kernels.md:155 is off by this one value; basalt's plain ``1.f / s`` governs). Then
+        the band's open form is off by this one value; basalt's plain ``1.f / s`` governs). Then
         ``0 * inf = NaN`` and ``x * inf = +-inf``, every one of which VCVTTPS2DQ turns into the integer indefinite:
         **every code -127, the zeros included**, sum -4064 and hx = s * (float) -4064.
     (b) one ulp of s above that, ``inv`` is the finite 3.402822e38 and the codes are ordinary - and subnormal
@@ -262,14 +260,14 @@ def test_a7_rounding_half_away_from_zero_and_the_tie():
     """A7. ``r = t + copysign(0.5, t)`` truncated is lround's rule, round half AWAY from zero: with amax = 127 the
     scale is exactly 1 and every t is exact, so +-2.5 must give +-3. And the second rounding is part of the
     contract: ``t = 0.49999997f`` makes the exact sum ``1 - 2^-25``, a tie that rounds to the even 1.0f, so the code
-    is 1 where ``lround(t)`` would give 0 (01-cpu-kernels.md:158)."""
+    is 1 where ``lround(t)`` would give 0 (docs/research/basalt-cpu-q2.md, section 3)."""
     x = np.zeros(QKA, F32)
     x[0], x[1], x[2], x[3], x[4] = F32(127.0), F32(2.5), F32(-2.5), F32(0.5), F32(-0.5)
     q, scale, _, _, _ = check_act(x)
     assert scale[0] == F32(1.0)
     assert (q[1], q[2], q[3], q[4]) == (3, -3, 1, -1), "half away from zero, both signs"
 
-    amax, xt = F32(np.e), F32(0.01070189569145441)                   # t = 0.49999997f exactly (plan section 7, A7)
+    amax, xt = F32(np.e), F32(0.01070189569145441)                   # t = 0.49999997f exactly
     x = np.zeros(QKA, F32)
     x[0], x[7], x[9] = amax, xt, -xt
     q, scale, _, _, _ = check_act(x)
@@ -312,9 +310,9 @@ def test_a8_the_saturation_trap():
     worst, worst_amax = -np.inf, None
     sweep = [F32(3.7322113794423347e-37)] + [F32(v) for v in rng.standard_normal(64) * 10 ** rng.uniform(-30, 30, 64)]
     for amax in sweep:
-        if not (amax > 0) or not np.isfinite(recip(F32(np.abs(amax) / F32(127.0)))):
+        amax = F32(np.abs(amax))                                       # the sweep's draw is signed; amax is not
+        if not (amax > 0) or not np.isfinite(recip(F32(amax / F32(127.0)))):
             continue
-        amax = F32(np.abs(amax))
         chunk = (amax * np.linspace(-1.0, 1.0, QKA)).astype(F32)
         chunk[0], chunk[QKA - 1] = amax, -amax
         r, v = pre_clamp(chunk)
@@ -334,7 +332,8 @@ def test_a8_the_saturation_trap():
 def test_a9_the_contraction_trap():
     """A9. Step 7's ``_mm512_mul_ps`` and step 9's ``_mm512_add_ps`` round twice, which GCC 12.2/13.2/14.3/15.2 and
     Clang 21 all emit as a separate vmulps and vaddps. A contracted ``fma(x, inv, +-0.5)`` skips the rounding of t
-    and changes the code, so this input fails the moment the translation unit loses ``-ffp-contract=off`` or the two
+    and changes the code, so this input fails the moment the two statements are written as one expression, or the
+    translation unit is built -ffp-contract=fast (its default, ``on``, leaves separate statements alone [M]), or the two
     statements are merged into one expression."""
     amax, xt = F32(np.e), F32(0.01070189569145441)
     x = np.zeros(QKA, F32)
@@ -496,7 +495,8 @@ def test_b8_against_a_float64_reference(n, nblocks, row_bytes):
 
     The bound is on ``sum |terms|``, not on ``|ref|``: a row whose terms cancel has a large relative error for a
     correct kernel. A misread unpack or lane mapping is an O(1) error, so 1e-6 of the row's own magnitude - about
-    twenty times the worst observed - still catches it."""
+    twenty times the worst per-row observation (5.3e-08) and about two and a half times the aggregate (3.9e-07) -
+    still catches it."""
     rng = np.random.default_rng(42)
     nrows = 48
     values = (rng.standard_normal((nrows, n)) * 0.02 * (0.5 + (np.arange(nrows)[:, None] % 7) / 7.0)).astype(F32)
@@ -531,3 +531,20 @@ def test_b9_determinism():
         assert np.array_equal(one[0], other[0]) and np.array_equal(one[2], other[2])
         assert np.array_equal(one[1].view(np.uint32), other[1].view(np.uint32))
         assert np.array_equal(one[3].view(np.uint32), other[3].view(np.uint32))
+
+
+@pytest.mark.parametrize(
+    "name, w_len, row_bytes, nblocks, nrows, message",
+    [("nblocks wraps the int product", 1024, 603979776, 1 << 25, 1, "nblocks must be 1..40"),
+     ("row_bytes * nrows wraps size_t", 18, 1 << 48, 1, 65536, "w is shorter than row_bytes")],
+)
+def test_b10_a_bound_that_would_overflow_still_refuses(name, w_len, row_bytes, nblocks, nrows, message):
+    """The binding's bounds divide rather than multiply. Written as products, both of these pass the check meant to
+    fail them - ``QK * nblocks`` reaches INT_MIN at nblocks = 2^25, and ``row_bytes * nrows`` wraps to 0 - and the
+    kernel then reads past the ActQ arrays or past ``w``, which segfaults."""
+    q = np.zeros((1, H), np.int8)
+    scale = np.zeros((1, MAXC), np.float32)
+    hx = np.zeros((1, MAXC), np.float32)
+    out = np.zeros((1, nrows), np.float32)
+    with pytest.raises(ValueError, match=message):
+        _nt.basalt_q2_0_gguf_rows_multi(np.zeros(w_len, np.uint8), row_bytes, nblocks, q, scale, hx, out, 0, 1)

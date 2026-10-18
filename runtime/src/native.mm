@@ -92,6 +92,9 @@ static int runner_clear(PyObject* self) {
   nb::inst_ptr<Runner>(self)->release_host_tasks();
   return 0;
 }
+static PyType_Slot callable_task_slots[] = {{Py_tp_traverse, (void*)callable_task_traverse}, {Py_tp_clear, (void*)callable_task_clear}, {0, nullptr}};
+static PyType_Slot runner_slots[] = {{Py_tp_traverse, (void*)runner_traverse}, {Py_tp_clear, (void*)runner_clear}, {0, nullptr}};
+
 // ---- basalt's two CPU Q2_0 kernels (basalt_cpu.h) ------------------------------------------------------------
 // Caller-owned numpy arrays, ActQ-shaped and C-contiguous: nanobind refuses a wrong dtype, rank or layout (the
 // arguments are .noconvert(), so it cannot quietly write into a copy), and these checks refuse a short buffer - a
@@ -109,9 +112,6 @@ using F32Out2 = nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 static void need(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(what);
 }
-
-static PyType_Slot callable_task_slots[] = {{Py_tp_traverse, (void*)callable_task_traverse}, {Py_tp_clear, (void*)callable_task_clear}, {0, nullptr}};
-static PyType_Slot runner_slots[] = {{Py_tp_traverse, (void*)runner_traverse}, {Py_tp_clear, (void*)runner_clear}, {0, nullptr}};
 
 NB_MODULE(_native, m) {
   m.doc() = "Metal runtime core (v0): device, buffers, runtime-compiled libraries, pipelines, timed dispatches";
@@ -246,10 +246,13 @@ NB_MODULE(_native, m) {
     need(q.shape(1) == (size_t)bc::H, "basalt_q2_0_gguf_rows_multi: q rows must hold H = 2560 int8 codes");
     need(scale.shape(1) == (size_t)bc::MAXC && hx.shape(1) == (size_t)bc::MAXC,
          "basalt_q2_0_gguf_rows_multi: scale and hx rows must hold MAXC = 80 elements");
-    need(nblocks >= 1 && bc::QK * nblocks <= bc::H, "basalt_q2_0_gguf_rows_multi: nblocks must be 1..40");
-    need(row_bytes >= (size_t)(bc::BB * nblocks), "basalt_q2_0_gguf_rows_multi: row_bytes is below 18 * nblocks");
+    // Every bound divides rather than multiplies: the products overflow, and a wrapped product passes the check it
+    // is meant to fail (nblocks = 2^25 makes QK * nblocks reach INT_MIN, row_bytes * nrows reaches 2^64 and wraps
+    // to 0), which the kernel then reads past the ActQ arrays and past w.
+    need(nblocks >= 1 && nblocks <= bc::H / bc::QK, "basalt_q2_0_gguf_rows_multi: nblocks must be 1..40");
+    need(row_bytes >= (size_t)bc::BB * (size_t)nblocks, "basalt_q2_0_gguf_rows_multi: row_bytes is below 18 * nblocks");
     need(r0 >= 0 && r1 >= r0 && r1 <= nrows, "basalt_q2_0_gguf_rows_multi: need 0 <= r0 <= r1 <= out.shape[1]");
-    need(w.size() >= row_bytes * (size_t)nrows, "basalt_q2_0_gguf_rows_multi: w is shorter than row_bytes * nrows");
+    need(nrows == 0 || row_bytes <= w.size() / (size_t)nrows, "basalt_q2_0_gguf_rows_multi: w is shorter than row_bytes * nrows");
     std::array<bc::ActQ, bc::MAXT> act{};
     const bc::ActQ* ap[bc::MAXT];
     float* op[bc::MAXT];

@@ -19,7 +19,7 @@ namespace monolith::basalt_cpu {
 // basalt's geometry (expert.hpp:25-36). H and MAXC bound the ActQ buffers; both kernels take their widths at run
 // time (n, nblocks, row_bytes), so nothing here pins a model.
 inline constexpr int H = 2560;          // n_embd: the widest reduction an ActQ holds
-inline constexpr int FF = 640;          // expert intermediate width
+inline constexpr int FF = 640;          // expert intermediate width: the second width the pool's callers quantize
 inline constexpr int QK = 64;           // QK2_0: weights per fp16 block scale
 inline constexpr int QKA = 32;          // activation elements per q8_1 scale
 inline constexpr int BB = 18;           // bytes per Q2_0 block: fp16 scale, then 16 code bytes
@@ -43,6 +43,9 @@ void act_quant_q8_1(const float* x, int n, ActQ& a);
 /// expert.cpp:544-556 through q2g_rows / q2g_row_multi. Row r is w + r * row_bytes; out[t] is indexed by the
 /// ABSOLUTE row r, and rows outside [r0, r1) are left alone. Reads a[t]->q[0, 64 * nblocks),
 /// a[t]->scale[0, 2 * nblocks) and a[t]->hx[0, 2 * nblocks), and nothing else - never nchunks, never sum.
+/// nt must be 1..MAXT and nblocks 1..H / QK: the per-token accumulators are MAXT wide and the reads above run to
+/// 64 * nblocks of an H-element array. basalt bounds nt by instantiating q2g_rows<8> for every nt above 8
+/// (expert.cpp:554); the caller here bounds it, and the kernel asserts both.
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                           float* const* out, int r0, int r1);
 
