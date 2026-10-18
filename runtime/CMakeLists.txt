@@ -12,8 +12,11 @@ if(NOT NB_RC EQUAL 0)
 endif()
 list(APPEND CMAKE_PREFIX_PATH "${NB_DIR}")
 find_package(nanobind CONFIG REQUIRED)
-nanobind_add_module(_native NB_STATIC src/native.mm src/metal_core.mm)
+nanobind_add_module(_native NB_STATIC src/native.mm src/metal_core.mm src/basalt_cpu.cpp)
 set_source_files_properties(src/native.mm src/metal_core.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+# basalt's CPU kernels transcribe two AVX-512 roundings (a vmulps then a vaddps) that a contracted fmla
+# would collapse into one, changing the activation codes; the Metal core keeps the default.
+set_source_files_properties(src/basalt_cpu.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 target_include_directories(_native PRIVATE src)
 target_link_libraries(_native PRIVATE "-framework Metal" "-framework Foundation" "-framework IOKit")
 set(LITHOS_METAL_NATIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/monolith/runtime" CACHE PATH "Python extension output directory")
