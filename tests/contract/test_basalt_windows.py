@@ -18,7 +18,7 @@ from monolith.formats.basalt_reader import HEADER_BYTES, BasaltFile, parse_heade
 from monolith.formats.gguf import GGML_TYPES, ggml_row_bytes
 from monolith.formats.safetensors_reader import SafetensorsDir, read_header
 from monolith.packs import PackFile
-from monolith.packs.basalt import BasaltEntry, BasaltSource
+from monolith.packs.basalt import HC8, BasaltEntry, BasaltSource
 from monolith.packs.packer import ALIGN
 from monolith.runtime.program import BufferSpec
 from tests.contract.test_basalt_reader import write_basalt
@@ -54,9 +54,10 @@ BOUND = ["gguf/a.weight", "gguf/b.weight", "gguf/c.weight", "gguf/e.weight", "gg
          "dense/n1.weight", "dense/n2.weight", "mtp/fc.weight", "mtp/norm.weight", "mtp/proj.weight", "mtp/experts"]
 
 
-def write(tmp_path, gguf=None, dense=None, name="model.basalt"):
-    """A synthetic .basalt file of random bytes with the tensors above; ``gguf`` / ``dense`` replace the tables."""
-    gguf, dense = gguf or GGUF, dense or DENSE
+def write(tmp_path, gguf=None, dense=None, name="model.basalt", mtp=None):
+    """A synthetic .basalt file of random bytes with the tensors above; ``gguf`` / ``dense`` / ``mtp`` replace the
+    tables."""
+    gguf, dense, mtp = gguf or GGUF, dense or DENSE, mtp or MTP
     rng = np.random.default_rng(7)
     noise = lambda n: rng.integers(0, 256, n, dtype=np.uint8).tobytes()          # noqa: E731
     meta = {"format": "basalt", "version": 1, "tensors": {
@@ -66,7 +67,7 @@ def write(tmp_path, gguf=None, dense=None, name="model.basalt"):
     index = f"# dense index v3\n# align 64 pool 81920 tensors {len(dense)}\n" + "\n".join(dense) + "\n"
     path = tmp_path / name
     path.write_bytes(write_basalt({"meta": json.dumps(meta).encode(), "dense": noise(81920),
-                                   "dense.index": index.encode(), "mtp/dense": noise(2048), "mtp/dense.index": MTP,
+                                   "dense.index": index.encode(), "mtp/dense": noise(2048), "mtp/dense.index": mtp,
                                    "mtp/experts": noise(33768), "gguf": noise(GGUF_BYTES)}))
     return path
 
@@ -213,6 +214,34 @@ def test_refuses_an_entry_basalt_does_not_ship_as_stored(tmp_path, name, why):
         basalt_windows(src, g.values.values())
 
 
+@pytest.mark.parametrize("name", ["dense/blk.0.hc_attn_down.weight", "dense/blk.3.hc_ffn_up.weight",
+                                  "gguf/output_hc_up.weight", "mtp/hyper_connection.input_mix_weight_attn"])
+def test_refuses_a_hyper_connection_matrix_basalt_holds_only_as_8_bit_copies(tmp_path, name):
+    """basalt's kernels read the hyper-connection down/up matrices only through their 8-bit copies, which its load
+    quantizes from the stored form and then drops (generate.cpp:2233-2244, mtp.cpp:215-218), so a step kernel must not
+    bind the stored bytes."""
+    path = write(tmp_path, gguf={**GGUF, "output_hc_up.weight": (0, [16], 112640)},
+                 dense=DENSE + ["blk.0.hc_attn_down.weight 0 4 67072 256 67328 256 64 2 0 0 1 0 0 0 0 0 0 0",
+                                "blk.3.hc_ffn_up.weight 0 4 67328 256 67584 256 64 2 0 0 1 0 0 0 0 0 0 0",
+                                "blk.0.hc_attn_scale.weight 0 2 67584 256 67840 256 64 0 0 0 1 0 0 0 0 0 0 0"],
+                 mtp=MTP + b"hyper_connection.input_mix_weight_attn bf16 2 64 1280 256\n"
+                           b"hyper_connection.output_weight bf16 2 64 1536 256\n")
+    src = BasaltSource(path)
+    assert src.refused[name] == HC8 and name not in src.entries
+    assert {"dense/blk.0.hc_attn_scale.weight", "mtp/hyper_connection.output_weight"} <= set(src.entries)
+    g = Graph("step")
+    g.const(name, (64,), DType.F32)
+    with pytest.raises(ValueError, match="only through its 8-bit copy"):
+        basalt_windows(src, g.values.values())
+
+
+def test_refuses_a_shape_whose_size_wraps_64_bits(tmp_path):
+    """(274177 * 67280421310721) = 2^64 + 1, so a 64-bit product of the leading dimensions reads 1 and this header's
+    64 bytes would pass for an F32 [274177, 67280421310721, 16]; the exact product refuses it."""
+    src = BasaltSource(write(tmp_path, gguf={**GGUF, "w.weight": (0, [16, 67280421310721, 274177], 112640)}))
+    assert src.refused["gguf/w.weight"].startswith("64 bytes are not f32 [274177, 67280421310721, 16]")
+
+
 @pytest.mark.parametrize("declare, why", [
     (lambda g: g.weight("gguf/a.weight", (4, 96), "q8_0"), r"is q8_0 \[4, 64\]; the graph declares q8_0 \[4, 96\]"),
     (lambda g: g.weight("gguf/a.weight", (4, 64), "q4_0"), r"is q8_0 \[4, 64\]; the graph declares q4_0 \[4, 64\]"),
@@ -332,18 +361,20 @@ def real_source():
 
 
 def test_real_pack_dense_rows_basalt_keeps():
-    """The 582 rows basalt copies to its dense arena (all loaded rows but the hyper-connection down/up matrices):
-    the contract's 214,208,000-byte pool, mapped as 146 windows of 216,596,480 bytes, every mapped page holding a kept
-    row's byte and no page inside a hyper-connection matrix mapped."""
+    """The 582 rows basalt copies to its dense arena (all loaded rows but the hyper-connection down/up matrices, which
+    the source refuses as basalt holds them only as 8-bit copies): the contract's 214,208,000-byte pool, mapped as 146
+    windows of 216,596,480 bytes, every mapped page holding a kept row's byte and no page inside a hyper-connection
+    matrix mapped."""
     src, _ = real_source()
-    dense = [n for n in src.entries if n.startswith("dense/")]
-    kept, hc = [n for n in dense if not HC.search(n)], [n for n in dense if HC.search(n)]
-    assert (len(dense), len(kept), len(hc)) == (776, 582, 194)
+    kept = [n for n in src.entries if n.startswith("dense/")]
+    hc = [n for n, why in src.refused.items() if n.startswith("dense/") and why == HC8]
+    assert (len(kept), len(hc)) == (582, 194) and all(HC.search(n) for n in hc) and not any(HC.search(n) for n in kept)
+    rows, base = {f"dense/{r.name}": r for r in src.file.dense_index().rows}, src.file.section("dense").offset
     assert sum(src.entries[n].nbytes for n in kept) == 214_208_000
     buffers, bound = plan(src, *kept)
     assert (len(buffers), sum(b.nbytes for b in buffers.values())) == (146, 216_596_480)
     assert mapped(buffers) == set().union(*(pages(src.entries[n].offset, src.entries[n].nbytes) for n in kept))
-    assert not set().union(*(pages(src.entries[n].offset, src.entries[n].nbytes, whole=True) for n in hc)) & mapped(buffers)
+    assert not set().union(*(pages(base + rows[n].src_off, rows[n].src_bytes, whole=True) for n in hc)) & mapped(buffers)
     assert all(off % 64 == 0 for _, off in bound.values())
 
 
@@ -353,17 +384,20 @@ def test_real_pack_binding_offsets():
     src, pack = real_source()
     secs = src.file.sections
     for e in pack["entries"]:
-        if e["source"] == "gguf":
+        if e["source"] == "gguf" and src.refused.get("gguf/" + e["tensor"]) == HC8:
+            assert e["tensor"] == "output_hc_down.weight"                          # held as its 8-bit copy only
+        elif e["source"] == "gguf":
             t = src.entries["gguf/" + e["tensor"]]
             assert (t.offset, t.nbytes, t.type_id) == (secs["gguf"].offset + e["meta"]["offset"], e["meta"]["bytes"],
                                                        e["type_id"])
     names = [n for n in src.entries if n.split("/")[0] in ("gguf", "dense", "mtp") and n not in secs] + ["mtp/experts"]
     buffers, bound = plan(src, *names)
     by_space = {s: [bound[n][1] for n in names if n.startswith(s + "/") and n != "mtp/experts"] for s in ("gguf", "dense", "mtp")}
-    assert [len(v) for v in by_space.values()] == [13, 776, 29]
+    assert [len(v) for v in by_space.values()] == [12, 582, 23]
+    assert [sum(n.startswith(s + "/") and why == HC8 for n, why in src.refused.items()) for s in by_space] == [1, 194, 6]
     assert all(off % 4096 == 0 for off in by_space["gguf"]) and all(off % 64 == 0 for off in by_space["dense"])
     assert all(off % 256 == 0 for off in by_space["mtp"])
-    assert sum(src.entries[n].offset % 4096 == 0 for n in names if n.startswith("dense/")) == 26
+    assert sum(src.entries[n].offset % 4096 == 0 for n in names if n.startswith("dense/")) == 16
     w, off = bound["mtp/experts"]
     assert off == 0 and buffers[w].nbytes == secs["mtp/experts"].nbytes == 707_788_800
     assert all(b.file_offset + b.nbytes <= src.file_bytes for b in buffers.values())

@@ -17,8 +17,9 @@ A value binds an entry only when it declares it exactly: a weight's format, or a
 ggml type name (``u8`` for a section), and its shape is the entry's. Refused when a value binds it, with the reason: a
 ``dense`` row with no ggml type a value can declare (an ``in_gguf`` row, which ``gguf/<name>`` serves; kind 0, basalt's
 verbatim planes; kinds 1 and 3, which basalt converts at load) or with source bytes that do not fill its arena slot
-exactly (basalt copies every source byte into the slot), a type the format plugins lack, a size its type and shape do
-not give, an entry of no bytes. Two entries of one name make the file unreadable.
+exactly (basalt copies every source byte into the slot), a hyper-connection down/up matrix (``held_as_hc8``: basalt's
+kernels read only its 8-bit copy, which the load quantizes from these bytes), a type the format plugins lack, a size
+its type and shape do not give, an entry of no bytes. Two entries of one name make the file unreadable.
 
 ``copy=True`` is a test mode: each bound tensor becomes a buffer of exactly its own bytes, so shader validation bounds
 every access by its tensor, not by a page-rounded window that holds its neighbours too. The bytes are the same.
@@ -26,17 +27,33 @@ every access by its tensor, not by a page-rounded window that holds its neighbou
 
 from __future__ import annotations
 
+import math
 import os
 from collections import namedtuple
 from typing import Dict, Optional, Sequence
-
-import numpy as np
 
 from ..formats.basalt_reader import MTP_KINDS, BasaltFile
 from ..formats.gguf import GGML_TYPES, ggml_row_bytes
 
 BasaltEntry = namedtuple("BasaltEntry", "name offset nbytes type_id shape")
 DENSE_KINDS = {2: 0, 4: 30, 5: 1}                 # dense.index kinds copied as stored -> ggml type id (F32, BF16, F16)
+HC8 = ("basalt's kernels read this hyper-connection matrix only through its 8-bit copy, which the load makes from the "
+       "stored form and then drops it (generate.cpp:2233-2244, :2319-2368 for the target; mtp.cpp:215-218, :254-260 "
+       "for the drafter; hc8_only() is true at hc_fused.cu:1250): only a port of that load-time quantizer may read it")
+
+
+def held_as_hc8(name: str, mtp: Optional[tuple] = None) -> bool:
+    """Whether basalt leaves this matrix out of its arena on one GPU and computes with its 8-bit hyper-connection copy
+    instead: the target's ``blk.*.hc_{attn,ffn}_{down,up}.weight`` and ``output_hc_{down,up}.weight``
+    (``generate.cpp:2235-2243``), or, for a drafter tensor ``mtp = (kind, rows, cols, nbytes)``, a bf16
+    ``hyper_connection`` ``input_mix_weight_`` matrix of exactly ``rows * cols * 2`` bytes (``mtp.cpp:215-218``)."""
+    if mtp is not None:
+        kind, rows, cols, nbytes = mtp
+        return (kind == "bf16" and "hyper_connection" in name and "input_mix_weight_" in name
+                and rows * cols * 2 == nbytes)
+    return ((name.startswith("blk.") and name.endswith((".hc_attn_down.weight", ".hc_attn_up.weight",
+                                                         ".hc_ffn_down.weight", ".hc_ffn_up.weight")))
+            or name in ("output_hc_down.weight", "output_hc_up.weight"))
 
 
 class BasaltSource:
@@ -57,11 +74,13 @@ class BasaltSource:
         if "meta" in f.sections and "gguf" in f.sections:
             for name in f.meta().get("tensors", {}):
                 t = f.tensor(name)
-                self._add(f"gguf/{name}", t.offset, t.nbytes, t.type_id, tuple(reversed(t.ne)))
+                self._add(f"gguf/{name}", t.offset, t.nbytes, t.type_id, tuple(reversed(t.ne)),
+                          HC8 if held_as_hc8(name) else None)
         if "dense.index" in f.sections:
             base = f.section("dense").offset
             for r in f.dense_index().rows:
-                why = (f"its bytes are in gguf: bind gguf/{r.name}" if r.in_gguf else
+                why = (HC8 if held_as_hc8(r.name) else
+                       f"its bytes are in gguf: bind gguf/{r.name}" if r.in_gguf else
                        f"kind {r.kind} has no ggml type to declare (kind 0 is basalt's verbatim planes; it converts "
                        "kinds 1 and 3 at load)" if r.kind not in DENSE_KINDS else
                        f"its row gives {r.src_bytes} source bytes but a {r.dst_bytes}-byte slot (basalt's loader "
@@ -72,6 +91,7 @@ class BasaltSource:
             base = f.section("mtp/dense").offset
             for t in f.mtp_dense_index():
                 self._add(f"mtp/{t.name}", base + t.offset, t.nbytes, MTP_KINDS.get(t.kind), (t.rows, t.cols),
+                          HC8 if held_as_hc8(t.name, (t.kind, t.rows, t.cols, t.nbytes)) else
                           None if t.kind in MTP_KINDS else f"mtp kind {t.kind!r} has no format here")
         for s in f.sections.values():
             self._add(s.name, s.offset, s.nbytes, None, (s.nbytes,))
@@ -83,7 +103,7 @@ class BasaltSource:
         if why is None and type_id is not None:                              # a section (no type) is bytes
             if type_id not in GGML_TYPES:
                 why = f"ggml type {type_id} has no format here"
-            elif nbytes != ggml_row_bytes(type_id, shape[-1]) * int(np.prod(shape[:-1], dtype=np.int64)):
+            elif nbytes != ggml_row_bytes(type_id, shape[-1]) * math.prod(shape[:-1]):    # exact: no int64 wrap
                 why = f"{nbytes} bytes are not {GGML_TYPES[type_id][0]} {list(shape)}"
         if why is None and not nbytes:
             why = "it holds no bytes"
