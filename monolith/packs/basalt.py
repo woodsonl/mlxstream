@@ -17,7 +17,8 @@ A value binds an entry only when it declares it exactly: a weight's format, or a
 ggml type name (``u8`` for a section), and its shape is the entry's. Refused when a value binds it, with the reason: a
 ``dense`` row with no ggml type a value can declare (an ``in_gguf`` row, which ``gguf/<name>`` serves; kind 0, basalt's
 verbatim planes; kinds 1 and 3, which basalt converts at load) or one basalt does not copy whole, a type the format
-plugins lack, a size its type and shape do not give, an entry of no bytes. Two entries of one name make the file unreadable.
+plugins lack, a size its type and shape do not give, an entry of no bytes. Two entries of one name make the file
+unreadable.
 
 ``copy=True`` is a test mode: each bound tensor becomes a buffer of exactly its own bytes, so shader validation bounds
 every access by its tensor, not by a page-rounded window that holds its neighbours too. The bytes are the same.
