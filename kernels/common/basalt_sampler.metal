@@ -98,6 +98,32 @@ static inline float philox_uniform(ulong seed, ulong counter) {
     return float(c0 >> 8) * 0x1p-24f;
 }
 
+// ---- Penalties (sampler.cu:65-77) ------------------------------------------------------------------------------------
+//
+// llama.cpp's penalties stage as nvcc compiles it (docs/research/basalt-nvcc/sampler.md 2.1). A logit the window
+// does not count keeps its bits. A counted one is divided by repeat when it is positive or NaN (setp.gtu.f32 on its
+// bits, so a positive subnormal divides), else multiplied, and then less fma(count, freq, present): the presence term
+// (count > 0 ? 1 : 0) * present folds to present, since count > 0 there. Every operation is CUDA's IEEE one, with
+// subnormals.
+
+// -x by its sign bit (unary minus on a subnormal is not measured on this GPU)
+static inline float neg(float x) { return as_type<float>(as_type<uint>(x) ^ 0x80000000u); }
+
+static inline uint history_count(device const int* h, uint n, uint v) {
+    uint c = 0u;
+    for (uint i = 0u; i < n; ++i)                                       // bounded: the window's n slots
+        if (h[i] == int(v)) ++c;
+    return c;
+}
+
+// apply_penalties on a logit's bits, with count its exact count over the window
+static inline uint apply_penalties(uint b, uint count, float repeat, float freq, float present) {
+    if (count == 0u) return b;
+    const float x = as_type<float>(b);
+    const float y = (fnan(b) || f_gt(b, 0u)) ? ieee_div(x, repeat) : ieee_mul(x, repeat);
+    return as_type<uint>(ieee_add(y, neg(ieee_fma_count(float(count), freq, present))));
+}
+
 // ---- The request's record (monolith/kernels.py's basalt_sampler_params) ---------------------------------------------
 //
 // basalt's SamplerParams without its per-step words: the seed is StepState's rng_lo / rng_hi, row t's counter
@@ -113,6 +139,7 @@ struct BsSampleParams {
     float penalty_repeat, penalty_freq, penalty_present;
     uint pad;
 };
+constant uint BS_BIAS = 1u;                                            // flags: add bias[v] to every logit first
 
 // ---- The greedy argmax on (key, id) pairs: am_take, am_merge (sampler.cu:180-185) -----------------------------------
 //
@@ -133,6 +160,19 @@ static inline void am_merge(uint ok, uint oi, thread uint& bk, thread uint& bi) 
 static inline void am_tree(thread uint& bk, thread uint& bi) {
     for (ushort off = 16; off > 0; off >>= 1) am_merge(simd_shuffle_down(bk, off), simd_shuffle_down(bi, off), bk, bi);
 }
+// The SIMD-group tree, then SIMD-group 0's tree over the nsg SIMD-groups' pairs (sampler.cu:135-153, :211-221): true
+// on SIMD-group 0's lane 0, which ends with the threadgroup's first pair. Every thread of the threadgroup calls it.
+static inline bool am_block(thread uint& bk, thread uint& bi, threadgroup uint* sk, threadgroup uint* si, uint lane,
+                            uint sg, uint nsg, uint nv) {
+    am_tree(bk, bi);
+    if (lane == 0u) { sk[sg] = bk; si[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg != 0u) return false;
+    bk = lane < nsg ? sk[lane] : BS_KEY_NINF;
+    bi = lane < nsg ? si[lane] : nv;
+    am_tree(bk, bi);
+    return lane == 0u;
+}
 
 #if STEP_STATE
 constant uint BS_AM_CTAS = 8u;                                         // kAmCtas: threadgroups per row
@@ -152,14 +192,7 @@ kernel void bs_greedy_partial(device const uint* logits [[buffer(0)]], constant 
     device const uint* l = logits + ulong(t) * nv;
     uint bk = BS_KEY_NINF, bi = nv;
     for (uint v = r * tpg + tid; v < nv; v += BS_AM_CTAS * tpg) am_take(l[v], v, bk, bi);   // bounded by nv
-    am_tree(bk, bi);
-    if (lane == 0u) { sk[sg] = bk; si[sg] = bi; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg != 0u) return;
-    bk = lane < nsg ? sk[lane] : BS_KEY_NINF;
-    bi = lane < nsg ? si[lane] : nv;
-    am_tree(bk, bi);
-    if (lane == 0u) part[ulong(t) * BS_AM_CTAS + r] = uint2(bk, bi);
+    if (am_block(bk, bi, sk, si, lane, sg, nsg, nv)) part[ulong(t) * BS_AM_CTAS + r] = uint2(bk, bi);
 }
 
 // The cluster kernel's CTA-0 merge (sampler.cu:233-238): one SIMD-group per row over its 8 partials.
@@ -172,5 +205,47 @@ kernel void bs_greedy_merge(device int* out [[buffer(5)]], constant BsSamplePara
     uint bk = c.x, bi = c.y;
     am_tree(bk, bi);
     if (lane == 0u) out[t] = bi < nv ? int(bi) : 0;
+}
+
+// sampler_greedy_kernel (sampler.cu:91-157), mode 1: each row's argmax after the logit bias (flags BIAS) and the
+// penalties over the tail of its history row, its last min(penalty_last_n, hist_len) slots. One threadgroup per row,
+// of any multiple of 32 threads up to basalt's 1,024 (the pick is order-free). The window's membership bitmap filters
+// the exact count, as basalt's shared one does: row t's ceil(vocab / 32) words of bits (device scratch, one region
+// per row), zeroed and ORed in every step that has a window, never touched without one; ids outside the vocabulary
+// set nothing.
+kernel void bs_greedy_one_block(device const uint* logits [[buffer(0)]], device const float* bias [[buffer(3)]],
+                                device const int* history [[buffer(4)]], device int* out [[buffer(5)]],
+                                constant BsSampleParams& p [[buffer(7)]], device atomic_uint* pbits [[buffer(10)]],
+                                device const StepState* st [[buffer(15)]],
+                                uint t [[threadgroup_position_in_grid]], uint tpg [[threads_per_threadgroup]],
+                                uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup uint sk[32], si[32];
+    if (st->done || t >= st->t_this_step || p.mode != 1u) return;
+    const uint nv = p.vocab, words = (nv + 31u) / 32u;
+    const uint hlen = uint(clamp(p.penalty_last_n, 0, int(p.hist_len)));                 // :97-103
+    device const int* hrow = history + ulong(t) * p.hist_len + (p.hist_len - hlen);      // the window is the tail
+    device atomic_uint* bits = pbits + ulong(t) * words;
+    if (hlen > 0u) {                                                                      // :110-121
+        for (uint w = tid; w < words; w += tpg) atomic_store_explicit(bits + w, 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint i = tid; i < hlen; i += tpg) {
+            const int id = hrow[i];
+            if (id >= 0 && uint(id) < nv)
+                atomic_fetch_or_explicit(bits + (uint(id) >> 5), 1u << (uint(id) & 31u), memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+    device const uint* l = logits + ulong(t) * nv;
+    const bool biased = (p.flags & BS_BIAS) != 0u;
+    uint bk = BS_KEY_NINF, bi = nv;
+    for (uint v = tid; v < nv; v += tpg) {                                                // :131-134, bounded by nv
+        const uint x = biased ? as_type<uint>(ieee_add(as_type<float>(l[v]), bias[v])) : l[v];
+        const bool hit = hlen > 0u
+                         && (atomic_load_explicit(bits + (v >> 5), memory_order_relaxed) & (1u << (v & 31u))) != 0u;
+        am_take(apply_penalties(x, hit ? history_count(hrow, hlen, v) : 0u, p.penalty_repeat, p.penalty_freq,
+                                p.penalty_present), v, bk, bi);
+    }
+    if (am_block(bk, bi, sk, si, lane, sg, nsg, nv)) out[t] = bi < nv ? int(bi) : 0;     // :135-156
 }
 #endif

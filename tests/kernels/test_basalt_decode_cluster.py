@@ -4,15 +4,19 @@
 # (MIT; third_party/NOTICE): its argmax fixtures, pre-fills and pass criterion.
 """decode_cluster_parity's argmax half (basalt src/kernels/decode_cluster_parity.cpp:174-243, :412-421) on the Metal
 sampler family: the cluster argmax, here its partials and merge dispatches (``greedy_cl``,
-tests/kernels/basalt_sampler_gpu.py), against the host's answer, the lowest index of the largest non-NaN value above
--inf, else 0.
+tests/kernels/basalt_sampler_gpu.py), against the one-block greedy kernel (``greedy_1b``) and the host's answer, the
+lowest index of the largest non-NaN value above -inf, else 0.
 
 DCP.1: for each vocabulary of basalt's list, each of its 12 argmax patterns (``fill_logits``, :175-212, on the port's
 own seeded draws: normal(0, 3), then the pattern's overwrites) and T in (1, 5), even rows take the pattern and odd rows
-the random one (:216); the output starts as 0xA5 bytes (:220). basalt skips without clusters (:390-393); the port has
-none to lack, so it never skips. numpy's float32 compares keep subnormals, as the host's do: the denormal pattern's
-largest values are subnormals, which this GPU's own compares would see as zero.
+the random one (:216); the cluster output starts as 0xA5 bytes, the one-block output as 0x5A (:220-221). The one-block
+side runs as basalt's ``greedy_one_block`` does (:45-62): a one-slot history of -1 per row with penalty_last_n 1, a
+window that counts nothing. basalt skips without clusters (:390-393); the port has none to lack, so it never skips.
+numpy's float32 compares keep subnormals, as the host's do: the denormal pattern's largest values are subnormals,
+which this GPU's own compares would see as zero.
 """
+
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -26,6 +30,7 @@ VOCABS = (248320, 248321, 248319, 32771, 24576, 8193, 1000, 33, 1)
 PATTERNS = ("random", "ties", "all-equal", "all--inf", "all-nan", "nan+max", "+inf", "signed-zero", "max-last",
             "max-first", "denormal", "ties-across")
 GREEDY = SamplerParams(greedy=True, temperature=0.0)
+NEUTRAL = replace(GREEDY, penalty_last_n=1)          # greedy_one_block's window (:57-61), over a history of -1
 
 
 def fill_logits(rs, nv, pattern):
@@ -88,11 +93,11 @@ def test_basalt_decode_cluster_host_orders_subnormals():
 @pytest.mark.parametrize("pattern", PATTERNS)
 @pytest.mark.parametrize("nv", VOCABS)
 def test_basalt_decode_cluster_argmax(nv, pattern, T):
-    """DCP.1, ``run_argmax_case`` (:214-243), its cluster side: every row's pick is the host's."""
+    """DCP.1, ``run_argmax_case`` (:214-243): every row's cluster pick equals its one-block pick and the host's."""
     rs = np.random.RandomState([20261002, nv, PATTERNS.index(pattern), T])
     l = np.stack([fill_logits(rs, nv, pattern if t % 2 == 0 else "random") for t in range(T)])
     a = gpu.greedy_cl(l, GREEDY, fill=0xA5)
+    b = gpu.greedy_1b(l, NEUTRAL, hist=np.full(T, -1, np.int32), hist_len=1, fill=0x5A)
     hb = [host_argmax(r) for r in l]
-    bad = sum(int(a[t] != hb[t]) for t in range(T))
-    assert bad == 0, ("a[t] != hb, the cluster side of "
-                      "if (a[(size_t) t] != b[(size_t) t] || a[(size_t) t] != hb) ++bad;")
+    bad = sum(int(a[t] != b[t] or a[t] != hb[t]) for t in range(T))
+    assert bad == 0, "if (a[(size_t) t] != b[(size_t) t] || a[(size_t) t] != hb) ++bad;"

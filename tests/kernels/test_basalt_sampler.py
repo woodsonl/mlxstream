@@ -7,7 +7,9 @@ tests/kernels/basalt_sampler_gpu.py. Each check is its own test and asserts its 
 quoted in the message; the host references are tests/basalt_sampler_ref.py's.
 
 A greedy check takes a path parameter from ``GREEDY``, the greedy paths built so far: ``greedy_cl``, the cluster
-argmax as its partials and merge dispatches (basalt's G-CL, sampler_greedy_cluster_kernel).
+argmax as its partials and merge dispatches (basalt's G-CL, sampler_greedy_cluster_kernel), and ``greedy_1b``, the
+one-block greedy kernel forced on the same rows (G-1B, sampler_greedy_kernel; F.1: every greedy check also passes on
+G-1B).
 
 - M1.1, fixture 1: plain greedy over normal rows is the lowest-index argmax.
 - M2.2, fixture 2: greedy over the order fixture picks 0 in every row.
@@ -16,6 +18,7 @@ argmax as its partials and merge dispatches (basalt's G-CL, sampler_greedy_clust
   temperature 1 (the mode rule, ``basalt_sampler_mode``, chooses greedy; a NaN temperature samples); the pick is the
   argmax, never id 0, the row's worst.
 - M11.2, fixture 11: a stale history with penalty_last_n = 0 leaves the greedy pick the argmax.
+- W.1, invariant 1: each path's window, row for row, equals its rows run alone.
 """
 
 from dataclasses import replace
@@ -24,10 +27,12 @@ import numpy as np
 import pytest
 
 from monolith import kernels
-from tests.basalt_sampler_ref import SamplerParams, fixture2_data, normal_rows, reference_pick
+from tests.basalt_sampler_ref import (SamplerParams, fixture2_data, fixture12_data, normal_rows, penalty_rows,
+                                      reference_pick)
 from tests.kernels import basalt_sampler_gpu as gpu
+from tests.kernels.test_basalt_decode_cluster import fill_logits
 
-GREEDY = ["greedy_cl"]
+GREEDY = ["greedy_cl", "greedy_1b"]
 
 
 def run(path, logits, p, want, hist=None, hist_len=0):
@@ -108,3 +113,33 @@ def test_basalt_sampler_stale_history_greedy(path):
     gwant = [reference_pick(row, gp, False) for row in l]
     assert run(path, l, gp, gwant, hist, 8) == 0, \
         'bad += run("stale history, last_n=0 (greedy)", l, NT, gp, gwant, hist, 8);'
+
+
+def w1_ties_across():
+    """5 rows of decode_cluster_parity's ties-across pattern at 248,320 logits (the maximum in several threadgroups'
+    and threads' ranges, NaN, -inf), greedy without a window."""
+    rs = np.random.RandomState(20261017)
+    return np.stack([fill_logits(rs, 248320, "ties-across") for _ in range(5)]), \
+        SamplerParams(greedy=True, temperature=0.0), None, 0
+
+
+def w1_per_row_history():
+    """Fixture 12's window of T = 8 rows and H = 64 slots with M12.G's request, but penalty_last_n 32: each row counts
+    the tail of its own penalty_rows history, whose newest token, the row's favourite, the presence penalty
+    overturns (on 7 of the 8 rows, row 0's history, a stride of 32 or the row's head would pick otherwise)."""
+    tail, cases = fixture12_data()
+    T, H, window, l = next(c for c in cases if c[:2] == (8, 64))
+    p = SamplerParams(greedy=True, temperature=0.0, top_k=0, top_p=1.0, penalty_last_n=32, penalty_present=4.0)
+    return l, p, penalty_rows(tail, window, T, H), H
+
+
+ROWS_ALONE = {"greedy_cl": w1_ties_across, "greedy_1b": w1_per_row_history}   # W.1's fixture for each path
+
+
+@pytest.mark.parametrize("path", ROWS_ALONE)
+def test_basalt_sampler_rows_alone(path):
+    """W.1: the path's multi-row window, row for row, equals each row run alone as a one-row window at its own
+    position (gpu.rows_alone, bitwise)."""
+    l, p, hist, hist_len = ROWS_ALONE[path]()
+    assert gpu.rows_alone(path, l, p, hist=hist, hist_len=hist_len) == [], \
+        "invariant 1: a row's output never depends on the window width T or its position in it"
