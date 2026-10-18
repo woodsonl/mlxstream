@@ -44,6 +44,7 @@
 #include "basalt_cpu_expf.h"
 
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -114,10 +115,15 @@ float expf_glibc(float x) {
     /* Round and convert z to int, the result is in [-150*N, 128*N] and
        ideally nearest int is used, otherwise the magnitude of r can be
        bigger which gives larger approximation error.  */
-    kd = z + SHIFT;
+    // Written as explicit fma, not left to the compiler: glibc's x86-64 ifunc picks __expf_fma on any host with
+    // FMA and AVX2, which is every host basalt's AVX-512 expert kernels run on, and its disassembly fuses these two
+    // (libm+0x7dc40, glibc 2.39-0ubuntu8.9, measured). The two variants differ at exactly two of the 2^32 float32
+    // arguments, 0x4202422f and 0xc27c65d9, where the fused rounding step rounds the other way; basalt holds the
+    // fused bits, so the port computes them whatever -ffp-contract says.
+    kd = std::fma(InvLn2N, xd, SHIFT);
     ki = asuint64(kd);
     kd -= SHIFT;
-    r = z - kd;
+    r = std::fma(InvLn2N, xd, -kd);
 
     /* exp(x) = 2^(k/N) * 2^(r/N) ~= s * (C0*r^3 + C1*r^2 + C2*r + 1) */
     t = T[ki % N];

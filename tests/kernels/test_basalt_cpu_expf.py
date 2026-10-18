@@ -31,9 +31,9 @@ SwiGLU: D1 its order against basalt's expression, D2 that the order is load-bear
 The suite bites, measured by mutating the kernel and rebuilding: ``poly`` in place of ``poly_scaled`` fails A1, B1,
 B2, B3, C4 and C6; the platform's ``expf`` fails B1, B2, B3 and C6 - it exceeds the 0.502 ulp this algorithm holds
 to, and differs from the transcription at 1,930,130 of the 2,218,786,818 float32 arguments in [-40, 40] (measured
-here), though not at any of the recorded six, so A1 alone would miss it; ``std::fma`` at ``z - kd`` and
-``z + SHIFT`` fails B3 and nothing else, which is what B3 is for; and the SwiGLU as ``g * (1 / (1 + e)) * u``
-fails D1.
+here), though not at any of the recorded six, so A1 alone would miss it; the rounding step written as ``z + SHIFT``
+and ``z - kd`` instead of the two ``fma()`` calls fails B3 and nothing else, which is what B3 is for; and the
+SwiGLU as ``g * (1 / (1 + e)) * u`` fails D1.
 
 Two mutations fail nothing, and both are findings rather than gaps. ``round``/``lround`` for the rounding - Arm's
 other branch, the one glibc compiles on aarch64 - passes, because no float32 argument makes ``InvLn2N * x`` an
@@ -156,13 +156,14 @@ def test_b2_the_measured_worst_case():
 
 
 def test_b3_the_two_arguments_contraction_would_move():
-    """B3. The build flag's witness. Contracting the two mul-adds around the rounding - `z + SHIFT` and `z - kd`,
-    which a compiler reaches once `z = InvLn2N * xd` is substituted - changes the result at exactly two of the
-    4,294,967,296 float32 inputs (measured here, both orders swept). These are those two. The expected values are
-    this port's own unfused arithmetic, since glibc's are not among the recorded six, so the case guards
-    -ffp-contract=off (runtime/CMakeLists.txt) rather than the bits: fused, the two would read 0x56FC9F1C and
-    0x11FA2993. Neither the error bound nor the recorded values can see this, which is why it is a case."""
-    assert list(bits_of(expf(f32([0x4202422F, 0xC27C65D9])))) == [0x56FC9F1B, 0x11FA2992]
+    """B3. The two arguments where glibc's own variants disagree, and the only place the rounding step's fusion is
+    visible: it changes the result at exactly two of the 4,294,967,296 float32 inputs (measured here, both orders
+    swept). glibc's x86-64 ifunc picks __expf_fma on any host with FMA and AVX2, so these are basalt's bits, and
+    the port writes those two mul-adds as explicit fma() to hold them whatever -ffp-contract says. Measured on a
+    Xeon 8375C under glibc 2.39-0ubuntu8.9: __expf_fma gives these, __expf_sse2 gives 0x56FC9F1B and 0x11FA2992,
+    which are the correctly rounded ones. basalt runs the fused variant, so the port is wrong when it agrees with
+    the correctly rounded answer here."""
+    assert list(bits_of(expf(f32([0x4202422F, 0xC27C65D9])))) == [0x56FC9F1C, 0x11FA2993]
 
 
 # ---- C: the specials ---------------------------------------------------------------------------------------------
