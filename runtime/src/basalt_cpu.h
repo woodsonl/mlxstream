@@ -36,8 +36,9 @@ struct ActQ {
     int nchunks;
 };
 
-/// expert.cpp:336-370 (the AVX-512 block; the scalar loop after it is unreachable). Writes q[0, n), and
-/// scale / sum / hx over [0, n / QKA), and sets nchunks. n must be a positive multiple of QKA, at most H.
+/// expert.cpp:336-370 (the AVX-512 block; the scalar loop after it is unreachable, and the --cpu-oracle-q8-0
+/// branch at :337-340 is not ported). Writes q[0, n), and scale / sum / hx over [0, n / QKA), and sets nchunks.
+/// n must be a positive multiple of QKA, at most H; the kernel throws std::invalid_argument otherwise.
 void act_quant_q8_1(const float* x, int n, ActQ& a);
 
 /// expert.cpp:544-556 through q2g_rows / q2g_row_multi. Row r is w + r * row_bytes; out[t] is indexed by the
@@ -45,7 +46,8 @@ void act_quant_q8_1(const float* x, int n, ActQ& a);
 /// a[t]->scale[0, 2 * nblocks) and a[t]->hx[0, 2 * nblocks), and nothing else - never nchunks, never sum.
 /// nt must be 1..MAXT and nblocks 1..H / QK: the per-token accumulators are MAXT wide and the reads above run to
 /// 64 * nblocks of an H-element array. basalt bounds nt by instantiating q2g_rows<8> for every nt above 8
-/// (expert.cpp:554); the caller here bounds it, and the kernel asserts both.
+/// (expert.cpp:554); the caller here bounds it, and the kernel throws std::invalid_argument on either, in a form
+/// that survives the Release build's NDEBUG.
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                           float* const* out, int r0, int r1);
 

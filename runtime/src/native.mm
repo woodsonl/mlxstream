@@ -220,8 +220,10 @@ NB_MODULE(_native, m) {
       .def("drain", &Runner::drain);
 
   m.def("basalt_act_quant_q8_1", [](F32In1 x, I8Out1 q, F32Out1 scale, I32Out1 sum, F32Out1 hx) {
-    const int n = (int)x.shape(0);
-    need(n > 0 && n % bc::QKA == 0 && n <= bc::H, "basalt_act_quant_q8_1: len(x) must be a positive multiple of 32, at most 2560");
+    const size_t len = x.shape(0);             // checked at full width: a narrowing cast first would accept a
+    need(len > 0 && len % bc::QKA == 0 && len <= (size_t)bc::H,   // length whose low 32 bits look valid
+         "basalt_act_quant_q8_1: len(x) must be a positive multiple of 32, at most 2560");
+    const int n = (int)len;
     need(q.shape(0) == (size_t)bc::H, "basalt_act_quant_q8_1: q must hold H = 2560 int8 codes");
     need(scale.shape(0) == (size_t)bc::MAXC && sum.shape(0) == (size_t)bc::MAXC && hx.shape(0) == (size_t)bc::MAXC,
          "basalt_act_quant_q8_1: scale, sum and hx must each hold MAXC = 80 elements");

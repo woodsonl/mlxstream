@@ -80,6 +80,9 @@
 //   - A regime the specification does not name: amax > 0 with fl(amax / 127) == 0 makes s = 0, so the s > 0.f
 //     guard gives inv = 0 and every code 0, with scale = 0 and hx = +0.0. That is amax <= 63 * 2^-149; from
 //     64 * 2^-149 the quotient rounds up to the subnormal s = 2^-149, whose inv is +inf, so every code is -127 [M].
+// basalt's act_quant_q8_1 opens with an --cpu-oracle-q8-0 branch (expert.cpp:337-340) that swaps the quantizer for
+// quantize_oracle_q8_0, a debug path with an fp16 scale. It is not ported: the pack's sessions never set it, and
+// the port reproduces the kernel this path runs, not basalt's debugging options.
 #include "basalt_cpu.h"
 
 #if !defined(__ARM_NEON)
@@ -88,9 +91,9 @@
 
 #include <arm_neon.h>
 
-#include <cassert>
 #include <climits>
 #include <cstring>
+#include <stdexcept>
 
 namespace monolith::basalt_cpu {
 namespace {
@@ -202,7 +205,8 @@ inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nt, int 
 }  // namespace
 
 void act_quant_q8_1(const float* x, int n, ActQ& a) {
-    assert(n > 0 && n % QKA == 0 && n <= H);   // the header's precondition: q[0, n) and the chunk arrays must fit
+    if (n <= 0 || n % QKA != 0 || n > H)       // the header's precondition: q[0, n) and the chunk arrays must fit
+        throw std::invalid_argument("act_quant_q8_1: n must be a positive multiple of 32, at most 2560");
     a.nchunks = n / QKA;
     const float32x4_t half = vdupq_n_f32(0.5f), mhalf = vdupq_n_f32(-0.5f), zero = vdupq_n_f32(0.0f);
     const int32x4_t lo = vdupq_n_s32(-127), hi = vdupq_n_s32(127);
@@ -244,9 +248,10 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
                           float* const* out, int r0, int r1) {
     // The accumulators below are MAXT wide and the ActQ reads run to 64 * nblocks of an H-element array, so a
     // caller past either bound writes or reads off the end. basalt bounds nt by instantiating q2g_rows<8> for
-    // every nt above 8 (expert.cpp:554); here it is a precondition the header states and this holds a C++ caller to.
-    assert(nt >= 1 && nt <= MAXT);
-    assert(nblocks >= 1 && nblocks <= H / QK);
+    // every nt above 8 (expert.cpp:554); here it is a precondition the header states and this holds a C++ caller
+    // to. Not an assert: the wheel builds Release, which defines NDEBUG (setup.py:30).
+    if (nt < 1 || nt > MAXT || nblocks < 1 || nblocks > H / QK)
+        throw std::invalid_argument("q2_0_gguf_rows_multi: need 1 <= nt <= 8 and 1 <= nblocks <= 40");
     float res[MAXT];
     for (int r = r0; r < r1; ++r) {
         q2g_row_multi(w + (size_t) r * row_bytes, a, nt, nblocks, res);
