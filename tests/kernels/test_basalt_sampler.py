@@ -11,14 +11,16 @@ argmax as its partials and merge dispatches (basalt's G-CL, sampler_greedy_clust
 one-block greedy kernel forced on the same rows (G-1B, sampler_greedy_kernel; F.1: every greedy check also passes on
 G-1B). A penalised greedy check runs G-1B, the path basalt's dispatcher takes for a penalty window. The logit_bias
 checks route each launch as the dispatcher does (``sample``, by the mode rule): a bias or a penalty window takes G-1B,
-a greedy request with neither G-CL, a sampled one S-SPLIT, and their ``forced`` cases run G-1B in G-CL's place (F.1).
-A sampled check takes its path from ``SAMPLED``, the sampled paths built so far: ``split``, the split part and merge
-(S-SPLIT, sampler_split_part_kernel then sampler_split_merge_kernel).
+a greedy request with neither G-CL, a sampled one S-SPLIT, and their ``forced`` cases run G-1B in G-CL's place (F.1)
+and S-1B in S-SPLIT's (F.2, A9). A sampled check takes its path from ``SAMPLED``, the sampled paths built so far:
+``split``, the split part and merge (S-SPLIT, sampler_split_part_kernel then sampler_split_merge_kernel), and
+``one_block``, the one-block sampled kernel forced on the same rows (S-1B, sampler_one_block_kernel; F.2: every split
+check also passes on S-1B, which basalt's dispatcher takes past 64 rows or 64 blocks).
 
-- LB.1-6, logit_bias (both sides): the bias added in the kernel picks what the host-biased rows pick (the sampled
-  penalised case also shows the order: bias, then penalties), bans an id at -inf and boosts one by 100, at 512 logits
-  and at the engine's 248,320 (61 split blocks, 60 of them empty after the ban), and leaves the rows it reads
-  unchanged.
+- LB.1-6, logit_bias (both sides), with A9: the bias added in the kernel picks what the host-biased rows pick (the
+  sampled penalised case also shows the order: bias, then penalties), bans an id at -inf and boosts one by 100, at 512
+  logits and at the engine's 248,320 (61 split blocks, 60 of them empty after the ban), and leaves the rows it reads
+  unchanged; A9 runs the sampled sides on S-1B forced.
 - M1.1, fixture 1: plain greedy over normal rows is the lowest-index argmax.
 - M2.2, fixture 2: greedy over the order fixture picks 0 in every row.
 - M3.1-2, fixture 3: greedy consumes no random number (two seeds, one pick) and is the argmax.
@@ -30,6 +32,9 @@ A sampled check takes its path from ``SAMPLED``, the sampled paths built so far:
 - M6.2, fixture 6: the penalties in the sampled chain turn its picks from [0, 0] to sampled_reference's [3, 2].
 - M7.2-4, fixture 7: min_p 0, 0.5 and 0.9 through the sampled chain pick sampled_reference's token.
 - M8.2, fixture 8: the penalty window is the tail of the history row.
+- M9.2, fixture 9: 8,000 rows of two equal logits, one of them penalised by its one-slot window, on S-1B (more rows
+  than the split takes): every draw is sampled_reference's.
+- M10.2, fixture 10: top_p before min_p on 256 rows, S-1B: every pick is sampled_reference's (token 2 drawn).
 - M11.1-2, fixture 11: a stale history with penalty_last_n = 0 leaves the sampled pick the no-history reference's and
   the greedy pick the argmax.
 - M12.G and M12.S, fixture 12: each row of a window counts its own history row (windows of 1 to 4,096 slots), greedy
@@ -37,15 +42,19 @@ A sampled check takes its path from ``SAMPLED``, the sampled paths built so far:
 - M13.1-2, fixture 13: history ids outside the vocabulary count nowhere, greedy and sampled.
 - M14.1-4, fixture 14: top_k 64 as given, and 0, 100 and -3 meaning 64, pick the 64-wide reference's token.
 - M16.1-2, fixture 16: under NaN arithmetic the pick is the list's k-th entry, so top_k 0 to 64 read the whole list
-  (ties, signed zeros, NaN, +inf, the empty rounds' sentinel, penalised ties) at 61, 25, 64 and 1 split blocks.
+  (ties, signed zeros, NaN, +inf, the empty rounds' sentinel, penalised ties) at 61, 25, 64 and 1 split blocks, and
+  on S-1B at 262,144 (the widest split) and 262,145 (one past it).
 - M17.1, fixture 17: tie-heavy rows through the whole chain on two queues, against the mirror.
-- M18.2, fixture 18 (a): the split path on penalised rows at the engine's vocabulary, against the mirror.
+- M18.2-3, fixture 18 (a) and (b): the split path on penalised rows at the engine's vocabulary, and each sampled path
+  on 64 and 70 rows (either side of the split's row cap), against the mirror.
 - A2-A4, A7 and A8, the port's additions (spec T§10.2): the sampled kernels' penalty window is the tail; the
   temperature comes after the filters; min_keep 3 and 10 clamp the top_p cut; subnormal logits are ordered exactly;
   min_p above 1 keeps nothing and picks the list's head.
 - TP.1, the port's addition (spec S§19.3): the drafter's greedy tail, ``top_prob`` (the cluster partials, then
   bs_greedy_top_prob), picks the host argmax, mapped, with the float64 softmax probability of the pick within
   q5k_head_parity's 1e-5.
+- The one-block geometry, the port's (spec S§16.3 (c)): S-1B at 32 and 96 threads per row reads fixture 16's lists
+  as M16.1 does, so the 1,024 threads this GPU runs it at are not what makes its list.
 - PL.1, the port's building-block check of the split path's first stage (``split_part``, bs_split_part alone): each
   4,096-logit block's list in the scratch equals mirror_select's over the block, ids and value bits.
 - W.1, invariant 1: each path's window, row for row, equals its rows run alone (the top-prob path's probabilities
@@ -61,16 +70,16 @@ import pytest
 from monolith import kernels
 from monolith.runtime import _native as nt
 from tests.basalt_sampler_ref import (SamplerParams, f32, fixture2_data, fixture4_data, fixture6_data, fixture7_data,
-                                      fixture8_data, fixture12_data, fixture13_data, fixture16_data, fixture17_data,
-                                      fixture18_data, greedy_pen, mirror_pick, mirror_prob, mirror_select, normal_rows,
-                                      penal_vec, penalty_rows, reference_pick, sampled_k, sampled_reference, select_vec,
-                                      window_of)
+                                      fixture8_data, fixture9_data, fixture10_data, fixture12_data, fixture13_data,
+                                      fixture16_data, fixture17_data, fixture18_data, greedy_pen, mirror_pick,
+                                      mirror_prob, mirror_select, normal_rows, penal_vec, penalty_rows, reference_pick,
+                                      sampled_k, sampled_reference, select_vec, window_of)
 from tests.kernels import basalt_sampler_gpu as gpu
 from tests.kernels.basalt_gpu import device
 from tests.kernels.test_basalt_decode_cluster import PATTERNS, VOCABS, fill_logits, host_argmax
 
 GREEDY = ["greedy_cl", "greedy_1b"]
-SAMPLED = ["split"]
+SAMPLED = ["split", "one_block"]
 
 
 def run(path, logits, p, want, hist=None, hist_len=0):
@@ -83,11 +92,12 @@ def run(path, logits, p, want, hist=None, hist_len=0):
 def sample(logits, p, *, hist=None, hist_len=0, bias=None, forced=False, lbuf=None):
     """sampler_parity's DeviceRows ``sample`` (:493-501) on the path basalt's dispatcher takes for ``p``
     (sampler.cu:988-1020), as the mode rule routes it: G-CL for a greedy request without a penalty window and a bias,
-    G-1B for one with either, S-SPLIT for a sampled request (every sampled shape here fits it: at most 64 rows and
-    64 blocks); ``forced``, G-1B in G-CL's place (F.1). ``lbuf``: the rows held in one buffer."""
+    G-1B for one with either, S-SPLIT for a sampled request (every shape this helper is given fits it: at most 64
+    rows and 64 blocks); ``forced``, G-1B in G-CL's place (F.1) and S-1B in S-SPLIT's (F.2). ``lbuf``: the rows held
+    in one buffer."""
     mode = kernels.basalt_sampler_mode(p.greedy, p.temperature, p.penalty_last_n, bias is not None)
     if mode == 2:
-        return gpu.split(logits, p, hist=hist, hist_len=hist_len, bias=bias, lbuf=lbuf)
+        return (gpu.one_block if forced else gpu.split)(logits, p, hist=hist, hist_len=hist_len, bias=bias, lbuf=lbuf)
     if mode == 0 and not forced:
         return gpu.greedy_cl(logits, p, hist=hist, hist_len=hist_len, lbuf=lbuf)
     return gpu.greedy_1b(logits, p, hist=hist, hist_len=hist_len, bias=bias, lbuf=lbuf)
@@ -115,10 +125,10 @@ def bias_request(greedy, penalty):
 
 
 # (greedy, penalty, forced): fixture A's greedy cases, and the unpenalised one with G-1B forced for its launches
-# without the bias (the others take G-1B anyway); then its sampled cases, S-SPLIT
+# without the bias (the others take G-1B anyway); then its sampled cases, S-SPLIT, and each with S-1B forced (A9)
 BIAS_CASES = [(True, False, False), (True, False, True), (True, True, False), (False, False, False),
-              (False, True, False)]
-BIAS_IDS = ["greedy", "greedy-F", "greedy-penalty", "sampled", "sampled-penalty"]
+              (False, False, True), (False, True, False), (False, True, True)]
+BIAS_IDS = ["greedy", "greedy-F", "greedy-penalty", "sampled", "sampled-F", "sampled-penalty", "sampled-penalty-F"]
 
 
 def bias_launches(greedy, penalty, forced):
@@ -214,8 +224,10 @@ def bias_b_requests(greedy):
             for k, top_p, min_p, seed in itertools.product((0, 1, 20, 64), (1.0, 0.5), (0.0, 0.3), (1, 2, 3))]
 
 
-BIAS_B_CASES = [(True, False), (False, False)]     # (greedy, forced): fixture B's greedy side, G-1B (a bias); sampled
-BIAS_B_IDS = ["greedy", "sampled"]                 # side, S-SPLIT over 61 blocks, 60 of them without a finite logit
+# (greedy, forced): fixture B's greedy side, G-1B (a bias); its sampled side, S-SPLIT over 61 blocks, 60 of them
+# without a finite logit, and S-1B forced (A9)
+BIAS_B_CASES = [(True, False), (False, False), (False, True)]
+BIAS_B_IDS = ["greedy", "sampled", "sampled-F"]
 
 
 @pytest.mark.parametrize("greedy,forced", BIAS_B_CASES, ids=BIAS_B_IDS)
@@ -378,6 +390,27 @@ def test_basalt_sampler_penalty_window_tail():
         'else bad += run("penalty window: tail only", {l.begin(), l.end()}, 1, p, {want}, hist, 8);'
 
 
+def test_basalt_sampler_one_penalty_stage():
+    """M9.2 (:1095-1118): fixture 9's 8,000 rows of two logits at 0.0, each with the one-slot window [0], sampled with
+    top_k 2 and temperature 0.7 at seed 53 under presence 1.5: token 0 falls to -1.5 once, before the temperature, and
+    every row's draw at counter t is sampled_reference's (832 zeros, M9.1). S-1B: 8,000 rows, more than the split
+    takes, each with a one-word bitmap."""
+    l, hist, p = fixture9_data()
+    want = [sampled_reference(l[t], hist[t:t + 1], p, t) for t in range(len(l))]
+    assert run("one_block", l, p, want, hist, 1) == 0, \
+        'bad += run("sampled chain: one penalties stage", l, NT9, p, want, hist, 1);'
+
+
+def test_basalt_sampler_top_p_before_min_p():
+    """M10.2 (:1121-1142): fixture 10's 256 rows (logf of 0.4, 0.3, 0.2 and 0.1, then -30) with top_k 4, top_p 0.75
+    and min_p 0.3 at temperature 1, seed 10: top_p keeps three, min_p keeps them, so token 2 is drawn (58 times, M10.1),
+    which min_p first would never do, and every pick is sampled_reference's. S-1B: 256 rows, more than the split
+    takes."""
+    l, p = fixture10_data()
+    want = [sampled_reference(row, [], p, t) for t, row in enumerate(l)]
+    assert run("one_block", l, p, want) == 0, 'bad += run("sampled chain: top_p then min_p", l, NT10, p, want);'
+
+
 def fixture11():
     """Fixture 11 (:1145-1155): normal(0, 1) rows (seed 11) with an 8-slot history each, left from a penalised request
     (token 3 first, -1 after it), and the sampled request, top_k 20, top_p 0.95, temperature 0.8 at seed 5, whose
@@ -511,7 +544,9 @@ def fx16_lists(l, hist, nv):
     return [mirror_select(l[t], nv, window_of(hist, 64, t, 64), FX16_BASE, sampled_k(64, nv)) for t in range(4)]
 
 
-FX16_CASES = [("split", nv) for nv in (248320, 100003, 262144, 1000)]       # (path, nv): 61, 25, 64 and 1 blocks
+# (path, nv): the split at 61, 25, 64 and 1 blocks; S-1B at the split's widest vocabulary and one past it, 65 blocks,
+# where basalt's dispatcher falls back to it (its 8,193-word bitmap beyond 32 KiB: device scratch here)
+FX16_CASES = [("split", nv) for nv in (248320, 100003, 262144, 1000)] + [("one_block", nv) for nv in (262144, 262145)]
 
 
 @pytest.mark.parametrize("path,nv", FX16_CASES, ids=[f"{path}-{nv}" for path, nv in FX16_CASES])
@@ -520,8 +555,8 @@ def test_basalt_sampler_top_k_list_under_ties(path, nv):
     of 11 candidates, penalised ties on window ids at the 1,024 and 4,096 edges, ids outside the vocabulary) hold a
     +inf, so the tail's sums are NaN, no cut fires, no draw lands, and the pick is the list's last kept entry,
     sel_ids[k - 1]: the 67 launches over the rows uploaded once read each row's list position by position, against
-    mirror_select's. Row 2's positions past its 11 candidates are the empty round's id 0, which the merge's sink makes
-    of the part's sentinel."""
+    mirror_select's. Row 2's positions past its 11 candidates are the empty round's id 0: the split's merge sink makes
+    it of the part's sentinel, the one-block kernel stores it for each empty round."""
     l, hist = fixture16_data(nv)
     lists = fx16_lists(l, hist, nv)
     rows = nt.Buffer(device(), l.tobytes())
@@ -531,6 +566,24 @@ def test_basalt_sampler_top_k_list_under_ties(path, nv):
         got = getattr(gpu, path)(l, p, hist=hist, hist_len=64, lbuf=rows)
         wrong += [(p.top_k, t, int(got[t]), lists[t].ids[k - 1]) for t in range(4) if got[t] != lists[t].ids[k - 1]]
     assert not wrong, f"if (got[(size_t) t] != want) {{ ... ++wrong; }} ((top_k, row, got, want): {wrong[:8]})"
+
+
+@pytest.mark.parametrize("threads", (32, 96))
+def test_basalt_sampler_one_block_geometry(threads):
+    """S-1B's list does not depend on its geometry (spec S§10, S§16.3 (c): the build runs it at 1,024 threads or the
+    pipeline's widest multiple of 32, which the soft-fp64 tail may lower): at 32 and 96 threads per row, its second
+    tree over 1 and 3 SIMD-groups' pairs padded with the sentinel, fixture 16's 67 launches at 1,000 logits read each
+    row's list position by position as M16.1 does, against mirror_select's."""
+    nv = 1000
+    l, hist = fixture16_data(nv)
+    lists, pso, rows = fx16_lists(l, hist, nv), gpu.pipeline("bs_sample_one_block"), len(l) + 1
+    wrong = []
+    for p in fx16_requests():
+        k = sampled_k(p.top_k, nv)
+        got = gpu.launch([(pso, (rows,), threads)], l, p, mode=2, hist=hist, hist_len=64,
+                         scratch={10: gpu.bitmap_bytes(p, rows, nv, 64)})[0]
+        wrong += [(p.top_k, t, int(got[t]), lists[t].ids[k - 1]) for t in range(4) if got[t] != lists[t].ids[k - 1]]
+    assert not wrong, f"the list at {threads} threads is mirror_select's ((top_k, row, got, want): {wrong[:8]})"
 
 
 @pytest.mark.parametrize("nv", (248320, 100003, 262144, 262145, 1000))
@@ -587,6 +640,24 @@ def test_basalt_sampler_split_after_replay():
     got = gpu.split(l, p, hist=hist, hist_len=H)
     wrong = int(np.count_nonzero(got != np.int32(want)))
     assert wrong == 0, 'compare("same stream, uncaptured", rows.sample(p, cs), lists, k, p);'
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+@pytest.mark.parametrize("T", (64, 70))
+def test_basalt_sampler_row_cap(path, T):
+    """M18.3 (:1599-1610): fixture 18 (b)'s T rows of 512 half steps (its history drawn and never read), sampled with
+    top_k 64, top_p 1 and temperature 2.5 at seed 18, counter T, no penalties: every pick is mirror_pick's over the
+    row's 64-entry list. basalt's dispatcher keeps 64 rows on the split and sends 70 to S-1B; here both paths run both
+    widths on the same rows (spec T§9), the split's 70 at kernel level, where nothing caps its rows (the cap is the
+    build's path choice)."""
+    nv = 512
+    l = fixture18_data(nv, T, 1810 + T)[0]
+    p = SamplerParams(top_k=64, top_p=1.0, temperature=2.5, seed=18, counter=T)
+    k = sampled_k(p.top_k, nv)
+    want = [mirror_pick(mirror_select(l[t], nv, [], p, k), k, p, t) for t in range(T)]
+    wrong = int(np.count_nonzero(getattr(gpu, path)(l, p) != np.int32(want)))
+    assert wrong == 0, \
+        'compare(T > 64 ? "70 rows (one block)" : "64 rows (split)", rows.sample(p, nullptr), lists, k, p);'
 
 
 # ---- the port's additions on the sampled paths (spec T§10.2) --------------------------------------------------------
@@ -875,7 +946,7 @@ def w1_sampled():
 
 
 ROWS_ALONE = {"greedy_cl": w1_ties_across, "greedy_1b": w1_per_row_history,     # W.1's fixture for each path
-              "top_prob": w1_finite_rows, "split": w1_sampled}
+              "top_prob": w1_finite_rows, "split": w1_sampled, "one_block": w1_sampled}
 
 
 @pytest.mark.parametrize("path", ROWS_ALONE)

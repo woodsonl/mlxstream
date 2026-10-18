@@ -476,12 +476,49 @@ kernel void bs_greedy_merge(device int* out [[buffer(5)]], constant BsSamplePara
     if (lane == 0u) out[t] = bi < nv ? int(bi) : 0;
 }
 
+// The one-block kernels' penalty window (sampler.cu:97-121, :453-475): the tail of row t's history row, its last
+// min(penalty_last_n, hist_len) slots, and their membership bitmap, row t's ceil(vocab / 32) words of device scratch
+// (one region per row; basalt's shared bitmap does not fit 32 KiB at every vocabulary), zeroed and ORed in every step
+// that has a window, never touched without one; ids outside the vocabulary set nothing. The bitmap only filters, as
+// basalt's does: logit v takes the window's exact count when its bit is set, else count 0. Every thread of the
+// threadgroup calls one_block_window (its barriers).
+struct BsWindow {
+    device const int* hrow;
+    uint hlen;
+    device atomic_uint* bits;
+};
+
+static inline BsWindow one_block_window(device const int* history, device atomic_uint* pbits,
+                                        constant BsSampleParams& p, uint t, uint tid, uint tpg) {
+    const uint nv = p.vocab, words = (nv + 31u) / 32u;
+    const uint hlen = uint(clamp(p.penalty_last_n, 0, int(p.hist_len)));                 // :97-103
+    const BsWindow w = {history + ulong(t) * p.hist_len + (p.hist_len - hlen), hlen, pbits + ulong(t) * words};
+    if (hlen > 0u) {                                                                      // :110-121
+        for (uint i = tid; i < words; i += tpg) atomic_store_explicit(w.bits + i, 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint i = tid; i < hlen; i += tpg) {
+            const int id = w.hrow[i];
+            if (id >= 0 && uint(id) < nv)
+                atomic_fetch_or_explicit(w.bits + (uint(id) >> 5), 1u << (uint(id) & 31u), memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+    return w;
+}
+
+// logit v of row l after the bias (flags BIAS) and the window's penalties (sampler.cu:132, :490)
+static inline uint one_block_logit(device const uint* l, device const float* bias, thread const BsWindow& w,
+                                   constant BsSampleParams& p, uint v) {
+    const uint x = (p.flags & BS_BIAS) != 0u ? as_type<uint>(ieee_add(as_type<float>(l[v]), bias[v])) : l[v];
+    const bool hit = w.hlen > 0u
+                     && (atomic_load_explicit(w.bits + (v >> 5), memory_order_relaxed) & (1u << (v & 31u))) != 0u;
+    return apply_penalties(x, hit ? history_count(w.hrow, w.hlen, v) : 0u, p.penalty_repeat, p.penalty_freq,
+                           p.penalty_present);
+}
+
 // sampler_greedy_kernel (sampler.cu:91-157), mode 1: each row's argmax after the logit bias (flags BIAS) and the
-// penalties over the tail of its history row, its last min(penalty_last_n, hist_len) slots. One threadgroup per row,
-// of any multiple of 32 threads up to basalt's 1,024 (the pick is order-free). The window's membership bitmap filters
-// the exact count, as basalt's shared one does: row t's ceil(vocab / 32) words of bits (device scratch, one region
-// per row), zeroed and ORed in every step that has a window, never touched without one; ids outside the vocabulary
-// set nothing.
+// penalties of its window (one_block_window). One threadgroup per row, of any multiple of 32 threads up to basalt's
+// 1,024 (the pick is order-free).
 kernel void bs_greedy_one_block(device const uint* logits [[buffer(0)]], device const float* bias [[buffer(3)]],
                                 device const int* history [[buffer(4)]], device int* out [[buffer(5)]],
                                 constant BsSampleParams& p [[buffer(7)]], device atomic_uint* pbits [[buffer(10)]],
@@ -491,30 +528,11 @@ kernel void bs_greedy_one_block(device const uint* logits [[buffer(0)]], device 
                                 uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
     threadgroup uint sk[32], si[32];
     if (st->done || t >= st->t_this_step || p.mode != 1u) return;
-    const uint nv = p.vocab, words = (nv + 31u) / 32u;
-    const uint hlen = uint(clamp(p.penalty_last_n, 0, int(p.hist_len)));                 // :97-103
-    device const int* hrow = history + ulong(t) * p.hist_len + (p.hist_len - hlen);      // the window is the tail
-    device atomic_uint* bits = pbits + ulong(t) * words;
-    if (hlen > 0u) {                                                                      // :110-121
-        for (uint w = tid; w < words; w += tpg) atomic_store_explicit(bits + w, 0u, memory_order_relaxed);
-        threadgroup_barrier(mem_flags::mem_device);
-        for (uint i = tid; i < hlen; i += tpg) {
-            const int id = hrow[i];
-            if (id >= 0 && uint(id) < nv)
-                atomic_fetch_or_explicit(bits + (uint(id) >> 5), 1u << (uint(id) & 31u), memory_order_relaxed);
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-    }
+    const uint nv = p.vocab;
+    const BsWindow w = one_block_window(history, pbits, p, t, tid, tpg);
     device const uint* l = logits + ulong(t) * nv;
-    const bool biased = (p.flags & BS_BIAS) != 0u;
     uint bk = BS_KEY_NINF, bi = nv;
-    for (uint v = tid; v < nv; v += tpg) {                                                // :131-134, bounded by nv
-        const uint x = biased ? as_type<uint>(ieee_add(as_type<float>(l[v]), bias[v])) : l[v];
-        const bool hit = hlen > 0u
-                         && (atomic_load_explicit(bits + (v >> 5), memory_order_relaxed) & (1u << (v & 31u))) != 0u;
-        am_take(apply_penalties(x, hit ? history_count(hrow, hlen, v) : 0u, p.penalty_repeat, p.penalty_freq,
-                                p.penalty_present), v, bk, bi);
-    }
+    for (uint v = tid; v < nv; v += tpg) am_take(one_block_logit(l, bias, w, p, v), v, bk, bi);   // :131-134
     if (am_block(bk, bi, sk, si, lane, sg, nsg, nv)) out[t] = bi < nv ? int(bi) : 0;     // :135-156
 }
 
@@ -595,13 +613,32 @@ kernel void bs_split_part(device const uint* logits [[buffer(0)]], device const 
 constant uint BS_SPLIT_MAX_BLOCKS = 64u;                               // kSplitMaxBlocks: the lists one merge holds
 constant uint BS_PENDING = sizeof(StepState::pending_tokens) / sizeof(int);   // the probe's queries, t + 1 below it
 
+// Row t's sampled tail and its stores (sampler.cu:419-437) for the target's two sampled paths, on one SIMD-group: the
+// row's list (sel_ids, sel_logit, k entries) through sampled_tail, the draw's counter ctr_base (two words, the
+// request's) + position + t, its seed StepState's rng_hi:rng_lo; out[t] gets the pick and, with flags PROBE, row
+// t < nq[0] the probability of its query pending_tokens[t + 1] in qprob[t] (sampler.cu:430-436). No other row or
+// request writes qprob, and nq is read only then.
+static inline void sample_row(threadgroup const int* sel_ids, threadgroup const uint* sel_logit, uint k,
+                              constant BsSampleParams& p, device const StepState* st, device const uint* ctr_base,
+                              device const uint* nq, device int* out, device uint* qprob, threadgroup ulong* ex,
+                              uint t, uint lane) {
+    const bool probe = (p.flags & BS_PROBE) != 0u && t < nq[0] && t + 1u < BS_PENDING;
+    const ulong seed = (ulong(st->rng_hi) << 32) | st->rng_lo;
+    const ulong counter = ((ulong(ctr_base[1]) << 32) | ctr_base[0]) + ulong(st->position) + ulong(t);
+    const BsDraw d = sampled_tail(sel_ids, sel_logit, k, as_type<uint>(p.top_p), as_type<uint>(p.min_p),
+                                  as_type<uint>(p.temperature), p.min_keep, seed, counter, probe,
+                                  probe ? st->pending_tokens[t + 1u] : 0, ex, lane);
+    if (lane == 0u) {
+        out[t] = d.pick;
+        if (probe) qprob[t] = d.qprob;
+    }
+}
+
 // sampler_split_merge_kernel (sampler.cu:663-682), mode 2: one SIMD-group per row (basalt's 32 threads) merges the
 // row's n_blocks block lists of k from cand, in place of basalt's copy into 32 KiB of shared memory (the same entries
-// read: the same list), into the row's top-k list, the sentinel's id vocab stored as 0, then runs the tail. The draw's
-// counter is ctr_base (two words, the request's) + position + t, its seed StepState's rng_hi:rng_lo. With flags PROBE,
-// row t < nq[0] also writes the probability of its query pending_tokens[t + 1] to qprob[t] (sampler.cu:430-436); no
-// other row or request writes qprob, and nq is read only then. A dispatch of another width returns at once (two
-// SIMD-groups would share the tail's arrays), as does a record of more blocks than the merge's 64 lists.
+// read: the same list), into the row's top-k list, the sentinel's id vocab stored as 0, then runs sample_row. A
+// dispatch of another width returns at once (two SIMD-groups would share the tail's arrays), as does a record of more
+// blocks than the merge's 64 lists.
 kernel void bs_split_merge(device const uint* ctr_base [[buffer(1)]], device const uint* nq [[buffer(2)]],
                            device int* out [[buffer(5)]], device uint* qprob [[buffer(6)]],
                            constant BsSampleParams& p [[buffer(7)]], device const uint2* cand [[buffer(9)]],
@@ -623,15 +660,63 @@ kernel void bs_split_merge(device const uint* ctr_base [[buffer(1)]], device con
         }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    const bool probe = (p.flags & BS_PROBE) != 0u && t < nq[0] && t + 1u < BS_PENDING;
-    const ulong seed = (ulong(st->rng_hi) << 32) | st->rng_lo;
-    const ulong counter = ((ulong(ctr_base[1]) << 32) | ctr_base[0]) + ulong(st->position) + ulong(t);
-    const BsDraw d = sampled_tail(sel_ids, sel_logit, k, as_type<uint>(p.top_p), as_type<uint>(p.min_p),
-                                  as_type<uint>(p.temperature), p.min_keep, seed, counter, probe,
-                                  probe ? st->pending_tokens[t + 1u] : 0, ex, lane);
-    if (lane == 0u) {
-        out[t] = d.pick;
-        if (probe) qprob[t] = d.qprob;
+    sample_row(sel_ids, sel_logit, k, p, st, ctr_base, nq, out, qprob, ex, t, lane);
+}
+
+// sampler_one_block_kernel (sampler.cu:441-518), mode 2 on the path the build takes when the split cannot (more rows
+// than its 64, or more than its 64 blocks of vocabulary): one threadgroup per row, of any multiple of 32 threads up to
+// basalt's 1,024. k = sampled_k(top_k, vocab) block-argmax rounds over the logits after the bias (flags BIAS) and the
+// penalties of the row's window (one_block_window, bs_greedy_one_block's), each recomputed in every round as basalt
+// does (the same operations, the same bits). Round i admits only what comes after the last pick (kp, pi) in the
+// selection order: the split part's filter on keys (sampler.cu:491), NaN's key 0 below every pick's and -inf's, so a
+// NaN is never admitted and a -inf never beats the round's start. The two trees move (value bits, id) pairs whole,
+// through warp_first's butterfly in place of basalt's shuffle-down trees (the first pair under the strict order is
+// the same whatever the tree: warp_first's comment), the second over the nsg SIMD-groups' pairs padded with the
+// sentinel (-inf, vocab); SIMD-group 0's lane 0 stores the pick, id vocab as 0 (:509). An empty round leaves
+// (0, -inf), and every round after it is empty: the list is the row's first k pairs, padded so, which is the split's
+// list (spec S§13). SIMD-groups 1 and up return after the last round's barrier, and SIMD-group 0 runs sample_row
+// (only simdgroup barriers).
+kernel void bs_sample_one_block(device const uint* logits [[buffer(0)]], device const uint* ctr_base [[buffer(1)]],
+                                device const uint* nq [[buffer(2)]], device const float* bias [[buffer(3)]],
+                                device const int* history [[buffer(4)]], device int* out [[buffer(5)]],
+                                device uint* qprob [[buffer(6)]], constant BsSampleParams& p [[buffer(7)]],
+                                device atomic_uint* pbits [[buffer(10)]], device const StepState* st [[buffer(15)]],
+                                uint t [[threadgroup_position_in_grid]], uint tpg [[threads_per_threadgroup]],
+                                uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup int sel_ids[BS_SEL_MAX];
+    threadgroup uint sel_logit[BS_SEL_MAX];
+    threadgroup ulong ex[BS_SEL_MAX];
+    threadgroup uint sv[32], si[32];
+    if (st->done || t >= st->t_this_step || p.mode != 2u) return;
+    const uint nv = p.vocab, k = sampled_k(p.top_k, nv);
+    const BsWindow w = one_block_window(history, pbits, p, t, tid, tpg);                  // :453-475
+    device const uint* l = logits + ulong(t) * nv;
+    uint kp = okey(0x7f800000u);                                     // +inf and id -1: round 0 admits every logit
+    int pi = -1;
+    for (uint i = 0u; i < k; ++i) {                                                       // :484-515, k <= 64 rounds
+        uint bb = BS_NINF_BITS, bi = nv, kb = BS_KEY_NINF;
+        for (uint v = tid; v < nv; v += tpg) {                                            // :489-492, bounded by nv
+            const uint s = one_block_logit(l, bias, w, p, v), kx = fnan(s) ? 0u : okey(s);
+            if ((kx < kp || (kx == kp && int(v) > pi)) && kx > kb) { bb = s; bi = v; kb = kx; }
+        }
+        warp_first(bb, bi);                                                               // :493-497
+        if (lane == 0u) { sv[sg] = bb; si[sg] = bi; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {                                                                   // :500-511
+            bb = lane < nsg ? sv[lane] : BS_NINF_BITS;
+            bi = lane < nsg ? si[lane] : nv;
+            warp_first(bb, bi);
+            if (lane == 0u) {
+                sel_ids[i] = bi < nv ? int(bi) : 0;
+                sel_logit[i] = bb;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        kp = okey(sel_logit[i]);                                                          // :513-514
+        pi = sel_ids[i];
     }
+    if (sg != 0u) return;
+    sample_row(sel_ids, sel_logit, k, p, st, ctr_base, nq, out, qprob, ex, t, lane);
 }
 #endif

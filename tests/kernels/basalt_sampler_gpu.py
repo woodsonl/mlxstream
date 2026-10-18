@@ -109,18 +109,21 @@ def greedy_cl(logits, p, *, hist=None, hist_len=0, position=0, fill=0xFF, lbuf=N
                   hist_len=hist_len, position=position, fill=fill, scratch={8: rows * AM_CTAS * 8}, lbuf=lbuf)[0]
 
 
+def bitmap_bytes(p, rows, V, hist_len):
+    """The one-block kernels' bitmap scratch, sized as basalt sizes its shared one (sampler.cu:988-990): ceil(V / 32)
+    words per row when the request has a window (penalty_last_n > 0 and a history), else a 16-byte placeholder, so
+    validation sees a bitmap store the request did not size."""
+    return rows * -(-V // 32) * 4 if p.penalty_last_n > 0 and hist_len > 0 else 16
+
+
 def greedy_1b(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None):
     """G-1B, basalt's sampler_greedy_kernel: ``bs_greedy_one_block`` alone, one threadgroup of up to 1,024 threads
     per row, in mode 1 whatever the request asks (the forced runs; the engine runs it after the cluster pair, which
-    would hide a G-1B that never wrote). Its bitmap scratch is sized as basalt sizes its shared one: ceil(V / 32)
-    words per row when the request has a window (penalty_last_n > 0 and a history), else a 16-byte placeholder, so
-    validation sees a bitmap store the request did not size. Returns the T picks."""
+    would hide a G-1B that never wrote), its bitmap scratch ``bitmap_bytes``. Returns the T picks."""
     pso = pipeline("bs_greedy_one_block")
     T, V = np.shape(logits)
-    rows = T + 1
-    bits = rows * -(-V // 32) * 4 if p.penalty_last_n > 0 and hist_len > 0 else 16
-    return launch([(pso, (rows,), threads(pso))], logits, p, mode=1, hist=hist, hist_len=hist_len, bias=bias,
-                  position=position, fill=fill, scratch={10: bits}, lbuf=lbuf)[0]
+    return launch([(pso, (T + 1,), threads(pso))], logits, p, mode=1, hist=hist, hist_len=hist_len, bias=bias,
+                  position=position, fill=fill, scratch={10: bitmap_bytes(p, T + 1, V, hist_len)}, lbuf=lbuf)[0]
 
 
 def top_prob(logits, p, *, id_map=None, hist=None, hist_len=0, position=0, fill=0xFF, lbuf=None):
@@ -169,6 +172,20 @@ def split(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF,
     picks, qbits = launch([(part, (nb, rows), SPLIT_THREADS), (merge, (rows,), 32)], logits, p, mode=2, hist=hist,
                           hist_len=hist_len, bias=bias, position=position, fill=fill,
                           scratch={9: rows * nb * sampled_k(p.top_k, V) * 8}, lbuf=lbuf, queue=queue)
+    assert np.all(qbits == np.frombuffer(bytes([fill]) * 4, np.uint32)[0]), "qprob was written without the probe"
+    return picks
+
+
+def one_block(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None, queue=None):
+    """S-1B, basalt's sampler_one_block_kernel: ``bs_sample_one_block`` alone, one threadgroup of up to 1,024 threads
+    per row, in mode 2 whatever the request asks and at any row count or vocabulary (the forced runs, F.2; the engine
+    runs it after the cluster pair, which would hide a row it never wrote), its bitmap scratch ``bitmap_bytes``. The
+    probe is off, so ``qprob`` must keep its prefill (asserted). Returns the T picks."""
+    pso = pipeline("bs_sample_one_block")
+    T, V = np.shape(logits)
+    picks, qbits = launch([(pso, (T + 1,), threads(pso))], logits, p, mode=2, hist=hist, hist_len=hist_len, bias=bias,
+                          position=position, fill=fill, scratch={10: bitmap_bytes(p, T + 1, V, hist_len)}, lbuf=lbuf,
+                          queue=queue)
     assert np.all(qbits == np.frombuffer(bytes([fill]) * 4, np.uint32)[0]), "qprob was written without the probe"
     return picks
 
