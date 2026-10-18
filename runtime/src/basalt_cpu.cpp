@@ -71,12 +71,15 @@
 //   - Step 6's "inv = +inf when s < 2^-128" (:155) is off by one value: 1.f / 2^-128 is already +inf, so the band
 //     is s <= 2^-128. The source is a plain 1.f / s and that is what this file computes. A subnormal s ABOVE
 //     2^-128 has a finite inv and ordinary codes.
-//   - Step 11's clamp has an unreachable high side. |x| <= amax and the rounding is monotone, so r is largest at
-//     x = amax; over every positive finite float32 amax with a finite inv, trunc(r) never exceeds 127 (the largest
-//     r is 127.50003, at amax = 3.7322113794423347e-37). The only reachable clamp action is the low side, through
-//     the integer indefinite: NaN, +-inf and overflow give -127, never +127. The clamp stays - it is basalt's code.
-//   - A regime the specification does not name: amax > 0 with fl(amax / 127) == 0 (amax = 2^-149) makes s = 0, so
-//     the s > 0.f guard gives inv = 0 and every code 0, with scale = 0 and hx = +0.0.
+//   - Step 11's clamp acts on both sides. The low side is the integer indefinite: NaN, +-inf and overflow give
+//     -127. The high side needs a NaN in the chunk, because the reduce_max tree can then swallow the true peak:
+//     x = 0.1 everywhere, x[4] = 0.11, x[16] = NaN gives amax = 0.1 (GCC's maxps drops lane 4 through the NaN),
+//     so x[4] scales to r = 140.2 and clamps to +127 [M]. Without a NaN, |x| <= amax and the rounding is monotone,
+//     so trunc(r) never exceeds 127 over any positive finite amax with a finite inv (the largest r is 127.50003,
+//     at amax = 3.7322113794423347e-37) [M].
+//   - A regime the specification does not name: amax > 0 with fl(amax / 127) == 0 makes s = 0, so the s > 0.f
+//     guard gives inv = 0 and every code 0, with scale = 0 and hx = +0.0. That is amax <= 63 * 2^-149; from
+//     64 * 2^-149 the quotient rounds up to the subnormal s = 2^-149, whose inv is +inf, so every code is -127 [M].
 #include "basalt_cpu.h"
 
 #if !defined(__ARM_NEON)

@@ -80,10 +80,13 @@ either infinity and for anything outside int32 ([S] Intel SDM Vol. 1, Table 11-1
   `±inf`: **every code is −127**, zeros included.
 - An infinite element gives `s = inf`, `inv = 0` and `t = inf * 0 = NaN`: that element is −127 while the finite
   ones, including `−0`, take the `>= 0` branch and give 0.
-- `amax` at or below `127 * 2^-149` rounds `s` to zero, so `inv = 0` and every code is 0.
+- `amax` at or below `63 * 2^-149` rounds `s` to zero, so `inv = 0` and every code is 0. From `64 * 2^-149` the
+  quotient rounds up to the subnormal `s = 2^-149`, which falls in the `inv = +inf` band above [M].
 
-The +127 side of the clamp is inert: wherever `inv` is finite, `|x| <= amax` holds `r` at 127.50003 or below [M],
-measured at the exhaustive worst case in case A8. ARM's `FCVTZS` **saturates** instead (NaN gives 0, `+inf` gives
+The +127 side of the clamp needs a NaN in the chunk, which lets the `reduce_max` tree swallow the true peak:
+`x = 0.1` everywhere with `x[4] = 0.11` and `x[16] = NaN` gives `amax = 0.1`, so `x[4]` scales to `r = 140.2` and
+clamps to `+127` [M]. Without a NaN it is inert: wherever `inv` is finite, `|x| <= amax` holds `r` at 127.50003 or
+below [M], measured at the exhaustive worst case in case A8. ARM's `FCVTZS` **saturates** instead (NaN gives 0, `+inf` gives
 `INT32_MAX`), which after the clamp would give code 0 and +127 where x86 gives −127 for both, so the port selects on
 `vcagtq_f32` against `2^31` and substitutes `INT32_MIN` itself.
 
