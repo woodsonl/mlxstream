@@ -126,6 +126,92 @@ def experts(blobs, grp_off, grp_start, ent_tok, ent_dst, xq, n_embd, n_ff, n_out
             "hq": np.frombuffer(b_hq.read(0, b_hq.nbytes), np.uint8), "out": f32(b_out).reshape(n_out_rows, n_embd)}
 
 
+def q8_0_scaled(x, fill=0x5A, src=None):
+    """``basalt_quantize_q8_0_scaled`` over the float32 vector ``x`` (a multiple of 32 values), into blocks and scales
+    whose bytes start as ``fill``: (34-byte blocks as bytes, fp32 scales). ``src``: another source of the kernels (the
+    tests' negative controls)."""
+    x = np.ascontiguousarray(x, np.float32)
+    nb = x.size // 32
+    pso = pipeline(src or kernels.basalt_s2_experts_source(), "basalt_quantize_q8_0_scaled")
+    out = run(pso, [x.tobytes(), nb * kernels.Q8_0_BLOCK_BYTES, 4 * nb], kernels.basalt_q8_0_scaled_params(x.size), 3,
+              kernels.basalt_q8_0_scaled_grid(x.size), kernels.S2_THREADS, fill)
+    return np.frombuffer(out[1], np.uint8), np.frombuffer(out[2], np.float32)
+
+
+def s2_experts(blob_bufs, grp, grp_start, n_groups, ent_tok, ent_dst, xq, xs, cap_groups, cap_entries, n_out_rows, *,
+               resident=None, out_fill=0xA5, scratch_fill=0x5A, src=None):
+    """basalt's ``moe_grouped_s2`` (with ``resident``: ``moe_group_resident`` first) in one command buffer.
+    ``blob_bufs``: device buffers holding the expert blobs; group g's blob is ``grp[g]`` = (buffer index, byte offset),
+    and the kernels get basalt's grp_ptr, that buffer's GPU address plus the offset (the table padded to cap_groups
+    with group 0's, the starts with the last, as basalt's test pads them). ``resident`` = (ids, k_per_tok, buffer
+    index, byte offset of expert 0): the plan comes from ``basalt_s2_group_resident`` instead, and ``grp``,
+    ``grp_start``, ``n_groups``, ``ent_tok`` and ``ent_dst`` are ignored. ``xq``: the activation rows (34-byte
+    blocks), ``xs`` their fp32 scales. The output (``n_out_rows`` rows of 2560 floats) starts as ``out_fill`` bytes,
+    the scratch (``basalt_s2_scratch``'s size) as ``scratch_fill``. Returns the output and scratch bytes, and the plan
+    the kernels read. ``src``: another source of the kernels (the tests' negative controls)."""
+    dev, src = device(), src or kernels.basalt_s2_experts_source()
+    pgu, psw, pq, pdn = (pipeline(src, n) for n in ("basalt_s2_gu", "basalt_s2_swiglu", "basalt_quantize_q8_0_scaled",
+                                                     "basalt_s2_down"))
+    grids, sc = kernels.basalt_s2_grids(cap_groups, cap_entries), kernels.basalt_s2_scratch(cap_entries)
+
+    def arr(a, dt, n, pad=0):
+        v = np.full(max(n, len(a), 1), pad, dt)
+        v[: len(a)] = a
+        return nt.Buffer(dev, v.tobytes())
+
+    ds = []
+    if resident is None:
+        b_ptr = arr([blob_bufs[i].gpu_address + int(o) for i, o in grp], np.uint64, cap_groups,
+                    blob_bufs[grp[0][0]].gpu_address + int(grp[0][1]) if len(grp) else 0)
+        b_start = arr(grp_start, np.int32, cap_groups + 1, grp_start[-1])
+        b_ng = nt.Buffer(dev, np.int32(n_groups).tobytes())
+        b_tok, b_dst = arr(ent_tok, np.int32, cap_entries), arr(ent_dst, np.int32, cap_entries)
+    else:
+        ids, k_per_tok, bi, bo = resident
+        n = len(ids)
+        b_ids = nt.Buffer(dev, np.asarray(ids, np.int32).tobytes())
+        b_ptr, b_start = nt.Buffer(dev, 8 * n), nt.Buffer(dev, 4 * (n + 1))
+        b_ng, b_dst, b_tok = nt.Buffer(dev, 16), nt.Buffer(dev, 4 * n), nt.Buffer(dev, 4 * n)
+        for b in (b_ptr, b_start, b_ng, b_dst, b_tok):
+            b.fill(0)
+        d0 = nt.Dispatch().pipeline(pipeline(src, "basalt_s2_group_resident")).buffer(0, b_ids)
+        d0 = d0.buffer(1, blob_bufs[bi], bo)
+        for k, b in enumerate((b_ptr, b_start, b_ng, b_dst, b_tok), start=2):
+            d0 = d0.buffer(k, b)
+        ds.append(d0.bytes(7, kernels.basalt_s2_resident_params(n, k_per_tok)).grid(1).threadgroup(128))
+    b_x = nt.Buffer(dev, np.ascontiguousarray(xq, np.uint8).tobytes())
+    b_xs = nt.Buffer(dev, np.ascontiguousarray(xs, np.float32).tobytes())
+    b_s, b_out = nt.Buffer(dev, sc["bytes"]), nt.Buffer(dev, 4 * n_out_rows * kernels.S2_H)
+    b_s.fill(scratch_fill)
+    b_out.fill(out_fill)
+    params = kernels.basalt_s2_params(cap_entries)
+    d1 = nt.Dispatch().pipeline(pgu)
+    for k, b in enumerate((b_ptr, b_start, b_ng, b_tok, b_x, b_xs, b_s)):
+        d1 = d1.buffer(k, b)
+    for b in blob_bufs:
+        d1 = d1.use(b)
+    ds.append(d1.bytes(7, params).grid(*grids["gu"]).threadgroup(kernels.S2_THREADS))
+    ds.append(nt.Dispatch().pipeline(psw).buffer(0, b_s).bytes(1, params).grid(grids["swiglu"])
+              .threadgroup(kernels.S2_THREADS))
+    ds.append(nt.Dispatch().pipeline(pq).buffer(0, b_s).buffer(1, b_s, sc["hq"]).buffer(2, b_s, sc["hs"])
+              .bytes(3, kernels.basalt_q8_0_scaled_params(cap_entries * kernels.S2_FF)).grid(grids["quant"])
+              .threadgroup(kernels.S2_THREADS))
+    d4 = nt.Dispatch().pipeline(pdn)
+    for k, b in enumerate((b_ptr, b_start, b_ng, b_dst)):
+        d4 = d4.buffer(k, b)
+    d4 = d4.buffer(4, b_s, sc["hq"]).buffer(5, b_s, sc["hs"]).buffer(6, b_out)
+    for b in blob_bufs:
+        d4 = d4.use(b)
+    ds.append(d4.grid(*grids["down"]).threadgroup(kernels.S2_THREADS))
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+    i32 = lambda b: np.frombuffer(b.read(0, b.nbytes), np.int32)
+    return {"out": np.frombuffer(b_out.read(0, b_out.nbytes), np.uint32).reshape(n_out_rows, kernels.S2_H),
+            "scratch": np.frombuffer(b_s.read(0, b_s.nbytes), np.uint8), "grp_ptr": np.frombuffer(
+                b_ptr.read(0, b_ptr.nbytes), np.uint64), "grp_start": i32(b_start), "n_groups": i32(b_ng),
+            "ent_dst": i32(b_dst), "ent_tok": i32(b_tok)}
+
+
 def mmvf(w, x, n_in, n_out, n_tok=1, ldx=None, ldy=None, fill=None):
     """``basalt_mmvf`` in basalt's launch (``bf16_gemv_fp32_mmvf_multi``; one row with ldy >= n_out:
     ``bf16_gemv_fp32_mmvf``) for BF16 bits ``w`` (n_out rows of n_in) and the float32 rows of ``x`` (row k at k * ldx,
@@ -213,3 +299,150 @@ def dense_tc_pair(type0, w0, n_out0, type1, w1, n_out1, xq, n_in, widths, fill=0
     assert not r.error, r.error
     f = lambda b, n: np.frombuffer(b.read(0, 32 * n), np.float32).reshape(8, n)
     return {t: (f(b0, n_out0), f(b1, n_out1)) for t, (_, b0, b1) in outs.items()}
+
+
+def _map_buffer(dev, map_, n):
+    """basalt's map (int32 ids, negative: no token) or, for nullptr, a dummy buffer with has_map 0."""
+    if map_ is None:
+        return nt.Buffer(dev, 4), False
+    return nt.Buffer(dev, np.ascontiguousarray(map_, np.int32).tobytes()), True
+
+
+def q5k_head(w, xq, n_in, n_out, ncols, fill=0xEE, **grid):
+    """``basalt_q5k_head`` (basalt's ``q5k_head_mmvq``) for ``ncols`` columns, into an output whose bytes start as
+    ``fill``; ``grid``: ``basalt_q5k_head_grid``'s keywords."""
+    macros = kernels.basalt_q5k_head_macros(n_in, ncols)
+    pso = pipeline(kernels.basalt_q5k_head_source(), "basalt_q5k_head", tuple(sorted(macros.items())))
+    out = run(pso, [np.ascontiguousarray(w, np.uint8).tobytes(), np.ascontiguousarray(xq, np.uint8).tobytes(),
+                    4 * ncols * n_out], kernels.basalt_q5k_head_params(n_in, n_out), 3,
+              kernels.basalt_q5k_head_grid(n_out, **grid), kernels.Q5K_HEAD_THREADS, fill)
+    return np.frombuffer(out[2], np.float32).reshape(ncols, n_out)
+
+
+def q5k_head_masked(w, xq, n_in, n_out, map_):
+    """basalt's plain head then ``q5k_head_mask_unmapped`` on its logits, in one command buffer: one column."""
+    dev = device()
+    src = kernels.basalt_q5k_head_source()
+    macros = tuple(sorted(kernels.basalt_q5k_head_macros(n_in, 1).items()))
+    bw = nt.Buffer(dev, np.ascontiguousarray(w, np.uint8).tobytes())
+    bx = nt.Buffer(dev, np.ascontiguousarray(xq, np.uint8).tobytes())
+    by = nt.Buffer(dev, 4 * n_out)
+    by.fill(0xEE)
+    bm, _ = _map_buffer(dev, map_, n_out)
+    params = kernels.basalt_q5k_head_params(n_in, n_out)
+    d1 = (nt.Dispatch().pipeline(pipeline(src, "basalt_q5k_head", macros)).buffer(0, bw).buffer(1, bx).buffer(2, by)
+          .bytes(3, params).grid(kernels.basalt_q5k_head_grid(n_out)).threadgroup(kernels.Q5K_HEAD_THREADS))
+    d2 = (nt.Dispatch().pipeline(pipeline(src, "basalt_q5k_head_mask_unmapped", macros)).buffer(0, by).buffer(1, bm)
+          .bytes(2, params).grid(-(-n_out // 256)).threadgroup(256))
+    r = nt.Queue(dev).run([d1, d2])
+    assert not r.error, r.error
+    return np.frombuffer(by.read(0, 4 * n_out), np.float32)
+
+
+def q5k_top1(w, xq, n_out, map_=None, **grid):
+    """basalt's ``q5k_head_top1`` (n_in 2560, one column): ``basalt_q5k_head_top1`` then ``basalt_q5k_head_top1_merge``
+    in one command buffer. Returns (logits, id, probability, the threadgroup partials as (m, idx, s) rows)."""
+    dev = device()
+    src = kernels.basalt_q5k_head_source()
+    macros = tuple(sorted(kernels.basalt_q5k_head_macros(2560, 1).items()))
+    blocks = kernels.basalt_q5k_head_grid(n_out, **grid)
+    bw = nt.Buffer(dev, np.ascontiguousarray(w, np.uint8).tobytes())
+    bx = nt.Buffer(dev, np.ascontiguousarray(xq, np.uint8).tobytes())
+    by, bpart, bid, bp = nt.Buffer(dev, 4 * n_out), nt.Buffer(dev, 12 * blocks), nt.Buffer(dev, 4), nt.Buffer(dev, 4)
+    for b in (by, bpart, bid, bp):
+        b.fill(0xEE)
+    bm, has = _map_buffer(dev, map_, n_out)
+    params = kernels.basalt_q5k_head_params(2560, n_out, has, blocks)
+    d1 = nt.Dispatch().pipeline(pipeline(src, "basalt_q5k_head_top1", macros))
+    for k, b in enumerate((bw, bx, by, bm, bpart)):
+        d1 = d1.buffer(k, b)
+    d1 = d1.bytes(5, params).grid(blocks).threadgroup(kernels.Q5K_HEAD_THREADS)
+    d2 = nt.Dispatch().pipeline(pipeline(src, "basalt_q5k_head_top1_merge", macros))
+    for k, b in enumerate((bpart, bm, bid, bp)):
+        d2 = d2.buffer(k, b)
+    d2 = d2.bytes(4, params).grid(1).threadgroup(kernels.Q5K_HEAD_THREADS)
+    r = nt.Queue(dev).run([d1, d2])
+    assert not r.error, r.error
+    part = np.frombuffer(bpart.read(0, 12 * blocks), np.float32).reshape(blocks, 3)
+    return (np.frombuffer(by.read(0, 4 * n_out), np.float32), int(np.frombuffer(bid.read(0, 4), np.int32)[0]),
+            np.frombuffer(bp.read(0, 4), np.float32)[0], part)
+
+
+def expf_ftz(x):
+    """basalt_fp.metal's expf_ftz (``__expf`` in a fast-math file) on the GPU, elementwise: the values the kernels use."""
+    src = kernels.PRELUDE + kernels.template("basalt_fp.metal") + """
+kernel void ex(device const float* x [[buffer(0)]], device float* e [[buffer(1)]], constant uint& n [[buffer(2)]],
+               uint i [[thread_position_in_grid]]) {
+    if (i < n) e[i] = expf_ftz(x[i]);
+}
+"""
+    x = np.ascontiguousarray(x, np.float32)
+    flat = x.reshape(-1)
+    out = run(pipeline(src, "ex"), [flat.tobytes(), 4 * flat.size], np.uint32(flat.size).tobytes(), 2,
+              -(-flat.size // 256), 256)
+    return np.frombuffer(out[1], np.float32).reshape(x.shape)
+
+
+def q5k_proxy_pack(q5, n_cap, packs, proxy=None):
+    """basalt's ``q5k_proxy_pack`` for each (row0, n) of ``packs`` in order, in one command buffer, into a copy for
+    ``n_cap`` rows that starts as ``proxy`` (bytes) or zeros (basalt's test clears it, q5k_head_parity.cpp:243)."""
+    dev = device()
+    pso = pipeline(kernels.basalt_q5k_head_source(), "basalt_q5k_proxy_pack")
+    nbytes = kernels.basalt_q5k_proxy_bytes(n_cap)
+    bq = nt.Buffer(dev, np.ascontiguousarray(q5, np.uint8).tobytes())
+    bp = nt.Buffer(dev, bytes(proxy) if proxy is not None else bytes(nbytes))
+    ds = [nt.Dispatch().pipeline(pso).buffer(0, bq).buffer(1, bp)
+          .bytes(2, kernels.basalt_q5k_proxy_params(n_cap, row0=row0, n=n))
+          .grid(-(-n * 80 // kernels.PX_THREADS_PACK)).threadgroup(kernels.PX_THREADS_PACK) for row0, n in packs]
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+    return np.frombuffer(bp.read(0, nbytes), np.uint8)
+
+
+def q5k_proxy_score(proxy, xq, n_rows, n_cap, map_):
+    """``px::score_kernel`` over the first ``n_rows`` rows of the copy ``proxy`` (``n_cap`` rows) for one q8_1 column:
+    (cand: (tiles, 4, 2) pairs (score, row bits), part: (tiles, 2) (max, sum)) from basalt's scratch layout."""
+    dev = device()
+    pso = pipeline(kernels.basalt_q5k_head_source(), "basalt_q5k_proxy_score")
+    nbytes = kernels.basalt_q5k_proxy_scratch_bytes(n_cap)
+    bs = nt.Buffer(dev, nbytes)
+    bs.fill(0xEE)
+    d = (nt.Dispatch().pipeline(pso).buffer(0, nt.Buffer(dev, np.ascontiguousarray(proxy, np.uint8).tobytes()))
+         .buffer(1, nt.Buffer(dev, np.ascontiguousarray(xq, np.uint8).tobytes()))
+         .buffer(2, nt.Buffer(dev, np.ascontiguousarray(map_, np.int32).tobytes())).buffer(3, bs)
+         .bytes(4, kernels.basalt_q5k_proxy_params(n_cap, n_rows=n_rows))
+         .grid(kernels.basalt_q5k_proxy_tiles(n_rows)).threadgroup(kernels.PX_THREADS_SCORE))
+    r = nt.Queue(dev).run([d])
+    assert not r.error, r.error
+    s = np.frombuffer(bs.read(0, nbytes), np.float32)
+    ntc, t = kernels.basalt_q5k_proxy_tiles(n_cap), kernels.basalt_q5k_proxy_tiles(n_rows)
+    return s[: 8 * t].reshape(t, 4, 2), s[8 * ntc: 8 * ntc + 2 * t].reshape(t, 2)
+
+
+def q5k_proxy_top1(proxy, q5, xq, n_rows, n_cap, map_):
+    """basalt's ``q5k_proxy_top1`` (q5k_head.cu:516-535): ``basalt_q5k_proxy_score`` then ``basalt_q5k_proxy_final``
+    in one command buffer, over the first ``n_rows`` rows of the copy ``proxy`` and of the Q5_K rows ``q5``, for one
+    q8_1 column. Returns (id, probability, the score's cand (tiles, 4, 2) and part (tiles, 2))."""
+    dev = device()
+    src = kernels.basalt_q5k_head_source()
+    final = pipeline(src, "basalt_q5k_proxy_final")
+    assert final.max_threads_per_threadgroup >= kernels.PX_THREADS_FINAL, final.max_threads_per_threadgroup
+    nbytes = kernels.basalt_q5k_proxy_scratch_bytes(n_cap)
+    bp, bq = (nt.Buffer(dev, np.ascontiguousarray(a, np.uint8).tobytes()) for a in (proxy, q5))
+    bx = nt.Buffer(dev, np.ascontiguousarray(xq, np.uint8).tobytes())
+    bm = nt.Buffer(dev, np.ascontiguousarray(map_, np.int32).tobytes())
+    bs, bid, bpr = nt.Buffer(dev, nbytes), nt.Buffer(dev, 4), nt.Buffer(dev, 4)
+    for b in (bs, bid, bpr):
+        b.fill(0xEE)
+    params = kernels.basalt_q5k_proxy_params(n_cap, n_rows=n_rows)
+    d1 = (nt.Dispatch().pipeline(pipeline(src, "basalt_q5k_proxy_score")).buffer(0, bp).buffer(1, bx).buffer(2, bm)
+          .buffer(3, bs).bytes(4, params).grid(kernels.basalt_q5k_proxy_tiles(n_rows))
+          .threadgroup(kernels.PX_THREADS_SCORE))
+    d2 = (nt.Dispatch().pipeline(final).buffer(0, bq).buffer(1, bx).buffer(2, bm).buffer(3, bs).buffer(4, bid)
+          .buffer(5, bpr).bytes(6, params).grid(1).threadgroup(kernels.PX_THREADS_FINAL))
+    r = nt.Queue(dev).run([d1, d2])
+    assert not r.error, r.error
+    s = np.frombuffer(bs.read(0, nbytes), np.float32)
+    ntc, t = kernels.basalt_q5k_proxy_tiles(n_cap), kernels.basalt_q5k_proxy_tiles(n_rows)
+    return (int(np.frombuffer(bid.read(0, 4), np.int32)[0]), np.frombuffer(bpr.read(0, 4), np.float32)[0],
+            s[: 8 * t].reshape(t, 4, 2), s[8 * ntc: 8 * ntc + 2 * t].reshape(t, 2))

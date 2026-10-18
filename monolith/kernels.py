@@ -276,6 +276,11 @@ def basalt_q8_1_params(n_values: int) -> bytes:
     return struct.pack("<IIII", n_values, 0, 0, 0)
 
 
+def basalt_q8_1_grid(n_values: int) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup) of a q8_1 quantizer over ``n_values`` values: one thread per value."""
+    return -(-n_values // Q8_1_THREADS), Q8_1_THREADS
+
+
 # basalt's iteration traits per ggml type (native_mmvq.cu:897-1098): values per block (DIV), threads per block (T),
 # blocks per iteration with four SIMD-groups (BPI)
 MMVQ_TRAITS = {2: (32, 2, 64), 6: (32, 2, 64), 8: (32, 4, 32), 20: (32, 2, 64), 11: (256, 16, 8), 12: (256, 16, 8),
@@ -377,6 +382,90 @@ def basalt_expert_params(n_embd: int, n_ff: int) -> bytes:
     return struct.pack("<8I", n_embd, n_ff, lay["gu_row"], lay["d_row"], lay["up_off"], lay["down_off"], 0, 0)
 
 
+# ---- basalt's drafter experts (kernels/common/basalt_s2_experts.metal; docs/research/basalt-nvcc/s2_experts.md) ----
+# The constants and the scratch layout are adapted from basalt (jesdga95/basalt) src/kernels/cuda/s2_expert_grouped.cu
+# :34-46, :554-562, :1085-1122 and src/kernels/cuda/quantize_act.cu:219-238 @ b4c63b55754637f4c72ad53a0f791d425f71eb36
+# (MIT; third_party/NOTICE).
+
+Q8_0_BLOCK_BYTES = 34       # fp16 d, 32 int8 codes
+S2_THREADS = 256            # every dispatch but the plan's: 256-thread threadgroups
+S2_H, S2_FF, S2_GMAX = 2560, 640, 8
+S2_BLOB_BYTES = 2 * S2_FF * S2_H // 4 + S2_H * S2_FF // 4 + 2 * S2_FF * S2_H // 64 * 2 + S2_H * S2_FF // 64 * 2
+
+
+def basalt_s2_experts_source() -> str:
+    """basalt's drafter experts: ``basalt_s2_group_resident`` (moe_group_resident), ``basalt_quantize_q8_0_scaled`` and
+    moe_grouped_s2's ``basalt_s2_gu``, ``basalt_s2_swiglu``, ``basalt_quantize_q8_0_scaled`` (the intermediate) and
+    ``basalt_s2_down``, dispatched in that order. The gate/up and down kernels take basalt's ``grp_ptr`` at buffer(0):
+    one 64-bit GPU address a group (each 2-byte aligned, inside a buffer the dispatch makes resident)."""
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_q8_1.metal")
+            + template("basalt_s2_experts.metal"))
+
+
+CUDA_GRID_X, CUDA_GRID_Y = 2 ** 31 - 1, 65535   # CUDA's largest gridDim.x and .y: a larger basalt launch exits
+
+
+def basalt_q8_0_scaled_params(n_values: int) -> bytes:
+    """``Q80Params`` for ``basalt_quantize_q8_0_scaled`` over ``n_values`` floats, a positive multiple of 32 (basalt
+    refuses others, quantize_act.cu:222-225) on a grid basalt can launch (``basalt_q8_0_scaled_grid``, threadgroups of
+    256). The block count is 64-bit, basalt's long long."""
+    if n_values <= 0 or n_values % 32:
+        raise ValueError(f"quantize_q8_0_scaled: the value count must be a positive multiple of 32, got {n_values}")
+    basalt_q8_0_scaled_grid(n_values)
+    return struct.pack("<QQ", n_values // 32, 0)
+
+
+def basalt_q8_0_scaled_grid(n_values: int) -> int:
+    """Threadgroups of 256 for ``n_values`` floats: one SIMD-group a block (quantize_act.cu:229-231). At most
+    ``CUDA_GRID_X``: basalt launches ``(unsigned) ((nb * 32 + 255) / 256)`` blocks and exits when the launch fails
+    (:230-236). Within it no 32-bit threadgroup position wraps."""
+    grid = -(-n_values // S2_THREADS)
+    if grid > CUDA_GRID_X:
+        raise ValueError(f"quantize_q8_0_scaled: {n_values} values need {grid} threadgroups, above {CUDA_GRID_X}")
+    return grid
+
+
+def basalt_s2_scratch(cap_entries: int) -> Dict[str, int]:
+    """moe_grouped_s2's scratch for ``cap_entries`` entries (s2_expert_grouped.cu:1090-1094): the byte offsets of the
+    quantized intermediate ("hq") and its fp32 scales ("hs") after gate/up at 0, each region's bytes rounded up to 16,
+    and the size basalt allocates (``moe_hit_grouped_scratch_bytes``, :554-562). At most 858,993,458 entries: basalt's
+    SwiGLU and quantizer grids of cap_entries * 640 / 256 blocks (:1107-1108, :1111) stop at ``CUDA_GRID_X``, which
+    also keeps the ``(int) cap_entries`` basalt hands the gate/up kernel (:1100) in range."""
+    if cap_entries <= 0:
+        raise ValueError(f"moe_grouped_s2: cap_entries must be positive, got {cap_entries}")
+    basalt_q8_0_scaled_grid(cap_entries * S2_FF)
+    r16 = lambda n: (n + 15) // 16 * 16
+    nc = S2_FF // 32
+    gu, q8, hs = r16(cap_entries * 2 * S2_FF * 4), r16(cap_entries * nc * Q8_0_BLOCK_BYTES), r16(cap_entries * nc * 4)
+    return {"hq": gu, "hs": gu + q8, "bytes": gu + q8 + 2 * hs + r16(S2_H // 32 * 4)}
+
+
+def basalt_s2_params(cap_entries: int) -> bytes:
+    """``S2Params`` of the gate/up and SwiGLU dispatches."""
+    basalt_s2_scratch(cap_entries)
+    return struct.pack("<IIII", cap_entries, 0, 0, 0)
+
+
+def basalt_s2_grids(cap_groups: int, cap_entries: int) -> Dict[str, object]:
+    """Threadgroup grids (each of 256 threads) of moe_grouped_s2's four dispatches (s2_expert_grouped.cu:1096-1121):
+    gate/up (40, cap_groups), the SwiGLU, the intermediate's quantizer, down (40, cap_groups). cap_groups is at most
+    ``CUDA_GRID_Y`` (basalt's grid y, :1097), so the kernels' ``int(tg.y)`` (basalt's ``int g = blockIdx.y``) stays
+    non-negative; cap_entries as ``basalt_s2_scratch`` takes it."""
+    if not 0 < cap_groups <= CUDA_GRID_Y:
+        raise ValueError(f"moe_grouped_s2: cap_groups must be 1..{CUDA_GRID_Y}, got {cap_groups}")
+    basalt_s2_scratch(cap_entries)
+    grid = basalt_q8_0_scaled_grid(cap_entries * S2_FF)              # the SwiGLU's too: a thread a value
+    return {"gu": (2 * S2_FF // 32, cap_groups), "swiglu": grid, "quant": grid, "down": (S2_H // 64, cap_groups)}
+
+
+def basalt_s2_resident_params(n: int, k_per_tok: int, blob: int = S2_BLOB_BYTES) -> bytes:
+    """``S2ResidentParams`` of ``basalt_s2_group_resident`` (one threadgroup of 128): n routed ids, 1..128 as basalt
+    requires (s2_expert_grouped.cu:1079), k_per_tok of them a token, experts ``blob`` bytes apart."""
+    if not 1 <= n <= 128 or k_per_tok <= 0:
+        raise ValueError(f"moe_group_resident: n must be 1..128 and k_per_tok positive, got {n}, {k_per_tok}")
+    return struct.pack("<iiII", n, k_per_tok, blob, 0)
+
+
 DEQUANT_TYPES = (11, 20, 23, 42)   # Q3_K, IQ4_NL, IQ4_XS, Q2_0: basalt's dequantizers for the types iq_parity checks
 
 
@@ -434,6 +523,12 @@ def basalt_mmvf_params(n_in: int, n_out: int, n_tok: int = 1, ldx: Optional[int]
                        ldy: Optional[int] = None) -> bytes:
     """``MmvfParams``: n_in, n_out, n_tok, ldx and ldy (defaults n_in and n_out)."""
     return struct.pack("<8I", n_in, n_out, n_tok, n_in if ldx is None else ldx, n_out if ldy is None else ldy, 0, 0, 0)
+
+
+def basalt_mmvf_grid(macros: Mapping[str, str], n_out: int) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup) for a ``basalt_mmvf_macros`` launch: one threadgroup of BLOCK threads
+    per output row."""
+    return n_out, int(macros["BLOCK"])
 
 
 def basalt_mmvf_cols(ncols: int) -> List[Tuple[int, int]]:
@@ -523,6 +618,89 @@ def basalt_dense_tc_pair_macros(type0: int, type1: int, n_in: int) -> Dict[str, 
 
 def basalt_dense_tc_pair_grid(n_out0: int, n_out1: int) -> Tuple[int, int]:
     return -(-n_out0 // 16) + -(-n_out1 // 16), 256
+
+
+# ---- basalt's Q5_K head (kernels/common/basalt_q5k_head.metal; docs/research/basalt-nvcc/q5k_head.md)
+# adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:337-386, :500-535 and
+# src/kernels/cuda/head_proxy.cuh:17-28 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE)
+
+Q5K_HEAD_THREADS = 256      # basalt's WPB * WARP: 8 SIMD-groups, one row each
+Q5K_TOP1_SM_COUNT = 170     # the multiprocessors of basalt's measured GPU (an RTX 5090)
+Q5K_TOP1_PER_SM = 2         # cudaOccupancyMaxActiveBlocksPerMultiprocessor of q5k_head_top1_kernel on sm_120: 126
+                            # registers (ptxas, NVCC 13.0 and 13.3) round to 128; 128 x 256 of 65,536 (q5k_head.md)
+Q5K_TOP1_MAX_BLOCKS = 4096  # basalt's cap: q5k_head_top1_scratch_bytes holds 4096 partials
+
+
+def basalt_q5k_head_source() -> str:
+    """basalt's ``q5k_head_mmvq`` (``basalt_q5k_head``), ``q5k_head_mask_unmapped`` (``basalt_q5k_head_mask_unmapped``),
+    ``q5k_head_top1`` (``basalt_q5k_head_top1`` then ``basalt_q5k_head_top1_merge``), ``q5k_proxy_pack``
+    (``basalt_q5k_proxy_pack``) and ``q5k_proxy_top1`` (``basalt_q5k_proxy_score`` then ``basalt_q5k_proxy_final``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_q5k_head.metal")
+
+
+def basalt_q5k_head_macros(n_in: int, ncols: int) -> Dict[str, str]:
+    """``q5k_head_supported`` (q5k_head.cu:365-368): n_in a positive multiple of 256 with at most 64 blocks a row, 1..8
+    columns whose staging (6 int4 per q8_1 block) fits basalt's 96 KiB; the port reads the columns from device memory,
+    so the rule is the API's, not Metal's."""
+    if n_in <= 0 or n_in % 256 or n_in // 256 > 64 or not 1 <= ncols <= 8 or ncols * (n_in // 32) * 96 > 96 * 1024:
+        raise ValueError(f"basalt_q5k_head: unsupported shape (n_in {n_in}, ncols {ncols})")
+    return {"NC": str(ncols)}
+
+
+def basalt_q5k_head_grid(n_out: int, *, sm_count: int = Q5K_TOP1_SM_COUNT, per_sm: int = Q5K_TOP1_PER_SM,
+                         cap: int = Q5K_TOP1_MAX_BLOCKS) -> int:
+    """basalt's grid rule (q5k_head.cu:353-354, 375-386): min(ceil(n_out / 8), sm_count * per_sm, cap) threadgroups of
+    256 threads. The top-1's probability sums in this order, so its last bits follow ``sm_count`` and ``per_sm``
+    (mtp.cpp:1007-1008); the defaults are basalt's on its measured GPU. The plain head's values do not depend on the
+    grid (basalt sizes it with the head kernel's own occupancy; the cap is the top-1's). The rows' loop steps an int
+    by 8 per threadgroup, as basalt's (q5k_head.cu:191-192, 249), so a grid whose last step would pass INT_MAX
+    (n_out > 2^31 - 8 * grid) is refused."""
+    if n_out <= 0 or sm_count <= 0 or per_sm <= 0:
+        raise ValueError(f"basalt_q5k_head: n_out, sm_count and per_sm must be positive")
+    grid = min(-(-n_out // 8), sm_count * per_sm, cap)
+    if n_out > 2 ** 31 - 8 * grid:
+        raise ValueError(f"basalt_q5k_head: n_out {n_out} with {grid} threadgroups steps a row past INT_MAX")
+    return grid
+
+
+def basalt_q5k_head_params(n_in: int, n_out: int, has_map: bool = False, n_blocks: int = 0) -> bytes:
+    """``Q5kHeadParams``: n_in, n_out (basalt's int: 1..INT_MAX), whether a map is bound, and for the top-1's merge
+    the first dispatch's threadgroup count."""
+    if not 0 < n_out < 2 ** 31:
+        raise ValueError(f"basalt_q5k_head: n_out must be in 1..INT_MAX, got {n_out}")
+    return struct.pack("<IIII", n_in, n_out, int(has_map), n_blocks)
+
+
+# basalt's 2-bit proxy of the head's rows (head_proxy.cuh:17-28; q5k_head.cu:500-535)
+PX_THREADS_PACK = 128       # q5k_proxy_pack: one thread per 32-weight group
+PX_THREADS_SCORE = 128      # px::score_kernel: four SIMD-groups per tile of 32 rows
+PX_THREADS_FINAL = 512      # q5k_proxy_final_kernel: one threadgroup
+
+
+def basalt_q5k_proxy_tiles(n: int) -> int:
+    """``px::tiles``: tiles of 32 rows."""
+    return (n + 31) // 32
+
+
+def basalt_q5k_proxy_bytes(n_cap: int) -> int:
+    """``q5k_proxy_bytes``: a 16-byte word per (tile, 64 weights, row), then two fp16 scales per word."""
+    return basalt_q5k_proxy_tiles(n_cap) * 40 * 32 * (16 + 4)
+
+
+def basalt_q5k_proxy_scratch_bytes(n_cap: int) -> int:
+    """``q5k_proxy_scratch_bytes``: the score's 4 candidates per tile, then its (max, sum) per tile, float2 each."""
+    return basalt_q5k_proxy_tiles(n_cap) * (4 + 1) * 8
+
+
+def basalt_q5k_proxy_params(n_cap: int, *, row0: int = 0, n: int = 0, n_rows: Optional[int] = None) -> bytes:
+    """``PxParams`` (row0, n, n_cap, n_rows): a pack's (rows row0 .. row0 + n - 1 of a copy sized for n_cap; n_rows
+    None) or the score's and top-1's (the first n_rows rows). basalt's API refuses n_rows outside 1..n_cap
+    (q5k_head.cu:518), and n_rows is its int (at most INT_MAX); the port also refuses a pack past n_cap, which would
+    store outside the copy, and an n_cap past the 32-bit field (basalt's int64_t: a copy of 2^32 rows is 3.4 TB)."""
+    if (not 0 < n_cap < 2 ** 32 or row0 < 0 or n < 0 or row0 + n > n_cap
+            or (n_rows is not None and not 0 < n_rows <= min(n_cap, 2 ** 31 - 1))):
+        raise ValueError(f"basalt_q5k_proxy: rows out of range (row0 {row0}, n {n}, n_rows {n_rows}, n_cap {n_cap})")
+    return struct.pack("<IIII", row0, n, n_cap, n_rows or 0)
 
 
 # ---- basalt's sampler (kernels/common/basalt_sampler.metal; docs/research/basalt-nvcc/sampler.md) ---------------

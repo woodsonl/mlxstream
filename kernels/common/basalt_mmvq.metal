@@ -15,7 +15,8 @@
 // block once and `apply` runs the format's dot product per column; SIMD-groups 1..NW-1 store their partial sums, SIMD-
 // group 0 adds them in SIMD-group order and reduces with basalt's XOR butterfly; lane i writes row row0 + i. The float
 // steps are the ones nvcc compiles (docs/research/basalt-nvcc/matvec.md): fma() exactly where SASS has FFMA.FTZ, the
-// rest .FTZ adds and multiplies. Integer steps are basalt's, as exact int32 arithmetic.
+// rest .FTZ adds and multiplies. Integer steps are basalt's, as exact int32 arithmetic. A NaN is stored as sm_120's
+// (cuda_nan; docs/research/basalt-nvcc/nan.md).
 //
 // Macros: MMVQ_TYPE the ggml type id (2 Q4_0, 6 Q5_0, 8 Q8_0, 11 Q3_K, 12 Q4_K, 13 Q5_K, 14 Q6_K, 20 IQ4_NL,
 // 23 IQ4_XS, 42 Q2_0); NCOLS 1..8; ROWS rows per threadgroup; NW SIMD-groups per threadgroup (BPI' = BPI * NW / 4).
@@ -41,28 +42,35 @@ struct MmvqParams { uint n_in; uint n_out; uint pad0; uint pad1; };
 
 // q8_d, q8_s, q8_w (a q8_1 block's scale, sum and code words) and iq4_table_lookup are basalt_fp.metal's.
 
-#if MMVQ_TYPE == 13 || MMVQ_TYPE == 12
-// Q5_K (176-byte blocks: dm, scales[12], qh[32], qs[128]) and Q4_K (144: dm, scales[12], qs[128]);
-// native_mmvq.cu:897-975 (Q5KTraits, Q4KTraits), dots :180-240 and :522-574
+#if MMVQ_TYPE == 13
+// Q5_K: basalt_fp.metal's q5k_load and q5k_dot (native_mmvq.cu:180-240, 897-937), shared with the Q5_K head
 #define DIV 256
 #define T_PER 16
 #define KBY 8
 #define BPI 8
-#define BLOCK_BYTES (MMVQ_TYPE == 13 ? 176 : 144)
-#define QS_BYTE (MMVQ_TYPE == 13 ? 48 : 16)
+#define BLOCK_BYTES 176
 static inline int kqs_of(int tid) { return 2 * (tid % 16); }
-struct Wt { int vl[2]; int vh[2]; uchar sc[2]; uchar m[2]; float dmx, dmy; int bq8_offset; };
+typedef Q5KW Wt;
+static inline Wt wload(device const ushort* blk, int iqs) { return q5k_load(blk, iqs); }
+static inline float apply_acc(float tmp, thread const Wt& r, device const uint* x, int iqs) {
+    return add_ftz(tmp, q5k_dot(r, x, iqs));
+}
+
+#elif MMVQ_TYPE == 12
+// Q4_K (144-byte blocks: dm, scales[12], qs[128]); native_mmvq.cu:938-975 (Q4KTraits), dot :522-574
+#define DIV 256
+#define T_PER 16
+#define KBY 8
+#define BPI 8
+#define BLOCK_BYTES 144
+static inline int kqs_of(int tid) { return 2 * (tid % 16); }
+struct Wt { int vl[2]; uchar sc[2]; uchar m[2]; float dmx, dmy; int bq8_offset; };
 static inline Wt wload(device const ushort* blk, int iqs) {
     Wt r;
     r.bq8_offset = 2 * ((iqs / 2) / 4);
-    const int ql = (QS_BYTE + 16 * r.bq8_offset + 4 * ((iqs / 2) % 4)) / 4;
+    const int ql = (16 + 16 * r.bq8_offset + 4 * ((iqs / 2) % 4)) / 4;
     r.vl[0] = load_int_b2(blk, ql);
     r.vl[1] = load_int_b2(blk, ql + 4);
-#if MMVQ_TYPE == 13
-    const int qh = (16 + 4 * ((iqs / 2) % 4)) / 4;
-    r.vh[0] = load_int_b2(blk, qh) >> r.bq8_offset;
-    r.vh[1] = load_int_b2(blk, qh + 4) >> r.bq8_offset;
-#endif
     const int j = r.bq8_offset / 2;
     const int jm = j & 1;
     const uint s0 = blk[2 + jm], s2 = blk[2 + jm + 2], s4 = blk[2 + jm + 4];
@@ -81,17 +89,10 @@ static inline float apply_acc(float tmp, thread const Wt& r, device const uint* 
         const int b = r.bq8_offset + i;
         const float d8 = q8_d(x, b);
         const int u0 = q8_w(x, b, (iqs / 2) % 4), u1 = q8_w(x, b, (iqs / 2) % 4 + 4);
-#if MMVQ_TYPE == 13
-        const int v0i = ((r.vl[0] >> (4 * i)) & 0x0f0f0f0f) | (((r.vh[0] >> i) << 4) & 0x10101010);
-        const int v1i = ((r.vl[1] >> (4 * i)) & 0x0f0f0f0f) | (((r.vh[1] >> i) << 4) & 0x10101010);
-        const int dot1 = dp4a(v0i, u0, dp4a(v1i, u1, 0));
-        const int dot2 = dp4a(0x01010101, u0, dp4a(0x01010101, u1, 0));
-#else
         const int v0i = (r.vl[0] >> (4 * i)) & 0x0f0f0f0f;
         const int v1i = (r.vl[1] >> (4 * i)) & 0x0f0f0f0f;
         const int dot1 = dp4a(v1i, u1, dp4a(v0i, u0, 0));
         const int dot2 = dp4a(0x01010101, u1, dp4a(0x01010101, u0, 0));
-#endif
         sumf_d = fma_ftz(d8, float(dot1 * int(r.sc[i])), sumf_d);
         sumf_m = fma_ftz(d8, float(dot2 * int(r.m[i])), sumf_m);
     }
@@ -300,7 +301,7 @@ kernel void basalt_mmvq(device const ushort* w [[buffer(0)]], device const uint*
             float t = tmp[j][i];
             for (int l = 0; l < NW - 1; ++l) t = add_ftz(t, partial[l][j][i][lane]);
             t = warp_sum_ftz(t);
-            if (int(lane) == i && row0 + i < n_out) y[j * n_out + row0 + i] = t;
+            if (int(lane) == i && row0 + i < n_out) y[j * n_out + row0 + i] = cuda_nan(t);
         }
     }
 }
