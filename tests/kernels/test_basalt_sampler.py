@@ -596,7 +596,13 @@ def test_basalt_sampler_rows_alone(path):
     if path in SAMPLED:
         T, V = l.shape
         k = sampled_k(p.top_k, V)
-        want = [mirror_pick(mirror_select(l[t], V, window_of(hist, hist_len, t, p.penalty_last_n), p, k), k, p, t)
-                for t in range(T)]
+
+        def mirror(q, windowed=True):
+            return [mirror_pick(mirror_select(l[t], V, window_of(hist, hist_len, t, q.penalty_last_n) if windowed
+                                              else [], q, k), k, q, t) for t in range(T)]
+
+        want = mirror(p)
+        assert want != mirror(replace(p, top_p=1.0)) and want != mirror(replace(p, min_p=0.0)) \
+            and want != mirror(p, windowed=False), "the fixture's top_p, min_p and penalties each decide a pick"
         got = list(getattr(gpu, path)(l, p, hist=hist, hist_len=hist_len))
         assert got == want, f"the window's picks {got} are mirror_pick's {want} (T§3.6)"
