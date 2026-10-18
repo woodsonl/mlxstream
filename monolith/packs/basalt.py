@@ -16,9 +16,9 @@ IR names and what each entry holds (``BasaltEntry``: absolute ``offset``, ``nbyt
 A value binds an entry only when it declares it exactly: a weight's format, or a constant's dtype, is the entry's
 ggml type name (``u8`` for a section), and its shape is the entry's. Refused when a value binds it, with the reason: a
 ``dense`` row with no ggml type a value can declare (an ``in_gguf`` row, which ``gguf/<name>`` serves; kind 0, basalt's
-verbatim planes; kinds 1 and 3, which basalt converts at load) or one basalt does not copy whole, a type the format
-plugins lack, a size its type and shape do not give, an entry of no bytes. Two entries of one name make the file
-unreadable.
+verbatim planes; kinds 1 and 3, which basalt converts at load) or with source bytes that do not fill its arena slot
+exactly (basalt copies every source byte into the slot), a type the format plugins lack, a size its type and shape do
+not give, an entry of no bytes. Two entries of one name make the file unreadable.
 
 ``copy=True`` is a test mode: each bound tensor becomes a buffer of exactly its own bytes, so shader validation bounds
 every access by its tensor, not by a page-rounded window that holds its neighbours too. The bytes are the same.
@@ -63,7 +63,8 @@ class BasaltSource:
                 why = (f"its bytes are in gguf: bind gguf/{r.name}" if r.in_gguf else
                        f"kind {r.kind} has no ggml type to declare (kind 0 is basalt's verbatim planes; it converts "
                        "kinds 1 and 3 at load)" if r.kind not in DENSE_KINDS else
-                       f"basalt copies {r.dst_bytes} of its {r.src_bytes} bytes" if r.src_bytes != r.dst_bytes else None)
+                       f"its row gives {r.src_bytes} source bytes but a {r.dst_bytes}-byte slot (basalt's loader "
+                       "copies every source byte into the slot)" if r.src_bytes != r.dst_bytes else None)
                 self._add(f"dense/{r.name}", base + r.src_off, r.src_bytes, DENSE_KINDS.get(r.kind),
                           (r.ne1, r.ne0) if r.ne1 else (r.ne0,), why)
         if "mtp/dense.index" in f.sections:

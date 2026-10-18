@@ -42,11 +42,11 @@ DENSE = [                                   # dense.index v3 rows: name file kin
     "n0.weight 0 2 0 256 0 256 64 0 0 0 1 0 0 0 0 0 0 0",                  # F32 [64], page 0
     "hc.weight 0 4 256 65536 256 65536 16384 2 0 0 1 0 0 0 0 0 0 0",       # BF16 [2, 16384]: pages 0 to 4, bound by none
     "n1.weight 0 5 65792 256 65792 256 64 2 0 0 1 0 0 0 0 0 0 0",          # F16 [2, 64], page 4
-    "n2.weight 0 2 66048 256 66048 256 16 4 0 0 1 0 0 0 0 0 0 0",          # F32 [4, 16], page 4
+    "n2.weight 0 2 66048 256 67072 256 16 4 0 0 1 0 0 0 0 0 0 0",          # F32 [4, 16], page 4; slot past m's
     "g.weight 0 0 0 0 0 0 64 2 8 0 32 0 0 0 0 0 0 0",                      # shape only: served from gguf
     "p.weight 0 1 66304 256 66304 128 64 0 0 0 1 0 0 0 0 0 0 0",           # BF16 promoted to F32: converted at load
     "k0.weight 0 0 66560 64 66560 64 256 0 2 0 32 0 0 64 0 0 0 0",         # kind 0: basalt's verbatim planes
-    "s.weight 0 2 66624 256 66624 128 64 0 0 0 1 0 0 0 0 0 0 0",           # copies 128 of its 256 bytes
+    "s.weight 0 2 66624 256 66624 128 64 0 0 0 1 0 0 0 0 0 0 0",           # 256 source bytes for a 128-byte slot
     "m.weight 0 2 66880 192 66880 192 64 0 0 0 1 0 0 0 0 0 0 0",           # 192 bytes for F32 [64]
 ]
 MTP = b"fc.weight q8_0 2 64 0 136\nnorm.weight f32 1 64 256 256\nproj.weight bf16 4 64 512 512\nodd.weight f64 1 8 1024 64\n"
@@ -99,19 +99,20 @@ def mapped(buffers):
 
 
 def test_source_names_each_tensor_by_its_name_space(tmp_path):
+    """Every entry the other tests bind (BOUND) at the offset the tables above give it, so the GPU test, which takes
+    its expected bytes from the entries, reads the right ones: a dense row at its file offset (src_off), not at its
+    arena slot (dst_off)."""
     src = BasaltSource(write(tmp_path))
     gg, de, mt, mx = (src.file.section(s).offset for s in ("gguf", "dense", "mtp/dense", "mtp/experts"))
     E = BasaltEntry
-    assert src.entries["gguf/a.weight"] == E("gguf/a.weight", gg, 272, 8, (4, 64))
-    assert src.entries["gguf/c.weight"] == E("gguf/c.weight", gg + 16384, 49152, 30, (3, 8192))
-    assert src.entries["gguf/q3.weight"] == E("gguf/q3.weight", gg + 102400, 110, 11, (1, 256))
-    assert src.entries["gguf/e.weight"] == E("gguf/e.weight", gg + 98304, 256, 0, (64,))
-    assert src.entries["dense/n0.weight"] == E("dense/n0.weight", de, 256, 0, (64,))
-    assert src.entries["dense/n1.weight"] == E("dense/n1.weight", de + 65792, 256, 1, (2, 64))
-    assert src.entries["dense/hc.weight"] == E("dense/hc.weight", de + 256, 65536, 30, (2, 16384))
-    assert src.entries["mtp/fc.weight"] == E("mtp/fc.weight", mt, 136, 8, (2, 64))
-    assert src.entries["mtp/proj.weight"] == E("mtp/proj.weight", mt + 512, 512, 30, (4, 64))
-    assert src.entries["mtp/experts"] == E("mtp/experts", mx, 33768, None, (33768,))
+    want = [E("gguf/a.weight", gg, 272, 8, (4, 64)), E("gguf/b.weight", gg + 4096, 288, 12, (2, 256)),
+            E("gguf/c.weight", gg + 16384, 49152, 30, (3, 8192)), E("gguf/q3.weight", gg + 102400, 110, 11, (1, 256)),
+            E("gguf/e.weight", gg + 98304, 256, 0, (64,)), E("dense/n0.weight", de, 256, 0, (64,)),
+            E("dense/n1.weight", de + 65792, 256, 1, (2, 64)), E("dense/n2.weight", de + 66048, 256, 0, (4, 16)),
+            E("dense/hc.weight", de + 256, 65536, 30, (2, 16384)), E("mtp/fc.weight", mt, 136, 8, (2, 64)),
+            E("mtp/norm.weight", mt + 256, 256, 0, (1, 64)), E("mtp/proj.weight", mt + 512, 512, 30, (4, 64)),
+            E("mtp/experts", mx, 33768, None, (33768,))]
+    assert [src.entries[e.name] for e in want] == want and set(BOUND) <= {e.name for e in want}
     assert set(src.refused) == {"gguf/x.weight", "gguf/z.weight", "dense/g.weight", "dense/p.weight",
                                 "dense/k0.weight", "dense/s.weight", "dense/m.weight", "mtp/odd.weight"}
     assert src.slabs == {} and src.aux == {} and src.file_bytes % ALIGN == 100
@@ -181,7 +182,7 @@ def test_copy_mode_binds_an_exact_buffer_per_tensor(tmp_path):
     ("dense/g.weight", "its bytes are in gguf: bind gguf/g.weight"),
     ("dense/p.weight", "kind 1 has no ggml type to declare"),
     ("dense/k0.weight", "kind 0 has no ggml type to declare"),
-    ("dense/s.weight", "basalt copies 128 of its 256 bytes"),
+    ("dense/s.weight", "its row gives 256 source bytes but a 128-byte slot"),
     ("dense/m.weight", r"192 bytes are not f32 \[64\]"),
     ("gguf/x.weight", "ggml type 99 has no format here"),
     ("gguf/z.weight", "it holds no bytes"),
