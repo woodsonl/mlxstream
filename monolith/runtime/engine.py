@@ -95,9 +95,10 @@ class Engine:
         if program.host_points:
             program.check_host_points(self._same_memory)
         self.pipelines = compile_pipelines(program, self.dev, fast_math=fast_math, cache=pipeline_cache)
-        for key, pso in self.pipelines.items():               # every kernel's SIMD-group is 32 lanes (crews, butterflies)
+        for key, pso in self.pipelines.items():               # the crews and butterflies take 32-lane SIMD-groups
             if pso.thread_execution_width != 32:
-                raise ValueError(f"kernel {key}: SIMD-groups of {pso.thread_execution_width} lanes; the kernels assume 32")
+                raise ValueError(f"kernel {key}: SIMD-groups of {pso.thread_execution_width} lanes; the kernels "
+                                 "assume 32")
         for o in program.ops:                                 # a larger threadgroup would not run as encoded
             limit = self.pipelines[o.kernel].max_threads_per_threadgroup
             if math.prod(o.threadgroup) > limit:

@@ -51,6 +51,7 @@ def test_refuses_a_simd_group_of_other_than_32_lanes(monkeypatch):
             self.max_threads_per_threadgroup = pso.max_threads_per_threadgroup
 
     assert all(p.thread_execution_width == 32 for p in Engine(capped_program(64)).pipelines.values())
-    monkeypatch.setattr(engine_module, "compile_pipelines", lambda *a, **k: {n: Narrow(p) for n, p in real(*a, **k).items()})
+    monkeypatch.setattr(engine_module, "compile_pipelines",
+                        lambda *a, **k: {n: Narrow(p) for n, p in real(*a, **k).items()})
     with pytest.raises(ValueError, match="kernel capped: SIMD-groups of 16 lanes; the kernels assume 32"):
         Engine(capped_program(64))

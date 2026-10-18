@@ -33,7 +33,8 @@ QK = kernels.Q8_1_BLOCK_BYTES
 # shared expert's down, fed by the SwiGLU quantizer), every dense_tc type in every summation order at basalt's defaults
 # (170 multiprocessors, an aligned weight; "tile" at 2721 rows, 171 tiles, where a row is whole 16-byte units and 170
 # tiles would take the one order), the pair's types, and Q4_K at 2048 x 336, which 170 multiprocessors run in the one
-# order and 20 (PROFILE's cores) in the tile order. BF16 rows (name: (n_out, n_in)) live in the dense section, as basalt's do.
+# order and 20 (PROFILE's cores) in the tile order. BF16 rows (name: (n_out, n_in)) live in the dense section, as
+# basalt's do.
 DTC_IN = {"one": 2048, "tile": 512, "s2": 22528, "s1": 23040}
 MMVQ = {f"mmvq.{t}": (t, 70, 2560) for t in kernels.MMVQ_TRAITS}
 MMVQ["mmvq.down"] = (8, 70, 640)
@@ -185,7 +186,8 @@ def expected(gop, src, t):
         t1, n_out1 = ws[1].type_id, ws[1].shape[0]
         m = kernels.basalt_dense_tc_pair_macros(tid, t1, n_in)
         return ("basalt_dense_tc_pair", m, kernels.basalt_dense_tc_source(),
-                kernels.basalt_dense_tc_params(n_in, n_out, t, n_out1), *kernels.basalt_dense_tc_pair_grid(n_out, n_out1))
+                kernels.basalt_dense_tc_params(n_in, n_out, t, n_out1),
+                *kernels.basalt_dense_tc_pair_grid(n_out, n_out1))
     m = kernels.basalt_mmvf_macros(n_in, n_out, t)
     return ("basalt_mmvf", m, kernels.basalt_mmvf_source(), kernels.basalt_mmvf_params(n_in, n_out, t),
             n_out, kernels.basalt_mmvf_block(n_in))
@@ -225,7 +227,7 @@ def test_dispatches_are_the_builders(src, t):
 
 
 def test_dense_tc_runs_basalts_orders(src):
-    """Each dtc.<type>.<order> tensor runs in the order it names, at basalt's 170 multiprocessors and aligned weights."""
+    """Each dtc.<type>.<order> tensor runs in the order it names (basalt's 170 multiprocessors, aligned weights)."""
     g = Graph("step")
     all_ops(g, src)
     prog = emit(g, src, 8)
@@ -286,7 +288,7 @@ def _dynamic(kind):
 
 
 def _q8_1_columns(quantizer):
-    def build(g, src, bad, tmp):                 # 16 columns: a static count, as the default t_max (8) allows no T past 8
+    def build(g, src, bad, tmp):     # 16 columns: a static count, as the default t_max (8) allows no T past 8
         rows = 16 if bad else 8
         xs = [g.input(n, (rows, 64), F32) for n in (("gate", "up") if quantizer == "swiglu" else ("x",))]
         q8_1(g, "xq", xs, quantizer, rows=rows)

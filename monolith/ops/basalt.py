@@ -4,10 +4,11 @@ merged kernel (``kernels/common/basalt_*.metal``); the emitter (``compiler/emit_
 threadgroup and params from ``monolith/kernels.py``'s builders only, never from the profile's crew or core count.
 
 Values. A weight is the GGUF tensor as shipped, ``[n_out, n_in]`` values: a weight value whose format is the ggml type's
-name, or, for BF16 rows, a constant whose dtype is (a ``.basalt`` file's ``dense`` rows; ``packs/basalt.py``).
-Activations are F32 ``[T, n]``; q8_1 rows are U8 ``[T, n_in / 32 * 36]``, column j's 36-byte blocks after column
-j - 1's (``basalt_q8_1.metal``). T, the window's columns, is the first output's rows. Columns are contiguous: an output is
-exactly ``[T, n_out]``, an input exactly its op's width (basalt's kernels address column j at j times the width).
+name, or, for BF16 rows, a constant whose dtype is (a ``.basalt`` file's ``dense`` rows; ``packs/basalt.py``), never a
+pack's block-lane-major slab. Activations are F32 ``[T, n]``; q8_1 rows are U8 ``[T, n_in / 32 * 36]``, column j's
+36-byte blocks after column j - 1's (``basalt_q8_1.metal``). T, the window's columns, is the first output's rows.
+Columns are contiguous: an output is exactly ``[T, n_out]``, an input exactly its op's width (basalt's kernels address
+column j at j times the width).
 
 Programs. basalt captures one graph per window width (T = 1 .. 8) and bakes T into every launch, so these ops compile T
 into their macros and params: one static program per width, sharing the weight windows by name. A dynamic-T program
@@ -25,7 +26,8 @@ is refused (it binds StepState, which none of these kernels reads).
   GPU's core count or a binding's offset would give.
 * ``basalt_dense_tc_pair`` (``dense_tc_pair``): ``(xq, w0 [n_out0, n_in], w1 [n_out1, n_in])`` →
   ``(y0 [T, n_out0], y1 [T, n_out1])``, two projections of one input in the tile order. basalt runs it for every GDN
-  layer's qkv and z projections whose weights are both 16-byte aligned (``pair_ok``), which every ``.basalt`` binding is.
+  layer's qkv and z projections whose weights are both 16-byte aligned (``pair_ok``), which every ``.basalt`` binding
+  is.
 * ``basalt_mmvf`` (``bf16_gemv_fp32_mmvf``, ``bf16_gemv_fp32_mmvf_multi``): ``(x [T, n_in] F32, w [n_out, n_in] bf16)``
   → ``y [T, n_out] F32``; the one-row kernel at T = 1, the multi-row kernel above, which gives every row the one-row
   kernel's bits.

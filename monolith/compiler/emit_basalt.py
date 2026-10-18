@@ -54,7 +54,8 @@ def _bind(ctx: _Ctx, op: Op, slot: int, v: Value, align: int) -> Tuple[int, str,
     checks the pointer; a window's buffer starts on a page)."""
     buf, off = ctx.buf(v)
     if off % align:
-        raise ValueError(f"{op.kind}: {v.name!r} binds at byte {off} of {buf}; slot {slot} needs {align}-byte alignment")
+        raise ValueError(f"{op.kind}: {v.name!r} binds at byte {off} of {buf}; slot {slot} needs {align}-byte "
+                         "alignment")
     return slot, buf, off
 
 
@@ -69,7 +70,7 @@ def _q8_1(ctx: _Ctx, op: Op) -> None:
     n_in = ctx.shape(xs[0])[-1]
     if n_in < 1 or n_in % 32:
         raise ValueError(f"basalt_q8_1: a column of {n_in} values is not whole 32-value blocks")
-    if kind != "ieee" and t > 8:                     # validate_shape (native_mmvq.cu:1465-1470); quantize_q8_1_rows has none
+    if kind != "ieee" and t > 8:     # validate_shape (native_mmvq.cu:1465-1470); quantize_q8_1_rows has none
         raise ValueError(f"basalt_q8_1 {kind}: {t} columns; basalt quantizes 1 to 8")
     for x in xs:
         _expect(ctx, op, x, (t, n_in), DType.F32, "the quantized columns")
@@ -77,8 +78,8 @@ def _q8_1(ctx: _Ctx, op: Op) -> None:
     if kind == "ieee":
         other = sorted({c.kind for c in y.consumers} - set(IEEE_READERS))
         if other:
-            raise ValueError(f"basalt_q8_1 ieee: {y.name!r} is read by {other}; basalt's IEEE rows feed only the routed "
-                             f"experts ({', '.join(IEEE_READERS)})")
+            raise ValueError(f"basalt_q8_1 ieee: {y.name!r} is read by {other}; basalt's IEEE rows feed only the "
+                             f"routed experts ({', '.join(IEEE_READERS)})")
     n = t * n_in
     k = ctx.kernel("basalt_q8_1", kernels.basalt_q8_1_source(), Q8_1_KERNELS[kind], {})
     prm = ctx.params("basalt_q8_1", kernels.basalt_q8_1_params(n))
@@ -125,15 +126,16 @@ def _dense_tc_pair(ctx: _Ctx, op: Op) -> None:
     t0, n_out0, n_in = _weight(ctx, op, w0, kernels.DENSE_TC_SB)
     t1, n_out1, n_in1 = _weight(ctx, op, w1, kernels.DENSE_TC_SB)
     if n_in1 != n_in:
-        raise ValueError(f"basalt_dense_tc_pair: {w0.name!r} has {n_in} columns, {w1.name!r} {n_in1}; the pair reads one input")
+        raise ValueError(f"basalt_dense_tc_pair: {w0.name!r} has {n_in} columns, {w1.name!r} {n_in1}; the pair reads "
+                         "one input")
     macros = kernels.basalt_dense_tc_pair_macros(t0, t1, n_in)
     _gemv_values(ctx, op, t, xq, n_in, [y0, y1], [n_out0, n_out1])
     grid, threads = kernels.basalt_dense_tc_pair_grid(n_out0, n_out1)
     k = ctx.kernel("basalt_dense_tc", kernels.basalt_dense_tc_source(), "basalt_dense_tc_pair", macros)
     prm = ctx.params("basalt_dense_tc_pair", kernels.basalt_dense_tc_params(n_in, n_out0, t, n_out1))
-    ctx.add(k, [_bind(ctx, op, 0, w0, 16), _bind(ctx, op, 1, w1, 16), _bind(ctx, op, 2, xq, 4), _bind(ctx, op, 3, y0, 4),
-                _bind(ctx, op, 4, y1, 4), (5, prm, 0)], (grid, 1, 1), (threads, 1, 1), f"{op.kind}:{w0.name}+{w1.name}",
-            writes=[3, 4])
+    bindings = [_bind(ctx, op, 0, w0, 16), _bind(ctx, op, 1, w1, 16), _bind(ctx, op, 2, xq, 4),
+                _bind(ctx, op, 3, y0, 4), _bind(ctx, op, 4, y1, 4), (5, prm, 0)]
+    ctx.add(k, bindings, (grid, 1, 1), (threads, 1, 1), f"{op.kind}:{w0.name}+{w1.name}", writes=[3, 4])
 
 
 def _mmvf(ctx: _Ctx, op: Op) -> None:
