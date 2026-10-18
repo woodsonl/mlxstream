@@ -285,23 +285,29 @@ def coupled_draft(logits, p, *, j, ring, cell=0, sub_to_id=None, id_to_sub=None,
     ``p``, whose image is the round's copy (coupled_parity uploads it there; no stage): ``bs_coupled_penalize``, one
     threadgroup of ``threads`` (basalt's 1,024), penalises the row in place over draft j's window in ``ring`` (cap +
     max_t,) int32; then ``bs_coupled_part``, ceil(nv / 4,096) + 1 threadgroups of exactly 512 (the extra one must exit
-    at the block guard), stores each block's list to cand at b * 64, which starts as 0xFF bytes. ``sub_to_id`` (nv,)
+    at the block guard), stores each block's list to cand at b * 64, which starts as 0xFF bytes; then
+    ``bs_coupled_merge``, one SIMD-group, merges the lists and draws the draft's token with the counter cell + 1, into
+    the id and probability words (each exactly 4 bytes, starting as 0xFF bytes) and ring[cap + j]. ``sub_to_id`` (nv,)
     and ``id_to_sub`` (id_vocab,) int32: the subset's maps (the node's flags), or None; ``cell``: the step record's.
-    Returns .logits, the row's bits after the run, .cand, the (n_blocks, 64, 2) uint32 lists, and .ring; asserts the
-    extra block untouched."""
+    Returns .logits, the row's bits after the run, .cand, the (n_blocks, 64, 2) uint32 lists, .ring, .id and .prob,
+    the probability's bits; asserts the extra block untouched."""
     l = np.ascontiguousarray(logits, np.float32)
     nv, dev = l.size, gpu.device()
     nb = -(-nv // kernels.BS_BLOCK)
     node = kernels.basalt_coupled_node(nv, nv if id_to_sub is None else len(id_to_sub), cap, j,
                                        id_to_sub=id_to_sub is not None, sub_to_id=sub_to_id is not None)
     bl, cand = nt.Buffer(dev, l.tobytes()), nt.Buffer(dev, (nb + 1) * kernels.BS_SEL_MAX * 8)
-    rb = nt.Buffer(dev, np.ascontiguousarray(ring, np.int32).tobytes())
-    cand.fill(0xFF)
-    bufs = {0: bl, 9: cand, 13: coupled_image(p), 14: rb, 18: np.int32(cell).tobytes()}
+    rb, oid, opr = nt.Buffer(dev, np.ascontiguousarray(ring, np.int32).tobytes()), nt.Buffer(dev, 4), nt.Buffer(dev, 4)
+    for b in (cand, oid, opr):
+        b.fill(0xFF)
+    bufs = {0: bl, 5: oid, 6: opr, 9: cand, 13: coupled_image(p), 14: rb, 18: np.int32(cell).tobytes()}
     bufs.update({k: np.ascontiguousarray(m, np.int32).tobytes() for k, m in ((11, sub_to_id), (12, id_to_sub))
                  if m is not None})
-    coupled_run([("bs_coupled_penalize", 1, threads), ("bs_coupled_part", nb + 1, CPL_PART_THREADS)], node, bufs)
+    coupled_run([("bs_coupled_penalize", 1, threads), ("bs_coupled_part", nb + 1, CPL_PART_THREADS),
+                 ("bs_coupled_merge", 1, 32)], node, bufs)
     lists = np.frombuffer(cand.read(0, cand.nbytes), np.uint32).reshape(nb + 1, kernels.BS_SEL_MAX, 2)
     assert np.all(lists[nb] == 0xFFFFFFFF), "the block past the row's was written"
     return SimpleNamespace(logits=np.frombuffer(bl.read(0, bl.nbytes), np.uint32).copy(), cand=lists[:nb].copy(),
-                           ring=np.frombuffer(rb.read(0, rb.nbytes), np.int32).copy())
+                           ring=np.frombuffer(rb.read(0, rb.nbytes), np.int32).copy(),
+                           id=int(np.frombuffer(oid.read(0, 4), np.int32)[0]),
+                           prob=int(np.frombuffer(opr.read(0, 4), np.uint32)[0]))

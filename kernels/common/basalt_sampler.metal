@@ -837,4 +837,50 @@ kernel void bs_coupled_part(device const uint* logits [[buffer(0)]], constant Bs
     part_list<BS_CPL_PER_LANE, BS_CPL_WARPS, false>(logits, nv, sampled_k(cparams->top_k, nv), b,
                                                     cand + ulong(b) * BS_SEL_MAX, wl, tid, lane, sg);
 }
+
+// coupled_merge_kernel (sampler.cu:779-818): draft j's token, on one SIMD-group (basalt's 32 threads). It merges the
+// first k = sampled_k(top_k, nv) entries of each of the row's ceil(nv / 4,096) block lists, read from cand at stride 64
+// in place of basalt's copy into shared memory (the same entries read: the same list), into the draft's top-k list,
+// the sentinel's id nv stored as 0. A greedy request (the greedy byte nonzero, or a temperature neither above 0 nor
+// NaN: sampler.cu:805's setp.gtu, on the bits, so a NaN or positive subnormal temperature samples) takes the list's
+// head with probability 1.0; any other runs sampled_tail with the round's seed and the counter of the row that will
+// verify the draft, the step record's cell sign-extended plus 1 (coupled_draft_counter), not the copy's counter. Lane 0
+// maps the pick through sub_to_id (flags SUB_TO_ID) and stores it to out_id and to ring[cap + j], the next draft's
+// window, and its probability's bits to out_prob. A dispatch of another width returns at once (two SIMD-groups would
+// share the tail's arrays), as does a row of more blocks than the merge's 64 lists.
+kernel void bs_coupled_merge(device int* out_id [[buffer(5)]], device uint* out_prob [[buffer(6)]],
+                             constant BsCoupledParams& c [[buffer(7)]], device const uint2* cand [[buffer(9)]],
+                             device const int* sub_to_id [[buffer(11)]],
+                             device const BsCoupledSampler* cparams [[buffer(13)]], device int* ring [[buffer(14)]],
+                             device const StepState* st [[buffer(15)]], device const int* step_rec [[buffer(18)]],
+                             uint tpg [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup int sel_ids[BS_SEL_MAX];
+    threadgroup uint sel_logit[BS_SEL_MAX];
+    threadgroup ulong ex[BS_SEL_MAX];
+    const uint nv = c.nv, nb = (nv + BS_BLOCK - 1u) / BS_BLOCK;
+    if (st->done || tpg != 32u || nb > BS_SPLIT_MAX_BLOCKS) return;
+    const BsCoupledSampler p = *cparams;                                                  // :787
+    const ulong counter = ulong(long(step_rec[0]) + 1);                                  // :788
+    const uint k = sampled_k(p.top_k, nv);                                                // :789
+    BsHeads h = merge_heads(cand, nb, BS_SEL_MAX, nv, lane);                              // :801-803
+    for (uint i = 0u; i < k; ++i) {                                                       // bounded: k rounds
+        const uint2 e = merge_lists(h, cand, BS_SEL_MAX, k, nv, lane);
+        if (lane == 0u) {
+            sel_ids[i] = e.x < nv ? int(e.x) : 0;
+            sel_logit[i] = e.y;
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    const uint tb = as_type<uint>(p.temperature);
+    BsDraw d = {sel_ids[0], 0x3f800000u, 0u};                                             // :805-806, greedy
+    if (p.greedy == 0 && (fnan(tb) || f_gt(tb, 0u)))                                      // :805, the same in every lane
+        d = sampled_tail(sel_ids, sel_logit, k, as_type<uint>(p.top_p), as_type<uint>(p.min_p), tb, p.min_keep, p.seed,
+                         counter, false, 0, ex, lane);                                    // :808
+    if (lane == 0u) {                                                                     // :811-817
+        const int id = (c.flags & BS_SUB_TO_ID) != 0u ? sub_to_id[d.pick] : d.pick;
+        out_id[0] = id;
+        out_prob[0] = d.prob;
+        ring[c.cap + c.j] = id;
+    }
+}
 #endif
