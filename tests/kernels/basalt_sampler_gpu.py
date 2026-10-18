@@ -12,6 +12,9 @@ its block lists.
   each buffer is exactly the size its rows need, so shader validation sees a store past it.
 - A wrapper takes the reference module's ``SamplerParams`` (tests/basalt_sampler_ref.py) and packs ``BsSampleParams``
   with the mode its kernels gate on; the seed goes to StepState ``rng_lo`` / ``rng_hi``, the counter to ``ctr_base``.
+- The probe (basalt's sample_tokens_probe, the sampled wrappers' ``query``): flags PROBE in the record, row t's query
+  in StepState ``pending_tokens[t + 1]``, as the engine's draft tokens sit there, and the queried row count in the
+  ``nq`` buffer.
 """
 
 import struct
@@ -51,15 +54,17 @@ def record(p, vocab, rows, hist_len, mode, bias=False, probe=False, id_map=False
         penalty_present=p.penalty_present)
 
 
-def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, id_map=None, position=0, fill=0xFF,
-           scratch=None, lbuf=None, queue=None):
+def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, id_map=None, query=None, nq=0, position=0,
+           fill=0xFF, scratch=None, lbuf=None, loff=0, queue=None):
     """Run ``steps``, (pipeline, grid, threads) in order, on one window: ``logits`` (T, V) float32, ``p`` the request,
     ``hist`` the flat (T, hist_len) int32 history rows, ``bias`` (V,) float32, ``id_map`` (V,) int32 (flags MAP),
-    ``position`` StepState's.
+    ``query`` the probe's T query ids (flags PROBE; rows t < ``nq`` write their query's probability), ``position``
+    StepState's.
     ``scratch``: {slot: a byte count, a fresh buffer starting as 0xFF; or an ``nt.Buffer`` the caller holds, to read
     back}. ``lbuf``: a buffer already holding ``logits``, bound in place of a fresh upload (sampler_parity's
-    DeviceRows, rows uploaded once and sampled many times: the test reads it back). ``queue``: the ``nt.Queue`` to
-    run on (basalt's stream), else a new one.
+    DeviceRows, rows uploaded once and sampled many times: the test reads it back), at byte offset ``loff`` (basalt's
+    ``d_l + t * NV``: ``logits`` then gives only the shape). ``queue``: the ``nt.Queue`` to run on (basalt's stream),
+    else a new one.
     Every slot the family binds is bound, a 16-byte placeholder where the request has no such datum. Returns the T
     picks and the T probabilities' bits; asserts the extra row of each output untouched."""
     l = np.ascontiguousarray(logits, np.float32)
@@ -74,20 +79,21 @@ def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, id_map=N
         return b
 
     st = LAYOUT.pack({"t_this_step": T, "position": position, "rng_lo": p.seed & 0xFFFFFFFF,
-                      "rng_hi": (p.seed >> 32) & 0xFFFFFFFF})
+                      "rng_hi": (p.seed >> 32) & 0xFFFFFFFF,
+                      "pending_tokens": [] if query is None else [0] + [int(q) for q in query]})
     slots = {0: buf(l.tobytes()) if lbuf is None else lbuf, 1: buf(struct.pack("<Q", p.counter & (2 ** 64 - 1))),
-             2: buf(bytes(16)),
+             2: buf(struct.pack("<I", nq)),
              3: buf(bytes(16) if bias is None else np.ascontiguousarray(bias, np.float32).tobytes()),
              4: buf(bytes(16) if hist is None else np.ascontiguousarray(hist, np.int32).tobytes()),
              5: buf(4 * rows, fill), 6: buf(4 * rows, fill),
-             7: buf(record(p, V, rows, hist_len, mode, bias is not None, id_map=id_map is not None)),
+             7: buf(record(p, V, rows, hist_len, mode, bias is not None, query is not None, id_map is not None)),
              11: buf(bytes(16) if id_map is None else np.ascontiguousarray(id_map, np.int32).tobytes()), 15: buf(st)}
     slots.update({k: n if isinstance(n, nt.Buffer) else buf(n, 0xFF) for k, n in (scratch or {}).items()})
     ds = []
     for pso, grid, tg in steps:
         d = nt.Dispatch().pipeline(pso)
         for k, b in slots.items():
-            d = d.buffer(k, b)
+            d = d.buffer(k, b, loff if k == 0 else 0)
         ds.append(d.grid(*grid).threadgroup(tg))
     r = (nt.Queue(dev) if queue is None else queue).run(ds)
     assert not r.error, r.error
@@ -160,50 +166,66 @@ def split_part(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=
     return lists[:T].copy()
 
 
-def split(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None, queue=None):
+def probed(picks, qbits, fill, query):
+    """A sampled wrapper's result: with the probe (``query``) the picks and the probabilities' bits, else the picks,
+    ``qprob`` asserted to keep its prefill."""
+    if query is not None:
+        return picks, qbits
+    assert np.all(qbits == np.frombuffer(bytes([fill]) * 4, np.uint32)[0]), "qprob was written without the probe"
+    return picks
+
+
+def split(logits, p, *, hist=None, hist_len=0, bias=None, query=None, nq=0, position=0, fill=0xFF, lbuf=None, loff=0,
+          queue=None):
     """S-SPLIT, basalt's sampler_split_part_kernel then sampler_split_merge_kernel: ``bs_split_part`` as in
     ``split_part``, then ``bs_split_merge``, one SIMD-group per row, which merges the row's block lists from ``cand``
     and runs the sampled tail. Mode 2 whatever the request asks, without the cluster pair the engine runs first (it
-    would hide a row the split never wrote); ``cand`` holds exactly the rows' lists. The probe is off, so ``qprob``
-    must keep its prefill (asserted). Returns the T picks."""
+    would hide a row the split never wrote); ``cand`` holds exactly the rows' lists. Returns the T picks, ``qprob``
+    asserted untouched; with the probe (``query``, ``nq``: S-SPLIT+Q) the picks and the probabilities' bits."""
     part, merge = pipeline("bs_split_part"), pipeline("bs_split_merge")
     T, V = np.shape(logits)
     rows, nb = T + 1, -(-V // kernels.BS_BLOCK)
     picks, qbits = launch([(part, (nb, rows), SPLIT_THREADS), (merge, (rows,), 32)], logits, p, mode=2, hist=hist,
-                          hist_len=hist_len, bias=bias, position=position, fill=fill,
-                          scratch={9: rows * nb * sampled_k(p.top_k, V) * 8}, lbuf=lbuf, queue=queue)
-    assert np.all(qbits == np.frombuffer(bytes([fill]) * 4, np.uint32)[0]), "qprob was written without the probe"
-    return picks
+                          hist_len=hist_len, bias=bias, query=query, nq=nq, position=position, fill=fill,
+                          scratch={9: rows * nb * sampled_k(p.top_k, V) * 8}, lbuf=lbuf, loff=loff, queue=queue)
+    return probed(picks, qbits, fill, query)
 
 
-def one_block(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None, queue=None):
+def one_block(logits, p, *, hist=None, hist_len=0, bias=None, query=None, nq=0, position=0, fill=0xFF, lbuf=None,
+              loff=0, queue=None):
     """S-1B, basalt's sampler_one_block_kernel: ``bs_sample_one_block`` alone, one threadgroup of up to 1,024 threads
     per row, in mode 2 whatever the request asks and at any row count or vocabulary (the forced runs, F.2; the engine
-    runs it after the cluster pair, which would hide a row it never wrote), its bitmap scratch ``bitmap_bytes``. The
-    probe is off, so ``qprob`` must keep its prefill (asserted). Returns the T picks."""
+    runs it after the cluster pair, which would hide a row it never wrote), its bitmap scratch ``bitmap_bytes``.
+    Returns the T picks, ``qprob`` asserted untouched; with the probe (``query``, ``nq``: S-1B+Q) the picks and the
+    probabilities' bits."""
     pso = pipeline("bs_sample_one_block")
     T, V = np.shape(logits)
     picks, qbits = launch([(pso, (T + 1,), threads(pso))], logits, p, mode=2, hist=hist, hist_len=hist_len, bias=bias,
-                          position=position, fill=fill, scratch={10: bitmap_bytes(p, T + 1, V, hist_len)}, lbuf=lbuf,
-                          queue=queue)
-    assert np.all(qbits == np.frombuffer(bytes([fill]) * 4, np.uint32)[0]), "qprob was written without the probe"
-    return picks
+                          query=query, nq=nq, position=position, fill=fill,
+                          scratch={10: bitmap_bytes(p, T + 1, V, hist_len)}, lbuf=lbuf, loff=loff, queue=queue)
+    return probed(picks, qbits, fill, query)
 
 
-def rows_alone(path, logits, p, *, hist=None, hist_len=0, position=0):
+def rows_alone(path, logits, p, *, hist=None, hist_len=0, query=None, nq=0, position=0):
     """W.1, invariant 1 (a row's output never depends on the window width T or its place in it): ``path``'s window
-    against each row t run alone, a one-row window of its logits and history row at ``position + t``. Returns the
-    rows whose outputs (the picks; and the probabilities' bits, for a path that returns them) differ bitwise."""
+    against each row t run alone, a one-row window of its logits and history row at ``position + t``; with the probe
+    (``query``, ``nq``), row t's query and nq 1 when the window queries the row (t < nq), else nq 0. Returns the rows
+    whose outputs (the picks; and the probabilities' bits, for a path that returns them) differ bitwise."""
     run = globals()[path]
 
     def outs(r):
         return [np.asarray(a).view(np.uint32) for a in (r if isinstance(r, tuple) else (r,))]
 
-    batch = outs(run(logits, p, hist=hist, hist_len=hist_len, position=position))
+    def probe(t=None):
+        if query is None:
+            return {}
+        return {"query": query, "nq": nq} if t is None else {"query": query[t:t + 1], "nq": int(t < nq)}
+
+    batch = outs(run(logits, p, hist=hist, hist_len=hist_len, position=position, **probe()))
     bad = []
     for t in range(len(logits)):
         h = None if hist is None else np.asarray(hist)[t * hist_len:(t + 1) * hist_len]
-        one = outs(run(logits[t:t + 1], p, hist=h, hist_len=hist_len, position=position + t))
+        one = outs(run(logits[t:t + 1], p, hist=h, hist_len=hist_len, position=position + t, **probe(t)))
         if any(b[t] != o[0] for b, o in zip(batch, one)):
             bad.append(t)
     return bad

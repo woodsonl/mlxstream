@@ -15,7 +15,8 @@ a greedy request with neither G-CL, a sampled one S-SPLIT, and their ``forced`` 
 and S-1B in S-SPLIT's (F.2, A9). A sampled check takes its path from ``SAMPLED``, the sampled paths built so far:
 ``split``, the split part and merge (S-SPLIT, sampler_split_part_kernel then sampler_split_merge_kernel), and
 ``one_block``, the one-block sampled kernel forced on the same rows (S-1B, sampler_one_block_kernel; F.2: every split
-check also passes on S-1B, which basalt's dispatcher takes past 64 rows or 64 blocks).
+check also passes on S-1B, which basalt's dispatcher takes past 64 rows or 64 blocks). ``PROBED`` names them with the
+probe on (+Q, sample_tokens_probe: each queried row also writes its query's probability).
 
 - LB.1-6, logit_bias (both sides), with A9: the bias added in the kernel picks what the host-biased rows pick (the
   sampled penalised case also shows the order: bias, then penalties), bans an id at -inf and boosts one by 100, at 512
@@ -47,9 +48,15 @@ check also passes on S-1B, which basalt's dispatcher takes past 64 rows or 64 bl
 - M17.1, fixture 17: tie-heavy rows through the whole chain on two queues, against the mirror.
 - M18.2-3, fixture 18 (a) and (b): the split path on penalised rows at the engine's vocabulary, and each sampled path
   on 64 and 70 rows (either side of the split's row cap), against the mirror.
-- A2-A4, A7 and A8, the port's additions (spec T§10.2): the sampled kernels' penalty window is the tail; the
-  temperature comes after the filters; min_keep 3 and 10 clamp the top_p cut; subnormal logits are ordered exactly;
-  min_p above 1 keeps nothing and picks the list's head.
+- P.1-P.5, probe_parity, with P.6: over 7 rows (the split, and S-1B forced) and 70 (S-1B) of the engine's vocabulary
+  and three requests, the probe picks what the request picks without it (and the mirror), leaves the row past nq
+  unwritten, gives each queried row its query's probability within 1e-6 of the double reference, 0 exactly outside
+  the kept list, finite, and bit for bit the float64 evaluation of the kernel's order (P.6), and gives the same bits
+  for a row run alone on the split.
+- A2-A5, A7 and A8, the port's additions (spec T§10.2): the sampled kernels' penalty window is the tail; the
+  temperature comes after the filters; min_keep 3 and 10 clamp the top_p cut; the seed's high word and the counter's
+  wrap reach the draw; subnormal logits are ordered exactly; min_p above 1 keeps nothing and picks the list's head,
+  with the probe the head's probability 1.0.
 - TP.1, the port's addition (spec S§19.3): the drafter's greedy tail, ``top_prob`` (the cluster partials, then
   bs_greedy_top_prob), picks the host argmax, mapped, with the float64 softmax probability of the pick within
   q5k_head_parity's 1e-5.
@@ -57,10 +64,12 @@ check also passes on S-1B, which basalt's dispatcher takes past 64 rows or 64 bl
   as M16.1 does, so the 1,024 threads this GPU runs it at are not what makes its list.
 - PL.1, the port's building-block check of the split path's first stage (``split_part``, bs_split_part alone): each
   4,096-logit block's list in the scratch equals mirror_select's over the block, ids and value bits.
-- W.1, invariant 1: each path's window, row for row, equals its rows run alone (the top-prob path's probabilities
-  bit for bit too); the split's window is also the mirror's (mirror_select, then mirror_pick), row for row.
+- W.1, invariant 1: each path's window, row for row, equals its rows run alone (the top-prob path's probabilities,
+  and with the probe the sampled paths', bit for bit too); a sampled path's window is also the mirror's
+  (mirror_select, then mirror_pick), row for row.
 """
 
+import functools
 import itertools
 from dataclasses import replace
 
@@ -69,17 +78,19 @@ import pytest
 
 from monolith import kernels
 from monolith.runtime import _native as nt
-from tests.basalt_sampler_ref import (SamplerParams, f32, fixture2_data, fixture4_data, fixture6_data, fixture7_data,
+from tests.basalt_sampler_ref import (M, SamplerParams, f32, fixture2_data, fixture4_data, fixture6_data, fixture7_data,
                                       fixture8_data, fixture9_data, fixture10_data, fixture12_data, fixture13_data,
-                                      fixture16_data, fixture17_data, fixture18_data, greedy_pen, mirror_pick,
-                                      mirror_prob, mirror_select, normal_rows, penal_vec, penalty_rows, reference_pick,
-                                      sampled_k, sampled_reference, select_vec, window_of)
+                                      fixture16_data, fixture17_data, fixture18_data, fmax, greedy_pen, mirror_pick,
+                                      mirror_prob, mirror_select, normal_rows, nv_exp_memo, nv_logf, penal_vec,
+                                      penalty_rows, philox_uniform, probe_rows, reference_pick, sampled_k,
+                                      sampled_reference, select_vec, window_of)
 from tests.kernels import basalt_sampler_gpu as gpu
 from tests.kernels.basalt_gpu import device
 from tests.kernels.test_basalt_decode_cluster import PATTERNS, VOCABS, fill_logits, host_argmax
 
 GREEDY = ["greedy_cl", "greedy_1b"]
 SAMPLED = ["split", "one_block"]
+PROBED = [path + "+Q" for path in SAMPLED]
 
 
 def run(path, logits, p, want, hist=None, hist_len=0):
@@ -660,6 +671,171 @@ def test_basalt_sampler_row_cap(path, T):
         'compare(T > 64 ? "70 rows (one block)" : "64 rows (split)", rows.sample(p, nullptr), lists, k, p);'
 
 
+# ---- probe_parity (:382-465): the probe, sample_tokens_probe ---------------------------------------------------------
+
+PROBE_NV = 248320
+PROBE_CASES = {                     # probe_parity's three requests (:389-392): top_k, top_p, min_p, temperature
+    "k20-p.95-t0.6": (20, 0.95, 0.0, 0.6),
+    "k20-p.95-t1.0": (20, 0.95, 0.0, 1.0),
+    "k64-minp.05-t1.5": (64, 1.0, 0.05, 1.5),
+}
+# (T, path): basalt's paths, the split at 7 rows and S-1B at 70 (more rows than the split takes), and S-1B forced at
+# 7 (F.2); the one-row launches of P.5 are always the split's, as basalt's dispatcher sends one row there
+PROBE_UNITS = [(T, path, c) for T, path in ((7, "split"), (7, "one_block"), (70, "one_block")) for c in PROBE_CASES]
+PROBE_PARAMS = pytest.mark.parametrize("T,path,case", PROBE_UNITS, ids=[f"T{T}-{p}-{c}" for T, p, c in PROBE_UNITS])
+probe_window = functools.lru_cache(maxsize=None)(probe_rows)
+
+
+@functools.lru_cache(maxsize=None)
+def probe_lists(T, k):
+    """Each probe row's k-entry list, mirror_select's without a window: with no penalties it depends on k alone."""
+    l = probe_window(T)
+    return [mirror_select(l[t], PROBE_NV, [], SamplerParams(), k) for t in range(T)]
+
+
+def probe_queries(lists, k, nv):
+    """probe_parity's queries (:413-419), row t's by t % 4: its list's first id, its second, its last, or its first
+    plus 1, bumped by 7 at each list id it equals in one pass in list order (basalt's loop, which can leave it on an
+    earlier list id)."""
+    q = []
+    for t, sel in enumerate(lists):
+        m = t % 4
+        x = sel.ids[0] if m == 0 else sel.ids[1] if m == 1 else sel.ids[k - 1] if m == 2 else (sel.ids[0] + 1) % nv
+        if m == 3:
+            for i in sel.ids:
+                if i == x:
+                    x = (x + 7) % nv
+        q.append(x)
+    return np.int32(q)
+
+
+def probe_fixture(T, case):
+    """probe_parity's unit (:385-422): its T rows (probe_rows: normal(0, 3), every even row peaked), the request (seed
+    77, counter 1000, min_keep 1, no penalties, no bias), k, the rows' lists, the queries and nq = T - 1 ("as the
+    verifier asks: the last row has no draft"). Returns (l, p, k, lists, q, nq)."""
+    top_k, top_p, min_p, temperature = PROBE_CASES[case]
+    p = SamplerParams(top_k=top_k, top_p=top_p, min_p=min_p, temperature=temperature, seed=77, counter=1000)
+    k = sampled_k(p.top_k, PROBE_NV)
+    lists = probe_lists(T, k)
+    return probe_window(T), p, k, lists, probe_queries(lists, k, PROBE_NV), T - 1
+
+
+@functools.lru_cache(maxsize=None)
+def probe_launches(T, case, path):
+    """The unit's two launches on ``path`` (:423-424) over its rows uploaded once: the request without the probe, its
+    picks ``ref`` (sample_tokens), then with it, its picks ``got`` and the probabilities' bits ``pr``
+    (sample_tokens_probe; qprob starts as 0xFF bytes). Shared by P.1-P.6: do not mutate."""
+    l, p, _, _, q, nq = probe_fixture(T, case)
+    rows = nt.Buffer(device(), l.tobytes())
+    ref = getattr(gpu, path)(l, p, lbuf=rows)
+    got, pr = getattr(gpu, path)(l, p, query=q, nq=nq, lbuf=rows)
+    return ref, got, pr
+
+
+def kernel_qprob(sel, k, p, q):
+    """P.6's float64 evaluation of the kernel's own order (spec T§5; sampler.cu:369-437): mirror_pick's survivors
+    (top_p with base the fmax of the list and the min_keep clamp, then min_p) and its temperature sums with CUDA's exp
+    (``nv_exp_memo``), then the float32 of ex / sum at the FIRST kept entry whose id is q; 0 outside the kept list,
+    1.0 when nothing is kept and the list's head is q. Returns the float32's bits: both sides are binary64 IEEE
+    arithmetic on one exp, so they are the kernel's own."""
+    ids, lg = sel
+    n_keep, mx = k, lg[0]
+    for i in range(1, k): mx = fmax(mx, lg[i])
+    if f32(p.top_p) < 1:
+        ex = [nv_exp_memo(float(lg[i]) - float(mx)) for i in range(k)]
+        s = 0.0
+        for e in ex: s += e
+        cum, cut = 0.0, k
+        for i in range(k):
+            cum += ex[i] / s
+            if cum >= float(f32(p.top_p)): cut = i + 1; break
+        if cut < p.min_keep: cut = p.min_keep if p.min_keep < k else k
+        n_keep = cut
+    if f32(p.min_p) > 0:
+        thresh = lg[0] + nv_logf(f32(p.min_p))
+        for i in range(n_keep):
+            if lg[i] < thresh: n_keep = i; break
+    if n_keep == 0:
+        return 0x3F800000 if ids[0] == q else 0
+    inv_t = f32(1) / f32(p.temperature) if f32(p.temperature) > 0 else f32(0)
+    sc = [lg[i] * inv_t for i in range(n_keep)]
+    smx = sc[0]
+    for x in sc[1:]: smx = fmax(smx, x)
+    ex = [nv_exp_memo(float(x) - float(smx)) for x in sc]
+    s = 0.0
+    for e in ex: s += e
+    i = next((i for i in range(n_keep) if ids[i] == q), None)
+    return 0 if i is None else int(np.float32(ex[i] / s).view(np.uint32))
+
+
+@PROBE_PARAMS
+def test_basalt_sampler_probe_picks(T, path, case):
+    """P.1 (:385-434): over probe_parity's rows (248,320 logits, T = 7 and 70, the even rows peaked), each of its
+    three requests picks with the probe what it picks without it, row for row: the query plumbing does not perturb the
+    pick. The picks are also mirror_pick's (spec T§3.6), which a check of the GPU against itself cannot show."""
+    _, p, k, lists, _, _ = probe_fixture(T, case)
+    ref, got, _ = probe_launches(T, case, path)
+    pick_diff = int(np.count_nonzero(got != ref))
+    assert pick_diff == 0, "if (got[(size_t) t] != ref[(size_t) t]) ++pick_diff;"
+    want = [mirror_pick(lists[t], k, p, t) for t in range(T)]
+    assert list(ref) == want, f"the picks {list(ref)} are mirror_pick's {want}"
+
+
+@PROBE_PARAMS
+def test_basalt_sampler_probe_rows_past_n_query(T, path, case):
+    """P.2 (:435-439): the probe writes no probability for a row at or past nq = T - 1: the last row's qprob keeps its
+    0xFF prefill (and the grid's extra row's, which launch asserts)."""
+    nq = probe_fixture(T, case)[5]
+    pr = probe_launches(T, case, path)[2]
+    untouched = int(np.count_nonzero(pr[nq:] != 0xFFFFFFFF))
+    assert untouched == 0, "if (bits != 0xFFFFFFFFu) ++untouched;   // a row past n_query is not written"
+
+
+@PROBE_PARAMS
+def test_basalt_sampler_probe_prob_vs_double(T, path, case):
+    """P.3, P.4 and P.6 (:440-446, :459): each row t < nq's probability of its query is within 1e-6 of mirror_prob's
+    double reference (the final distribution, after top_p, min_p and the temperature), and is 0 exactly where the
+    reference is (a query outside the kept list; both kinds of query occur). P.6, the port's: basalt's std::max drops
+    a NaN error, so a non-finite probability counts as a failure; and each probability's bits are kernel_qprob's, the
+    float64 evaluation in the kernel's order, on which the port tightens P.3 (spec T§5)."""
+    _, p, k, lists, q, nq = probe_fixture(T, case)
+    pr = probe_launches(T, case, path)[2][:nq]
+    prob = pr.view(np.float32)
+    want = [mirror_prob(lists[t], k, p, int(q[t])) for t in range(nq)]
+    max_abs = 0.0
+    for t in range(nq):
+        e = abs(float(prob[t]) - want[t])
+        max_abs = e if max_abs < e else max_abs                    # std::max(max_abs, e), which keeps max_abs on NaN
+    zeros = [t for t in range(nq) if (want[t] == 0.0) != (float(prob[t]) == 0.0)]
+    nonfinite = [t for t in range(nq) if not np.isfinite(prob[t])]
+    bits = [t for t in range(nq) if pr[t] != kernel_qprob(lists[t], k, p, int(q[t]))]
+    assert 0 < sum(w == 0.0 for w in want) < nq, "the queries hold ids inside and outside the kept lists"
+    assert not nonfinite, f"P.6: a non-finite qprob for t < nq counts as a failure (rows {nonfinite})"
+    assert not max_abs > 1e-6, \
+        f"const double e = std::fabs((double) pr[(size_t) t] - want); ... max_abs > 1e-6 (max_abs {max_abs:.2e})"
+    assert not zeros, f"if ((want == 0.0) != (pr[(size_t) t] == 0.0f)) ++pick_diff; (rows {zeros})"
+    assert not bits, f"P.6: the probabilities' bits are the kernel-order float64 evaluation's (rows {bits})"
+
+
+@PROBE_PARAMS
+def test_basalt_sampler_probe_row_alone(T, path, case):
+    """P.5 (:447-458), invariant 1 for the probe: each row t < min(nq, 8) run alone, a one-row probe on the split
+    (basalt's path for one row, whatever path the window took: at T = 70 and forced at 7 this compares the one-block
+    kernel's probability with the split's, bit for bit) with nq 1, its query, the window's rows bound at row t's offset
+    and its counter 1000 + t through StepState position, gives the window's probability bits and the pick of the
+    request without the probe."""
+    l, p, _, _, q, nq = probe_fixture(T, case)
+    ref, _, pr = probe_launches(T, case, path)
+    rows = nt.Buffer(device(), l.tobytes())
+    width_diff = []
+    for t in range(min(nq, 8)):
+        pick1, one = gpu.split(l[t:t + 1], p, query=q[t:t + 1], nq=1, position=t, lbuf=rows, loff=4 * t * PROBE_NV)
+        if one[0] != pr[t] or pick1[0] != ref[t]:
+            width_diff.append(t)
+    assert not width_diff, \
+        f"if (std::memcmp(&one, &pr[(size_t) t], 4) != 0 || pick1 != ref[(size_t) t]) ++width_diff; (rows {width_diff})"
+
+
 # ---- the port's additions on the sampled paths (spec T§10.2) --------------------------------------------------------
 
 @pytest.mark.parametrize("path", SAMPLED)
@@ -714,6 +890,32 @@ def test_basalt_sampler_min_keep(path, min_keep):
     assert run(path, l, p, want) == 0, "A4: min_keep 3 and 10 keep 3 and 6; picks equal the mirror"
 
 
+A5_CASES = [((1 << 40) + 123, (1 << 32) + 7, 32), (123, 2 ** 64 - 2, 4)]     # (seed, counter, rows)
+
+
+@pytest.mark.parametrize("path", SAMPLED)
+@pytest.mark.parametrize("seed,counter,n", A5_CASES, ids=["seed-high-word", "counter-wrap"])
+def test_basalt_sampler_seed_counter_words(path, seed, counter, n):
+    """A5: the draw-counter rows (DC.1, :1336-1363: 16 logits of 0, top_k 16, top_p 1, temperature 1), on which each
+    pick is floor(16 u) of the row's draw u: with the seed (1 << 40) + 123 over 32 rows at DC.1's counter 2^32 + 7,
+    and with the counter 2^64 - 2 over 4 rows, which wraps to 0 and 1 at rows 2 and 3 (ctr_base's two words, at
+    kernel level). Every pick is the host Philox's, where a kernel that dropped the seed's high word, or the carry
+    into the counter's, would pick otherwise."""
+    p = SamplerParams(top_k=16, top_p=1.0, temperature=1.0, seed=seed, counter=counter)
+
+    def host(s, c):
+        return [int(f32(16) * philox_uniform(s, c(t))) for t in range(n)]
+
+    want = host(seed, lambda t: (counter + t) & (2 ** 64 - 1))
+    if seed > M:                                                       # the seed's high word dropped
+        bug = host(seed & M, lambda t: counter + t)
+    else:                                                              # no carry into the counter's high word
+        bug = host(seed, lambda t: (counter & ~M) | (counter + t & M))
+    assert want != bug, f"spec T§10.2 A5: the host Philox picks {want}, the dropped word {bug}"
+    got = getattr(gpu, path)(np.zeros((n, 16), np.float32), p)
+    assert list(got) == want, "A5: seed above 2^32 and a wrapping counter equal the host Philox"
+
+
 A7_BITS = (0x00000001, 0x00000002, 0x007FFFFF, 0x80000001, 0x80000002, 0x807FFFFF, 0x00000000, 0x80000000)
 
 
@@ -752,11 +954,14 @@ def test_basalt_sampler_subnormal_order(path, nv, top_p):
     assert run(path, l, p, want) == 0, "A7: subnormal-led rows equal the mirror"
 
 
-@pytest.mark.parametrize("path", SAMPLED)
+@pytest.mark.parametrize("path", SAMPLED + PROBED)
 def test_basalt_sampler_empty_keep(path):
     """A8: fixture 14's rows and request (top_k 64, top_p 1, temperature 1.5, seed 14) at min_p 2, which basalt's
     callers never pass and its record takes: the threshold sel[0] + logf(2) lies above the list's head, the min_p cut
-    keeps nothing, and the tail picks sel_ids[0], each row's argmax (mirror_pick), where min_p 0 draws other tokens."""
+    keeps nothing, and the tail picks sel_ids[0], each row's argmax (mirror_pick), where min_p 0 draws other tokens.
+    With the probe (+Q; rows 0 and 2 query their list's head, row 1 its second id, nq 3), the picks are the same, the
+    head's probability is exactly 1.0 and any other query's 0 (sampler.cu:433-435; mirror_prob, basalt's reference,
+    gives 0 for both), and row 3, past nq, keeps its prefill."""
     l = normal_rows(14, scale=0.3)
     p = SamplerParams(top_k=64, top_p=1.0, temperature=1.5, seed=14, min_p=2.0)
     k = sampled_k(p.top_k, 512)
@@ -765,7 +970,14 @@ def test_basalt_sampler_empty_keep(path):
     drawn = [mirror_pick(sel, k, replace(p, min_p=0.0), t) for t, sel in enumerate(sels)]
     assert want == [int(np.argmax(row)) for row in l] and drawn != want, \
         f"spec T§10.2 A8: min_p 2 picks {want}, min_p 0 {drawn}"
-    assert run(path, l, p, want) == 0, "A8: `min_p = 2.0`: pick `sel_ids[0]`"
+    if path in SAMPLED:
+        assert run(path, l, p, want) == 0, "A8: `min_p = 2.0`: pick `sel_ids[0]`"
+        return
+    q = np.int32([sel.ids[t & 1] for t, sel in enumerate(sels)])
+    got, qbits = getattr(gpu, path.removesuffix("+Q"))(l, p, query=q, nq=3)
+    assert list(got) == want, "A8: `min_p = 2.0`: pick `sel_ids[0]`"
+    assert [hex(b) for b in qbits] == ["0x3f800000", "0x0", "0x3f800000", "0xffffffff"], \
+        "A8: `min_p = 2.0`: pick `sel_ids[0]`, prob 1.0 (qprob 1.0 for the head's query, 0 for another's)"
 
 
 # ---- TP.1: the drafter's greedy tail (spec S§19.3) ------------------------------------------------------------------
@@ -946,7 +1158,8 @@ def w1_sampled():
 
 
 ROWS_ALONE = {"greedy_cl": w1_ties_across, "greedy_1b": w1_per_row_history,     # W.1's fixture for each path
-              "top_prob": w1_finite_rows, "split": w1_sampled, "one_block": w1_sampled}
+              "top_prob": w1_finite_rows, "split": w1_sampled, "one_block": w1_sampled, "split+Q": w1_sampled,
+              "one_block+Q": w1_sampled}
 
 
 @pytest.mark.parametrize("path", ROWS_ALONE)
@@ -954,20 +1167,29 @@ def test_basalt_sampler_rows_alone(path):
     """W.1: the path's multi-row window, row for row, equals each row run alone as a one-row window at its own
     position (gpu.rows_alone, bitwise). A sampled path's window must also be the mirror's, mirror_pick over
     mirror_select's list with the row's window at counter + t, so that the check cannot pass on a tail that is wrong
-    in every row alike."""
+    in every row alike. +Q, the probe on either sampled path: the queries are probe_parity's over each row's list, nq
+    = T - 1 (a row run alone queries with nq 1, or 0 past nq), and the window's probabilities are kernel_qprob's
+    (P.6) where queried, 0 at three of the seven, and the prefill past nq."""
     l, p, hist, hist_len = ROWS_ALONE[path]()
-    assert gpu.rows_alone(path, l, p, hist=hist, hist_len=hist_len) == [], \
+    base, T, V = path.removesuffix("+Q"), *l.shape
+    k = sampled_k(p.top_k, V)
+    lists = [mirror_select(l[t], V, window_of(hist, hist_len, t, p.penalty_last_n), p, k) for t in range(T)] \
+        if base in SAMPLED else None
+    probe = {"query": probe_queries(lists, k, V), "nq": T - 1} if path in PROBED else {}
+    assert gpu.rows_alone(base, l, p, hist=hist, hist_len=hist_len, **probe) == [], \
         "invariant 1: a row's output never depends on the window width T or its position in it"
-    if path in SAMPLED:
-        T, V = l.shape
-        k = sampled_k(p.top_k, V)
-
+    if base in SAMPLED:
         def mirror(q, windowed=True):
             return [mirror_pick(mirror_select(l[t], V, window_of(hist, hist_len, t, q.penalty_last_n) if windowed
                                               else [], q, k), k, q, t) for t in range(T)]
 
-        want = mirror(p)
+        want = [mirror_pick(lists[t], k, p, t) for t in range(T)]
         assert want != mirror(replace(p, top_p=1.0)) and want != mirror(replace(p, min_p=0.0)) \
             and want != mirror(p, windowed=False), "the fixture's top_p, min_p and penalties each decide a pick"
-        got = list(getattr(gpu, path)(l, p, hist=hist, hist_len=hist_len))
-        assert got == want, f"the window's picks {got} are mirror_pick's {want} (T§3.6)"
+        got = getattr(gpu, base)(l, p, hist=hist, hist_len=hist_len, **probe)
+        assert list(got[0] if probe else got) == want, f"the window's picks {got} are mirror_pick's {want} (T§3.6)"
+    if probe:
+        q, nq = probe["query"], probe["nq"]
+        bits = [kernel_qprob(lists[t], k, p, int(q[t])) for t in range(nq)] + [0xFFFFFFFF]
+        assert sum(b == 0 for b in bits) == 3 and list(got[1]) == bits, \
+            f"the window's probabilities {list(got[1])} are kernel_qprob's {bits}"
