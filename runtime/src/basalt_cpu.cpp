@@ -8,9 +8,10 @@
 //
 // ============================== the transcription contract ==============================
 //
-// Every output bit must equal what basalt's AVX-512 kernels produce for the same input, except the payload of a
-// NaN this kernel GENERATES, which is the one documented exception (THE NaN PAYLOAD below). These are the steps
-// where the obvious NEON intrinsic silently changes bits, and what stands in for each AVX-512 instruction:
+// Every output bit must equal what basalt's AVX-512 kernels produce for the same input. No exception is left: the
+// one place where the NEON path writes different bits is the payload of a NaN res[t], and THE NaN PATH below
+// recomputes that row and token on a scalar path that applies x86's rules instead. These are the steps where the
+// obvious NEON intrinsic silently changes bits, and what stands in for each AVX-512 instruction:
 //
 //   _mm512_and_ps(x, 0x7fffffff)      -> vabsq_f32            identical: clears the sign bit, NaN stays NaN.
 //   _mm512_max_ps, every reduce node  -> maxps() below        NOT vmaxq_f32 (FMAX keeps the NaN) and NOT
@@ -42,18 +43,34 @@
 //
 // The 16 x86 lanes are four float32x4_t: lane L lives in vector L/4 at position L%4.
 //
-// THE NaN PAYLOAD. res[t] is the one output whose bits can differ, and only where this kernel GENERATES a NaN from
-// operands that are not NaN. An infinite activation element gives its chunk scale = +inf, and then any of four
-// sites makes one: p = d * scale with d = +-0, vfmaq_f32(acc, +-inf, 0.0f) on a lane whose four codes are all
-// zero, the same on corr, or reduce_add_ps(acc) - reduce_add_ps(corr) as inf - inf. AArch64 writes its default
-// NaN, 0x7fc00000; x86 writes the floating-point indefinite, 0xffc00000, sign bit set ([S] Intel SDM Vol. 1
-// 4.8.3.7) [M, both measured]. act_quant_q8_1 cannot emit one: amax > 0 is an ordered compare, and s = inf needs
-// an infinite lane, whose sum <= -127 makes hx = s * sum = -inf rather than inf * 0. So the comparison that holds
-// this port is bitwise everywhere and NaN-ness on res (test_basalt_cpu_q2.py:67-68), and a recorded-output replay
-// against an AVX-512 machine must compare res the same way.
+// THE NaN PATH. res[t] is the one output whose bits the NEON path gets wrong, in two ways: AArch64 writes its
+// default NaN 0x7fc00000 where x86 writes the floating-point indefinite 0xffc00000, sign bit set ([S] Intel SDM
+// Vol. 1 4.8.3.7), and FMLA prefers the addend's NaN where VFMADD231PS prefers the multiplicand's. NaN-ness itself
+// never differs - both ISAs make a NaN at the same sites from the same inputs - so the vector result decides:
+// where res[t] is a NaN, x86_row() below recomputes that (row, token) lane by lane under x86's rules, picking the
+// NaN at every site by an explicit bit test rather than letting FMUL, FMLA or FADD pick. That is not pedantry:
+// this port's own NaN payloads move with clang's optimisation level, and LLVM's LangRef entitles no expression
+// written in C to a particular payload. The replay runs on no finite row, so it costs nothing.
 //
-// THE ONE COMPILER-DEPENDENT VALUE. _mm512_reduce_max_ps is header-defined and basalt pins no compiler
-// (README.md:33-35, CMakeLists.txt:43-46). GCC 14's gcc/config/i386/avx512fintrin.h:16339-16350 (used by
+// What the port then guarantees, from the AVX-512 ground truth (a Xeon Platinum 8488C running basalt's own
+// kernels at basalt's own flags; .context/basalt-port/pr21-ground-truth/pr21-x86-ground-truth.md, cited below as
+// ground-truth:<line>):
+//   - A row whose fp16 block scales are all non-NaN, with activations from act_quant_q8_1 - which never writes a
+//     NaN, since amax > 0 is an ordered compare and s = inf needs an infinite lane, whose sum <= -127 makes
+//     hx = s * sum = -inf rather than inf * 0: every NaN in res[t] was GENERATED, every generated NaN on x86 is
+//     the indefinite, and a propagated indefinite keeps its bits, so res[t] is exactly 0xffc00000. Measured over
+//     2,506 such outputs under each of GCC 12.5, 13.4, 14.3 and 15.2 (ground-truth:375-378).
+//   - A row a NaN ENTERS - a NaN fp16 block scale, or a NaN planted in scale or hx through the binding - has no
+//     single x86 answer. The two halves of acc can end on different NaNs, and which one survives depends on the
+//     token slot, on how many tokens share the job and on the GCC version (ground-truth:379-389), so basalt's own
+//     x86 output there contradicts its promise that "Every token's output is bitwise the single-token job's"
+//     (pool.hpp:54-55). This port pins one of those answers: GCC 14.3's NT = 1 operand order, for every token
+//     slot, which is basalt 14.3's single-token job bit for bit and keeps the promise. That pin is a SECOND
+//     build-dependent value beside amax below - a basalt built by another GCC, or run with nt > 1, may hold
+//     different bits in this case alone.
+//
+// THE TWO COMPILER-DEPENDENT VALUES. The first is amax. _mm512_reduce_max_ps is header-defined and basalt pins
+// no compiler (README.md:33-35, CMakeLists.txt:43-46). GCC 14's gcc/config/i386/avx512fintrin.h:16339-16350 (used by
 // _mm512_reduce_max_ps at :16359-16364) passes the HIGH half as SRC1 at the first two levels; Clang 21's
 // avx512fintrin.h:9580 lowers __builtin_ia32_reduce_fmax_ps512 with the LOW half as SRC1. Levels 3 and 4 agree.
 // MAXPS returns SRC2 on an unordered compare, so the two orders swallow different lanes and a chunk containing a
@@ -62,10 +79,12 @@
 // NaN chunk's amax is undefined rather than merely differently ordered, and the low-half tree is the measured
 // realisation of it [M]. This port writes GCC's order (basalt builds only on Linux - AGENTS.md:3, README.md:33 -
 // where the default c++ is g++); flipping it is the operand order of the three maxps calls at the first two levels
-// of reduce_max_ps. _mm512_reduce_add_ps needs no such choice, but not because addition commutes: a reduction's
-// bits follow its GROUPING, and both headers happen to expand to the same four-level pairwise tree (GCC's
-// avx512fintrin.h:16297-16306; Clang's reassoc llvm.vector.reduce.fadd, measured lowering [M]). Clang's reassoc
-// licenses any association, so that agreement is a measurement to re-check, not a guarantee.
+// of reduce_max_ps. The second is the NaN path's pinned tree order above. _mm512_reduce_add_ps needs no choice for
+// a NUMERIC result, but not because addition commutes: a reduction's bits follow its GROUPING, and both headers
+// expand to the same four-level pairwise tree (GCC's avx512fintrin.h:16297-16306; Clang's reassoc
+// llvm.vector.reduce.fadd, measured lowering [M]). Clang's reassoc licenses any association, so that agreement is
+// a measurement to re-check, not a guarantee. Its per-node operand order is invisible to a numeric result and
+// decides a NaN one, which is why the NaN path owns that order and the vector trees below do not.
 //
 // WHERE THE RESEARCH (docs/research/basalt-cpu-q2.md) AND basalt's SOURCE DISAGREE - the source governs:
 //   - Step 6's "inv = +inf when s < 2^-128" (:155) is off by one value: 1.f / 2^-128 is already +inf, so the band
@@ -92,6 +111,7 @@
 #include <arm_neon.h>
 
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -118,7 +138,8 @@ inline float reduce_max_ps(const float32x4_t v[4]) {
 }
 
 /// _mm512_reduce_add_ps's four-level tree, same grouping. Written in GCC's operand order for symmetry; float
-/// addition is bitwise commutative on non-NaN operands, so the bits do not depend on it.
+/// addition is bitwise commutative on non-NaN operands, so a numeric result does not depend on it, and a NaN one
+/// is not taken from here at all (THE NaN PATH: x86_row() recomputes it).
 inline float reduce_add_ps(const float32x4_t v[4]) {
     const float32x4_t u0 = vaddq_f32(v[2], v[0]);
     const float32x4_t u1 = vaddq_f32(v[3], v[1]);
@@ -148,20 +169,111 @@ inline void unpack64_q2_0(const uint8_t* codes, uint8x16_t w[4]) {
         w[j] = vandq_u8(vshlq_u8(vqtbl1q_u8(qs, vaddq_u8(byte, vdupq_n_u8((uint8_t) (4 * j)))), shift), three);
 }
 
+/// The eight fp16 block scales of the group at b0, converted as _mm256_cvtph_ps does, with the tail left at
+/// 0x0000 (= +0.0) exactly as basalt's sc[8] is (:523). vcvt_f32_f16 is VCVTPH2PS for every half, NaN payloads
+/// included (case B6 checks all 65,536 against the x86 rule).
+inline void group_scales(const uint8_t* row, int b0, int nb, float d[8]) {
+    alignas(16) uint16_t sc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < nb; ++i) std::memcpy(&sc[i], row + (size_t) (b0 + i) * BB, 2);
+    vst1q_f32(d, vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(sc))));
+    vst1q_f32(d + 4, vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(sc + 4))));
+}
+
+// ---- THE NaN PATH: x86's NaN rules, applied scalar and lane-exact ------------------------------------------------
+//
+// Each helper selects the NaN by an explicit bit test, in the operand order of the instruction GCC emits at that
+// site, and returns the indefinite for a NaN the operation itself created. No NEON NaN rule is consulted.
+
+inline uint32_t to_bits(float f) {
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    return b;
+}
+inline float from_bits(uint32_t b) {
+    float f;
+    std::memcpy(&f, &b, 4);
+    return f;
+}
+inline bool is_nan(float x) { return (to_bits(x) & 0x7F800000u) == 0x7F800000u && (to_bits(x) & 0x007FFFFFu) != 0; }
+inline float quiet(float x) { return from_bits(to_bits(x) | 0x00400000u); }   // an SNaN keeps its payload, bit 22 set
+
+/// VMULPS, VADDPS, VADDSS and VSUBSS: SRC1's NaN if it has one, else SRC2's, each quieted ([S] Intel SDM Vol. 1
+/// Table 4-8; [M] ground-truth:134-136); a NaN the operation CREATES (inf * 0, inf - inf) is the floating-point
+/// indefinite 0xffc00000 (4.8.3.7).
+inline float x86_src1_first(float src1, float src2, float computed) {
+    if (is_nan(src1)) return quiet(src1);
+    if (is_nan(src2)) return quiet(src2);
+    return is_nan(computed) ? from_bits(0xFFC00000u) : computed;
+}
+inline float x86_mul(float src1, float src2) { return x86_src1_first(src1, src2, src1 * src2); }
+inline float x86_add(float src1, float src2) { return x86_src1_first(src1, src2, src1 + src2); }
+inline float x86_sub(float src1, float src2) { return x86_src1_first(src1, src2, src1 - src2); }
+
+/// VFMADD231PS: the first NaN in the order first multiplicand, second multiplicand, addend, quieted ([S] Vol. 1
+/// Table 14-17; [M] ground-truth:137-141). A QNaN addend therefore survives an inf * 0 product, where FMLA
+/// discards it for the default NaN.
+inline float x86_fma(float m1, float m2, float addend) {
+    if (is_nan(m1)) return quiet(m1);
+    if (is_nan(m2)) return quiet(m2);
+    if (is_nan(addend)) return quiet(addend);
+    const float r = std::fma(m1, m2, addend);
+    return is_nan(r) ? from_bits(0xFFC00000u) : r;
+}
+
+/// _mm512_reduce_add_ps as GCC 14.3's build emits it for a ONE-token job: SRC1 is the high half at levels 1 and 2,
+/// the {2,3,0,1} shuffle at level 3 and lane 0 at level 4 ("hhs0" for both trees, ground-truth:270; level 3 is the
+/// shuffle in every slot of every version, :342). Pinning NT = 1 for every token slot is what keeps pool.hpp:54-55.
+inline float reduce_add_x86(const float v[16]) {
+    float u[8], t[4], w[2];
+    for (int j = 0; j < 8; ++j) u[j] = x86_add(v[j + 8], v[j]);
+    for (int j = 0; j < 4; ++j) t[j] = x86_add(u[j + 4], u[j]);
+    for (int j = 0; j < 2; ++j) w[j] = x86_add(t[j + 2], t[j]);
+    return x86_add(w[0], w[1]);
+}
+
+/// q2g_row_multi for ONE row and ONE token under the rules above, 16 lanes wide like the AVX-512 original: lane L
+/// of the group at b0 takes block b0 + L/2's fp16 scale and the activation's chunk 2*b0 + L, and acc lanes 0-7 and
+/// 8-15 take the block's first and second chunk. A single-accumulator loop would get the trees wrong.
+/// The masked lanes (L >= 2 * nb) are skipped rather than read: they would read past the row's width (case B5),
+/// and fma(+0, +0, corr) returns corr anyway, since corr is never -0.0 (its first write is +0.0 + a product, and
+/// round-to-nearest gives -0.0 only when both addends are).
+float x86_row(const uint8_t* row, const ActQ* a, int nblocks) {
+    float acc[16] = {0.0f}, corr[16] = {0.0f};
+    for (int b0 = 0; b0 < nblocks; b0 += 8) {
+        const int nb = nblocks - b0 < 8 ? nblocks - b0 : 8;
+        float d[8], p[16];
+        group_scales(row, b0, nb, d);
+        for (int L = 0; L < 2 * nb; ++L) {
+            p[L] = x86_mul(d[L / 2], a->scale[2 * b0 + L]);                   // site 1: vmulps, SRC1 = dd
+            corr[L] = x86_fma(d[L / 2], a->hx[2 * b0 + L], corr[L]);          // site 2: dd, hx, corr
+        }
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* qs = row + (size_t) (b0 + i) * BB + 2;
+            const int8_t* q = a->q + (size_t) (b0 + i) * QK;
+            for (int L = 0; L < 16; ++L) {
+                int dot = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const int m = 4 * L + k;
+                    dot += ((qs[m / 4] >> (2 * (m % 4))) & 3) * q[m];
+                }
+                acc[L] = x86_fma(p[2 * i + (L >= 8)], (float) dot, acc[L]);   // site 3: P, D (never a NaN), acc
+            }
+        }
+    }
+    return x86_sub(reduce_add_x86(acc), reduce_add_x86(corr));                // sites 4 and 5: vsubss, SRC1 = A
+}
+
 /// q2g_row_multi (expert.cpp:503-533) for nt tokens. The port drops basalt's template<int NT> switch, which is a
-/// register-allocation device: the bits do not depend on NT (acc[t], corr[t] and p[t] are per token).
+/// register-allocation device: a numeric result does not depend on NT (acc[t], corr[t] and p[t] are per token),
+/// and a NaN one comes from x86_row(), which pins NT = 1 for every token slot (THE NaN PATH).
 inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nt, int nblocks, float* res) {
     float32x4_t acc[MAXT][4], corr[MAXT][4];
     for (int t = 0; t < nt; ++t)
         for (int v = 0; v < 4; ++v) acc[t][v] = corr[t][v] = vdupq_n_f32(0.0f);
     for (int b0 = 0; b0 < nblocks; b0 += 8) {
         const int nb = nblocks - b0 < 8 ? nblocks - b0 : 8;
-        // d8 = cvtph_ps of eight fp16 block scales, the tail left at 0x0000 (= +0.0), as basalt's sc[8] is (:523).
-        alignas(16) uint16_t sc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        for (int i = 0; i < nb; ++i) std::memcpy(&sc[i], row + (size_t) (b0 + i) * BB, 2);
         float d[8];
-        vst1q_f32(d, vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(sc))));
-        vst1q_f32(d + 4, vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(sc + 4))));
+        group_scales(row, b0, nb, d);
         // dd = permutexvar(dup, d8) masked by m16 = (1 << 2*nb) - 1: dd[L] = d[L/2] where 2*b0+L is a real chunk,
         // +0.0 beyond - which the zero tail of sc already gives, since L >= 2*nb implies L/2 >= nb.
         float32x4_t dd[4];
@@ -199,7 +311,12 @@ inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nt, int 
             }
         }
     }
-    for (int t = 0; t < nt; ++t) res[t] = reduce_add_ps(acc[t]) - reduce_add_ps(corr[t]);
+    for (int t = 0; t < nt; ++t) {
+        res[t] = reduce_add_ps(acc[t]) - reduce_add_ps(corr[t]);
+        // NaN-ness is the same on both ISAs, so the vector path decides WHETHER this row made a NaN and the
+        // scalar replay decides WHICH one (THE NaN PATH).
+        if (is_nan(res[t])) res[t] = x86_row(row, a[t], nblocks);
+    }
 }
 
 }  // namespace

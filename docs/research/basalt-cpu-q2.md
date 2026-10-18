@@ -16,10 +16,15 @@ function returns at `:369`, so the scalar loop at `:371-397` is unreachable) and
 `q2g_rows`, `q2_0_gguf_rows_multi`), with `include/basalt/kernels/cpu/expert.hpp:25-61` for `ActQ` and the
 geometry. `src/kernels/cpu/expert_layout.cpp:124-133` routes this pack to them wherever AVX-512 is present.
 
-## 1. Which compiler, and the one value that depends on the answer
+## 1. Which compiler, and the values that depend on the answer
 
 basalt pins no compiler: `README.md:35-43` asks for "CMake 3.24 or newer and a C++20 compiler" and builds with a
-bare `cmake -S . -B build`; `CMakeLists.txt` sets no `CMAKE_CXX_COMPILER` and only `-Wall -Wextra` (`:45-46`).
+bare `cmake -S . -B build`; `CMakeLists.txt` sets no `CMAKE_CXX_COMPILER` and only `-Wall -Wextra` (`:45-46`). What
+it does pin is the build type and the ISA: `:12-14` forces `CMAKE_BUILD_TYPE=Release` when the caller names none,
+so these kernels compile at CMake's `CMAKE_CXX_FLAGS_RELEASE`, `-O3 -DNDEBUG` — the flags come from CMake's own
+default, not from basalt's file — and `:673-674` gives `expert.cpp` alone
+`-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi -mf16c -mfma`. Both matter to what follows:
+the optimisation level changes which FMA form GCC emits (section 6).
 `_mm512_reduce_add_ps` and `_mm512_reduce_max_ps` are header-defined, so their lane trees come from whichever
 compiler builds basalt. Both candidates were read, and both were cross-compiled and their x86 output inspected [M]:
 
@@ -41,8 +46,16 @@ R_max(v[0..15]):  u[j] = maxps(v[j+8], v[j]);       t[j] = maxps(u[j+4], u[j])
 
 The sum is identical under both because the **grouping** is, not because addition commutes: a reduction's bits
 follow its association. Clang's `reassoc llvm.vector.reduce.fadd` licenses any association [M], so that agreement
-is a measurement to re-check rather than a guarantee. The **only** compiler-dependent value in either kernel is
-`amax` when a chunk contains a NaN: GCC's first two levels take `src1 = hi` as written above, Clang's
+is a measurement to re-check rather than a guarantee. The grouping is all that a **numeric** result depends on;
+the per-node operand order decides a **NaN** one, and that order is not even fixed within one binary — GCC treats
+`+` as commutative and reassigns the add tree's registers per token and per `NT`, so a row that makes a NaN has a
+different answer in token slot 0 of an `NT = 2` job than in a single-token job, and a different one again under
+another GCC version (section 6, [M] `pr21-x86-ground-truth.md:258-342`). So `amax` is **not** the only
+compiler-dependent value, as this section first claimed: the add tree's operand order is a second, and
+`p = d * scale`'s a third (GCC emits `SRC1 = dd`, Clang `SRC1 = scale`). The other two are invisible to a NaN
+activation, since `act_quant_q8_1` never writes a NaN; they are reached by a NaN fp16 block scale or by a forged
+`ActQ`. `amax` is the one a NaN activation reaches:
+GCC's first two levels take `src1 = hi` as written above, Clang's
 take `src1 = lo`, and MAXPS returns SRC2 on an unordered compare. The port writes GCC's order, since basalt is
 Linux-only (`AGENTS.md:3`, `README.md:33`), so its default `c++` is g++ (**Inference**); `runtime/src/basalt_cpu.cpp`
 records both orders, and `tests/kernels/test_basalt_cpu_q2.py` case A6 asserts one while printing the other, so the
@@ -55,11 +68,15 @@ is the measured realisation of it [M].
 `res[t]` can differ where the kernel **generates** a NaN from operands that are not NaN. An infinite activation
 element gives its chunk `scale = +inf`, and then `d * scale` with `d = ±0`, the accumulator's fused multiply-add on
 a lane whose four codes are all zero, the same on the correction, or `inf - inf` in the final subtraction each
-produce one. AArch64 writes its default NaN, `0x7fc00000`; x86 writes the floating-point indefinite, `0xffc00000`,
-with the sign bit set ([S] Intel SDM Vol. 1 4.8.3.7) [M, both measured]. `act_quant_q8_1` cannot emit one, since
+produce one. AArch64 writes its default NaN, `0x7fc00000` [M]; x86 writes the floating-point indefinite,
+`0xffc00000`, with the sign bit set ([S] Intel SDM Vol. 1 4.8.3.7 and Table 11-1; **[M]** on a Xeon Platinum 8488C
+running basalt's own kernels, `pr21-x86-ground-truth.md:22-32`, after this note was first written without an
+AVX-512 machine). `act_quant_q8_1` cannot emit one, since
 `amax > 0` is an ordered compare and `s = inf` requires an infinite lane, whose `sum <= -127` makes
-`hx = s * sum = -inf` rather than `inf * 0`. The port's comparison is therefore bitwise everywhere and NaN-ness on
-`res`, and a recorded-output replay against an AVX-512 machine must compare it the same way.
+`hx = s * sum = -inf` rather than `inf * 0`. The port's comparison was therefore bitwise everywhere and NaN-ness on
+`res`; **section 6 closes that carve-out**, since the x86 bits are fixed at every site, and the port now computes
+them — `runtime/src/basalt_cpu.cpp`'s `x86_row()` recomputes any NaN `res[t]` under x86's rules, and the tests
+compare all 32 bits.
 
 ## 3. The floating-point environment
 
@@ -104,3 +121,144 @@ below [M], measured at the exhaustive worst case in case A8. ARM's `FCVTZS` **sa
 | `_mm512_multishift_epi64_epi8` | `vqtbl1q_u8`, `vshlq_u8`, `vandq_u8` | the port decodes the documented rule `code m = (qs[m / 4] >> 2 * (m % 4)) & 3` (`ggml/src/ggml-quants.c:220-222`), which is what VPMULTISHIFTQB produces |
 | `_mm256_cvtph_ps` | `vcvt_f32_f16` | both exact for every half including subnormals at the defaults of section 2 [M] |
 | `_mm512_cvtepi32_epi8`, `_mm512_reduce_add_epi32` | `vmovn_s32` with `vmovn_s16`, `vaddvq_s32` | exact after the clamp; the integer sum is order-independent (`abs(sum) <= 4064`) |
+
+## 6. Which NaN each site returns, and where x86 and AArch64 part
+
+This section supersedes three claims made earlier here: section 1's "only compiler-dependent value" (the operand
+order of `p = d * scale` and of the add tree are two more, reachable not from a NaN activation but from a NaN fp16
+block scale or a forged `ActQ`), section 2's carve-out that the port's comparison is NaN-ness rather than bits on
+`res`, and section 2's "[M, both measured]" on the x86 indefinite. The emitted form governs, not the written one:
+GCC's `avx512fintrin.h:16297-16306` writes the add tree's level 3 as `__T6 + __T7`, and GCC emits `vaddps` with
+`__T7` as SRC1.
+
+**How the output was obtained.** This section was first written without an AVX-512 machine, so its x86 *results*
+were **[S]**, the SDM's rule applied to an instruction form that was itself **[M]**: one translation unit,
+`include/basalt/kernels/cpu/expert.hpp` followed by `src/kernels/cpu/expert.cpp`, the two functions byte-identical
+to the originals (`diff` over `:336-400` and `:500-560`), through the Compiler Explorer API
+(`POST godbolt.org/api/compiler/g142/compile`, and `g144`) with **`-O2`** `-std=c++20 -Wall -Wextra` plus basalt's
+per-file flags (`CMakeLists.txt:673-674`), Intel syntax, so the first register after the destination is SRC1.
+
+They are now **[M]**. The PR #21 reviewer ran basalt's own `act_quant_q8_1` and `q2_0_gguf_rows_multi`, verbatim,
+on a Xeon Platinum 8488C (AVX-512) at basalt's Release flags — **`-O3 -DNDEBUG`** plus the `-m` list — under GCC
+12.5, 13.4, 14.3, 14.4, 15.2 and 15.3, with per-instruction operand probes, end-to-end fixtures, a ~700,000-case
+differential and a lane-level scalar model that reproduces the real kernel with **0 mismatches in 62,374 outputs**
+on each of four GCC versions: `pr21-x86-ground-truth.md` (`.context/basalt-port/pr21-ground-truth/`, cited below
+as `GT:<line>`). Where that measurement and the `-O2` inference below disagree, the measurement governs and the
+row says so. The AArch64 column was measured on an
+Apple M3 Max, macOS 27.0.1, FPCR = 0 (DN = 0, FZ = 0) [M], with single-instruction probes and with
+`reduce_add_ps` replayed verbatim from `runtime/src/basalt_cpu.cpp`. Probe inputs must be `volatile`:
+LLVM's constant folder does not follow FMLA's NaN rule and folds case A below to x86's answer [M].
+
+**x86's two rules** [S]. For the two-source instructions (`VMULPS`, `VADDPS`, `VSUBPS`, `VADDSS`, `VSUBSS`,
+`VMULSS`), Intel SDM Vol. 1 Table 4-7, "Rules for Handling NaNs": two QNaNs give the "First source operand", two
+SNaNs or a mixed pair give the first source operand converted to a QNaN, and the table's note fixes which that is
+— "For AVX instructions, the first source operand is usually the 2nd operand in a non-destructive source syntax".
+`MAXPS` is the documented exception (section 5). For the FMA instructions, Vol. 1 §14.5.1 maps the mnemonic's three
+digits onto the arithmetic equation — first digit the multiplicand, second the multiplier, third the addend, each
+naming an operand position — and Table 14-17 gives the priority as **x (multiplicand), then y (multiplier), then z
+(addend)**: `Q(x)` whenever x is a NaN whatever y and z are, `Q(y)` when only y and z can be, `Q(z)` only when
+neither multiplicand nor multiplier is a NaN. When a NaN is **created** rather than propagated — `INF * 0`, or
+`x*y` and `z` infinite with opposite signs — Table 14-17 gives `QNaNIndefinite`, defined there as "the QNaN which
+has the sign bit equal to 1, the most significand field equal to 1, and the remaining significand field bits equal
+to 0", i.e. `0xffc00000`. For the two-source instructions the definitive source is Table 11-1, "Masked Responses of
+SSE/SSE2/SSE3 Instructions to Invalid Arithmetic Operations" (§11.5.2.1, and Intel AVX follows SSE here per
+§4.8.3.5): "Addition of opposite signed infinities or subtraction of like-signed infinities → Return the QNaN
+floating-point Indefinite" and "Multiplication of infinity by zero → Return the QNaN floating-point Indefinite"
+— §4.8.3.7 names that value, and Table 14-17's quoted definition gives its bits. The same table fixes `MAXPS`
+("Return the source 2 operand value") and the integer indefinite of section 4. The indefinite's bits do not
+depend on the compiler, the instruction form or the operand order.
+
+**AArch64's two rules** [M, this machine]. `FADD`/`FSUB`/`FMUL` return op1's NaN when both sources are NaNs
+(`fadd A, B` → A, `fadd B, A` → B), the same first-source rule as x86. Vector `FMLA Vd, Vn, Vm` (`vfmaq_f32`)
+returns the **addend** first, then Vn, then Vm (`fmla d=A n=B m=C` → A; `fmla d=1 n=A m=B` → A; `fmla d=1 n=B m=A`
+→ B) — the reverse of x86's ranking. Every created NaN is the default NaN `0x7fc00000`, sign clear (`0*inf`,
+`inf-inf`, `inf+-inf`). One extra AArch64 case has no x86 counterpart: when the product is `0 * Inf`, a QNaN
+addend is **discarded** for the default NaN (`fmla d=A n=0 m=inf` → `7fc00000`), where x86's Table 14-17 returns
+`Q(z)`, the addend. SNaN quieting agrees on both (`0x7f800005` → `0x7fc00005`).
+
+| Site | GCC emits (basalt's Release `-O3` build) | x86 returns | AArch64 / the port returns |
+|---|---|---|---|
+| `p = d * scale` (`:518`) | `vmulps p, dd, scale` — SRC1 = `dd`, in all six GCC versions [M] `GT:156` | both NaN → **`d`**; `0 * ±inf` → `0xffc00000` [M] `GT:204-217` | `fmul` op1 = `d` → **`d`**, same; created → `0x7fc00000`. The port's `x86_row()` writes the x86 rule explicitly |
+| `corr = fmadd(dd, hx, corr)` (`:519`) | `vfmadd231ps corr, dd, hx` at **every** NT and token, in all six versions [M] `GT:157`. (The `-O2` run below read `vfmadd213ps` at NT ≥ 3; that was an artefact of its constant-propagated clones, and the ranking was the same either way) | **`dd` > `hx` > `corr`**; `dd * hx = 0 * inf` → `0xffc00000`, unless `corr` is a NaN, which Table 14-17 then returns [M] `GT:221-241` | `FMLA`: **`corr` first**; created → `0x7fc00000`, *including* when `corr` is a NaN and the product is `0 * inf`. `x86_row()` restores the x86 ranking |
+| `acc = fmadd(perm(p), cvt(dot), acc)` (`:528`) | `vfmadd231ps acc, P, D` — priority `P`, `D`, `acc`, and `D` is a `vcvtdq2ps` result, never a NaN [M] `GT:158`. GCC 15.2/15.3 swap `P` and `D` at NT = 5, tokens 0-3, which cannot change the answer because `D` is never a NaN | effective **`P` > `acc`** [M] `GT:245-254` | **`acc` > `P`**; `x86_row()` restores it |
+| add tree, levels 1–2 (`:532`; the `acc` and `corr` trees are separate reductions) | `vaddps u, hi, lo` or `lo, hi` — **the side varies with NT, the token slot and the GCC version** [M] `GT:159`, `:268-342`; the one-token job is `hi` at both levels in every version | the chosen half's NaN | `vaddq_f32(v[2], v[0])`, op1 = high → the one-token job's side. `x86_row()` pins that order for every slot |
+| add tree, level 3 | `vpermilps t7, t6, 78` then `vaddps a, t7, t6` — SRC1 = the **permuted** vector, in every slot of every version [M] `GT:342` | lane 0 returns **`t[2]`**, lane 1 `t[3]` | `vaddq_f32(t, vextq_f32(t, t, 2))` emits `ext.16b v2, v1, v1, #8` then `fadd.2s v1, v1, v2`, op1 = `t` → returns **`t[0]`** [M] — the order mismatch the vector path keeps and `x86_row()` corrects |
+| add tree, level 4 | `vaddss res, T8[0], T8[1]` — lane 0 or lane 1, varying with the slot as levels 1–2 do [M] `GT:159`, `:268-342`; lane 0 in the one-token job | the chosen lane's NaN | `vgetq_lane(p,0) + vgetq_lane(p,1)`, op1 = lane 0 → the one-token job's lane |
+| `res = reduce(acc) - reduce(corr)` (`:532`) | `vsubss res, acc_sum, corr_sum` — SRC1 = the `acc` sum, all six versions [M] `GT:160` | the **`acc`** sum's NaN; `inf - inf` → `0xffc00000` [M] `GT:346-353` | `fsub` op1 = the `acc` sum → same; created → `0x7fc00000`, which `x86_row()` replaces with the indefinite |
+| `amax` max tree (`:352`) | `vmaxps` per section 1 | `MAXPS` returns SRC2 on any unordered compare | the `maxps()` select, same — and a NaN `amax` then dies at `vcomiss`: `amax > 0.f` is false, so `s = +0` |
+| `t = x * inv` (`:356`) | `vmulps t, x, inv` — SRC1 = `x` | `x`'s NaN; `0 * inf` → `0xffc00000` | op1 = `x` → same; created → `0x7fc00000` |
+| `r = t ± 0.5` (`:357-358`) | `vaddps r, t, blend` — SRC1 = `t` | `t`'s NaN | `vaddq_f32(t0, c)`, op1 = `t` → same |
+| `hx = s * (float) sum` (`:367`) | `vmulss hx, (float) sum, s` — GCC **swaps** the written order, SRC1 = `(float) sum` | inert: `sum` is a `vcvtsi2ss` result, so at most one operand is ever a NaN | same |
+
+The last four rows never reach an output. A NaN `amax` is killed by the ordered compare; a NaN `t` or `r` is killed
+by `VCVTTPS2DQ`, which returns the integer indefinite that the clamp takes to −127 (section 4); and `s * sum` with
+`s = +inf` needs `sum = 0`, which an infinite lane's −127 forbids (section 2). So `act_quant_q8_1` writes no NaN,
+and the only NaN-valued input the row kernel can see from basalt's own pipeline is a row's own fp16 block scale.
+
+**Is the choice compiler-dependent?** (a) The FMA priority is not: all six measured GCC versions make `dd` the
+first multiplicand and `corr` the addend, and `P` the first multiplicand with `acc` the addend [M] `GT:154-160`,
+and Clang 21 the same [M, here]. The *form* does vary with the optimisation level — the `-O2` clones emit `vfmadd213ps`,
+basalt's Release `-O3` build `vfmadd231ps` everywhere — without changing the ranking, since each form's own
+formula names the same operand first. (b) `p = d * scale` **is** compiler-dependent: GCC emits SRC1 = `dd`, Clang
+`vmulps p, scale, dd`, SRC1 = `scale` [M], so under a Clang-built basalt an `a->scale` NaN would beat the block
+scale's. (c) The add tree's operand order is compiler-dependent **and** slot-dependent: GCC 12.5 differs from 14.3
+in 19 of the 36 (NT, token) slots, 13.4 in 15, 15.2 and 15.3 in 6, and 14.4 in none [M] `GT:326-340`; Clang mirrors
+levels 1–2 and takes the unpermuted vector at level 3 [M]. Level 3 alone is fixed: the shuffle is SRC1 in every
+slot of every version [M] `GT:342`. basalt's build is g++ (section 1's inference), so the port follows the GCC
+column, at the one-token slot. (d) The subtraction and the created-NaN bits are fixed by the ISA and depend on
+nothing [M] `GT:346-353`.
+
+**The inputs that separate them.** The port side was measured here by replaying its own operations [M]; the x86
+side is now measured too, each case through basalt's own kernels on the AVX-512 host [M]. Codes `0x55` make every
+weight code 1, so each `VPDPBUSD` dword lane holds 4 * 127 = 508.
+
+| Case | Input | x86 | the port, before `x86_row()` |
+|---|---|---|---|
+| A — the `acc` FMA | `nblocks = 2`, fp16 block scales `0x7e01` then `0x7e02` (→ `0x7fc02000`, `0x7fc04000` [M]), codes `0x55`, 128 activations of `1.0` (`s = 1/127`, `hx = 32`) | `0x7fc04000` — block 1's scale is the first multiplicand [M] `GT:40`, fixture (b), every (nt, t) | `0x7fc02000` — the accumulator is the addend |
+| B — add tree level 3 | finite block scales, every `a->scale` zero, `a->hx` with two payloads four lanes apart; a forged `ActQ`, since `act_quant_q8_1` writes no NaN, so this one is latent rather than reachable | the shuffle's, i.e. lane 2's [M] `GT:313`, probe P2, every (nt, t) | lane 0's |
+| C — any created NaN | 64 copies of `2^124` give `scale = 1.674618e+35` (`0x7a010204`) and `hx = +inf` with no infinity in the input; one block, `d = 1.0`, codes `0x55`, so each `acc` lane stays finite at 8.51e37 and **`acc`'s reduction** overflows to `+inf` against `corr = +inf`: `res = inf - inf` | `0xffc00000` [M] `GT:29`, fixture (a), every (nt, t) | `0x7fc00000` |
+| D — the reverse direction | a QNaN `acc` lane meeting an `inf * 0` product: block 1's codes are all zero while its chunk scale is `+inf`, against an `acc` already holding a QNaN | the QNaN survives — Table 14-17's `Q(z)`, the addend [M] `GT:53`, fixture (c1), every (nt, t) | `0x7fc00000` — the addend discarded |
+
+**The smallest correct rule.** NaN-*ness* never differs: both ISAs make a NaN at the same sites from the same
+inputs, so `isnan(res[t])` is true on exactly the same rows — measured over 21,635 NaN outputs of the large
+differential, where every non-NaN output and every NaN *position* agreed and only payloads differed [M]
+`GT:101-103`. Only the bits differ, in three ways — the created-NaN
+payload (every site, always `0xffc00000` against `0x7fc00000`), the FMA's ranking (cases A and D), and the add
+tree's operand order (level 3 in every slot, case B; levels 1, 2 and 4 wherever x86's slot order is not the
+one-token one). The third is *not* repairable by swapping the two arguments in the C source: LLVM's LangRef,
+"Behavior of Floating-Point NaN values", gives a NaN result "a non-deterministic sign" with "the quiet bit and
+payload ... non-deterministically chosen" between the preferred all-zero payload and a copy from any NaN input
+[S], so no NEON expression written in C is entitled to a particular payload at all — the AArch64 column above is
+this compiler's and this chip's measured behaviour, not a contract. Only explicit bit tests are. That gives a
+two-case rule, which `runtime/src/basalt_cpu.cpp` implements as one scalar replay at the single write of `res[t]`:
+
+1. If no NaN enters the row — none among its `nblocks` fp16 block scales (one per 18-byte block) and none among
+   the `2 * nblocks` `ActQ` `scale` and `hx` values it reads —
+   then any NaN in `res[t]` was created, and every created NaN on x86 is the indefinite; a propagated indefinite
+   keeps its bits, so the answer is exactly `0xffc00000`. Measured on all 2,506 such outputs of the model run,
+   identical under GCC 12.5, 13.4, 14.3 and 15.2 [M] `GT:375-378`; it covers the whole case reachable from
+   `act_quant_q8_1`'s own output (section 2). The blanket rewrite "`0x7fc00000` →
+   `0xffc00000`" is **not** equivalent and is wrong on an ordinary input: an fp16 block scale of `0x7e00`, the
+   canonical half NaN, converts to `0x7fc00000` [M] and must survive unchanged, while `0xfe00` propagates to
+   `0xffc00000` [M] and must not be read as a created one.
+2. If a NaN does enter, the row's result needs x86's rankings, which the NEON path cannot give at the two FMA
+   sites — and x86 has **no single answer** there: the two halves of `acc` can end on different NaNs, and which
+   one the add tree keeps moves with the token slot, the token count and the GCC version (1,103 of the model's
+   kind-0 outputs differ between slots of the 14.3 build, 309 between versions) [M] `GT:379-389`, so basalt's own
+   output contradicts its promise that "Every token's output is bitwise the single-token job's"
+   (`include/basalt/kernels/cpu/pool.hpp:54-55`). The port therefore pins **GCC 14.3's one-token order for every
+   slot**, which is basalt 14.3's single-token job bit for bit and keeps the promise. That is a second
+   build-dependent value beside `amax`.
+   The replay is **lane-exact**, not a single-accumulator loop: 16 lanes; lane `L` of the
+   group at `b0` takes block `b0 + L/2`'s `dd` and `a->hx[2*b0 + L]`; `acc` lanes 0-7 and 8-15 take `p[2i]` and
+   `p[2i+1]`; and both trees use the pairings and SRC1 sides of the table. A single-accumulator loop gets case B
+   wrong, and every row whose `corr` lanes hold different blocks' NaNs with it. It selects NaNs by
+   **explicit bit tests** at each site, never by letting
+   native float arithmetic choose: `fmaf` lowers to `FMADD`, which is addend-first with the default NaN, so a
+   replay written in plain C reproduces exactly the two divergences it is there to remove. It runs on no finite
+   row, so it costs nothing, and it subsumes case 1.
+
+The port in that form reproduces the reviewer's lane-level model — the one validated against basalt's real kernel
+with 0 mismatches in 62,374 outputs — bit for bit on all three activation kinds, at `-O0`, `-O2` and `-O3` [M], and
+matches every recorded fixture and probe at `nt = 1` (`tests/kernels/test_basalt_cpu_q2.py`, group C). What remains
+different from a particular basalt binary is only case 2 at `nt > 1`, or under a GCC other than 14.3/14.4.

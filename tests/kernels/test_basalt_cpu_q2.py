@@ -7,33 +7,44 @@
 AVX-512 semantics they transcribe (tests/kernels/basalt_cpu_emu.py) and, for the row dot, against an independent
 float64 reference.
 
-Comparison policy, the same everywhere: **float32 bits** where the result is not a NaN, **NaN-ness** where either
-side is. The two platforms' default NaN differs (x86 sets the sign bit of the ``0 * inf`` indefinite, AArch64 does
-not), nothing downstream reads those bits, and ``abs``, MAXPS, the ``>= 0`` compare and the truncation all ignore
-the payload. Where a case pins a value rather than a match - the all-zero chunk's ``+0.0``, the band's -127 codes,
-the untouched output rows - the test asserts that value directly, because the kernel and the emulator share one
-reading of the specification and a case that drifts into a harmless regime would otherwise still pass.
+Comparison policy, the same everywhere: **all 32 bits**, NaN payloads included. Nothing is compared loosely. The
+kernel reproduces x86's NaN bits as well as its numbers (runtime/src/basalt_cpu.cpp, THE NaN PATH) and the
+reference models x86's rule at every site, so a NaN payload is as much a result as any other. Where a case pins a
+value rather than a match - the all-zero chunk's ``+0.0``, the band's -127 codes, the untouched output rows - the
+test asserts that value directly, because the kernel and the emulator share one reading of the specification and a
+case that drifts into a harmless regime would otherwise still pass.
 
-The one compiler-dependent value in either kernel is ``amax`` when a chunk holds a NaN: ``_mm512_reduce_max_ps``
-is header-defined, and GCC's first two levels pass the high half to MAXPS as SRC1 where Clang's pass the low half.
-The port writes GCC's order; case A6 asserts it at the positions where the two actually differ and prints Clang's
-value beside it, so a flip is a one-line change in both the kernel and the emulator.
+Group C is the answer to "both sides could be wrong together": golden constants recorded from basalt's own kernels
+running on an AVX-512 machine (a Xeon Platinum 8488C, GCC 14.3, basalt's Release flags), which depend on neither
+the port nor the numpy reference. They are cited as ``pr21-x86-ground-truth.md:<line>``, the PR #21 reviewer's
+measurement at ``.context/basalt-port/pr21-ground-truth/`` beside basalt's checkout.
+
+Two values are compiler-dependent, and both are pinned here rather than hidden. ``amax`` when a chunk holds a NaN:
+``_mm512_reduce_max_ps`` is header-defined, and GCC's first two levels pass the high half to MAXPS as SRC1 where
+Clang's pass the low half - case A6 asserts GCC's at the positions where the two differ and prints Clang's beside
+it. And a NaN ``res[t]`` of a row a NaN ENTERS: x86's own answer there moves with the token slot, the token count
+and the GCC version, so the port pins GCC 14.3's one-token order for every slot, which case C3 asserts against the
+recorded nt = 1 column.
 
 Cases (the plan's section 7). A, ``act_quant_q8_1``: A1 the two caller widths, A2 an all-zero chunk, A3 +-0 and the
 maximum planted in each of the 32 positions, A4 the scale band's four regimes, A5 +-inf, A6 the NaN sweep over both
 reduction orders, A7 the half-away-from-zero rounding and the ``0.49999997f`` tie, A8 the saturation trap, A9 the
-contraction trap. B, ``q2_0_gguf_rows_multi``: B1 both pack shapes, B2 nt = 1..8 token independence, B3 the row
-ranges and the absolute-index write, B4 stride padding, B5 the unread tail, B6 all 65,536 fp16 block scales, B7
-adversarial activations, B8 the independent float64 check, B9 determinism.
+contraction trap, A10 the reciprocal's witness. B, ``q2_0_gguf_rows_multi``: B1 both pack shapes, B2 nt = 1..8 token
+independence, B3 the row ranges and the absolute-index write, B4 stride padding, B5 the unread tail, B6 all 65,536
+fp16 block scales, B7 adversarial activations, B8 the independent float64 check, B9 determinism. C, the recorded
+x86 values: C1 the five end-to-end fixtures, C2 the quantizer's own outputs, C3 the nine site probes, C4 the
+per-site NaN tables.
 
 Fixtures are the repository's: ``random_rows`` (test_basalt_experts, basalt's own Q2_0 row fixture - random code
 bytes with a finite fp16 scale per block) for the bitwise cases, and ``quantize_q2_0`` (test_basalt_iq_parity,
 tools/gguf_writer.py's quantizer) for B8, which needs rows that mean something.
 
 The suite bites, checked by mutating the kernel: the saturating FCVTZS in place of the integer indefinite fails
-A4, A5, A6 and A8; Clang's operand order in ``reduce_max_ps`` fails A6 alone; a reversed unpack shift fails every
-B case; and the same reversed shift applied to the emulator as well - a misreading the kernel and its reference
-share - fails B8 alone, which is what B8 is for.
+A4, A5, A6 and A8; Clang's operand order in ``reduce_max_ps`` fails A6 alone; ``inv = 127.f / amax`` in place of
+basalt's ``1.f / s`` fails A10 alone; a reversed unpack shift fails every B case; and the same reversed shift
+applied to the emulator as well - a misreading the kernel and its reference share - fails B8 alone, which is what
+B8 is for. Group C catches the third kind, where both sides move together: swapping the add tree's level-3
+operands in the *reference* fails C3's P2 probe, which no kernel-side mutation could have shown.
 
 Run with ``-s`` for the A6 Clang-order table, the A8 pre-clamp margin and the B7 cancellation residue.
 """
@@ -62,16 +73,14 @@ def recip(s):
         return (F32(1.0) / F32(s)).astype(F32)
 
 
-def same_f32(got, want, what):
-    """float32 bits where neither side is a NaN, NaN-ness where either is."""
-    got = np.ascontiguousarray(got, F32).reshape(-1)
-    want = np.ascontiguousarray(want, F32).reshape(-1)
-    gn, wn = np.isnan(got), np.isnan(want)
-    bad = np.flatnonzero(gn != wn)
-    assert bad.size == 0, f"{what}: NaN-ness differs at {bad[:8]} (got {got[bad[:8]]}, want {want[bad[:8]]})"
-    gb, wb = got[~gn].view(np.uint32), want[~wn].view(np.uint32)
+def same_bits(got, want, what):
+    """All 32 bits of every element, NaN payloads included - the whole comparison, everywhere."""
+    gb = np.ascontiguousarray(got, F32).reshape(-1).view(np.uint32)
+    wb = np.ascontiguousarray(want, F32).reshape(-1).view(np.uint32)
+    assert gb.shape == wb.shape, f"{what}: {gb.shape} against {wb.shape}"
     bad = np.flatnonzero(gb != wb)
-    assert bad.size == 0, f"{what}: bits differ at {bad[:8]} (got {got[~gn][bad[:8]]}, want {want[~wn][bad[:8]]})"
+    assert bad.size == 0, (f"{what}: bits differ at {bad[:8]} (got {[hex(v) for v in gb[bad[:8]]]}, "
+                           f"want {[hex(v) for v in wb[bad[:8]]]})")
 
 
 def kernel_act(x):
@@ -89,8 +98,8 @@ def check_act(x, order="gcc"):
     assert got[4] == want[4], f"nchunks {got[4]} != {want[4]}"
     assert np.array_equal(got[0], want[0]), f"codes differ at {np.flatnonzero(got[0] != want[0])[:8]}"
     assert np.array_equal(got[2], want[2]), f"sum differs at {np.flatnonzero(got[2] != want[2])[:8]}"
-    same_f32(got[1], want[1], "scale")
-    same_f32(got[3], want[3], "hx")
+    same_bits(got[1], want[1], "scale")
+    same_bits(got[3], want[3], "hx")
     return got
 
 
@@ -124,7 +133,7 @@ def check_rows(w, row_bytes, nblocks, act, nrows, r0=0, r1=None, what=""):
     r1 = nrows if r1 is None else r1
     got = kernel_rows(w, row_bytes, nblocks, act, nrows, r0, r1)
     want = emu.q2_0_gguf_rows_multi(w, row_bytes, nblocks, list(zip(*act)), prefilled(act[0].shape[0], nrows), r0, r1)
-    same_f32(got, want, what or f"rows({row_bytes}, {nblocks}, {r0}:{r1})")
+    same_bits(got, want, what or f"rows({row_bytes}, {nblocks}, {r0}:{r1})")
     return got
 
 
@@ -335,8 +344,8 @@ def test_a9_the_contraction_trap():
     and changes the code, so this input fails the moment the two statements are written as one expression. Measured,
     no contraction setting fuses them while they are two statements, because ``t`` also feeds the ``>= 0`` compare
     and has to be materialised either way; what ``-ffast-math`` does to this file instead is substitute FMAXNM for
-    the nine ``maxps`` selects, which case A6 catches. The two
-    statements are merged into one expression."""
+    the nine ``maxps`` selects, which case A6 catches. The mutant that this case does catch is the one where the two
+    statements are merged into one expression by hand, ``vfmaq_f32(+-0.5, x, inv)``, which no flag can undo."""
     amax, xt = F32(np.e), F32(0.01070189569145441)
     x = np.zeros(QKA, F32)
     x[0], x[6], x[11] = amax, xt, -xt
@@ -347,6 +356,22 @@ def test_a9_the_contraction_trap():
     assert not np.array_equal(np.trunc(two.astype(np.float64)), np.trunc(fused.astype(np.float64))), \
         f"this input no longer separates the two roundings from the FMA: {two} against {fused}"
     assert (q[6], q[11]) == (1, -1), f"contracted codes would be {np.trunc(fused.astype(np.float64)).astype(int)}"
+
+
+def test_a10_the_reciprocal_is_one_over_s_not_127_over_amax():
+    """A10. basalt divides twice - ``s = amax / 127.f`` then ``inv = 1.f / s`` (expert.cpp:353-354) - and the
+    algebraically equal ``inv = 127.f / amax`` (the oracle quantizer's expression at :90) is a different float32,
+    because ``s`` rounds first. Every other case in this suite survives that substitution: it moves ``inv`` by an
+    ulp, and a code changes only where ``t = x * inv`` straddles a rounding boundary. This chunk straddles one."""
+    amax, x = np.uint32([0x3FB8DD4C, 0x3EE5FD24]).view(F32)
+    chunk = np.zeros(QKA, F32)
+    chunk[0], chunk[5] = amax, x
+    q, scale, _, _, _ = check_act(chunk)
+    assert scale[0] == F32(amax / F32(127.0))
+    mutant = F32(F32(127.0) / amax)
+    assert mutant != recip(scale[0]), "this witness no longer separates the two reciprocals"
+    assert int(np.trunc(np.float64(F32(F32(x * mutant) + F32(0.5))))) == 40, "the mutant's code is 40 here"
+    assert q[5] == 39, "1.f / s gives 39; 127.f / amax gives 40"
 
 
 # ---- B. q2_0_gguf_rows_multi -------------------------------------------------------------------------------------
@@ -433,8 +458,9 @@ def test_b5_the_unread_tail():
 def test_b6_every_fp16_block_scale():
     """B6. All 65,536 half bit patterns as a block's ``d`` against one fixed activation: +-0, every subnormal, 65504,
     +-inf and every NaN. ``_mm256_cvtph_ps`` and ``vcvt_f32_f16`` are both exact for every half, subnormals included
-    (MXCSR.DAZ is ignored, and FPCR's FZ16 is off); NaN payloads may differ between the two, which is why the
-    comparison is NaN-ness where either side is a NaN."""
+    (MXCSR.DAZ is ignored, and FPCR's FZ16 is off), and this case is what proves the NaN halves too: the reference
+    converts them by VCVTPH2PS's own rule (payload << 13, quiet bit forced), the kernel by the instruction, and the
+    comparison is bitwise, so all 2,046 NaN patterns are checked against x86's conversion rather than assumed."""
     rng = np.random.default_rng(13)
     nrows, nblocks, row_bytes = 1 << 16, 1, BB
     w = np.empty((nrows, row_bytes), np.uint8)
@@ -550,3 +576,239 @@ def test_b10_a_bound_that_would_overflow_still_refuses(name, w_len, row_bytes, n
     out = np.zeros((1, nrows), np.float32)
     with pytest.raises(ValueError, match=message):
         _nt.basalt_q2_0_gguf_rows_multi(np.zeros(w_len, np.uint8), row_bytes, nblocks, q, scale, hx, out, 0, 1)
+
+
+# ---- C. the recorded x86 ground truth -----------------------------------------------------------------------------
+#
+# Every value below was measured by running basalt's own kernels on an AVX-512 machine (module docstring); none of
+# it comes from this port or from the numpy reference, which is the point of the group. Citations are lines of
+# ``pr21-x86-ground-truth.md``.
+
+GT = "pr21-x86-ground-truth.md"
+PX, PY = 0x7FC000A1, 0x7FC000B1                  # the two planted payloads of the site probes (GT:307-309)
+QA, QB, QC, SNAN = 0x7FC0000A, 0x7FC0000B, 0xFFC0000C, 0x7F80000D        # the per-site tables' operands (GT:120-123)
+INDEF, INF, NINF = 0xFFC00000, 0x7F800000, 0xFF800000
+ONE, FOUR, PZERO, NZERO = 0x3F800000, 0x40800000, 0x00000000, 0x80000000
+
+
+def f32(bits):
+    """The float32 holding these bits."""
+    return np.uint32(bits).view(F32)
+
+
+def u32(x):
+    """The 32 bits of a one-element float32 result."""
+    return int(np.ascontiguousarray(x, F32).reshape(-1).view(np.uint32)[0])
+
+
+def packed_row(blocks):
+    """One Q2_0 row from a (fp16 scale bits, code byte) pair per block, the weight shape the fixtures use."""
+    w = np.zeros((len(blocks), BB), np.uint8)
+    for b, (d, code) in enumerate(blocks):
+        w[b, :2] = np.asarray([d], np.uint16).view(np.uint8)
+        w[b, 2:] = code
+    return w.reshape(-1)
+
+
+def blank_act():
+    """A full-width (q, scale, hx) to plant into, as the fixtures' ``memset`` leaves theirs."""
+    return np.zeros(H, np.int8), np.zeros(MAXC, F32), np.zeros(MAXC, F32)
+
+
+def quantized_act(x):
+    """``act_quant_q8_1(x)`` as one token's full-width (q, scale, hx)."""
+    q, scale, hx = act_arrays([x])
+    return q[0], scale[0], hx[0]
+
+
+def tiled(act, ntok):
+    """One activation handed to ``ntok`` identical tokens, as every fixture and probe hands it."""
+    return tuple(np.tile(v, (ntok, 1)) for v in act)
+
+
+def fixture_a():
+    return packed_row([(0x3C00, 0x55)]), 1, quantized_act(np.full(64, f32(0x7D800000), F32)), INDEF
+
+
+def fixture_b():
+    return packed_row([(0x7E01, 0x55), (0x7E02, 0x55)]), 2, quantized_act(np.ones(128, F32)), 0x7FC04000
+
+
+def fixture_c1():
+    q, scale, hx = blank_act()
+    q[:128] = 1
+    scale[:4] = [f32(0x7FC12345), F32(1.0), F32(np.inf), F32(1.0)]
+    return packed_row([(0x3C00, 0x55), (0x3C00, 0x00)]), 2, (q, scale, hx), 0x7FC12345
+
+
+def fixture_c2():
+    q, scale, hx = blank_act()
+    scale[:18] = F32(1.0)
+    hx[0], hx[16] = f32(0x7FC54321), F32(-np.inf)
+    return packed_row([(0x3C00, 0x55)] * 8 + [(0x0000, 0x55)]), 9, (q, scale, hx), 0x7FC54321
+
+
+def fixture_c3():
+    x = np.full(64, F32(0.25), F32)
+    x[3] = F32(np.inf)
+    return packed_row([(0x3C00, 0x1B)]), 1, quantized_act(x), INDEF
+
+
+@pytest.mark.parametrize(
+    "name, build, nts, cite",
+    [("a, inf - inf in the final subtraction", fixture_a, range(1, MAXT + 1), "29"),
+     ("b, two NaN block scales at the acc FMA", fixture_b, range(1, MAXT + 1), "40"),
+     ("c1, a QNaN accumulator against inf * 0", fixture_c1, range(1, MAXT + 1), "53"),
+     ("c2, a QNaN correction against 0 * inf", fixture_c2, range(1, MAXT + 1), "64"),
+     ("c3, a quantized chunk holding +inf", fixture_c3, (1, 2), "75")],
+)
+def test_c1_the_end_to_end_fixtures(name, build, nts, cite):
+    """C1. The five end-to-end fixtures, each against the 32 bits x86 wrote for it. (a) and (c3) are the
+    generated-NaN case - every NaN in the row was made, not propagated, so x86's indefinite is the whole answer
+    and all four GCC versions agree (GT:375-378). (b), (c1) and (c2) are the propagated case, where x86 ranks the
+    FMA's operands the other way round from AArch64's FMLA: (b) keeps the second block's scale over the
+    accumulator, (c1) and (c2) keep a QNaN addend that FMLA would discard for the default NaN.
+
+    x86 gives the same bits at every (nt, t) for all five, so each is checked at every token count the ground
+    truth records."""
+    w, nblocks, act, golden = build()
+    for ntok in nts:
+        out = check_rows(w, BB * nblocks, nblocks, tiled(act, ntok), 1, what=f"C1 ({name}) nt={ntok}")
+        got = out.view(np.uint32).reshape(-1)
+        assert np.all(got == golden), \
+            f"({name}) nt={ntok}: {[hex(int(v)) for v in got]} != {hex(golden)} ({GT}:{cite})"
+
+
+def _nan_swallows(peak):
+    """Fixture (d): a flat chunk whose true maximum at element 4 is swallowed by the NaN at 16."""
+    x = np.full(QKA, F32(0.1), F32)
+    x[4], x[16] = peak, f32(0x7FC00000)
+    return x
+
+
+def _subnormal_peak(k):
+    """Fixture (e): a zero chunk with ``k * 2^-149`` at 0 and ``-2^-149`` at 1."""
+    x = np.zeros(QKA, F32)
+    x[0], x[1] = f32(k), f32(0x80000001)
+    return x
+
+
+# name, x, [(scale, inv, sum, hx, every code, the exceptions) per chunk], citation
+QUANTIZER_GOLDENS = [
+    ("a", np.full(64, f32(0x7D800000), F32),
+     [(0x7A010204, 0x04FE0000, 4064, 0x7F800000, 127, {})] * 2, "24-25"),
+    ("b", np.ones(128, F32), [(0x3C010204, 0x42FE0000, 4064, 0x42000000, 127, {})] * 4, "36"),
+    ("c3", np.where(np.arange(64) == 3, F32(np.inf), F32(0.25)).astype(F32),
+     [(0x7F800000, 0x00000000, -127, 0xFF800000, 0, {3: -127}),
+      (0x3B010204, 0x43FE0000, 4064, 0x41000000, 127, {})], "69-71"),
+    ("d1", _nan_swallows(F32(0.11)), [(0x3A4E69A0, 0x449EC000, 3810, 0x40400000, 127, {4: 127, 16: -127})], "82"),
+    ("d2", _nan_swallows(F32(1e7)), [(0x3A4E69A0, 0x449EC000, 3556, 0x40333333, 127, {4: -127, 16: -127})], "83"),
+    ("e63", _subnormal_peak(63), [(0x00000000, 0x00000000, 0, 0x00000000, 0, {})], "92"),
+    ("e64", _subnormal_peak(64), [(0x00000001, 0x7F800000, -4064, 0x80000FE0, -127, {})], "93"),
+]
+
+
+@pytest.mark.parametrize("name, x, chunks, cite", QUANTIZER_GOLDENS)
+def test_c2_the_quantizer_goldens(name, x, chunks, cite):
+    """C2. ``act_quant_q8_1``'s own outputs, recorded from the x86 run: the fixtures' two scales, (c3)'s infinite
+    chunk, (d)'s two NaN-swallowed maxima - the one input that reaches the clamp's +127 side (d1) and the one that
+    reaches the integer indefinite from a finite element (d2) - and (e)'s 63 against 64 times 2^-149 threshold.
+    ``inv`` is not an output; it is basalt's guarded ``s > 0.f ? 1.f / s : 0.f`` on the recorded scale, checked
+    because the band's whole behaviour turns on it."""
+    got = check_act(np.asarray(x, F32))
+    q, scale, total, hx, nchunks = got
+    assert nchunks == len(chunks), f"{name}: {nchunks} chunks, not {len(chunks)} ({GT}:{cite})"
+    for k, (sc, inv, sm, hxb, default, exceptions) in enumerate(chunks):
+        where = f"{name} chunk {k} ({GT}:{cite})"
+        assert scale.view(np.uint32)[k] == sc, f"{where}: scale {hex(int(scale.view(np.uint32)[k]))} != {hex(sc)}"
+        guarded = recip(scale[k]) if scale[k] > 0 else F32(0.0)      # basalt's `s > 0.f ? 1.f / s : 0.f` (:354)
+        assert u32(guarded) == inv, f"{where}: inv is {hex(u32(guarded))}, not {hex(inv)}"
+        assert total[k] == sm, f"{where}: sum {total[k]} != {sm}"
+        assert hx.view(np.uint32)[k] == hxb, f"{where}: hx {hex(int(hx.view(np.uint32)[k]))} != {hex(hxb)}"
+        want = np.full(QKA, default, np.int8)
+        for pos, code in exceptions.items():
+            want[pos] = code
+        assert np.array_equal(q[k * QKA: (k + 1) * QKA], want), f"{where}: codes"
+
+
+def probe(pat):
+    """The nine site probes of ``probes_main.inc``: q = 1 everywhere, scale and hx zero, every block d = 1.0 with
+    code bytes 0x55, and two distinct QNaN payloads planted where exactly one site decides between them."""
+    q, scale, hx = np.ones(H, np.int8), np.zeros(MAXC, F32), np.zeros(MAXC, F32)
+    nblocks, d0 = (8, 8, 8, 8, 1, 1, 9, 2, 1)[pat], 0x3C00
+    plant = {0: ((hx, 0, PX), (hx, 8, PY)), 1: ((hx, 0, PX), (hx, 4, PY)), 2: ((hx, 0, PX), (hx, 2, PY)),
+             3: ((hx, 0, PX), (hx, 1, PY)), 4: ((scale, 0, PX), (scale, 1, PY)), 5: ((scale, 0, PX), (hx, 0, PY)),
+             6: ((hx, 0, PX), (hx, 16, PY)), 7: ((scale, 0, PX), (scale, 2, PY)),
+             8: ((scale, 0, PY), (scale, 1, ONE))}[pat]
+    for arr, idx, val in plant:
+        arr[idx] = f32(val)
+    if pat == 8:
+        d0 = 0x7E05                                      # -> 0x7fc0a000 after vcvtph2ps, against a QNaN scale
+    return packed_row([(d0, 0x55)] + [(0x3C00, 0x55)] * (nblocks - 1)), nblocks, (q, scale, hx)
+
+
+@pytest.mark.parametrize(
+    "pat, golden, what",
+    [(0, PY, "add tree level 1, corr lanes 0 and 8: SRC1 is the high half"),
+     (1, PY, "add tree level 2, corr lanes 0 and 4: SRC1 is the high quarter"),
+     (2, PY, "add tree level 3, corr lanes 0 and 2: SRC1 is the shuffle, in every slot of every GCC (GT:342)"),
+     (3, PX, "add tree level 4, corr lanes 0 and 1: SRC1 is lane 0"),
+     (4, PY, "add tree level 1 on acc, lanes 0-7 against 8-15"),
+     (5, PX, "site 5, vsubss: the acc sum is SRC1 and outranks the corr sum"),
+     (6, PY, "site 2, vfmadd231ps corr, dd, hx: hx outranks the accumulated corr"),
+     (7, PY, "site 3, vfmadd231ps acc, P, D: P outranks the accumulator"),
+     (8, 0x7FC0A000, "site 1, vmulps: dd is SRC1 and outranks a QNaN scale")],
+)
+def test_c3_the_site_probes(pat, golden, what):
+    """C3. Each probe plants two payloads where one site decides between them, and the golden is x86's answer for
+    a ONE-token job (GT:313). That column is what the port pins for every token slot, so the same value is also
+    asserted at nt = 2 - where x86 itself would answer differently for P0, P1, P3 and P4 (GT:314), because GCC
+    reassigns the add tree's operands per token and basalt's own output there stops being the single-token job's
+    (pool.hpp:54-55). Pinning is the deliberate divergence; the fixed value is checked, not assumed."""
+    w, nblocks, act = probe(pat)
+    for ntok in (1, 2):
+        out = check_rows(w, BB * nblocks, nblocks, tiled(act, ntok), 1, what=f"C3 P{pat} nt={ntok}")
+        got = out.view(np.uint32).reshape(-1)
+        assert np.all(got == golden), f"P{pat} ({what}) nt={ntok}: {[hex(int(v)) for v in got]} != {hex(golden)}"
+
+
+SITE1 = [(PZERO, INF, INDEF), (INF, PZERO, INDEF), (NZERO, INF, INDEF), (0x7FC02000, ONE, 0x7FC02000),
+         (ONE, QA, QA), (0x7FC02000, QA, 0x7FC02000), (0x7FC02000, QC, 0x7FC02000), (0x7FE02000, ONE, 0x7FE02000),
+         (ONE, SNAN, 0x7FC0000D), (0x7FE02000, QA, 0x7FE02000), (0x7FC02000, SNAN, 0x7FC02000),
+         (0x7FE02000, SNAN, 0x7FE02000), (0x7FC02000, INF, 0x7FC02000), (PZERO, QA, QA)]
+SITE2 = [(PZERO, INF, ONE, INDEF), (INF, PZERO, ONE, INDEF), (ONE, INF, NINF, INDEF),
+         (0x7FC02000, ONE, ONE, 0x7FC02000), (ONE, QA, ONE, QA), (ONE, ONE, QB, QB), (QA, QB, ONE, QA),
+         (QA, ONE, QB, QA), (ONE, QA, QB, QA), (QA, QB, QC, QA), (PZERO, INF, QB, QB), (INF, PZERO, QB, QB),
+         (0x7FE02000, ONE, ONE, 0x7FE02000), (ONE, SNAN, ONE, 0x7FC0000D), (ONE, SNAN, QB, 0x7FC0000D),
+         (QA, SNAN, ONE, QA), (0x7FE02000, QA, ONE, 0x7FE02000), (0x7FE02000, ONE, QB, 0x7FE02000),
+         (PZERO, SNAN, QB, 0x7FC0000D)]
+SITE3 = [(INF, PZERO, ONE, INDEF), (INF, FOUR, NINF, INDEF), (QA, FOUR, ONE, QA), (ONE, FOUR, QB, QB),
+         (QA, FOUR, QB, QA), (QC, FOUR, QB, QC), (INF, PZERO, QB, QB), (QA, PZERO, ONE, QA)]
+SITE5 = [(INF, INF, INDEF), (QA, ONE, QA), (ONE, QB, QB), (QA, QB, QA), (QC, QB, QC), (QA, INF, QA)]
+HALVES = [(0x7E01, 0x7FC02000), (0x7E02, 0x7FC04000), (0xFE03, 0xFFC06000), (0x7D01, 0x7FE02000),
+          (0xFD05, 0xFFE0A000), (0x7C01, 0x7FC02000), (0x0001, 0x33800000)]
+
+
+def test_c4_the_per_site_nan_tables():
+    """C4. The reference's own rule at each site, against the rows the reviewer measured on the hardware and on
+    basalt's emitted instruction forms: site 1 ``vmulps``, SRC1 = dd (GT:202-217); site 2
+    ``vfmadd231ps corr, dd, hx``, priority dd, hx, corr (GT:221-241); site 3 ``vfmadd231ps acc, P, D``, priority
+    P, D, acc (GT:245-254); site 5 ``vsubss``, SRC1 = A (GT:346-353); and VCVTPH2PS's NaN conversion (GT:142-146).
+    An SNaN never outranks a QNaN in a later slot, and a QNaN addend beats an ``inf * 0`` product - the two rules
+    AArch64 has backwards. The kernel meets the same rows end to end through C1 and C3."""
+    for src1, src2, want in SITE1:
+        got = u32(emu.x86_mul(f32(src1), f32(src2)))
+        assert got == want, f"site 1 ({GT}:202-217): mul({hex(src1)}, {hex(src2)}) = {hex(got)} != {hex(want)}"
+    for dd, hx, corr, want in SITE2:
+        got = u32(emu.x86_fma(f32(dd), f32(hx), f32(corr)))
+        assert got == want, \
+            f"site 2 ({GT}:221-241): fma({hex(dd)}, {hex(hx)}, {hex(corr)}) = {hex(got)} != {hex(want)}"
+    for p, d, acc, want in SITE3:
+        got = u32(emu.x86_fma(f32(p), f32(d), f32(acc)))
+        assert got == want, f"site 3 ({GT}:245-254): fma({hex(p)}, {hex(d)}, {hex(acc)}) = {hex(got)} != {hex(want)}"
+    for a, b, want in SITE5:
+        got = u32(emu.x86_sub(f32(a), f32(b)))
+        assert got == want, f"site 5 ({GT}:346-353): sub({hex(a)}, {hex(b)}) = {hex(got)} != {hex(want)}"
+    for half, want in HALVES:
+        got = u32(emu.h2f(np.uint16(half)))
+        assert got == want, f"vcvtph2ps ({GT}:142-146): h2f({hex(half)}) = {hex(got)} != {hex(want)}"
