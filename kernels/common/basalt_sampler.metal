@@ -19,7 +19,9 @@
 // bits.
 
 // a / b, and ieee_div(1, x) for rcp.rn.f32: the binary64 quotient, rounded to nearest even and then to binary32. That
-// double rounding is the correctly rounded quotient, the subnormal grid included (53 >= 2 * 24 + 2: Figueroa).
+// double rounding is the correctly rounded quotient: on the normal grid since 53 >= 2 * 24 + 2 (Figueroa), and on the
+// subnormal grid because a quotient of floats off a midpoint lies more than 2^-48 of itself from it, beyond binary64's
+// rounding, while one on a midpoint stays on it (H.3).
 static inline float ieee_div(float a, float b) {
     const float q = a / b;
     const uint ab = as_type<uint>(a), bb = as_type<uint>(b);

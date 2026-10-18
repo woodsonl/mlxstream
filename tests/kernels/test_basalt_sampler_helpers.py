@@ -28,7 +28,8 @@ pattern), against host references. Every comparison is bitwise.
   patterns and planted classes, more than half of the rows with a subnormal operand or result: every exponent field,
   subnormals and the lowest binades, products and quotients at the bottom of the range, a subnormal c that moves a
   normal fma, exact results just below 2^-126 that round up to it (which the GPU flushes) and the exact pairs at
-  2^-126 and above FLT_MAX, ties and near ties (the subnormal grid at every shift, quotients and fmas near a midpoint
+  2^-126 and above FLT_MAX, ties and near ties (the subnormal grid at every shift, quotients on its ties by divisors
+  that are not powers of two, quotients and fmas near a midpoint
   just above the hardware path's 2^-125 bound, with divisors of 2^126 and products below 2^-142), fma gaps,
   cancellation and exact zeros, products beyond FLT_MAX beside a large or an infinite c, fmas that rounding to
   nearest twice (binary64, then binary32) gets wrong, on both paths, overflow and every triple of specials. A NaN
@@ -702,6 +703,13 @@ def h3_rows(rng):
               offset32(pow2(ea - 151) | sign(n), rng.choice([-1, 0, 0, 1], n)),
               f32(np.ldexp(np.where(k[:n] % 2 == 0, 1.0, 1 + 2.0 ** -23), h - pa)) | sign(n)],
         np.r_[words(rng, 4 * n, U32), floats(rng, ec)])
+    # quotients on the subnormal grid's ties by divisors that are not powers of two: +-(2j + 1) M 2^E / (M 2^(E + 150))
+    # = (2j + 1) 2^-150, M odd from 3 to 4095, (2j + 1) M below 2^24 (1 / b is inexact in binary64)
+    mo = rng.integers(1, 1 << 11, n) * 2 + 1
+    odd = 2 * np.floor(rng.random(n) * ((2 ** 24 // mo - 1) // 2)) + 1
+    e = rng.integers(-149, -35, n)
+    rows["div_ties"] = (f32(odd * mo * np.ldexp(1.0, e)) | sign(n), f32(mo * np.ldexp(1.0, e + 150)) | sign(n),
+                        np.zeros(n, U32))
     # quotients near a midpoint: Ma * 2^24 (2^25 for Ma < Mb) = K * Mb + d, 0 < |d| <= 3, Mb odd: at divisors of
     # 2^126 and above with quotients of 2^-125 to 2^-119 (the guard's edge), and at random exponents
     near = []
@@ -822,9 +830,9 @@ def test_basalt_ieee_add_mul_div_fma_vs_fraction():
     e = at["edges"]
     for col in (1, 2, 3):                                     # below 2^-126, rounded up to it (the GPU flushes these)
         assert np.count_nonzero((np.abs(exact[col][e]) < 2.0 ** -126) & (mag[e, col] == 0x800000)) > 50, col
-    for col in range(4):
-        v = case[at["ties"], col]
-        assert np.count_nonzero(v == DOWN) > 100 and np.count_nonzero(v == UP) > 100, col          # ties, either way
+    for name, col in [("ties", 0), ("ties", 1), ("ties", 2), ("ties", 3), ("div_ties", 2)]:
+        v = case[at[name], col]
+        assert np.count_nonzero(v == DOWN) > 100 and np.count_nonzero(v == UP) > 100, (name, col)  # either way
     assert np.count_nonzero(case[at["near"], 2] == NEAR) > 500 and np.count_nonzero(case[at["near"], 3] == NEAR) > 500
     s = at["sub_c"]
     assert np.count_nonzero(normal[s, 3] & (want[s, 3] != want[s, 1])) > 1000         # a subnormal c moves the fma
