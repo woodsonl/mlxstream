@@ -4,6 +4,11 @@ checks basalt's launchers make (shapes, column counts, pointer alignment) and th
 q8_1 rows feed only the routed experts; outputs are contiguous columns); a static program only (one per window width).
 """
 
+# The launcher checks are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu:1465-1475, :1490-1494,
+# :1549-1552 and :1563-1568, src/kernels/cuda/dense_tc.cu:1077-1082 and :1107-1113,
+# src/kernels/cuda/native_bf16.cu:139-171 and src/kernels/cuda/iq_kernels.cu:2450-2455 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, Sequence, Tuple
@@ -56,8 +61,8 @@ def _weight(ctx: _Ctx, op: Op, w: Value, types: Sequence[int]) -> Tuple[int, int
 
 
 def _bind(ctx: _Ctx, op: Op, slot: int, v: Value, align: int) -> Tuple[int, str, int]:
-    """``(slot, buffer, offset)`` of ``v``, refused unless the offset is a multiple of ``align`` bytes (basalt's launch
-    checks the pointer; a window's buffer starts on a page)."""
+    """``(slot, buffer, offset)`` of ``v``, refused unless the offset is a multiple of ``align`` bytes (basalt's
+    launchers check most of these pointers, ``ops/basalt.py`` says which; a window's buffer starts on a page)."""
     buf, off = ctx.buf(v)
     if off % align:
         raise ValueError(f"{op.kind}: {v.name!r} binds at byte {off} of {buf}; slot {slot} needs {align}-byte "

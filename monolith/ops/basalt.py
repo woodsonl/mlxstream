@@ -33,9 +33,14 @@ is refused (it binds StepState, which none of these kernels reads).
   kernel's bits.
 
 Alignment, checked at every binding: 4 bytes for each q8_1, ``basalt_mmvq`` and ``basalt_dense_tc`` binding, and for
-the BF16 GEMV's weight and output; 8 for the BF16 GEMV's activation (read as float2); 16 for both pair weights. These
-are basalt's launch checks (``native_mmvq.cu:1465-1475``, ``native_bf16.cu:141-144``, ``:164-171``,
-``dense_tc.cu:1076-1078``, ``:1107-1108`` at b4c63b5).
+the BF16 GEMV's weight and output; 8 for the BF16 GEMV's activation (read as float2); 16 for both pair weights.
+basalt's launchers check most of these (at b4c63b5): every pointer of ``native_mmvq`` and of the native and SwiGLU
+quantizers at 4 (``validate_pointer``, ``native_mmvq.cu:1471-1475``, called by each type's launcher and at
+``:1551-1552``, ``:1566-1568``), dense_tc's weight and rows at 4 (``dense_tc.cu:1078-1079``), the pair's weights at
+16 and its rows at 4 (``:1109-1110``), the one-row BF16 GEMV's activation at 8 and its weight and output at 4
+(``native_bf16.cu:167-171``), the multi-row one's activation at 8 (``:142-143``). The port adds the rest, which
+basalt's allocations meet unchecked: the IEEE quantizer's (``quantize_q8_1_rows`` checks none,
+``iq_kernels.cu:2450-2455``), dense_tc's output, the pair's outputs, the multi-row BF16 GEMV's weight and output.
 """
 
 from ..core.ir import OpClass
