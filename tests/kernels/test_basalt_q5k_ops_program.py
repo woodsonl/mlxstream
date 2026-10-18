@@ -4,7 +4,7 @@
 # (MIT; third_party/NOTICE): the rows' rescaling and the planted row (centered here).
 """basalt's Q5_K head ops (monolith/ops/basalt.py) in compiled static programs on the GPU, as basalt captures them: the
 verify head (``q5k_head_mmvq`` over ``output.weight``, T columns, no map) in one program per width T = 1 .. 8, and a
-drafter's head, one program per draft-head tier and width (``round_exec_[tier][T]``, mtp.cpp:1516; ``mtp.cpp:1006-1023``
+drafter's head, one program per draft-head tier and width (``round_exec_[tier][T]``, mtp.cpp:1516; ``mtp.cpp:1006-1025``
 picks the launches): at T = 1 the proxy top-1 over the 2-bit copy of the first n_tier1 rows (tier 0) or the top-1 with
 the map over every gathered row (tier 1), above T = 1 the head over the tier's rows and the mask on each column; and the
 top-1 over ``output.weight`` without a map (a drafter with no draft vocabulary). The file is bound through its windows
@@ -50,7 +50,7 @@ PIPELINES = {}                                           # one pipeline cache fo
 
 @pytest.fixture(scope="module")
 def data():
-    """The head's rows, the draft vocabulary's map (base ids, the context rows' -1, added ids: mtp.cpp:647-652), the
+    """The head's rows, the draft vocabulary's map (base ids, the context rows' -1, added ids: mtp.cpp:647-653), the
     flush's tokens (outside the vocabulary) and 8 q8_1 columns, column j planted with the row of token j % 4: its
     values less their mean at 60 / |row - mean|^2 (q5k_head_parity.cpp:263-293 plants 20 / |row|^2)."""
     rng = np.random.default_rng(2560)
@@ -152,7 +152,7 @@ def test_file_programs_run_twice_alike(file_runs):
 
 def draft_program(tier, t):
     """Tier 0 reads the first N_CAP gathered rows (the proxy top-1 at T = 1), tier 1 all of them (the top-1 with the
-    map); above T = 1 both run the head over their rows and mask each column (mtp.cpp:1006-1023)."""
+    map); above T = 1 both run the head over their rows and mask each column (mtp.cpp:1006-1025)."""
     g = Graph("step")
     rows, mp, proxy = draft_inputs(g, rows=N_DVOCAB, cap=N_CAP)
     if t == 1:
@@ -242,7 +242,7 @@ def test_top1_with_the_map_is_the_harness(data, draft_runs, state):
 @pytest.mark.parametrize("tier", [0, 1])
 def test_masked_head_is_the_harness(data, draft_runs, tier, state):
     """Each tier above T = 1: column j of the T-wide masked head bit for bit the harness's head and mask on column j
-    over the tier's rows (basalt masks each column in turn, mtp.cpp:1022-1023); after the flush column j's best row is
+    over the tier's rows (basalt masks each column in turn, mtp.cpp:1024-1025); after the flush column j's best row is
     the context row of the token planted in it."""
     s, nv = draft_runs["states"][state], (N_CAP, N_DVOCAB)[tier]
     want = [gpu.q5k_head_masked(s["dhead"], data["xq"][j * QCOL: (j + 1) * QCOL], N_IN, nv, s["dvocab"])

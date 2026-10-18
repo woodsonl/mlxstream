@@ -230,7 +230,7 @@ def _q5k_head(ctx: _Ctx, op: Op) -> None:
     ctx.add(ctx.kernel("basalt_q5k_head", src, "basalt_q5k_head", macros), head,
             (kernels.basalt_q5k_head_grid(n_out), 1, 1), (kernels.Q5K_HEAD_THREADS, 1, 1), f"{op.kind}:{w.name}",
             writes=[2])
-    if mp:                           # basalt masks each column's logits (mtp.cpp:1022-1023)
+    if mp:                           # basalt masks each column's logits (mtp.cpp:1024-1025)
         km = ctx.kernel("basalt_q5k_head", src, "basalt_q5k_head_mask_unmapped", macros)
         grid, threads = kernels.basalt_q5k_mask_grid(n_out)
         _, yb, yo = head[2]

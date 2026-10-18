@@ -176,7 +176,7 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `src/kernels/cuda/s2_expert_grouped.cu:34-46`, `:554-562` and `:1085-1122` and
   `src/kernels/cuda/quantize_act.cu:219-238`, the drafter experts' blob size, scratch layout (`basalt_s2_scratch`),
   launch grids and checks. License: `third_party/BASALT-LICENSE`.
-- `monolith/kernels.py` — adapted from `src/kernels/cuda/q5k_head.cu:337-386`, `:404-408` and `:500-535` and
+- `monolith/kernels.py` — adapted from `src/kernels/cuda/q5k_head.cu:337-386`, `:406-408` and `:500-535` and
   `src/kernels/cuda/head_proxy.cuh:17-28` (MIT): `q5k_head_supported` (`basalt_q5k_head_macros`), the head's and the
   top-1's grid rule (`basalt_q5k_head_grid`), the top-1's partials (`basalt_q5k_top1_part_bytes`), the mask's launch
   (`basalt_q5k_mask_grid`), and the proxy's `tiles`, `bytes` and `scratch_bytes` (`basalt_q5k_proxy_tiles`,
@@ -189,7 +189,7 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `validate_pointer`'s 4-byte alignment, `dense_tc`'s and `dense_tc_pair`'s pointer checks, the BF16 GEMVs' pointer
   checks and their `ldy >= n_out` routing, the IEEE quantizer's unchecked column count, the Q5_K head's shape rule,
   the top-1's 2,560 inputs, the proxy top-1's row range and required map) and the Q5_K head's launch sequence (the
-  per-column mask of `src/core/mtp.cpp:1022-1023`, the top-1's grid shared by its two dispatches); `monolith/kernels.py`'s
+  per-column mask of `src/core/mtp.cpp:1024-1025`, the top-1's grid shared by its two dispatches); `monolith/kernels.py`'s
   `basalt_q8_1_grid` and `basalt_mmvf_grid` transcribe the quantizers' and the BF16 GEMVs' grids
   (`native_mmvq.cu:1556-1558`, `iq_kernels.cu:2453`, `native_bf16.cu:147-150`, `:174`). License:
   `third_party/BASALT-LICENSE`.

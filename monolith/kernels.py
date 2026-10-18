@@ -619,7 +619,7 @@ def basalt_dense_tc_pair_grid(n_out0: int, n_out1: int) -> Tuple[int, int]:
 
 
 # ---- basalt's Q5_K head (kernels/common/basalt_q5k_head.metal; docs/research/basalt-nvcc/q5k_head.md)
-# adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:337-386, :404-408, :500-535 and
+# adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:337-386, :406-408, :500-535 and
 # src/kernels/cuda/head_proxy.cuh:17-28 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE)
 
 Q5K_HEAD_THREADS = 256      # basalt's WPB * WARP: 8 SIMD-groups, one row each
