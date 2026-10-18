@@ -262,3 +262,202 @@ def test_q8_1_rows_reach_their_readers_behind_a_barrier(src):
     gemv(g, "basalt_mmvf", "y2", x, weight(g, "dense/mmvf.q", src))
     prog = emit(g, src, 2)
     assert [o.barrier_before for o in prog.ops] == [True, True, False, False]
+
+
+# ---- refusals: each case's valid input emits, and the same input with its one defect is refused by its own check ---
+
+def pack(directory, entries):
+    """A pack of zeros whose aux entries ``{name: (offset, nbytes)}`` sit at those offsets: the only route to a
+    misaligned binding (a .basalt entry binds at a multiple of 16, ``basalt_windows``; activations at whole rows)."""
+    directory.mkdir()
+    size = -(-max(o + n for o, n in entries.values()) // ALIGN) * ALIGN
+    (directory / "weights.pack").write_bytes(bytes(size))
+    (directory / "manifest.json").write_text(json.dumps({
+        "version": 2, "alignment": ALIGN, "pack": "weights.pack", "nbytes": size, "slabs": [],
+        "aux": [{"name": n, "offset": o, "nbytes": nb, "dtype": "U8", "shape": [nb]} for n, (o, nb) in entries.items()]}))
+    return PackFile(directory)
+
+
+def one_op(kind, g, src):
+    """A valid op of ``kind`` at T columns (with the quantizer feeding a q8_1 GEMV)."""
+    x = g.input("x", (T, 2560), F32)
+    if kind == "basalt_q8_1":
+        return q8_1(g, "xq", [x])
+    if kind == "basalt_mmvf":
+        return gemv(g, kind, "y", x, weight(g, "dense/mmvf.q", src))
+    ws = [weight(g, f"gguf/pair.14.23.{m}", src) for m in (0, 1)]
+    return gemv(g, kind, "y", q8_1(g, "xq", [x]), *(ws if kind == "basalt_dense_tc_pair" else ws[:1]))
+
+
+def _dynamic(kind):
+    def build(g, src, bad, tmp):
+        one_op(kind, g, src)
+        return {"dynamic_t": bad}
+    return build
+
+
+def _q8_1_columns(quantizer):
+    def build(g, src, bad, tmp):                 # 16 columns: a static count, as the default t_max (8) allows no T past 8
+        rows = 16 if bad else 8
+        xs = [g.input(n, (rows, 64), F32) for n in (("gate", "up") if quantizer == "swiglu" else ("x",))]
+        q8_1(g, "xq", xs, quantizer, rows=rows)
+        return {}
+    return build
+
+
+def _q8_1_block(g, src, bad, tmp):
+    q8_1(g, "xq", [g.input("x", (T, 48 if bad else 64), F32)], width=72)
+    return {}
+
+
+def _q8_1_width(g, src, bad, tmp):
+    q8_1(g, "xq", [g.input("x", (T, 64), F32)], width=76 if bad else 72)
+    return {}
+
+
+def _q8_1_rows(g, src, bad, tmp):
+    q8_1(g, "xq", [g.input("x", (T, 64), F32)], rows=1 if bad else T)
+    return {}
+
+
+def _q8_1_quantizer(g, src, bad, tmp):
+    q8_1(g, "xq", [g.input("x", (T, 64), F32)], "fast" if bad else "native")
+    return {}
+
+
+def _ieee_reader(g, src, bad, tmp):
+    x = g.input("x", (T, 2560), F32)
+    ieee, native = q8_1(g, "xq_ieee", [x], "ieee"), q8_1(g, "xq", [x])
+    gemv(g, "basalt_mmvq", "y", ieee if bad else native, weight(g, "gguf/mmvq.8", src))
+    return {}
+
+
+def _weight_type(kind, good, other):
+    def build(g, src, bad, tmp):
+        x = g.input("x", (T, 2560), F32)
+        gemv(g, kind, "y", x if kind == "basalt_mmvf" else q8_1(g, "xq", [x]), weight(g, other if bad else good, src))
+        return {}
+    return build
+
+
+def _xq_width(g, src, bad, tmp):
+    xq = q8_1(g, "xq", [g.input("x", (T, 640 if bad else 2560), F32)])
+    gemv(g, "basalt_mmvq", "y", xq, weight(g, "gguf/mmvq.8", src))
+    return {}
+
+
+def _out_width(kind, extra):
+    """``kind`` whose (last) output is ``extra`` values wider than its weight's rows."""
+    def build(g, src, bad, tmp):
+        x = g.input("x", (T, 2560), F32)
+        names = {"basalt_mmvf": ["dense/mmvf.q"], "basalt_dense_tc_pair": ["gguf/pair.14.23.0", "gguf/pair.14.23.1"]}
+        ws = [weight(g, n, src) for n in names.get(kind, ["gguf/pair.14.23.0"])]
+        widths = [w.shape[0] + (extra if bad and m == len(ws) - 1 else 0) for m, w in enumerate(ws)]
+        gemv(g, kind, "y", x if kind == "basalt_mmvf" else q8_1(g, "xq", [x]), *ws, widths=widths)
+        return {}
+    return build
+
+
+def _pair_inputs(g, src, bad, tmp):
+    xq = q8_1(g, "xq", [g.input("x", (T, 2560), F32)])
+    gemv(g, "basalt_dense_tc_pair", "y", xq, weight(g, "gguf/pair.14.23.0", src),
+         weight(g, "gguf/dtc.12.one" if bad else "gguf/pair.14.23.1", src))
+    return {}
+
+
+def _mmvf_x_width(g, src, bad, tmp):
+    gemv(g, "basalt_mmvf", "y", g.input("x", (T, 2562 if bad else 2560), F32), weight(g, "dense/mmvf.q", src))
+    return {}
+
+
+def _aligned(kind, slot, offset):
+    """``kind`` with the value of kernel slot ``slot`` read from a pack entry at byte 16 (valid) or ``offset``."""
+    def build(g, src, bad, tmp):
+        at = offset if bad else 16
+        x = g.input("x", (T, 2560), F32)
+        if kind == "basalt_q8_1":
+            q8_1(g, "xq", [g.const("p", (2, 64), F32)])
+            return {"packs": [pack(tmp, {"p": (at, 2 * 64 * 4)})]}
+        if kind == "basalt_mmvf":
+            v = g.const("p", *(((2, 2560), F32) if slot == 0 else ((128, 2560), DType.BF16)))
+            gemv(g, kind, "y", v if slot == 0 else x, v if slot == 1 else weight(g, "dense/mmvf.q", src))
+            return {"packs": [pack(tmp, {"p": (at, int(np.prod(v.shape)) * v.dtype.itemsize)})]}
+        ws = [weight(g, f"gguf/pair.14.23.{m}", src) for m in (0, 1)][: 2 if kind == "basalt_dense_tc_pair" else 1]
+        if slot == len(ws):                                                     # the q8_1 rows
+            gemv(g, kind, "y", g.const("p", (2, 2880), U8), *ws)
+            return {"packs": [pack(tmp, {"p": (at, 2 * 2880)})]}
+        e = src.entries[ws[slot].name]
+        ws[slot] = g.weight("p", e.shape, GGML_TYPES[e.type_id][0])
+        gemv(g, kind, "y", q8_1(g, "xq", [x]), *ws)
+        return {"packs": [pack(tmp, {"p": (at, e.nbytes)})]}
+    return build
+
+
+REFUSALS = [
+    *[(f"dynamic-T {k}", _dynamic(k), "a dynamic-T program cannot run them") for k in KINDS],
+    ("native q8_1 of 16 columns", _q8_1_columns("native"), "16 columns; basalt quantizes 1 to 8"),
+    ("swiglu q8_1 of 16 columns", _q8_1_columns("swiglu"), "16 columns; basalt quantizes 1 to 8"),
+    ("q8_1 column not whole blocks", _q8_1_block, "a column of 48 values is not whole 32-value blocks"),
+    ("q8_1 rows of another width", _q8_1_width, r"is u8 \[2, 76\], not u8 \[2, 72\] \(q8_1 rows"),
+    ("q8_1 rows for other columns", _q8_1_rows, r"'x' is f32 \[2, 64\], not f32 \[1, 64\] \(the quantized columns\)"),
+    ("q8_1 quantizer unknown", _q8_1_quantizer, "attr quantizer must be one of"),
+    ("IEEE q8_1 rows read by a GEMV", _ieee_reader, r"is read by \['basalt_mmvq'\]; basalt's IEEE rows feed only"),
+    ("mmvq on a BF16 matrix", _weight_type("basalt_mmvq", "gguf/mmvq.8", "dense/mmvf.q"), "of ggml type"),
+    ("dense_tc on a Q8_0 matrix", _weight_type("basalt_dense_tc", "gguf/mmvq.12", "gguf/mmvq.8"), "of ggml type"),
+    ("mmvf on a Q8_0 matrix", _weight_type("basalt_mmvf", "dense/mmvf.q", "gguf/mmvq.8"), r"of ggml type \['bf16'\]"),
+    ("mmvq rows of another input", _xq_width, r"is u8 \[2, 720\], not u8 \[2, 2880\] \(q8_1 rows of the weight's"),
+    *[(f"{k} output wider than its rows", _out_width(k, 2), "contiguous columns of the weight's rows")
+      for k in ("basalt_mmvq", "basalt_dense_tc", "basalt_dense_tc_pair", "basalt_mmvf")],
+    ("mmvf ldy < n_out", _out_width("basalt_mmvf", -1), r"would overlap \(ldy >= n_out\)"),
+    ("mmvf input wider than its weight", _mmvf_x_width, "contiguous columns of the weight's width"),
+    ("pair over two input widths", _pair_inputs, "the pair reads one input"),
+    ("q8_1 input off 4 bytes", _aligned("basalt_q8_1", 0, 2), "slot 0 needs 4-byte alignment"),
+    ("mmvq weight off 4 bytes", _aligned("basalt_mmvq", 0, 2), "slot 0 needs 4-byte alignment"),
+    ("mmvq rows off 4 bytes", _aligned("basalt_mmvq", 1, 2), "slot 1 needs 4-byte alignment"),
+    ("dense_tc weight off 4 bytes", _aligned("basalt_dense_tc", 0, 2), "slot 0 needs 4-byte alignment"),
+    ("dense_tc rows off 4 bytes", _aligned("basalt_dense_tc", 1, 2), "slot 1 needs 4-byte alignment"),
+    ("pair w0 off 16 bytes", _aligned("basalt_dense_tc_pair", 0, 8), "slot 0 needs 16-byte alignment"),
+    ("pair w1 off 16 bytes", _aligned("basalt_dense_tc_pair", 1, 8), "slot 1 needs 16-byte alignment"),
+    ("pair rows off 4 bytes", _aligned("basalt_dense_tc_pair", 2, 2), "slot 2 needs 4-byte alignment"),
+    ("mmvf input off 8 bytes", _aligned("basalt_mmvf", 0, 4), "slot 0 needs 8-byte alignment"),
+    ("mmvf weight off 4 bytes", _aligned("basalt_mmvf", 1, 2), "slot 1 needs 4-byte alignment"),
+]
+
+
+@pytest.mark.parametrize("build, why", [r[1:] for r in REFUSALS], ids=[r[0] for r in REFUSALS])
+def test_refusals(src, tmp_path, build, why):
+    for bad in (False, True):
+        g = Graph("step")
+        kw = build(g, src, bad, tmp_path / f"pack{int(bad)}")
+        packs = kw.pop("packs", [])
+        if not bad:
+            emit(g, src, 2, packs, **kw)
+            continue
+        with pytest.raises(ValueError, match=why):
+            emit(g, src, 2, packs, **kw)
+
+
+def test_ieee_q8_1_takes_any_column_count(src):
+    """basalt's quantize_q8_1_rows checks only that it has values (iq_kernels.cu:2450-2453): 16 columns emit."""
+    g = Graph("step")
+    q8_1(g, "xq", [g.input("x", (16, 64), F32)], "ieee", rows=16)
+    (o,) = emit(g, src, 1).ops
+    assert o.grid == (4, 1, 1)
+
+
+def test_dense_tc_order_is_basalts_not_this_gpus(src, tmp_path):
+    """Q4_K at 2048 x 336 (21 tiles): basalt's 170 multiprocessors run the one order, PROFILE's 20 cores would give the
+    tile order, and a weight off a 16-byte boundary the KS 2 order. The emitted order stays basalt's for the file's
+    weight and for the same shape bound at byte 8 of a pack (4-byte aligned, which dense_tc takes)."""
+    rule = kernels.basalt_dense_tc_variant
+    assert (rule(12, 2048, 336), rule(12, 2048, 336, sm_count=PROFILE.gpu_cores), rule(12, 2048, 336, aligned=False)) \
+        == ("one", "tile", "s2")
+    for at in (None, 8):
+        g = Graph("step")
+        xq = q8_1(g, "xq", [g.input("x", (T, 2048), F32)])
+        w = weight(g, "gguf/order.q4_k", src) if at is None else g.weight("p", (336, 2048), "q4_k")
+        gemv(g, "basalt_dense_tc", "y", xq, w)
+        prog = emit(g, src, 4, [] if at is None else [pack(tmp_path / "p", {"p": (at, 336 * 1152)})])
+        (o,) = specs(prog, "basalt_dense_tc")
+        assert o.bindings[0][2] % 16 == (0 if at is None else 8)
+        assert prog.kernels[o.kernel].macros == {"DTC_TYPE": "12", "DTC_ORDER": "0"}
