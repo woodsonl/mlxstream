@@ -39,22 +39,37 @@ R_max(v[0..15]):  u[j] = maxps(v[j+8], v[j]);       t[j] = maxps(u[j+4], u[j])
                   where maxps(a, b) = (a > b) ? a : b      [S] Intel SDM, MAXPS Operation
 ```
 
-Addition commutes bitwise, so the sum is identical under both. The **only** compiler-dependent value in either
-kernel is `amax` when a chunk contains a NaN: GCC's first two levels take `src1 = hi` as written above, Clang's
+The sum is identical under both because the **grouping** is, not because addition commutes: a reduction's bits
+follow its association. Clang's `reassoc llvm.vector.reduce.fadd` licenses any association [M], so that agreement
+is a measurement to re-check rather than a guarantee. The **only** compiler-dependent value in either kernel is
+`amax` when a chunk contains a NaN: GCC's first two levels take `src1 = hi` as written above, Clang's
 take `src1 = lo`, and MAXPS returns SRC2 on an unordered compare. The port writes GCC's order, since basalt is
 Linux-only (`AGENTS.md:3`, `README.md:33`), so its default `c++` is g++ (**Inference**); `runtime/src/basalt_cpu.cpp`
 records both orders, and `tests/kernels/test_basalt_cpu_q2.py` case A6 asserts one while printing the other, so the
-choice flips in one line if basalt's build is ever shown to be Clang.
+choice flips in one line if basalt's build is ever shown to be Clang. Clang's `fmax` reduction carries `nnan`, so
+under Clang that value is undefined for a NaN chunk rather than merely differently ordered, and the low-half tree
+is the measured realisation of it [M].
 
-## 2. The floating-point environment
+## 2. The one output whose bits may differ
+
+`res[t]` can differ where the kernel **generates** a NaN from operands that are not NaN. An infinite activation
+element gives its chunk `scale = +inf`, and then `d * scale` with `d = ±0`, the accumulator's fused multiply-add on
+a lane whose four codes are all zero, the same on the correction, or `inf - inf` in the final subtraction each
+produce one. AArch64 writes its default NaN, `0x7fc00000`; x86 writes the floating-point indefinite, `0xffc00000`,
+with the sign bit set ([S] Intel SDM Vol. 1 4.8.3.7) [M, both measured]. `act_quant_q8_1` cannot emit one, since
+`amax > 0` is an ordered compare and `s = inf` requires an infinite lane, whose `sum <= -127` makes
+`hx = s * sum = -inf` rather than `inf * 0`. The port's comparison is therefore bitwise everywhere and NaN-ness on
+`res`, and a recorded-output replay against an AVX-512 machine must compare it the same way.
+
+## 3. The floating-point environment
 
 `grep -rn "setcsr|FLUSH_ZERO|DENORMALS_ZERO|ffast-math|Ofast|ffp-contract|crtfastmath|_MM_SET_"` over basalt's
 `CMakeLists.txt`, `src` and `include` returns nothing [M], so basalt runs on the default MXCSR: round to nearest
 even, every exception masked, flush-to-zero off, denormals-are-zero off (**Inference** from that absence plus the
 x86-64 ABI default). macOS on arm64 leaves FPCR at 0 (round to nearest, flush-to-zero off), so subnormals survive on
-both sides and the subnormal-scale case of section 3 is reachable here too.
+both sides and the subnormal-scale case of section 4 is reachable here too.
 
-## 3. The quantizer's reachable edge cases
+## 4. The quantizer's reachable edge cases
 
 `s = amax > 0 ? amax / 127 : 0` and `inv = s > 0 ? 1 / s : 0`, then `t = x * inv`, `r = t + copysign(0.5, t)` and
 `VCVTTPS2DQ` (`expert.cpp:352-362`). The conversion returns the **integer indefinite** `0x80000000` for a NaN, for
@@ -72,7 +87,7 @@ measured at the exhaustive worst case in case A8. ARM's `FCVTZS` **saturates** i
 `INT32_MAX`), which after the clamp would give code 0 and +127 where x86 gives −127 for both, so the port selects on
 `vcagtq_f32` against `2^31` and substitutes `INT32_MIN` itself.
 
-## 4. Where NEON is not x86
+## 5. Where NEON is not x86
 
 | x86 | NEON | Why they differ |
 |---|---|---|
@@ -81,7 +96,7 @@ measured at the exhaustive worst case in case A8. ARM's `FCVTZS` **saturates** i
 | `_mm512_reduce_add_ps`, `_mm512_reduce_max_ps` | the explicit four-level trees | `vaddvq_f32` gives `(t0+t1)+(t2+t3)` where x86 gives `(t0+t2)+(t1+t3)`, and `FMAXV` has the wrong NaN rule |
 | `_mm512_mul_ps` then `_mm512_add_ps` | `vmulq_f32` then `vaddq_f32`, built `-ffp-contract=off` | two roundings; a contracted `fma` skips the rounding of `t` and changes codes. Apple clang keeps them apart at its default while they are separate statements and fuses them under `fast` [M], so the flag pins the guarantee |
 | `_mm512_fmadd_ps` (`acc`, `corr`) | `vfmaq_f32` | one rounding; fusion is required here, which is why contraction is disabled on the file and not globally |
-| `_mm512_cvttps_epi32` | `vbslq_s32(vcagtq_f32(2^31, r), vcvtq_s32_f32(r), INT32_MIN)` | section 3 |
+| `_mm512_cvttps_epi32` | `vbslq_s32(vcagtq_f32(2^31, r), vcvtq_s32_f32(r), INT32_MIN)` | section 4 |
 | `_mm512_dpbusd_epi32` | `vdotq_s32` | SDOT is signed by signed, VPDPBUSD unsigned by signed, equal here because codes are 0..3. NEON vector `j` lane `k` is the x86 dword lane `4j + k` |
 | `_mm512_multishift_epi64_epi8` | `vqtbl1q_u8`, `vshlq_u8`, `vandq_u8` | the port decodes the documented rule `code m = (qs[m / 4] >> 2 * (m % 4)) & 3` (`ggml/src/ggml-quants.c:220-222`), which is what VPMULTISHIFTQB produces |
 | `_mm256_cvtph_ps` | `vcvt_f32_f16` | both exact for every half including subnormals at the defaults of section 2 [M] |

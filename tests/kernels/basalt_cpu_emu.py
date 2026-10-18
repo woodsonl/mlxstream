@@ -48,7 +48,9 @@ def maxps(src1, src2):
 
 def reduce_max_ps(v, order="gcc"):
     """``_mm512_reduce_max_ps`` over the last axis (16 lanes). The four-level tree of both compilers' headers; only
-    the first two levels' operand order differs (GCC passes the high half as SRC1, Clang the low half)."""
+    the first two levels' operand order differs (GCC passes the high half as SRC1, Clang the low half). Clang's
+    lowering carries ``nnan``, so ``order="clang"`` is the measured realisation of a value its compiler leaves
+    undefined for a chunk holding a NaN, not a prediction of what every Clang build gives."""
 
     def node(hi, lo):
         return maxps(hi, lo) if order == "gcc" else maxps(lo, hi)

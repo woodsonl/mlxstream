@@ -8,8 +8,9 @@
 //
 // ============================== the transcription contract ==============================
 //
-// Every output bit must equal what basalt's AVX-512 kernels produce for the same input. These are the steps where
-// the obvious NEON intrinsic silently changes bits, and what stands in for each AVX-512 instruction:
+// Every output bit must equal what basalt's AVX-512 kernels produce for the same input, except the payload of a
+// NaN this kernel GENERATES, which is the one documented exception (THE NaN PAYLOAD below). These are the steps
+// where the obvious NEON intrinsic silently changes bits, and what stands in for each AVX-512 instruction:
 //
 //   _mm512_and_ps(x, 0x7fffffff)      -> vabsq_f32            identical: clears the sign bit, NaN stays NaN.
 //   _mm512_max_ps, every reduce node  -> maxps() below        NOT vmaxq_f32 (FMAX keeps the NaN) and NOT
@@ -35,12 +36,21 @@
 //                                       code m = (qs[m/4] >> 2(m%4)) & 3 (ggml_quants.c:220-222), which is what
 //                                       VPMULTISHIFTQB with basalt's (ctrl, lanes) argument order produces.
 //   _mm256_cvtph_ps                   -> vcvt_f32_f16         both exact for every half, subnormals included, with
-//                                                             MXCSR and FPCR at their defaults. NaN payloads may
-//                                                             differ in bits; nothing downstream reads them.
+//                                                             MXCSR and FPCR at their defaults.
 //   _mm512_cvtepi32_epi8, _mm512_reduce_add_epi32 -> vmovn_s32/vmovn_s16, vaddvq_s32: exact after the clamp, and
 //                                                             the integer sum is order-independent (|sum| <= 4064).
 //
 // The 16 x86 lanes are four float32x4_t: lane L lives in vector L/4 at position L%4.
+//
+// THE NaN PAYLOAD. res[t] is the one output whose bits can differ, and only where this kernel GENERATES a NaN from
+// operands that are not NaN. An infinite activation element gives its chunk scale = +inf, and then any of four
+// sites makes one: p = d * scale with d = +-0, vfmaq_f32(acc, +-inf, 0.0f) on a lane whose four codes are all
+// zero, the same on corr, or reduce_add_ps(acc) - reduce_add_ps(corr) as inf - inf. AArch64 writes its default
+// NaN, 0x7fc00000; x86 writes the floating-point indefinite, 0xffc00000, sign bit set ([S] Intel SDM Vol. 1
+// 4.8.3.7) [M, both measured]. act_quant_q8_1 cannot emit one: amax > 0 is an ordered compare, and s = inf needs
+// an infinite lane, whose sum <= -127 makes hx = s * sum = -inf rather than inf * 0. So the comparison that holds
+// this port is bitwise everywhere and NaN-ness on res (test_basalt_cpu_q2.py:67-68), and a recorded-output replay
+// against an AVX-512 machine must compare res the same way.
 //
 // THE ONE COMPILER-DEPENDENT VALUE. _mm512_reduce_max_ps is header-defined and basalt pins no compiler
 // (README.md:33-35, CMakeLists.txt:43-46). GCC 14's gcc/config/i386/avx512fintrin.h:16339-16350 (used by
@@ -48,10 +58,14 @@
 // avx512fintrin.h:9580 lowers __builtin_ia32_reduce_fmax_ps512 with the LOW half as SRC1. Levels 3 and 4 agree.
 // MAXPS returns SRC2 on an unordered compare, so the two orders swallow different lanes and a chunk containing a
 // NaN can get a different amax - sometimes a different FINITE amax. basalt's own binary therefore differs between
-// its own builds and no bit-contract exists for a NaN activation. This port writes GCC's order (basalt builds only
-// on Linux - AGENTS.md:3, README.md:33 - where the default c++ is g++); flipping it is the operand order of the
-// two nd() calls in reduce_max_ps. _mm512_reduce_add_ps needs no such choice: float addition is bitwise commutative
-// on non-NaN operands, so R(acc) - R(corr) has the same bits under either toolchain.
+// its own builds and no bit-contract exists for a NaN activation. Clang's lowering also carries nnan, so there a
+// NaN chunk's amax is undefined rather than merely differently ordered, and the low-half tree is the measured
+// realisation of it [M]. This port writes GCC's order (basalt builds only on Linux - AGENTS.md:3, README.md:33 -
+// where the default c++ is g++); flipping it is the operand order of the three maxps calls at the first two levels
+// of reduce_max_ps. _mm512_reduce_add_ps needs no such choice, but not because addition commutes: a reduction's
+// bits follow its GROUPING, and both headers happen to expand to the same four-level pairwise tree (GCC's
+// avx512fintrin.h:16297-16306; Clang's reassoc llvm.vector.reduce.fadd, measured lowering [M]). Clang's reassoc
+// licenses any association, so that agreement is a measurement to re-check, not a guarantee.
 //
 // WHERE THE RESEARCH (docs/research/basalt-cpu-q2.md) AND basalt's SOURCE DISAGREE - the source governs:
 //   - Step 6's "inv = +inf when s < 2^-128" (:155) is off by one value: 1.f / 2^-128 is already +inf, so the band

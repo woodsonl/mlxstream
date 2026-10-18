@@ -50,7 +50,7 @@ from tests.kernels.test_basalt_iq_parity import quantize_q2_0
 
 F32 = np.float32
 H, MAXC, QKA, QK, BB, MAXT = emu.H, emu.MAXC, emu.QKA, emu.QK, emu.BB, emu.MAXT
-TWO_M128 = F32(2.0) ** -128                  # s <= this gives inv = +inf (docs/research/basalt-cpu-q2.md, 3)
+TWO_M128 = F32(2.0) ** -128                  # s <= this gives inv = +inf (docs/research/basalt-cpu-q2.md, 4)
 TWO_M149 = F32(2.0) ** -149                  # the smallest positive float32
 
 
@@ -260,7 +260,7 @@ def test_a7_rounding_half_away_from_zero_and_the_tie():
     """A7. ``r = t + copysign(0.5, t)`` truncated is lround's rule, round half AWAY from zero: with amax = 127 the
     scale is exactly 1 and every t is exact, so +-2.5 must give +-3. And the second rounding is part of the
     contract: ``t = 0.49999997f`` makes the exact sum ``1 - 2^-25``, a tie that rounds to the even 1.0f, so the code
-    is 1 where ``lround(t)`` would give 0 (docs/research/basalt-cpu-q2.md, section 3)."""
+    is 1 where ``lround(t)`` would give 0 (docs/research/basalt-cpu-q2.md, section 4)."""
     x = np.zeros(QKA, F32)
     x[0], x[1], x[2], x[3], x[4] = F32(127.0), F32(2.5), F32(-2.5), F32(0.5), F32(-0.5)
     q, scale, _, _, _ = check_act(x)
@@ -332,8 +332,10 @@ def test_a8_the_saturation_trap():
 def test_a9_the_contraction_trap():
     """A9. Step 7's ``_mm512_mul_ps`` and step 9's ``_mm512_add_ps`` round twice, which GCC 12.2/13.2/14.3/15.2 and
     Clang 21 all emit as a separate vmulps and vaddps. A contracted ``fma(x, inv, +-0.5)`` skips the rounding of t
-    and changes the code, so this input fails the moment the two statements are written as one expression, or the
-    translation unit is built -ffp-contract=fast (its default, ``on``, leaves separate statements alone [M]), or the two
+    and changes the code, so this input fails the moment the two statements are written as one expression. Measured,
+    no contraction setting fuses them while they are two statements, because ``t`` also feeds the ``>= 0`` compare
+    and has to be materialised either way; what ``-ffast-math`` does to this file instead is substitute FMAXNM for
+    the nine ``maxps`` selects, which case A6 catches. The two
     statements are merged into one expression."""
     amax, xt = F32(np.e), F32(0.01070189569145441)
     x = np.zeros(QKA, F32)
