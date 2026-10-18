@@ -234,18 +234,20 @@ inline float reduce_add_x86(const float v[16]) {
 /// q2g_row_multi for ONE row and ONE token under the rules above, 16 lanes wide like the AVX-512 original: lane L
 /// of the group at b0 takes block b0 + L/2's fp16 scale and the activation's chunk 2*b0 + L, and acc lanes 0-7 and
 /// 8-15 take the block's first and second chunk. A single-accumulator loop would get the trees wrong.
-/// The masked lanes (L >= 2 * nb) are skipped rather than read: they would read past the row's width (case B5),
-/// and fma(+0, +0, corr) returns corr anyway, since corr is never -0.0 (its first write is +0.0 + a product, and
-/// round-to-nearest gives -0.0 only when both addends are).
+/// The masked lanes (L >= 2 * nb) read nothing - they would read scale and hx past the width, which case B5
+/// poisons - but still run sites 1 and 2 on the zeros the masked loads leave, as x86's unmasked vmulps and
+/// vfmadd231ps do. fma(+0, +0, corr) is corr except where corr is -0.0, and there it is +0.0; corr can be -0.0,
+/// because an underflowing product rounds to a signed zero (dd * hx = 2^-24 * -2^-149 = -2^-173 gives -0.0).
 float x86_row(const uint8_t* row, const ActQ* a, int nblocks) {
     float acc[16] = {0.0f}, corr[16] = {0.0f};
     for (int b0 = 0; b0 < nblocks; b0 += 8) {
         const int nb = nblocks - b0 < 8 ? nblocks - b0 : 8;
         float d[8], p[16];
-        group_scales(row, b0, nb, d);
-        for (int L = 0; L < 2 * nb; ++L) {
-            p[L] = x86_mul(d[L / 2], a->scale[2 * b0 + L]);                   // site 1: vmulps, SRC1 = dd
-            corr[L] = x86_fma(d[L / 2], a->hx[2 * b0 + L], corr[L]);          // site 2: dd, hx, corr
+        group_scales(row, b0, nb, d);                                         // d[nb..7] = +0.0: the masked dd
+        for (int L = 0; L < 16; ++L) {
+            const bool on = L < 2 * nb;
+            p[L] = x86_mul(d[L / 2], on ? a->scale[2 * b0 + L] : 0.0f);       // site 1: vmulps, SRC1 = dd
+            corr[L] = x86_fma(d[L / 2], on ? a->hx[2 * b0 + L] : 0.0f, corr[L]);   // site 2: dd, hx, corr
         }
         for (int i = 0; i < nb; ++i) {
             const uint8_t* qs = row + (size_t) (b0 + i) * BB + 2;
@@ -284,8 +286,8 @@ inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nt, int 
         float p[MAXT][8][2];
         for (int t = 0; t < nt; ++t) {
             // corr_L = fma(dd_L, hx_{2*b0+L}, corr_L). The masked lanes read nothing (_mm512_maskz_loadu_ps does
-            // not touch them) and contribute fma(+0, +0, corr) = corr, since corr starts at +0.0 and a
-            // round-to-nearest sum is -0.0 only when both addends are.
+            // not touch them) but still run the FMA, as x86's does, with dd = hx = +0.0: fma(+0, +0, corr) is corr
+            // except where corr is -0.0 - an underflowing product leaves one, as in x86_row() - and +0.0 there.
             float hx[16];
             for (int L = 0; L < 16; ++L) hx[L] = L < 2 * nb ? a[t]->hx[2 * b0 + L] : 0.0f;
             for (int v = 0; v < 4; ++v) corr[t][v] = vfmaq_f32(corr[t][v], dd[v], vld1q_f32(hx + 4 * v));
