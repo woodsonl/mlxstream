@@ -56,9 +56,9 @@ def _bind(ctx: _Ctx, op: Op, slot: int, v: Value, align: int) -> Tuple[int, str,
 
 
 def _q8_1(ctx: _Ctx, op: Op) -> None:
-    kind = op.attrs.get("kind")
+    kind = op.attrs.get("quantizer")
     if kind not in Q8_1_KERNELS:
-        raise ValueError(f"basalt_q8_1: attr kind must be one of {sorted(Q8_1_KERNELS)}, got {kind!r}")
+        raise ValueError(f"basalt_q8_1: attr quantizer must be one of {sorted(Q8_1_KERNELS)}, got {kind!r}")
     t = _columns(ctx, op)
     xs, (y,) = list(op.inputs), op.outputs
     if len(xs) != (2 if kind == "swiglu" else 1):

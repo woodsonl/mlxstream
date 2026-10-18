@@ -13,7 +13,7 @@ Programs. basalt captures one graph per window width (T = 1 .. 8) and bakes T in
 into their macros and params: one static program per width, sharing the weight windows by name. A dynamic-T program
 is refused (it binds StepState, which none of these kernels reads).
 
-* ``basalt_q8_1``, attr ``kind``: ``native`` (``native_quantize_q8_1``) ``(x [T, n_in] F32)`` → ``xq``;
+* ``basalt_q8_1``, attr ``quantizer``: ``native`` (``native_quantize_q8_1``) ``(x [T, n_in] F32)`` → ``xq``;
   ``swiglu`` (``native_swiglu_quantize_q8_1``) ``(gate, up [T, n_in] F32)`` → the q8_1 rows of their SwiGLU;
   ``ieee`` (``quantize_q8_1_rows``) ``(x)`` → ``xq`` in nvcc's IEEE arithmetic. n_in is a multiple of 32. The native
   and SwiGLU kinds refuse more than 8 columns (basalt's ``validate_shape``); the IEEE rows feed only the routed experts
