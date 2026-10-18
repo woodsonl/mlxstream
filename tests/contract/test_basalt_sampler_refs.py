@@ -12,15 +12,25 @@
 - The vectorized top-k list (``mirror_select``: bincount counts, the elementwise penalty, a stable sort) equals
   basalt's O(k x nv) loop (``mirror_select_scalar``), ids and logit bits, on 44 rows that have ties, signed zeros,
   +-inf, NaN, ids outside the vocabulary and fewer candidates than places.
+- On the 40 of them with only finite logits, ``mirror_pick`` over that list draws ``sampled_reference``'s token at
+  rows 0 and 1's counters: the mirror stands in for basalt's sampled reference on such rows (spec T§3.10).
+- ``mirror_prob`` on fixture 10's row (probabilities 0.4 / 0.3 / 0.2 / 0.1, top_p 0.75, min_p 0.3) keeps the three
+  that top_p keeps before min_p, then applies the temperature: min_p first would keep two.
+- Fixture 16's generator writes row 3's history as T§8.18 lists it, every third slot repeating its edge.
+- Every fixture generator, called twice with its seed, gives the same bytes.
 """
 
+import hashlib
 import math
+import types
 
 import numpy as np
 import pytest
 
-from tests.basalt_sampler_ref import (NINF, SamplerParams, f2u, mirror_select, mirror_select_scalar, nv_logf,
-                                      sampled_k, u2f)
+from tests.basalt_sampler_ref import (NINF, SamplerParams, bench_rows, coupled_cases, f2u, f32, fixture12_data,
+                                      fixture13_data, fixture16_data, fixture17_data, fixture18_data, mirror_pick,
+                                      mirror_prob, mirror_select, mirror_select_scalar, normal_rows, nv_logf,
+                                      probe_rows, sampled_k, sampled_reference, u2f)
 
 # min_p (float bits), its correctly rounded logf (float bits), the exact logarithm's offset from that float (ulps)
 MIN_P_LOGF = [(0x3D4CCCCD, 0xC03FBA14, 0.205), (0x3DCCCCCD, 0xC0135D8E, 0.197), (0x3E4CCCCD, 0xBFCE0210, 0.377),
@@ -86,3 +96,57 @@ def test_basalt_sampler_ref_mirror_select_vectorized_matches_scalar():
         want = mirror_select_scalar(list(l), len(l), win, p, k)
         if got.ids != want.ids or bits(got) != bits(want): bad.append(name)
     assert len(rows) == 44 and not bad, f"vectorized vs scalar: {len(rows)} cases, {len(bad)} mismatches: {bad}"
+
+
+def test_basalt_sampler_ref_mirror_pick_matches_sampled_reference():
+    rows = [case for case in _mirror_cases() if case[0].startswith("nv512")]
+    bad = [(name, t) for name, l, win, p, k in rows for t in (0, 1)
+           if mirror_pick(mirror_select(l, len(l), win, p, k), k, p, t) != sampled_reference(l, win, p, t)]
+    assert len(rows) == 40 and not bad, \
+        f"mirror_pick(mirror_select) vs sampled_reference: {2 * len(rows)} picks, {len(bad)} differ: {bad}"
+
+
+@pytest.mark.parametrize("temperature, want", [(1.0, [4 / 9, 3 / 9, 2 / 9]), (0.5, [16 / 29, 9 / 29, 4 / 29])])
+def test_basalt_sampler_ref_mirror_prob_cuts_then_scales(temperature, want):
+    p = SamplerParams(top_k=4, top_p=0.75, min_p=0.3, temperature=temperature)
+    row = np.array([nv_logf(f32(x)) for x in (0.4, 0.3, 0.2, 0.1)] + [-30.0] * 4, np.float32)
+    sel = mirror_select(row, 8, [], p, 4)
+    got = [mirror_prob(sel, 4, p, q) for q in range(8)]
+    assert sel.ids == [0, 1, 2, 3] and max(abs(g - w) for g, w in zip(got, want + [0.0] * 5)) < 1e-6, \
+        f"mirror_prob over ids {sel.ids}: {got}; top_p keeps three, min_p keeps them, the temperature last: {want}"
+
+
+@pytest.mark.parametrize("nv", [1000, 248320])
+def test_basalt_sampler_ref_fixture16_history(nv):
+    h = fixture16_data(nv)[1].reshape(4, 64)
+    want = ([0, 501, 998, 998, 1000, 1077, -5] if nv == 1000 else
+            [0, 1023, 1024, 1024, 4095, 4096, 4096, 8191, 8192, 8192, 12345, nv // 2 + 1, nv // 2 + 1, nv - 2, nv,
+             nv + 77, -5])
+    assert (h[:3] == -1).all() and h[3].tolist() == want + [-1] * (64 - len(want)), \
+        f"fixture 16 history at nv {nv}: row 3 {h[3].tolist()}, want {want} then -1; rows 0-2 all -1"
+
+
+GENERATORS = {  # one per random block of sampler_parity (spec T§4), at its cheapest shape
+    "logit_bias B": lambda: normal_rows(5, 1, 248320), "fixture 1": lambda: normal_rows(3),
+    "fixture 3": lambda: normal_rows(5), "fixture 11": lambda: normal_rows(11), "fixture 12": fixture12_data,
+    "fixture 13": fixture13_data, "fixture 14": lambda: normal_rows(14, scale=0.3),
+    "fixture 16": lambda: fixture16_data(1000), "fixture 17": lambda: fixture17_data(512),
+    "fixture 18": lambda: fixture18_data(512, 64, 1874), "probe": lambda: probe_rows(7), "bench": lambda: bench_rows(4),
+    "coupled": coupled_cases,
+}
+
+
+def _digest(x, h):
+    """Feeds a generator's output to ``h``: each array's dtype, shape and bytes (NaN compares by its bits), each other
+    value's repr; tuples, lists and generators element by element."""
+    if isinstance(x, np.ndarray): h.update(f"{x.dtype.str}{x.shape}".encode() + x.tobytes())
+    elif isinstance(x, (tuple, list, types.GeneratorType)):
+        for v in x: _digest(v, h)
+    else: h.update(repr(x).encode())
+    return h.hexdigest()
+
+
+@pytest.mark.parametrize("block", GENERATORS)
+def test_basalt_sampler_ref_generators_deterministic(block):
+    a, b = (_digest(GENERATORS[block](), hashlib.sha256()) for _ in range(2))
+    assert a == b, f"{block}: two calls with the same seed gave other bytes"

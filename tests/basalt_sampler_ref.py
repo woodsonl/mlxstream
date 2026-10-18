@@ -18,20 +18,25 @@ import ...``.
   (sampler.cu:37-59) transcribed; basalt's own variant, not a library generator. The draw for row t is
   ``philox_uniform(seed, (counter + t) mod 2^64)``.
 - sampler_parity's host references, on float32 scalars one operation at a time (``SamplerParams``, ``fmax``):
-  ``reference_pick`` / ``reference_cut``; the kernels' own list and tail, ``mirror_select`` and ``mirror_pick``, with
-  ``sampled_k`` and ``window_of``; ``greedy_pen`` for the greedy references local to its main. ``penal`` is their
-  penalty, rounded as the device rounds it. ``mirror_pick`` calls ``nv_exp`` and ``nv_logf`` where basalt's host
-  calls std::exp(double) and logf; ``reference_pick`` and ``reference_cut`` keep ``math.exp``: no kernel computes
-  their sums.
+  ``reference_pick`` / ``reference_cut``; the sampled chain in llama.cpp's order, ``sampled_reference``, and its
+  survivor count ``sampled_cut``; the kernels' own list and tail, ``mirror_select`` and ``mirror_pick``, with
+  ``sampled_k`` and ``window_of``; the probe's probability, ``mirror_prob``; ``greedy_pen`` for the greedy references
+  local to its main. ``penal`` is their penalty, rounded as the device rounds it. ``sampled_reference``,
+  ``sampled_cut`` and ``mirror_pick`` call ``nv_exp`` and ``nv_logf`` where basalt's host calls std::exp(double) and
+  logf; ``reference_pick``, ``reference_cut`` and ``mirror_prob`` keep ``math.exp``: no kernel computes their sums,
+  and ``mirror_prob`` is the independent check of the kernel's probability.
 - The vectorized forms the large fixtures need: ``penal_vec``, ``select_vec`` and ``mirror_select`` itself, equal
   bit for bit to basalt's loop, ``mirror_select_scalar``.
+- The fixture generators, one per random block of sampler_parity (spec T§4): ``normal_rows`` for the plain fills,
+  ``fixture12_data``, ``fixture13_data``, ``fixture16_data``, ``fixture17_data``, ``fixture18_data``, ``probe_rows``,
+  ``bench_rows`` and ``coupled_cases``; ``raw32`` gives basalt's ``rng()`` draws and ``roundf`` C's rounding.
 """
 
 import functools
 import math
 import struct
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import NamedTuple
 
@@ -324,6 +329,123 @@ def mirror_pick(sel, k, p, row):
     return pick
 
 
+# ---- sampled_reference, sampled_cut (sampler_parity.cpp:160-265) and mirror_prob (:347-380) -------------------------
+# Transcribed apart from mirror_pick, though they share its tail's steps: test_basalt_sampler_refs compares mirror_pick
+# over the vectorized list with sampled_reference, which a shared helper would compare with itself.
+
+def _select_first(l, hist, p):
+    """The top-k of sampled_reference and sampled_cut (:165-189): k = sampled_k(top_k, nv); each round the first untaken
+    id wins outright, even at -inf or NaN, then strict > (the lowest id on a tie), every logit through ``penal`` with
+    its count over all of ``hist`` (the callers pass the window). Each id's count and penalty are computed once rather
+    than once per round, the same values."""
+    nv, cnt = len(l), Counter(int(h) for h in hist)
+    s = [penal(l[v], cnt[v], p) for v in range(nv)]
+    taken, ids, lg = [False] * nv, [], []
+    for _ in range(sampled_k(p.top_k, nv)):
+        best, bv = -1, f32(0)
+        for v in range(nv):
+            if taken[v]: continue
+            if best < 0 or s[v] > bv: best, bv = v, s[v]
+        taken[best] = True; ids.append(best); lg.append(bv)
+    return ids, lg
+
+
+def sampled_reference(l, hist, p, row):
+    """The sampled chain in llama.cpp's order (:160-222) on one row ``l`` and its counted window ``hist``:
+    ``_select_first``'s list; top_p over the whole list with base lg[0] (no max taken) and the min_keep clamp; the
+    min_p prefix cut (strict <) on top_p's survivors; the temperature (float32 products with 1 / T, 0 when T <= 0),
+    base the fmax of the kept products; the draw philox_uniform(seed, counter + row): the first kept entry whose
+    cumulative probability exceeds it, else the last kept one. Binary64 sums in list order from 0, with ``nv_exp_memo``
+    and ``nv_logf`` where the host calls std::exp(double) and logf. It equals ``mirror_pick`` over ``mirror_select``'s
+    list on rows without NaN that hold at least k values above -inf (spec T§3.10); the mirror is the reference
+    elsewhere."""
+    ids, lg = _select_first(l, hist, p)
+    n_sel = n_keep = len(ids)
+    if f32(p.top_p) < 1:
+        s = 0.0
+        for x in lg: s += nv_exp_memo(float(x) - float(lg[0]))
+        cum, cut = 0.0, n_sel
+        for i, x in enumerate(lg):
+            cum += nv_exp_memo(float(x) - float(lg[0])) / s
+            if cum >= float(f32(p.top_p)): cut = i + 1; break
+        if cut < p.min_keep: cut = p.min_keep if p.min_keep < n_sel else n_sel
+        n_keep = cut
+    if f32(p.min_p) > 0:
+        thresh = lg[0] + nv_logf(f32(p.min_p))
+        for i in range(n_keep):
+            if lg[i] < thresh: n_keep = i; break
+    assert n_keep > 0, "min_p > 1 kept nothing: basalt's host then reads sel_ids[-1]; use the mirror"
+    inv_t = f32(1) / f32(p.temperature) if f32(p.temperature) > 0 else f32(0)
+    sc = [x * inv_t for x in lg]
+    smx = sc[0]
+    for i in range(1, n_keep): smx = fmax(smx, sc[i])
+    s = 0.0
+    for i in range(n_keep): s += nv_exp_memo(float(sc[i]) - float(smx))
+    u = philox_uniform(p.seed, (p.counter + row) & (2**64 - 1))
+    cum, pick = 0.0, ids[n_keep - 1]
+    for i in range(n_keep):
+        cum += nv_exp_memo(float(sc[i]) - float(smx)) / s
+        if float(u) < cum: pick = ids[i]; break
+    return pick
+
+
+def sampled_cut(l, hist, p):
+    """The survivors of the min_p and top_p cuts (:224-265), in the REVERSE of the chain's order: min_p over the whole
+    ``_select_first`` list (threshold sel[0] + logf(min_p), strict <), then top_p over its survivors with base sel[0]
+    and the min_keep clamp. Its one caller, fixture 7, has top_p = 1, where the order cannot matter; it is not the
+    chain where top_p < 1 and min_p > 0 together. ``nv_exp_memo`` and ``nv_logf``, as in sampled_reference."""
+    _, sel = _select_first(l, hist, p)
+    n_minp = len(sel)
+    if f32(p.min_p) > 0:
+        thresh = sel[0] + nv_logf(f32(p.min_p))
+        for i in range(len(sel)):
+            if sel[i] < thresh: n_minp = i; break
+    if f32(p.top_p) >= 1: return n_minp
+    s = 0.0
+    for i in range(n_minp): s += nv_exp_memo(float(sel[i]) - float(sel[0]))
+    cum, cut = 0.0, n_minp
+    for i in range(n_minp):
+        cum += nv_exp_memo(float(sel[i]) - float(sel[0])) / s
+        if cum >= float(f32(p.top_p)): cut = i + 1; break
+    if cut < p.min_keep: cut = p.min_keep if p.min_keep < n_minp else n_minp
+    return cut
+
+
+def mirror_prob(sel, k, p, q):
+    """The probe's double reference (:347-380): the final probability of id ``q`` under the tail over sel[0:k], 0
+    outside the survivors. Its survivors are mirror_pick's, computed again here: top_p with base the fmax of the list
+    and the min_keep clamp, then min_p. Then the kept logits times 1 / T in float32 (unguarded: its callers have T >
+    0), base the fmax of those products as doubles from -inf, and the probability of the LAST kept entry whose id is
+    ``q`` (the kernel's qprob takes the first, sampler.cu:433-434; only id 0 can repeat, from empty rounds). Every
+    exponential is ``math.exp``, as basalt's host std::exp: it is the independent double check behind P.3's 1e-6, not
+    the kernels' exp; the min_p threshold uses ``nv_logf``, the one logf helper."""
+    ids, lg = sel
+    n_keep, mx = k, lg[0]
+    for i in range(1, k): mx = fmax(mx, lg[i])
+    if f32(p.top_p) < 1:
+        s = 0.0
+        for i in range(k): s += math.exp(float(lg[i]) - float(mx))
+        cum, cut = 0.0, k
+        for i in range(k):
+            cum += math.exp(float(lg[i]) - float(mx)) / s
+            if cum >= float(f32(p.top_p)): cut = i + 1; break
+        if cut < p.min_keep: cut = p.min_keep if p.min_keep < k else k
+        n_keep = cut
+    if f32(p.min_p) > 0:
+        thresh = lg[0] + nv_logf(f32(p.min_p))
+        for i in range(n_keep):
+            if lg[i] < thresh: n_keep = i; break
+    inv_t = f32(1) / f32(p.temperature)
+    smx = -math.inf
+    for i in range(n_keep): smx = fmax(smx, float(lg[i] * inv_t))
+    s = pq = 0.0
+    for i in range(n_keep):
+        e = math.exp(float(lg[i] * inv_t) - smx)
+        s += e
+        if ids[i] == q: pq = e
+    return pq / s if n_keep > 0 else 0.0
+
+
 def window_of(hist, hist_len, t, last_n):
     """Row t's counted window (:504-510): the last min(last_n, hist_len) of its hist_len slots, as the kernels count
     them (sampler.cu:97-103); empty without a history or without penalties."""
@@ -352,3 +474,192 @@ def greedy_pen(l, hist, p, divide_unconditionally=False):
             s = penal(l[v], c, p)
         if v == 0 or s > bv: best, bv = v, s
     return best
+
+
+# ---- fixture generators (spec T§4) ---------------------------------------------------------------------------------
+# The port draws its own rows, not basalt's (libstdc++'s normal_distribution is not numpy's): one RandomState per block,
+# seeded with basalt's seed unless a gate whose truth rests on the data needs another (M12.O, M17.2: change the seed,
+# never the criterion), with basalt's distributions, transforms and constructed overwrites in float32, and raw draws
+# where basalt has ``rng() % n``. Logits are (rows, nv) float32; histories flat int32, row t at [t * H, (t + 1) * H),
+# as ``window_of`` reads them.
+
+def raw32(rs, n):
+    """n raw 32-bit draws of RandomState ``rs``, as int64: std::mt19937's rng() for the same seed (numpy's legacy
+    seeding is init_genrand), so basalt's ``rng() % m`` is ``raw32(rs, n) % m``."""
+    return rs.randint(0, 2**32, size=n, dtype=np.uint64).astype(np.int64)
+
+
+def _normal(rs, shape, scale):
+    """normal_distribution<float>(0, scale) values: float32 standard normals times f32(scale), the product rounded in
+    float32 as libstdc++'s ``ret * stddev`` is."""
+    return rs.standard_normal(shape).astype(np.float32) * np.float32(scale)
+
+
+def roundf(x):
+    """C's roundf on float32 values: halves away from zero, where np.round rounds them to even; in float64, where the
+    + 0.5 is exact for a float32."""
+    x = np.asarray(x, np.float32).astype(np.float64)
+    return np.copysign(np.floor(np.abs(x) + 0.5), x).astype(np.float32)
+
+
+def normal_rows(seed, rows=4, nv=512, scale=1.0):
+    """A (rows, nv) fill of normal(0, 1) times ``scale`` from RandomState(seed), for the blocks that are one plain fill:
+    logit_bias fixture B's ``zeros`` (seed 5, one row of 248,320; :781-782), fixtures 1, 3 and 11 (seeds 3, 5 and 11,
+    4 x 512) and fixture 14 (seed 14, scale 0.3: ``g(rng) * 0.3f``, :1282-1284)."""
+    return _normal(np.random.RandomState(seed), (rows, nv), scale)
+
+
+def fixture12_data(seed=12):
+    """Fixture 12 (:1191-1204) from RandomState(seed): the 5,000-token tail (raw draws mod 512), then, for T in (1, 2,
+    4, 8) and H in (1, 64, 1024, 4096) within each T, a (T, 512) normal(0, 1) fill whose row t holds 5.0 at its draft
+    100 + 37 t. Returns the tail and the 16 cases (T, H, window, logits) in that order; the case's histories are
+    ``penalty_rows(tail, window, T, H)``."""
+    rs = np.random.RandomState(seed)
+    tail, cases = (raw32(rs, 5000) % 512).astype(np.int32), []
+    for T in (1, 2, 4, 8):
+        for H in (1, 64, 1024, 4096):
+            window = (100 + 37 * np.arange(T)).astype(np.int32)
+            l = _normal(rs, (T, 512), 1.0)
+            l[np.arange(T), window] = 5.0
+            cases.append((T, H, window, l))
+    return tail, cases
+
+
+def fixture13_data(seed=13):
+    """Fixture 13 (:1238-1250) from RandomState(seed): a (4, 512) normal(0, 1) fill, then each row's 16 history slots
+    in order, a raw draw mod 512 in each slot j % 3 != 0 (drawn only there) and junk in the others (512, 1512,
+    0x7fffffff, -5, 1 << 20, 512); then the id in row t's slot 1 gets the logit 4.0. Returns the logits, the history
+    and ``valid_only`` (the drawn ids, -1 in the junk slots), flat int32 of 4 x 16."""
+    rs = np.random.RandomState(seed)
+    junk = (512, 1512, 0x7FFFFFFF, -5, 1 << 20)
+    l = _normal(rs, (4, 512), 1.0)
+    hist, valid = np.full(64, -1, np.int32), np.full(64, -1, np.int32)
+    for t in range(4):
+        for j in range(16):
+            hist[16 * t + j] = junk[j // 3 % 5] if j % 3 == 0 else raw32(rs, 1)[0] % 512
+            if j % 3: valid[16 * t + j] = hist[16 * t + j]
+        l[t, hist[16 * t + 1]] = 4.0
+    return l, hist, valid
+
+
+def fixture16_data(nv, seed=None):
+    """Fixture 16 (:1380-1422) for vocabulary nv, from RandomState(1600 + nv) or ``seed``: a (4, nv) fill of
+    floor(normal(0, 1) * 4) / 4 (quarter steps), then basalt's constructed rows in its order, spread(j) being
+    (7919 j + 13) % nv:
+    - row 0: 6.25 at spread(j) for j < 20 and 6.0 for 20 <= j < 320, then +inf at nv / 2 and nv - 1;
+    - row 1: -|v|, each zero signed by its id's parity (-0 at even ids), then +inf at 3;
+    - row 2: -inf, but 1.0 at spread(400 .. 404) and 0.5 at spread(405 .. 409), then NaN at spread(500) and
+      spread(501) and +inf at spread(502): 11 candidates;
+    - row 3: 9.0 at each window edge below nv (0, 1023, 1024, 4095, 4096, 8191, 8192, 12345, nv / 2 + 1, nv - 2),
+      3.75 at spread(600 .. 614) and 3.5 at spread(615 .. 629), then +inf at nv / 2, outside the window.
+    Returns the logits and the history, flat int32 of 4 x 64: -1 except row 3's first slots, which hold the edges in
+    order (an edge stored into a slot that is the third, sixth, ... is stored once more: counted twice), then nv,
+    nv + 77 and -5, outside the vocabulary."""
+    rs = np.random.RandomState(1600 + nv if seed is None else seed)
+    inf, sp = np.float32(np.inf), lambda j: (7919 * j + 13) % nv
+    l = np.floor(_normal(rs, (4, nv), 1.0) * np.float32(4)) / np.float32(4)
+    for j in range(320): l[0, sp(j)] = 6.25 if j < 20 else 6.0
+    l[0, nv // 2] = l[0, nv - 1] = inf
+    r1 = -np.abs(l[1])
+    l[1] = np.where(r1 == 0, np.where(np.arange(nv) & 1, np.float32(0.0), np.float32(-0.0)), r1)
+    l[1, 3] = inf
+    l[2] = -inf
+    for j in range(10): l[2, sp(j + 400)] = 1.0 if j < 5 else 0.5
+    l[2, sp(500)] = l[2, sp(501)] = np.nan
+    l[2, sp(502)] = inf
+    h3 = []
+    for e in (0, 1023, 1024, 4095, 4096, 8191, 8192, 12345, nv // 2 + 1, nv - 2):
+        if e < nv and e != nv // 2:
+            h3.append(e)
+            if len(h3) % 3 == 0: h3.append(e)
+            l[3, e] = 9.0
+    h3 += [nv, nv + 77, -5]
+    for j in range(30): l[3, sp(j + 600)] = 3.75 if j < 15 else 3.5
+    l[3, nv // 2] = inf
+    hist = np.full(4 * 64, -1, np.int32)
+    hist[192:192 + len(h3)] = h3
+    return l, hist
+
+
+def fixture17_data(nv, seed=None):
+    """Fixture 17 (:1471-1487) for vocabulary nv, from RandomState(1700 + nv) or ``seed``: a (17, nv) fill of
+    floor(normal(0, 1.5) * 2) / 2 (half steps; at nv = 512 then floor(v / 2), whole steps), then each row's 64 history
+    slots, one raw draw each: the draw mod nv in odd slots, head[draw mod len(head)] in even ones, head being the ids
+    (ascending) whose logit is at least the row's maximum minus 1. Returns the logits and the history, flat int32 of
+    17 x 64."""
+    rs = np.random.RandomState(1700 + nv if seed is None else seed)
+    l = np.floor(_normal(rs, (17, nv), 1.5) * np.float32(2)) / np.float32(2)
+    if nv == 512: l = np.floor(l / np.float32(2))
+    hist = np.empty(17 * 64, np.int32)
+    for t in range(17):
+        head, r = np.nonzero(l[t] >= l[t].max() - np.float32(1))[0], raw32(rs, 64)
+        hist[64 * t:64 * (t + 1)] = np.where(np.arange(64) & 1, r % nv, head[r % len(head)])
+    return l, hist
+
+
+def fixture18_data(nv, T, seed):
+    """Fixture 18's ``make`` (:1556-1563) from RandomState(seed): a (T, nv) fill of floor(normal(0, 1.5) * 2) / 2, then
+    T x 64 history slots of raw draws mod nv, flat int32. basalt calls it as (248320, 3, 1800) and as (512, T, 1810 + T)
+    for T in (64, 70)."""
+    rs = np.random.RandomState(seed)
+    l = np.floor(_normal(rs, (T, nv), 1.5) * np.float32(2)) / np.float32(2)
+    return l, (raw32(rs, 64 * T) % nv).astype(np.int32)
+
+
+def probe_rows(T, seed=4242):
+    """probe_parity's rows (:387-396) for T in (7, 70): one RandomState(seed) for both windows, normal(0, 3), the 7-row
+    fill first and the 70-row fill after it; then every even row t gets 14 + t added at (977 t) % 248,320."""
+    rs = np.random.RandomState(seed)
+    for n in (7, 70)[:(7, 70).index(T) + 1]:
+        l = _normal(rs, (n, 248320), 3.0)
+    t = np.arange(0, T, 2)
+    l[t, t * 977 % 248320] += np.float32(14) + t.astype(np.float32)
+    return l
+
+
+def bench_rows(T, seed=20):
+    """bench_sampled's rows (:517-521) for T in (1, 4, 8): one RandomState(seed), normal(0, 3), a (T, 248,320) fill per
+    window, in that order."""
+    rs = np.random.RandomState(seed)
+    for n in (1, 4, 8)[:(1, 4, 8).index(T) + 1]:
+        l = _normal(rs, (n, 248320), 3.0)
+    return l
+
+
+COUPLED_VOCABS = (106299, 40525, 4096, 4097, 300, 20, 7)
+
+
+class CoupledCase(NamedTuple):
+    """One coupled_parity case (:603-621): the draft vocabulary nv (subset index i is token id i + 25, of nv + 50 ids),
+    the case number c, its logits (nv,), params, draft index j, the 264-slot ring and the step record's cell."""
+    nv: int
+    c: int
+    logits: np.ndarray
+    p: SamplerParams
+    j: int
+    ring: np.ndarray
+    cell: int
+
+
+def coupled_cases(seed=77):
+    """coupled_parity's 420 cases (:579-621), in its order, from one RandomState(seed) over ``COUPLED_VOCABS``, 60 cases
+    each. Case c: nv values of normal(0, 1 if c % 3 == 0 else 4), then roundf(v * 4) / 4 if c % 4 == 1 (exact ties),
+    then l[0] at every third id if c % 7 == 2 (a wide tie); top_k (20, 0, 1, 64, 5, 20, 100)[c % 7], top_p 1 if
+    c % 5 == 0 else 0.95, min_p 0.05 if c % 6 == 3 else 0, temperature 0.6, seed 1000 + c, and if c % 3 == 1 the
+    penalties last_n 64, repeat 1.1, freq 0.05, present 0.1; j = c % 8; the ring's 264 slots -1 except 176 .. 255 + j,
+    which hold subset tokens (a raw draw mod min(nv, 40), plus 25); then the cell, a raw draw mod 100,000. After the
+    first vocabulary's cases the stream gives the coupled bench's normal(0, 3) row (:659-660): drawn and dropped, as
+    basalt draws it before the next vocabulary."""
+    rs = np.random.RandomState(seed)
+    for nv in COUPLED_VOCABS:
+        for c in range(60):
+            l = _normal(rs, nv, 1.0 if c % 3 == 0 else 4.0)
+            if c % 4 == 1: l = roundf(l * np.float32(4)) / np.float32(4)
+            if c % 7 == 2: l[::3] = l[0]
+            p = SamplerParams(top_k=(20, 0, 1, 64, 5, 20, 100)[c % 7], top_p=1.0 if c % 5 == 0 else 0.95,
+                              min_p=0.05 if c % 6 == 3 else 0.0, temperature=0.6, seed=1000 + c)
+            if c % 3 == 1: p = replace(p, penalty_last_n=64, penalty_repeat=1.1, penalty_freq=0.05, penalty_present=0.1)
+            ring = np.full(264, -1, np.int32)
+            ring[176:256 + c % 8] = raw32(rs, 80 + c % 8) % min(nv, 40) + 25
+            yield CoupledCase(nv, c, l, p, c % 8, ring, int(raw32(rs, 1)[0] % 100000))
+        if nv == 106299: _normal(rs, nv, 3.0)
