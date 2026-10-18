@@ -22,6 +22,8 @@ pick from the cluster's.
   one-block greedy kernel on the same logits.
 - The greedy-only build (attr ``greedy_only``, the cluster pair alone), the port's: its picks equal the full build's in
   mode 0 and the host argmax, at t = 1 and 8.
+- The bias flag without a bias input, the port's: a record's BIAS flag changes no pick in modes 1 and 2 of a program
+  built without the input (its kernels never read slot 3's placeholder).
 - MG.1, the port's: one penalised request in each mode, the record's ``mode`` deciding which dispatches run: mode 0
   the cluster pick, mode 1 the one-block greedy pick, mode 2 the sampled pick; the scratch of a dispatch its mode
   gates off keeps its 0xFF bytes. On the split and on the one-block path (forced).
@@ -232,6 +234,31 @@ def test_basalt_sampler_greedy_only_program(t):
             picks.append(step(eng, t)[0].tolist())
         want = [host_argmax(row) for row in l]
         assert picks[0] == picks[1] == want, f"replay {rep}: greedy_only {picks[0]}, full {picks[1]}, host {want}"
+
+
+@pytest.mark.parametrize("forced", [False, True], ids=["split", "one_block-F"])
+def test_basalt_sampler_bias_flag_without_bias_input(forced):
+    """A program built without a bias input binds a 16-byte placeholder at slot 3 and compiles its kernels with
+    BS_BIAS_BOUND 0, so a record that sets flags BIAS anyway changes no pick and reads nothing there: 8 rows of
+    248,320 normal logits, the request top_k 4, top_p 1, temperature 1, seed 181, counter 5, in mode 1 (the one-block
+    greedy kernel) and mode 2 (the sampled path), each with the flag clear and set: the same picks (the
+    shader-validation run sees any read past the placeholder)."""
+    rows = 8
+    l = np.random.RandomState(20261019).standard_normal((rows, V)).astype(np.float32)
+    p = SamplerParams(top_k=4, top_p=1.0, temperature=1.0, seed=181, counter=5)
+    eng = program(8, forced=forced)
+    assert all(eng.program.kernels[o.kernel].macros["BS_BIAS_BOUND"] == "0" for o in eng.program.ops)
+    eng.buffers["logits"].write(l.tobytes(), 0)
+    request(eng, p)
+    state(eng, t_this_step=rows)
+    name = binding(eng, "bs_greedy_partial", 7)
+    vocab, built_rows, _, hist_len = struct.unpack_from("<IIII", eng.program.buffers[name].init)
+    for mode in (1, 2):
+        picks = []
+        for bias in (False, True):
+            eng.buffers[name].write(gpu.record(p, vocab, built_rows, hist_len, mode, bias=bias), 0)
+            picks.append(step(eng, rows)[0].tolist())
+        assert picks[0] == picks[1], f"mode {mode}: the BIAS flag changed the picks without a bias input: {picks}"
 
 
 # ---- MG.1: the mode word gates the dispatches ------------------------------------------------------------------------

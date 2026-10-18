@@ -8,7 +8,8 @@ its Philox draw, bit for bit basalt's.
     (StepState's ``position``). 0 in the engine.
   - ``nq``: the probe's queried rows. With flags PROBE, row t < ``nq[0]`` writes to ``qprob[t]`` the probability of its
     query ``pending_tokens[t + 1]`` (basalt's ``sample_tokens_probe``); ``nq`` is read only then.
-  - ``bias``, present with attr ``bias=True``: added to every logit first when the request sets flags BIAS.
+  - ``bias``, present with attr ``bias=True``: added to every logit first when the request sets flags BIAS. A program
+    built without it compiles its kernels with ``BS_BIAS_BOUND`` 0, so a record's BIAS flag has no effect there.
   - ``history``, present with attr ``hist_len = H > 0``: row t's last H tokens, -1-padded, most recent last. A
     penalty window counts its last ``min(penalty_last_n, H)`` slots.
   - Per step, from StepState: the rows (``t_this_step``, in static programs too), the seed (``rng_hi:rng_lo``), the

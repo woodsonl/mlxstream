@@ -75,7 +75,7 @@ def test_basalt_sample_program_at_basalt_vocabulary(dynamic, inputs):
     assert [o.name for o in ops] == ["basalt_sample", "bs_greedy_merge", "bs_greedy_one_block", "bs_split_part",
                                      "bs_split_merge"]
     for o in ops:                                                     # STEP_STATE alone: no T_SRC, static or not
-        assert prog.kernels[o.kernel].macros == {"STEP_STATE": "1"}
+        assert prog.kernels[o.kernel].macros == {"STEP_STATE": "1", "BS_BIAS_BOUND": "1" if inputs else "0"}
         assert "struct StepState" in prog.kernels[o.kernel].source
         assert [b for b in o.bindings if b[0] == 15] == [(15, prog.step_state, 0)]
     assert [o.grid for o in ops] == [(8, 8, 1), (8, 1, 1), (8, 1, 1), (61, 8, 1), (8, 1, 1)]

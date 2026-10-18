@@ -1326,8 +1326,8 @@ def _basalt_sample(ctx: _Ctx, op: Op) -> None:
     n_blocks = -(-vocab // kernels.BS_BLOCK)
     src = kernels.basalt_sampler_source()
 
-    def kern(function: str) -> str:
-        return ctx.kernel("basalt_sampler", src, function, {"STEP_STATE": "1"})
+    def kern(function: str) -> str:              # BS_BIAS_BOUND 0: no kernel reads slot 3, whatever a record's flags
+        return ctx.kernel("basalt_sampler", src, function, {"STEP_STATE": "1", "BS_BIAS_BOUND": str(int(has_bias))})
 
     prm = ctx.params("basalt_sample", kernels.basalt_sampler_params(vocab, t_c, n_blocks, hist_len))
     part = ctx.scratch("bs.greedy_part", t_c * kernels.BS_AM_CTAS * 8, shared=True)

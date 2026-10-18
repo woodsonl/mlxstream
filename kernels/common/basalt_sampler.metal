@@ -139,7 +139,12 @@ static inline uint apply_penalties(uint b, uint count, float repeat, float freq,
 // basalt's SamplerParams without its per-step words: the seed is StepState's rng_lo / rng_hi, row t's counter
 // ctr_base + st->position + t. vocab, t_rows, n_blocks and hist_len are the program's; the rest the request's. mode:
 // 0 greedy (the cluster argmax alone), 1 greedy with a penalty window or a bias (the one-block greedy kernel after
-// it), 2 sampled. flags: 1 BIAS, 2 PROBE, 4 MAP (the top-prob kernel's subset map, the program's).
+// it), 2 sampled. flags: 1 BIAS, 2 PROBE, 4 MAP (the top-prob kernel's subset map, the program's). BIAS takes effect
+// only where BS_BIAS_BOUND is 1: the handler compiles a program's kernels with 1 when it binds the (V,) bias input
+// at slot 3 and with 0 when that slot holds a 16-byte placeholder, so no record can make a kernel read past it.
+#ifndef BS_BIAS_BOUND
+#define BS_BIAS_BOUND 1
+#endif
 struct BsSampleParams {
     uint vocab, t_rows, n_blocks, hist_len;
     uint mode, flags;
@@ -555,7 +560,8 @@ static inline BsWindow one_block_window(device const int* history, device atomic
 // logit v of row l after the bias (flags BIAS) and the window's penalties (sampler.cu:132, :490)
 static inline uint one_block_logit(device const uint* l, device const float* bias, thread const BsWindow& w,
                                    constant BsSampleParams& p, uint v) {
-    const uint x = (p.flags & BS_BIAS) != 0u ? as_type<uint>(ieee_add(as_type<float>(l[v]), bias[v])) : l[v];
+    const uint x = BS_BIAS_BOUND && (p.flags & BS_BIAS) != 0u ? as_type<uint>(ieee_add(as_type<float>(l[v]), bias[v]))
+                                                               : l[v];
     const bool hit = w.hlen > 0u
                      && (atomic_load_explicit(w.bits + (v >> 5), memory_order_relaxed) & (1u << (v & 31u))) != 0u;
     return apply_penalties(x, hit ? history_count(w.hrow, w.hlen, v) : 0u, p.penalty_repeat, p.penalty_freq,
@@ -653,8 +659,8 @@ kernel void bs_split_part(device const uint* logits [[buffer(0)]], device const 
     const uint hlen = uint(clamp(p.penalty_last_n, 0, int(p.hist_len)));                 // :590-596
     device const int* hrow = history + ulong(t) * p.hist_len + (p.hist_len - hlen);      // the window is the tail
     part_list<32u, BS_SPLIT_WARPS, true>(logits + ulong(t) * nv, nv, k, b, cand + (ulong(t) * p.n_blocks + b) * k, wl,
-                                         tid, lane, sg, bits, bias, (p.flags & BS_BIAS) != 0u, hrow, hlen,
-                                         p.penalty_repeat, p.penalty_freq, p.penalty_present);
+                                         tid, lane, sg, bits, bias, BS_BIAS_BOUND && (p.flags & BS_BIAS) != 0u,
+                                         hrow, hlen, p.penalty_repeat, p.penalty_freq, p.penalty_present);
 }
 
 constant uint BS_SPLIT_MAX_BLOCKS = 64u;                               // kSplitMaxBlocks: the lists one merge holds
