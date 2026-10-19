@@ -24,6 +24,9 @@ token the draft vocabulary lacks until a flush brings it in.
   rows, the 2-bit copy packed over them by the harness's direct pack dispatch (row0 > 0) on top of the load's pack,
   their ids written into the map. Every draft program scored again equals the harness on the new bytes, its pick
   moves to the planted token, and the copy equals a pack of the new rows at load.
+- Window invariance at program level (docs/design/flash-next.md invariant 1): column j of the T-wide verify head bit
+  for bit the 1-wide program on column j alone.
+- A draft vocabulary of one row on session buffers of exactly its bytes, the map's 4 among them.
 - Each program run twice gives identical bits."""
 
 import numpy as np
@@ -120,10 +123,12 @@ def file_runs(request, data, tmp_path_factory):
     xq = data["xq"]
     for t in WIDTHS:
         out[t] = runs_twice(engines[t], {"xq": xq[: t * QCOL].tobytes()}, {"y": 4 * t * N_VOCAB})
+    ones = [run(engines[1], {"xq": xq[j * QCOL: (j + 1) * QCOL].tobytes()}, {"y": 4 * N_VOCAB}, 0xFF)["y"]
+            for j in range(8)]
     part, part_bytes = workspace(progs["top1"], "basalt_q5k_head_top1", 4)
     out["top1"] = runs_twice(engines["top1"], {"x1": xq[:QCOL].tobytes()},
                              {"t.y": 4 * N_VOCAB, "t.id": 4, "t.p": 4, part: part_bytes})
-    return {"src": src, "progs": progs, "engines": engines, "out": out, "part": part}
+    return {"src": src, "progs": progs, "engines": engines, "out": out, "ones": ones, "part": part}
 
 
 def test_verify_head_is_the_harness(data, file_runs):
@@ -134,6 +139,16 @@ def test_verify_head_is_the_harness(data, file_runs):
         y = np.frombuffer(file_runs["out"][t][0]["y"], F32).reshape(t, N_VOCAB)
         assert y.tobytes() == gpu.q5k_head(w, xq[: t * QCOL], N_IN, N_VOCAB, t).tobytes(), t
         assert np.all(np.isfinite(y)) and np.argmax(y[0]) == data["tokens"][0], t
+
+
+def test_verify_head_window_invariance(file_runs):
+    """Window invariance at program level (docs/design/flash-next.md invariant 1): column j of each width's logits bit
+    for bit the 1-wide program's on column j alone, every logit finite."""
+    for t in WIDTHS:
+        y = file_runs["out"][t][0]["y"]
+        assert np.all(np.isfinite(np.frombuffer(y, F32))), t
+        for j in range(t):
+            assert y[4 * N_VOCAB * j: 4 * N_VOCAB * (j + 1)] == file_runs["ones"][j], (t, j)
 
 
 def test_top1_without_a_map_is_the_harness(data, file_runs):
@@ -278,3 +293,42 @@ def test_draft_programs_run_twice_alike(draft_runs):
     for state, s in draft_runs["states"].items():
         for key, (first, second) in s["out"].items():
             assert first == second, (state, key)
+
+
+def test_one_row_on_exact_session_buffers(data):
+    """A draft vocabulary of one row on session buffers of exactly its bytes (rows 1,760, map 4, copy
+    q5k_proxy_bytes(1)), as basalt allocates them (mtp.cpp:656-657, :676): Engine takes them, and the proxy top-1, the
+    top-1 with the map and the masked head at T = 2 are bit for bit the harness's. Shader validation bounds each read
+    by its buffer, so a read past the one id is a report."""
+    w1, mp, xq = data["w"][:1], np.array([7], np.int32), data["xq"]
+    proxy = gpu.q5k_proxy_pack(w1, 1, [(0, 1)])
+    dev = gpu.device()
+    session = {"dhead": gpu.nt.Buffer(dev, w1.tobytes()), "dvocab": gpu.nt.Buffer(dev, mp.tobytes()),
+               "proxy": gpu.nt.Buffer(dev, proxy.tobytes())}
+    assert [b.nbytes for b in session.values()] == [ROW, 4, kernels.basalt_q5k_proxy_bytes(1)]
+    progs = {}
+    for kind, t in (("proxy", 1), ("top1", 1), ("head", 2)):
+        g = Graph("step")
+        rows, m, cp = draft_inputs(g, rows=1, cap=1)
+        x = g.input("x1", (1, QCOL), U8) if t == 1 else g.input("xq", (T, QCOL), U8)
+        {"proxy": lambda: proxy_top1(g, "p", x, cp, rows, m, n_rows=1, n_cap=1),
+         "top1": lambda: top1(g, "t", x, rows, m), "head": lambda: head(g, "y", x, rows, m)}[kind]()
+        progs[kind] = emit_program(g, pack=[], profile=PROFILE, t=t, tail=None)
+    eng = {k: Engine(p, dev, buffers=session, pipeline_cache=PIPELINES) for k, p in progs.items()}
+    x1 = {"x1": xq[:QCOL].tobytes()}
+
+    scratch = workspace(progs["proxy"], "basalt_q5k_proxy_score", 3)
+    got = run(eng["proxy"], x1, dict([("p.id", 4), ("p.p", 4), scratch]), 0xFF)
+    tid, p, cand, part = gpu.q5k_proxy_top1(proxy, w1, xq[:QCOL], 1, 1, mp)
+    assert (got[scratch[0]][:32], got[scratch[0]][32:40]) == (cand.tobytes(), part.tobytes())   # one tile
+    assert np.frombuffer(got["p.id"], np.int32)[0] == tid == 7 and got["p.p"] == p.tobytes()
+
+    part_ws = workspace(progs["top1"], "basalt_q5k_head_top1", 4)
+    got = run(eng["top1"], x1, dict([("t.y", 4), ("t.id", 4), ("t.p", 4), part_ws]), 0xFF)
+    y, tid, p, part = gpu.q5k_top1(w1, xq[:QCOL], 1, mp)
+    assert (got["t.y"], got["t.p"], got[part_ws[0]][: part.nbytes]) == (y.tobytes(), p.tobytes(), part.tobytes())
+    assert np.frombuffer(got["t.id"], np.int32)[0] == tid == 7
+
+    got = run(eng["head"], {"xq": xq[: 2 * QCOL].tobytes()}, {"y": 8}, 0xFF)
+    want = [gpu.q5k_head_masked(w1, xq[j * QCOL: (j + 1) * QCOL], N_IN, 1, mp) for j in range(2)]
+    assert got["y"] == b"".join(a.tobytes() for a in want)
