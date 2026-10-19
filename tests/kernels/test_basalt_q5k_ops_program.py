@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/q5k_head_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
-# (MIT; third_party/NOTICE): the rows' rescaling and the planted row (centered here).
+# (MIT; third_party/NOTICE): the rows' rescaling and the planted row (centered here; basalt plants it uncentered).
 """basalt's Q5_K head ops (monolith/ops/basalt.py) in compiled static programs on the GPU, as basalt captures them: the
 verify head (``q5k_head_mmvq`` over ``output.weight``, T columns, no map) in one program per width T = 1 .. 8, and a
 drafter's head, one program per draft-head tier and width (``round_exec_[tier][T]``, mtp.cpp:1516; ``mtp.cpp:1006-1025``
@@ -127,7 +127,8 @@ def file_runs(request, data, tmp_path_factory):
 
 
 def test_verify_head_is_the_harness(data, file_runs):
-    """basalt's H3 (verify.cpp:1936): each width's logits bit for bit the harness's launch for T columns."""
+    """The verify head (basalt's ``q5k_head_mmvq`` over ``output.weight``, verify.cpp:1935-1936): each width's logits
+    bit for bit the harness's launch for T columns."""
     w, xq = data["w"], data["xq"]
     for t in WIDTHS:
         y = np.frombuffer(file_runs["out"][t][0]["y"], F32).reshape(t, N_VOCAB)

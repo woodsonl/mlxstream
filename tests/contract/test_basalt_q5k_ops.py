@@ -169,6 +169,17 @@ def test_host_inputs_are_the_sessions(src):
     assert prog.buffers["proxy"].nbytes == kernels.basalt_q5k_proxy_bytes(N_CAP)
 
 
+def test_host_inputs_are_sized_exactly(src):
+    """A host buffer is its value's bytes, a one-id map 4 (basalt allocates ``map.size() * 4``, mtp.cpp:656), so Engine
+    takes the session's exact allocation; the program's own buffers keep their 16-byte floor."""
+    g = Graph("step")
+    x1, (rows, mp, proxy) = g.input("x1", (1, QCOL), U8), draft_inputs(g, rows=1, cap=1)
+    proxy_top1(g, "p", x1, proxy, rows, mp, n_rows=1, n_cap=1)
+    prog = emit(g, src, 1)
+    assert {n: prog.buffers[n].nbytes for n in ("dhead", "dvocab", "proxy", "p.id")} == {
+        "dhead": ROW, "dvocab": 4, "proxy": kernels.basalt_q5k_proxy_bytes(1), "p.id": 16}
+
+
 @pytest.mark.parametrize("t", (1, 3, 8))
 def test_follow_ups_wait_for_their_first_dispatch(src, t):
     """In the finished program (place_barriers, then the backend's finalize) under ``barriers="minimal"``, each mask,
@@ -257,9 +268,13 @@ def _rows_not_host(g, src, bad, tmp):
     return {}
 
 
-def _rows_blocks(g, src, bad, tmp):
-    head(g, "y", g.input("x1", (1, QCOL), U8), g.input("dhead", (64, ROW - 60 if bad else ROW), U8, host=True))
-    return {}
+def _host_rows(name="dhead", shape=(64, ROW), dtype=U8):
+    """The head over host rows ``dhead`` u8 [64, ROW], or (bad) the given name, shape or dtype."""
+    def build(g, src, bad, tmp):
+        rows = g.input(name if bad else "dhead", shape if bad else (64, ROW), dtype if bad else U8, host=True)
+        head(g, "y", g.input("x1", (1, QCOL), U8), rows)
+        return {}
+    return build
 
 
 def _rows_held(kind):
@@ -277,9 +292,16 @@ def _rows_held(kind):
     return build
 
 
-def _head_columns(g, src, bad, tmp):        # 16 columns: a static count, as the default t_max (8) allows no T past 8
-    head(g, "y", g.input("xq", (16 if bad else 8, QCOL), U8), weight(g, "gguf/head", src))
-    return {}
+def _head_shape(good, bad):
+    """The head of ``good`` = (columns, blocks a row) over host rows of that width, or of ``bad``: q5k_head_supported's
+    rule (1 to 64 blocks, 1 to 8 columns, their staging within 96 KiB). Static counts, as the default t_max (8) allows
+    no T past 8."""
+    def build(g, src, is_bad, tmp):
+        cols, blocks = bad if is_bad else good
+        head(g, "y", g.input("xq", (cols, blocks * 8 * kernels.Q8_1_BLOCK_BYTES), U8),
+             g.input("dhead", (64, blocks * 176), U8, host=True))
+        return {}
+    return build
 
 
 def _head_xq_width(g, src, bad, tmp):
@@ -304,10 +326,13 @@ def _map_short(kind):
     return build
 
 
-def _map_dtype(g, src, bad, tmp):
-    mp = g.input("dvocab", (N_DVOCAB,), DType.U32 if bad else I32, host=True)
-    head(g, "y", g.input("x1", (1, QCOL), U8), g.input("dhead", (N_DVOCAB, ROW), U8, host=True), mp)
-    return {}
+def _head_map(shape=(N_DVOCAB,), dtype=I32):
+    """The head with the map i32 [N_DVOCAB], or (bad) of the given shape or dtype."""
+    def build(g, src, bad, tmp):
+        mp = g.input("dvocab", shape if bad else (N_DVOCAB,), dtype if bad else I32, host=True)
+        head(g, "y", g.input("x1", (1, QCOL), U8), g.input("dhead", (N_DVOCAB, ROW), U8, host=True), mp)
+        return {}
+    return build
 
 
 def _top1_n_in(kind):
@@ -357,10 +382,12 @@ def _proxy_map(g, src, bad, tmp):
     return {}
 
 
-def _proxy_attrs(g, src, bad, tmp):
-    x1, (rows, mp, proxy) = g.input("x1", (1, QCOL), U8), draft_inputs(g)
-    proxy_top1(g, "y", x1, proxy, rows, mp, n_rows=None if bad else N_CAP)
-    return {}
+def _proxy_attrs(attr):
+    def build(g, src, bad, tmp):
+        x1, (rows, mp, proxy) = g.input("x1", (1, QCOL), U8), draft_inputs(g)
+        proxy_top1(g, "y", x1, proxy, rows, mp, **{attr: None if bad else N_CAP})
+        return {}
+    return build
 
 
 def _proxy_rows_past_cap(g, src, bad, tmp):
@@ -412,14 +439,26 @@ REFUSALS = [
      r"5 inputs; it takes \(xq, proxy, rows, map\)"),
     ("head on Q4_K rows", _rows_type, r"of ggml type \['q5_k'\]"),
     ("head rows an input the program allocates", _rows_not_host, "is an input each program allocates"),
-    ("head host rows not whole Q5_K blocks", _rows_blocks, r"u8 \[64, 1700\], not u8 \[rows, whole 176-byte"),
+    ("head host rows not whole Q5_K blocks", _host_rows(shape=(64, ROW - 60)),
+     r"u8 \[64, 1700\], not u8 \[rows, whole 176-byte"),
+    ("head host rows not u8", _host_rows(dtype=F32), r"'dhead' are f32 \[64, 1760\], not u8 \[rows, whole 176-byte"),
+    ("head host rows of rank 3", _host_rows(shape=(64, ROW, 2)),
+     r"'dhead' are u8 \[64, 1760, 2\], not u8 \[rows, whole 176-byte"),
+    ("head host rows of no blocks", _host_rows(shape=(64, 0)), r"unsupported shape \(n_in 0, ncols 1\)"),
+    *[(f"head host rows named after StepState's {f}", _host_rows(name=n),
+       f"the host input '{n}' is named after StepState's '{f}'")
+      for n, f in (("draft_tokens", "draft_tokens"), ("tokens", "pending_tokens"))],
     *[(f"{k} reads a row past its rows", _rows_held(k), f"'dhead' holds {N_DVOCAB} rows; the op reads {N_DVOCAB + 1}")
       for k in KINDS],
-    ("head of 16 columns", _head_columns, r"unsupported shape \(n_in 2560, ncols 16\)"),
+    ("head of 16 columns", _head_shape((8, 10), (16, 10)), r"unsupported shape \(n_in 2560, ncols 16\)"),
+    ("head of no columns", _head_shape((1, 10), (0, 10)), r"unsupported shape \(n_in 2560, ncols 0\)"),
+    ("head rows of 65 blocks", _head_shape((1, 64), (1, 65)), r"unsupported shape \(n_in 16640, ncols 1\)"),
+    ("head of 3 columns of 64 blocks", _head_shape((2, 64), (3, 64)), r"unsupported shape \(n_in 16384, ncols 3\)"),
     ("head q8_1 rows of another width", _head_xq_width, r"not u8 \[2, 2880\] \(q8_1 rows of the rows' width\)"),
     ("head logits not F32", _head_logits, r"not f32 \[2, 4000\] \(contiguous columns of the logits\)"),
     *[(f"{k} map a row short", _map_short(k), rf"\[{N_CAP - 1}\]; it maps the {N_CAP} rows read") for k in KINDS],
-    ("head map not I32", _map_dtype, r"the map 'dvocab' is u32"),
+    ("head map not I32", _head_map(dtype=DType.U32), r"the map 'dvocab' is u32"),
+    ("head map of rank 2", _head_map(shape=(N_DVOCAB, 2)), rf"the map 'dvocab' is i32 \[{N_DVOCAB}, 2\]"),
     ("top-1 on rows of 2048", _top1_n_in("basalt_q5k_top1"), "rows of 2048 values; q5k_head_top1 takes 2560"),
     ("proxy top-1 on rows of 2048", _top1_n_in("basalt_q5k_proxy_top1"),
      "rows of 2048 values; the 2-bit copy holds rows of 2560"),
@@ -428,7 +467,8 @@ REFUSALS = [
     *[(f"{k} id not I32", _out_dtype(k, 1), r"\(the best row's id\)") for k in KINDS[1:]],
     *[(f"{k} probability not F32", _out_dtype(k, 2), r"\(its probability\)") for k in KINDS[1:]],
     ("proxy top-1 without the map", _proxy_map, r"3 inputs; .* basalt refuses it without the map"),
-    ("proxy top-1 without n_rows", _proxy_attrs, "attrs n_rows and n_cap must be ints, got None"),
+    ("proxy top-1 without n_rows", _proxy_attrs("n_rows"), f"must be ints, got None and {N_CAP}"),
+    ("proxy top-1 without n_cap", _proxy_attrs("n_cap"), f"must be ints, got {N_CAP} and None"),
     ("proxy top-1 n_rows past n_cap", _proxy_rows_past_cap,
      rf"rows out of range \(row0 0, n 0, n_rows {N_CAP}, n_cap {N_CAP - 1}\)"),
     ("proxy top-1 copy not a host input", _proxy_not_host, "the 2-bit copy 'proxy2' is not a host input"),

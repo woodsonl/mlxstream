@@ -9,8 +9,8 @@ A follow-up dispatch reads what the one before it wrote, which ``writes`` declar
 # The launcher checks are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu:1465-1475, :1490-1494,
 # :1549-1552 and :1563-1568, src/kernels/cuda/dense_tc.cu:1077-1082 and :1107-1113,
 # src/kernels/cuda/native_bf16.cu:139-171, src/kernels/cuda/iq_kernels.cu:2450-2455 and
-# src/kernels/cuda/q5k_head.cu:372-374, :406-408, :411-412 and :516-518 @ b4c63b55754637f4c72ad53a0f791d425f71eb36
-# (MIT; third_party/NOTICE).
+# src/kernels/cuda/q5k_head.cu:372-374, :406-408, :411-412 and :516-518, and the Q5_K head's per-column mask from
+# src/core/mtp.cpp:1024-1025 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 
 from __future__ import annotations
 
@@ -192,7 +192,7 @@ def _q5k_rows(ctx: _Ctx, op: Op, w: Value, n: int) -> int:
         if not w.is_host:
             raise ValueError(f"{op.kind}: {w.name!r} is an input each program allocates; Q5_K rows that are no file "
                              "tensor are the session's gathered head rows, a host input")
-        if w.dtype != DType.U8 or len(shape) != 2 or shape[1] < 1 or shape[1] % Q5K_BLOCK:
+        if w.dtype != DType.U8 or len(shape) != 2 or shape[1] % Q5K_BLOCK:   # no blocks: each op refuses n_in 0
             raise ValueError(f"{op.kind}: the host rows {w.name!r} are {w.dtype} {list(shape)}, not u8 [rows, whole "
                              f"{Q5K_BLOCK}-byte Q5_K blocks] (the rows as stored)")
         rows, n_in = shape[0], shape[1] // Q5K_BLOCK * 256
