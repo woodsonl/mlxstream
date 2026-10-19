@@ -62,18 +62,18 @@ def plan_inputs(g, name, cap_groups, cap_entries, rows=None, dtypes=TABLES):
     return [g.input(f"{name}.{s}", (r,), dt) for s, r, dt in zip(PLAN, rows, dtypes)]
 
 
-def routed(g, t, *, name="moe", n_embd=H, n_ff=FF, cap=None, tables=None, rows=None, dtypes=TABLES, xq=None,
+def routed(g, t, *, name="moe", n_embd=H, n_ff=FF, tables=None, rows=None, dtypes=TABLES, xq=None,
            quantizer="ieee", out_rows=None, out_dtype=F32, **attrs):
     """basalt's decode call of the routed experts at t tokens (``verify.cpp:1731``, ``:1744``, ``:1764``): the FFN
-    input's IEEE q8_1 rows, a plan of the call's t * K entries, and native_expert_grouped with cap_groups =
-    cap_entries = t * K into a row per entry, its blobs in the session's cache. ``attrs`` override the op's attrs
-    (None drops one)."""
-    cap = t * K if cap is None else cap
+    input's IEEE q8_1 rows, a plan of the call's t * K entries, and native_expert_grouped with k_per_tok K (so
+    cap_groups = cap_entries = t * K) into a row per entry, its blobs in the session's cache. ``attrs`` override the
+    op's attrs (None drops one)."""
+    cap = t * K
     if xq is None:
         xq = q8_1(g, f"{name}.xq", [g.input(f"{name}.x", (t, n_embd), F32)], quantizer, rows=t)
     tables = tables or plan_inputs(g, name, cap, cap, rows, dtypes)
     out = g.value(f"{name}.out", (cap if out_rows is None else out_rows, n_embd), out_dtype)
-    a = {"n_ff": n_ff, "cap_groups": cap, "cap_entries": cap, "blobs": CACHE, **attrs}
+    a = {"n_ff": n_ff, "k_per_tok": K, "blobs": CACHE, **attrs}
     op(g, "basalt_experts", [*tables, xq], [out], **{k: v for k, v in a.items() if v is not None})
     return out
 
@@ -418,13 +418,16 @@ ALIGN = r"binds at byte {} of [\w.]+; slot {} needs {}-byte alignment"
 
 REFUSALS = [
     # the routed experts
-    ("routed n_ff missing", case(r2, {}, {"n_ff": None}), "attrs n_ff, cap_groups, cap_entries must be positive ints"),
-    ("routed cap_entries 0", case(r2, {}, {"cap_entries": 0}), r"must be positive ints, got \[640, 20, 0\]"),
+    ("routed n_ff missing", case(r2, {}, {"n_ff": None}), "attrs n_ff, k_per_tok must be positive ints"),
+    ("routed k_per_tok 0", case(r2, {}, {"k_per_tok": 0}), r"must be positive ints, got \[640, 0\]"),
     ("routed blobs empty", case(r2, {}, {"blobs": []}), "attr blobs must list the buffers its blobs live in"),
     ("routed blobs a string", case(r2, {}, {"blobs": "cache.0"}), "attr blobs must list the buffers"),
     ("routed out a row short", case(r2, {}, {"out_rows": 19}),
-     r"'moe.out' is f32 \[19, 2560\]; .* so out is f32 \[>= cap_entries \(20\), n_embd\]"),
+     r"'moe.out' is f32 \[19, 2560\]; .* so out is f32 \[>= T x k_per_tok \(20\), n_embd\]"),
     ("routed out i32", case(r2, {}, {"out_dtype": I32}), r"'moe.out' is i32 \[20, 2560\]; an entry writes the row"),
+    ("routed tables of 2 tokens, xq of 3", case(routed, {"t": 2, "rows": (20, 21, 1, 20, 20), "out_rows": 30},
+                                                 {"t": 3, "rows": (20, 21, 1, 20, 20), "out_rows": 30}),
+     r"'moe.grp_ptr' is i64 \[20\], not i64 \[>= 30\] \(an address per group\)"),
     ("routed n_ff not whole 64-value blocks", case(r2, {}, {"n_ff": 96}),
      "n_embd must be a multiple of 256 and n_ff of 64"),
     ("routed q8_1 rows of another width", _routed_xq(2560),

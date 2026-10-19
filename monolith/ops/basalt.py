@@ -51,25 +51,27 @@ The tables are 1-D I32 values but for grp_ptr. The kernels reach the blobs only 
 gate/up and down dispatches name the buffers the blobs live in in ``meta["indirect_reads"]`` (``runtime/program.py``):
 the barrier pass sees the reads, and ``Engine`` refuses a name that is no program buffer and makes each one resident.
 T, the window's columns, is here the activation input's rows (an expert op's first output holds its entries). The
-launchers take the plan's capacities as counts; the ops take them as attrs ``cap_groups`` and ``cap_entries``, which
-give the grids and the scratch (basalt calls with both at T x 10, the call's routed entries: ``verify.cpp:1744``,
-``:1764``; ``mtp.cpp:931-935``).
+launchers take the plan's capacities as counts (cap_groups, cap_entries), which give the grids and the scratch;
+basalt's calls pass both as T x K, the call's routed entries, K = 10 a token (``verify.cpp:1744``, ``:1764``;
+``mtp.cpp:931-935``). The routed op derives them so from its attr ``k_per_tok``: its plan is the session's, with no
+count the handler could check them against. The drafter's experts take them as attrs, checked against its device
+plan's ids.
 
 * ``basalt_experts`` (``native_expert_grouped``, Q2_0 gate/up and Q2_0 down, this pack's ``experts.layout``), attrs
-  ``n_ff``, ``cap_groups``, ``cap_entries`` and ``blobs``: ``(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, xq [T,
-  n_embd / 32 * 36])`` → ``out [rows, n_embd] F32``, three dispatches (gate/up, SwiGLU + q8_1, down) with basalt's
-  kernel choice for the shape (``basalt_expert_macros``) and its threadgroup rows, min(cap_groups, 24) (its decode
-  call leaves ``gy`` at 0, ``verify.cpp:1794``). xq is the IEEE q8_1 of the FFN input, a ``basalt_q8_1`` op's
-  ``ieee`` rows (basalt's F4, ``verify.cpp:1731``). The tables hold the capacities (cap_groups addresses, cap_groups +
-  1 starts, cap_entries destinations and tokens, at least one count) and out cap_entries rows: an entry's destination
+  ``n_ff``, ``k_per_tok`` and ``blobs``: ``(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, xq [T, n_embd / 32 *
+  36])`` → ``out [rows, n_embd] F32``, three dispatches (gate/up, SwiGLU + q8_1, down) with cap_groups = cap_entries =
+  cap = T x k_per_tok, basalt's kernel choice for the shape (``basalt_expert_macros``) and its threadgroup rows,
+  min(cap, 24) (its decode call leaves ``gy`` at 0, ``verify.cpp:1794``). xq is the IEEE q8_1 of the FFN input, a
+  ``basalt_q8_1`` op's ``ieee`` rows (basalt's F4, ``verify.cpp:1731``). The tables hold the capacity (cap addresses,
+  cap + 1 starts, cap destinations and tokens, at least one count) and out cap rows: an entry's destination
   is its routing index (basalt's ``resident_plan``, ``verify_kernels.cu:1002-1005``). ``blobs`` names the buffers the
   addresses point into: a graph value (its buffer; a ``.basalt`` file's ``experts`` section through its window, in
   tests) or a buffer the session allocates (the expert cache), which the program declares with role ``host``, so that
   ``Engine`` requires the session to pass it. The plan is its producer's (basalt's ``resident_plan``, not ported yet;
   until then a test supplies it): groups in first-appearance order, their entries in routing order, each address
-  2-byte aligned and inside a named buffer, ``grp_start`` from 0 and nondecreasing, at most cap_groups groups and
-  cap_entries entries, each ``ent_tok`` < T. A group's entries are taken six at a time however many there are
-  (``GRP_NC``), so T needs no bound here.
+  2-byte aligned and inside a named buffer, ``grp_start`` from 0 and nondecreasing, at most cap groups and cap
+  entries, each ``ent_tok`` < T. A group's entries are taken six at a time however many there are (``GRP_NC``), so T
+  needs no bound here.
 * ``basalt_s2_plan`` (``moe_group_resident``), attrs ``k_per_tok`` and ``n_expert``: ``(ids [n] I32, base)`` →
   ``(grp_ptr, grp_start, counts, ent_dst, ent_tok)``, one threadgroup of 128 over the n routed ids, 1 <= n <= 128: a
   group per distinct id in first-appearance order, its entries in routing order, group g's blob at ``base + id *

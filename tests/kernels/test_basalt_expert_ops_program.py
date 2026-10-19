@@ -3,7 +3,8 @@ T = 1 .. 8 (basalt captures one graph per width), each run bitwise equal to the 
 (tests/kernels/basalt_gpu.py) on the same bytes, under shader validation.
 
 - The routed experts (``basalt_experts``) on the IEEE q8_1 of the FFN input, t * 10 entries (cap_groups = cap_entries
-  = t * 10, basalt's call), with the plan basalt's ``resident_plan`` makes (not ported; transcribed here): blobs split
+  = t * 10, basalt's call), with the plan basalt's ``resident_plan`` makes (not ported; transcribed here, its
+  invariants asserted on each plan): blobs split
   over two host buffers the session allocates, so that grp_ptr crosses buffers as the harness builds it
   (``basalt_gpu.py:90-93``), at 2560 x 640 (the two-row gate/up and 16-lane down basalt runs) and 512 x 256 (the
   one-row kernels); and blobs in a synthetic .basalt file's ``experts`` section, through its window and as an exact
@@ -89,6 +90,18 @@ def resident_plan(ids, k=K):
     return experts, start, order, order // k
 
 
+def check_plan(t, start, dst, tok, ptr, spans, blob, k=K):
+    """``resident_plan``'s invariants (``verify_kernels.cu:947-1013``), asserted on the plan a test supplies in its
+    place: at most cap = t * k groups; grp_start from 0, nondecreasing, to cap; every routing index an entry once
+    (ent_dst < cap), its token the index / k (< t); at most t entries a group (a token's ids are distinct); each
+    address even and a whole blob inside one of ``spans``, the (GPU address, bytes) of the blobs the op names."""
+    cap, ng = t * k, len(ptr)
+    assert ng <= cap and start[0] == 0 and start[ng] == cap and np.all(np.diff(start[: ng + 1]) >= 0)
+    assert sorted(dst.tolist()) == list(range(cap)) and np.array_equal(tok, dst // k) and tok.max() < t
+    assert np.diff(start[: ng + 1]).max() <= t
+    assert all(p % 2 == 0 and any(a <= p <= a + n - blob for a, n in spans) for p in ptr)
+
+
 def plan_bytes(name, cap, ptr, start, dst, tok, n_groups):
     """The plan's tables as the program's inputs ``name.*`` hold them: grp_ptr padded with null addresses, grp_start
     with -1 (the kernels read neither past the plan)."""
@@ -135,6 +148,7 @@ def test_routed_over_the_session_cache(files, n_embd, n_ff):
         eng = Engine(prog, dev, buffers=cache, pipeline_cache=PIPELINES)
         experts, start, dst, tok = resident_plan(routing(rng, t))
         ptr = [cache[CACHE[where[e][0]]].gpu_address + where[e][1] for e in experts]
+        check_plan(t, start, dst, tok, ptr, [(b.gpu_address, b.nbytes) for b in cache.values()], lay["bytes"])
         x = rng.standard_normal((t, n_embd)).astype(F32)
         scratch = [bound(prog, "basalt_expert_gu", 6), bound(prog, "basalt_expert_gu", 7),
                    bound(prog, "basalt_expert_swiglu_q8_1", 4)]
@@ -167,6 +181,7 @@ def test_routed_over_a_file_section(files, copy):
         eng = Engine(prog, dev, pipeline_cache=PIPELINES)
         experts, start, dst, tok = resident_plan(routing(rng, t))
         ptr = [eng.buffers[win].gpu_address + off + e * BLOB for e in experts]
+        check_plan(t, start, dst, tok, ptr, [(eng.buffers[win].gpu_address + off, E * BLOB)], BLOB)
         x = rng.standard_normal((t, H)).astype(F32)
         scratch = [bound(prog, "basalt_expert_gu", 6), bound(prog, "basalt_expert_gu", 7),
                    bound(prog, "basalt_expert_swiglu_q8_1", 4)]

@@ -218,37 +218,38 @@ def _experts(ctx: _Ctx, op: Op) -> None:
     _columns(ctx, op)                                       # a static program; T is xq's rows
     grp_ptr, grp_start, n_groups, ent_dst, ent_tok, xq = op.inputs
     (out,) = op.outputs
-    n_ff, cap_groups, cap_entries = _counts(op, "n_ff", "cap_groups", "cap_entries")
+    n_ff, k_per_tok = _counts(op, "n_ff", "k_per_tok")
     blobs = op.attrs.get("blobs")
     if isinstance(blobs, str) or not blobs or not all(isinstance(b, str) for b in blobs):
         raise ValueError(f"basalt_experts: attr blobs must list the buffers its blobs live in, got {blobs!r}")
+    t = ctx.shape(xq)[0]
+    cap = t * k_per_tok                 # cap_groups = cap_entries: T tokens' routed entries (verify.cpp:1744, :1764)
     shape = ctx.shape(out)
-    if out.dtype != DType.F32 or len(shape) != 2 or shape[0] < cap_entries:
+    if out.dtype != DType.F32 or len(shape) != 2 or shape[0] < cap:
         raise ValueError(f"basalt_experts: {out.name!r} is {out.dtype} {list(shape)}; an entry writes the row of its "
-                         f"routing index, so out is f32 [>= cap_entries ({cap_entries}), n_embd]")
+                         f"routing index, so out is f32 [>= T x k_per_tok ({cap}), n_embd]")
     n_embd = shape[1]
     lay = kernels.basalt_expert_layout(n_embd, n_ff)        # native_expert_supported (iq_kernels.cu:2511-2515)
     macros = kernels.basalt_expert_macros(n_embd, n_ff)     # basalt's kernels for the shape
-    t = ctx.shape(xq)[0]
     _expect(ctx, op, xq, (t, n_embd // 32 * kernels.Q8_1_BLOCK_BYTES), DType.U8, "q8_1 rows of the output's width")
     q = xq.producer
     if q is None or q.kind != "basalt_q8_1" or q.attrs.get("quantizer") != "ieee":
         raise ValueError(f"basalt_experts: {xq.name!r} is not a basalt_q8_1 op's ieee rows; basalt's routed experts "
                          "read the IEEE q8_1 of the FFN input (quantize_q8_1_rows, verify.cpp:1731)")
-    for v, dt, rows, what in ((grp_ptr, DType.I64, cap_groups, "an address per group"),
-                              (grp_start, DType.I32, cap_groups + 1, "a start per group and the end"),
+    for v, dt, rows, what in ((grp_ptr, DType.I64, cap, "an address per group"),
+                              (grp_start, DType.I32, cap + 1, "a start per group and the end"),
                               (n_groups, DType.I32, 1, "the group count"),
-                              (ent_dst, DType.I32, cap_entries, "a row per entry"),
-                              (ent_tok, DType.I32, cap_entries, "a token per entry")):
+                              (ent_dst, DType.I32, cap, "a row per entry"),
+                              (ent_tok, DType.I32, cap, "a token per entry")):
         _table(ctx, op, v, dt, rows, what)
     ptr, start, count = _bind(ctx, op, 1, grp_ptr, 8), _bind(ctx, op, 2, grp_start, 4), _bind(ctx, op, 3, n_groups, 4)
     dst, tok = _bind(ctx, op, 4, ent_dst, 4), _bind(ctx, op, 4, ent_tok, 4)
     xb, ob = _bind(ctx, op, 5, xq, 4), _bind(ctx, op, 6, out, 4)
     reads = _blob_buffers(ctx, blobs, lay["bytes"])
     gate, up, hq = (ctx.scratch(f"basalt_experts.{s}", nb)
-                    for s, nb in zip(("gate", "up", "hq"), kernels.basalt_expert_scratch(cap_entries, n_ff)))
+                    for s, nb in zip(("gate", "up", "hq"), kernels.basalt_expert_scratch(cap, n_ff)))
     prm = ctx.params("basalt_experts", kernels.basalt_expert_params(n_embd, n_ff))
-    ggu, gsw, gdn = kernels.basalt_expert_grids(macros, n_embd, n_ff, cap_groups, cap_entries)   # gy: min(cap, 24)
+    ggu, gsw, gdn = kernels.basalt_expert_grids(macros, n_embd, n_ff, cap, cap)     # gy: min(cap, 24)
     src, th = kernels.basalt_experts_source(), (kernels.EXPERT_THREADS, 1, 1)
     ctx.add(ctx.kernel("basalt_experts", src, "basalt_expert_gu", macros),
             [ptr, start, count, tok, xb, (6, gate, 0), (7, up, 0), (8, prm, 0)], (*ggu, 1), th, f"{op.kind}:{out.name}",
