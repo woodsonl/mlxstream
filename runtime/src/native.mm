@@ -9,6 +9,7 @@
 #include <cstring>
 #include <stdexcept>
 #include "basalt_cpu.h"
+#include "basalt_pool.h"
 #include "basalt_cpu_expf.h"
 #include "metal_core.h"
 
@@ -211,6 +212,52 @@ NB_MODULE(_native, m) {
   // which would be 16 GB as an array. The digest runs here instead, over one range of bit patterns per call: the
   // FNV-1a of the result bits in increasing argument order, the rule tests/kernels/fixtures/expf_digests.txt
   // records glibc's own output under.
+  // ---- the CPU expert pool (basalt_pool.h) ----------------------------------------------------------------
+  // Driven from the tests with a native body, never a Python callable: a body that took the GIL would serialise
+  // every worker and the synchronisation this pool exists to get right would never be exercised.
+  nb::class_<bc::ExpertPool>(m, "ExpertPool")
+      .def("__init__", [](bc::ExpertPool* self, int n_workers, bool host_works, double spin_before_sleep_ms) {
+             new (self) bc::ExpertPool(n_workers, host_works,
+                                       std::chrono::microseconds((long long) (spin_before_sleep_ms * 1000.0)));
+           },
+           nb::arg("n_workers") = 0, nb::arg("host_works") = true, nb::arg("spin_before_sleep_ms") = 20.0)
+      .def_prop_ro("workers", &bc::ExpertPool::workers)
+      .def_prop_ro("host_works", &bc::ExpertPool::host_works)
+      .def_prop_ro("poisoned", &bc::ExpertPool::poisoned)
+      .def("claim_owner", [](bc::ExpertPool& p, uintptr_t owner) { return p.claim_owner((const void*) owner); })
+      .def("release_owner", [](bc::ExpertPool& p, uintptr_t owner) { p.release_owner((const void*) owner); })
+      // One phase whose job j does out[j] += 1 and records the worker that ran it in who[j]. Every job running
+      // exactly once per phase is the property the epoch-tagged claim exists to give.
+      .def("count_phase", [](bc::ExpertPool& p, I32Out1 out, I32Out1 who) {
+             need(who.shape(0) == out.shape(0), "count_phase: who must hold as many ints as out");
+             const int n = (int) out.shape(0);
+             int32_t* op = out.data();
+             int32_t* wp = who.data();
+             std::string err;
+             bc::PhaseTimes t;
+             bool ok;
+             {
+               nb::gil_scoped_release unlock;
+               ok = p.run_phase(n, [op, wp](int job, int id) { op[job] += 1; wp[job] = id; }, err, &t);
+             }
+             need(ok, err.c_str());
+             return nb::make_tuple(t.wait_parked_before_ms, t.work_ms, t.wait_parked_after_ms);
+           }, nb::arg("out").noconvert(), nb::arg("who").noconvert(),
+           "run one phase of out.size() jobs; job j does out[j] += 1 and writes its worker id to who[j]")
+      .def("stall_phase", [](bc::ExpertPool& p, double hold_s) {
+             // One job that outlives kStall, so the stall path and the poisoning can be tested. The pool it
+             // poisons must be abandoned, never destroyed: its worker still holds this lambda.
+             std::string err;
+             bool ok;
+             {
+               nb::gil_scoped_release unlock;
+               ok = p.run_phase(1, [hold_s](int, int) {
+                      std::this_thread::sleep_for(std::chrono::duration<double>(hold_s));
+                    }, err, nullptr);
+             }
+             return nb::make_tuple(ok, err);
+           }, nb::arg("hold_s"), "run one job that sleeps hold_s seconds, so a wait can be made to stall");
+
   m.def("basalt_expf_digest", [](uint32_t first_bits, uint32_t count) {
     // Refused rather than wrapped: a range that runs off the end of the bit patterns would silently digest a
     // different set of arguments than the caller named.
