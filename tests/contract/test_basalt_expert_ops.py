@@ -129,9 +129,9 @@ def all_ops(g, t):
 # ---- registration, each dispatch against the builders, indirect reads, host buffers, barriers ----------------------
 
 def test_registered_and_covered(src):
-    for kind, klass in zip(KINDS, (OpClass.MAP, OpClass.SERIAL, OpClass.MAP, OpClass.MAP)):
+    for kind in KINDS:
         od = OPS.get(kind)
-        assert od.klass == klass and od.binding_for(PROFILE.key).kernel == kind
+        assert od.klass == OpClass.MAP and od.binding_for(PROFILE.key).kernel == kind
     g = Graph("step")
     all_ops(g, 2)
     assert {o.kind for o in g.ops} == set(KINDS) | {"basalt_q8_1"}
@@ -255,6 +255,19 @@ def test_session_buffers_are_host(src):
                                                                           for n in CACHE}
     w = basalt_windows(src, g.values.values(), 2)[0]
     assert all(prog.buffers[n] == spec and spec.file == src.path for n, spec in w.items())
+
+
+def test_blobs_in_a_graph_value_keep_its_buffer(src):
+    """Blobs in a graph value the session writes (an input): no dispatch binds its buffer, but the gate/up and down
+    reach it through grp_ptr, so the program keeps it (the emitter drops only arena buffers no dispatch uses) and
+    declares nothing host."""
+    g = Graph("step")
+    g.input("moe.cache", (BLOB,), U8)
+    routed(g, 2, blobs=["moe.cache"])
+    prog = emit(g, src, 2)
+    assert prog.buffers["moe.cache"] == BufferSpec(BLOB, None, "arena")
+    assert [o.meta.get("indirect_reads") for o in prog.ops[1:]] == [["moe.cache"], None, ["moe.cache"]]
+    assert not any(b.role == "host" for b in prog.buffers.values())
 
 
 @pytest.mark.parametrize("t", (1, 3, 8))

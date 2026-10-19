@@ -111,7 +111,7 @@ BASALT_DENSE_TC_PAIR = register_op(OpDef("basalt_dense_tc_pair", OpClass.MAP, "r
                                    .bind("*", KernelBinding("basalt_dense_tc_pair")))
 BASALT_EXPERTS = register_op(OpDef("basalt_experts", OpClass.MAP, "rows")            # gate/up, SwiGLU + q8_1, down
                              .bind("*", KernelBinding("basalt_experts")))
-BASALT_S2_PLAN = register_op(OpDef("basalt_s2_plan", OpClass.SERIAL, "rows")         # one threadgroup over the ids
+BASALT_S2_PLAN = register_op(OpDef("basalt_s2_plan", OpClass.MAP, "rows")            # one threadgroup over the ids
                              .bind("*", KernelBinding("basalt_s2_plan")))
 BASALT_Q8_0_SCALED = register_op(OpDef("basalt_q8_0_scaled", OpClass.MAP, "rows")
                                  .bind("*", KernelBinding("basalt_q8_0_scaled")))
