@@ -116,6 +116,14 @@ static void need(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(what);
 }
 
+// An elementwise kernel writes out[i] from in[i], so it is well defined when the two are the same buffer and not
+// when they merely overlap: a shifted view (x = a[:-1], out = a[1:]) is contiguous and passes every other check,
+// and the store to out[i] would change the value read as x[i+1]. Refused rather than copied, because a copy would
+// quietly give a different answer than the docstring states where the caller meant the arrays to be distinct.
+static void no_partial_overlap(const float* in, const float* out, size_t n, const char* what) {
+  need(in == out || in + n <= out || out + n <= in, what);
+}
+
 NB_MODULE(_native, m) {
   m.doc() = "Metal runtime core (v0): device, buffers, runtime-compiled libraries, pipelines, timed dispatches";
 
@@ -281,6 +289,7 @@ NB_MODULE(_native, m) {
     const size_t n = x.shape(0);
     const float* xp = x.data();
     float* op = out.data();
+    no_partial_overlap(xp, op, n, "basalt_expf: out may be x itself but must not partly overlap it");
     nb::gil_scoped_release unlock;
     for (size_t i = 0; i < n; ++i) op[i] = bc::expf_glibc(xp[i]);
   }, nb::arg("x").noconvert(), nb::arg("out").noconvert(),
@@ -293,6 +302,8 @@ NB_MODULE(_native, m) {
     const float* gp = g.data();
     const float* up = u.data();
     float* op = out.data();
+    no_partial_overlap(gp, op, n, "basalt_swiglu: out may be g itself but must not partly overlap it");
+    no_partial_overlap(up, op, n, "basalt_swiglu: out may be u itself but must not partly overlap it");
     nb::gil_scoped_release unlock;
     for (size_t i = 0; i < n; ++i) op[i] = bc::swiglu(gp[i], up[i]);
   }, nb::arg("g").noconvert(), nb::arg("u").noconvert(), nb::arg("out").noconvert(),

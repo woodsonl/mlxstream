@@ -230,8 +230,14 @@ def test_b4_every_block_of_the_recorded_sweep():
 
     The trailer of the fixture carries the two blocks __expf_sse2 digests differently, 0x420 and 0xc27, which hold
     the two arguments of B3; those are the blocks the unfused rounding step fails."""
-    block, _first, _last, want = _recorded("expf_digests.txt", 4)
+    block, first, last, want = _recorded("expf_digests.txt", 4)
     assert len(want) == 4096, f"expected 4,096 block digests, read {len(want)}"
+    # the fixture's own shape, so a duplicated or reordered row cannot stand in for the block it is missing, and
+    # the block-to-bit-pattern mapping this case relies on is the one the fixture recorded
+    assert np.array_equal(block, np.arange(4096, dtype=U32))
+    starts = block.astype(np.uint64) << np.uint64(20)
+    assert np.array_equal(first.astype(np.uint64), starts)
+    assert np.array_equal(last.astype(np.uint64), starts + 0xFFFFF)
     bad = [(int(k), int(w)) for k, w in zip(block, want)
            if _nt.basalt_expf_digest(int(k) << 20, 1 << 20) != int(w)]
     assert not bad, (f"{len(bad)} of 4,096 blocks differ, first block {bad[0][0]:#x} "
@@ -383,6 +389,16 @@ def test_binding_refuses_mismatched_lengths_and_dtypes():
         _nt.basalt_expf(np.zeros((2, 4), F32), np.zeros((2, 4), F32))
     with pytest.raises(TypeError):
         _nt.basalt_expf(np.zeros(16, F32)[::2], np.zeros(8, F32))          # not contiguous
+    a = np.arange(9, dtype=F32)
+    with pytest.raises(ValueError, match="partly overlap"):
+        _nt.basalt_expf(a[:8], a[1:])                                      # a shifted view of the same buffer
+    with pytest.raises(ValueError, match="partly overlap"):
+        _nt.basalt_swiglu(a[:8], np.zeros(8, F32), a[1:])
+    with pytest.raises(ValueError, match="partly overlap"):
+        _nt.basalt_swiglu(np.zeros(8, F32), a[:8], a[1:])
+    b = f32([0x3F000000] * 4)                                              # out being x itself is well defined
+    _nt.basalt_expf(b, b)
+    assert list(bits_of(b)) == [0x3FD3094C] * 4
     with pytest.raises(ValueError, match="past 2\\^32"):
         _nt.basalt_expf_digest(0xFFFFFFFF, 2)                              # a range that would wrap
     # the top of the range is accepted and digests 0xFFFFFFFF itself rather than wrapping to 0: that pattern is a
