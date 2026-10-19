@@ -297,9 +297,9 @@ def test_draft_programs_run_twice_alike(draft_runs):
 
 def test_one_row_on_exact_session_buffers(data):
     """A draft vocabulary of one row on session buffers of exactly its bytes (rows 1,760, map 4, copy
-    q5k_proxy_bytes(1)), as basalt allocates them (mtp.cpp:656-657, :676): Engine takes them, and the proxy top-1, the
-    top-1 with the map and the masked head at T = 2 are bit for bit the harness's. Shader validation bounds each read
-    by its buffer, so a read past the one id is a report."""
+    q5k_proxy_bytes(1)), as basalt allocates them (mtp.cpp:656-657, :676-678): Engine takes them, and the proxy
+    top-1, the top-1 with the map and the masked head at T = 2 are bit for bit the harness's. Shader validation bounds
+    each read by its buffer, so a read past the one id is a report."""
     w1, mp, xq = data["w"][:1], np.array([7], np.int32), data["xq"]
     proxy = gpu.q5k_proxy_pack(w1, 1, [(0, 1)])
     dev = gpu.device()
