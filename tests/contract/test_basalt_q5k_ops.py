@@ -450,7 +450,7 @@ REFUSALS = [
       for n, f in (("draft_tokens", "draft_tokens"), ("tokens", "pending_tokens"))],
     *[(f"{k} reads a row past its rows", _rows_held(k), f"'dhead' holds {N_DVOCAB} rows; the op reads {N_DVOCAB + 1}")
       for k in KINDS],
-    ("head of 16 columns", _head_shape((8, 10), (16, 10)), r"unsupported shape \(n_in 2560, ncols 16\)"),
+    ("head of 9 columns", _head_shape((8, 10), (9, 10)), r"unsupported shape \(n_in 2560, ncols 9\)"),
     ("head of no columns", _head_shape((1, 10), (0, 10)), r"unsupported shape \(n_in 2560, ncols 0\)"),
     ("head rows of 65 blocks", _head_shape((1, 64), (1, 65)), r"unsupported shape \(n_in 16640, ncols 1\)"),
     ("head of 3 columns of 64 blocks", _head_shape((2, 64), (3, 64)), r"unsupported shape \(n_in 16384, ncols 3\)"),
