@@ -178,9 +178,10 @@ def test_c3_a_stalled_pool_poisons_itself():
     this reports instead, and the pool is poisoned: its workers may still hold pointers into buffers the caller is
     about to free, so it is never destroyed and never reused.
 
-    The stall limit is 60 seconds, so this case does not run by default. It is the only case that proves the limit
-    is armed at all, which matters because the transcribed spin wraps its clock every 1.8 s if armed as basalt
-    arms it; run it with -m slow."""
+    The stall limit is 60 seconds, so this case costs the kernels tier about 70 of them. It carries the ``slow``
+    marker for a run that wants to deselect it, and the tier does not: it runs, and it is the only case that
+    proves the limit is armed at all, which matters because the transcribed spin wraps its clock every 1.8 s if
+    armed as basalt arms it."""
     p = pool()
     ok, err = p.stall_phase(70.0)
     assert not ok and "stalled" in err
