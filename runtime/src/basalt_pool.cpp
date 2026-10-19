@@ -239,4 +239,31 @@ bool ExpertPool::run_phase(int n_tasks, const std::function<void(int, int)>& bod
     return true;
 }
 
+PoolTask::PoolTask(std::shared_ptr<ExpertPool> pool, Work work) : pool_(std::move(pool)), work_(std::move(work)) {}
+
+PoolTask::~PoolTask() {
+    if (pool_) pool_->release_owner(this);
+}
+
+bool PoolTask::run(const HostCall& call, std::string& error) {
+    if (!pool_) {
+        error = "this host point's pool is gone";
+        return false;
+    }
+    // One owner at a time, so two tasks cannot drive one pool and overlap their phases. Claimed on the first call
+    // rather than at construction, because the owner is the task and the pool may outlive any one program.
+    if (!pool_->claim_owner(this)) {
+        error = "the CPU expert pool is already driven by another host task";
+        return false;
+    }
+    std::function<void(int, int)> body;
+    const int n = work_(call.step, call.point, body);
+    if (n <= 0) return true;                                      // a point with nothing to do
+    if (!body) {
+        error = "the host point asked for " + std::to_string(n) + " jobs and gave no body to run";
+        return false;
+    }
+    return pool_->run_phase(n, body, error, &last_);
+}
+
 }  // namespace monolith::basalt_cpu

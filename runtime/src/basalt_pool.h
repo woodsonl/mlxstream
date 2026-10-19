@@ -45,6 +45,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include "metal_core.h"
 #include <vector>
 
 namespace monolith::basalt_cpu {
@@ -148,6 +150,37 @@ class ExpertPool {
     std::atomic<int32_t> hstate_{kIdle};
     std::vector<std::vector<unsigned char>> scratch_;
     std::vector<std::thread> threads_;
+};
+
+/// A host task that drives the pool, for a program whose points carry CPU expert work.
+///
+/// It is a C++ `HostTask` and not a `CallableTask` on purpose: a Python task takes the GIL on every call, and this
+/// one runs on the pump thread once per MoE layer, which is 48 times a step. The pump commits nothing while it
+/// runs, so the GPU's own experts for the layer must already be in flight; that is what the point's
+/// [publish, wait) window is for.
+///
+/// The pool's release/acquire pair is what publishes the workers' rows to the GPU, not just to the waiting host:
+/// a worker's stores land, then its `done_` increment releases, then the pump's `wait_done` acquires, then the
+/// pump commits the command buffer that reads them. A port that made `done_` a plain counter would break GPU
+/// visibility and not merely the wait.
+class PoolTask : public HostTask {
+  public:
+    /// `work(step, point)` returns the jobs for this call: the count, and the body each job runs. A count of zero
+    /// is a point with nothing to do, which still returns true.
+    using Work = std::function<int(uint64_t, uint32_t, std::function<void(int, int)>&)>;
+
+    PoolTask(std::shared_ptr<ExpertPool> pool, Work work);
+    ~PoolTask() override;
+
+    bool run(const HostCall& call, std::string& error) override;
+
+    /// The phase times of the last call that ran jobs, for the caller to report.
+    PhaseTimes last_times() const { return last_; }
+
+  private:
+    std::shared_ptr<ExpertPool> pool_;
+    Work work_;
+    PhaseTimes last_;
 };
 
 }  // namespace monolith::basalt_cpu
