@@ -11,15 +11,17 @@ transcription of ``hc8_quant_kernel``, written apart from it, and against groups
 by hand from basalt's arithmetic and written below."""
 
 import numpy as np
+import pytest
 
-from monolith.formats.fp import f32_to_bf16
+from monolith.formats.fp import bf16_to_f32, f32_to_bf16
 from monolith.packs.basalt_hc8 import quantize
-from tests.basalt_hc_ref import hc8_quant_scalar
+from tests.basalt_hc_ref import dequant_copy, hc8_parity_matrices, hc8_quant_scalar
 
 
-def _differing_groups(w, q, s, q_ref, sc_ref):
+def _differing_groups(w, q, s, q_ref, sc_ref, at=None):
     """The groups whose codes or scale differ between ``quantize``'s ``(q, s)`` of the BF16 bits ``w [rows, cols]`` and
-    the scalar transcription's ``(q_ref, sc_ref)``: a message counting them and printing the first, ``""`` if none."""
+    the scalar transcription's ``(q_ref, sc_ref)``: a message counting them and printing the first, ``""`` if none.
+    When ``w``'s rows are groups gathered from a matrix, ``at`` holds their rows and groups there, for the message."""
     rows, cols = w.shape
     gpr = cols // 32
     q, q_ref = q.view(np.int8).reshape(rows, gpr, 32), q_ref.reshape(rows, gpr, 32)
@@ -28,7 +30,8 @@ def _differing_groups(w, q, s, q_ref, sc_ref):
     if not len(bad):
         return ""
     r, j = bad[0]
-    return (f"{len(bad)} of {rows * gpr} groups differ; the first, row {r} group {j} (BF16 "
+    where = f"row {r} group {j}" if at is None else f"row {at[0][r]} group {at[1][r]}"
+    return (f"{len(bad)} of {rows * gpr} groups differ; the first, {where} (BF16 "
             f"{[hex(b) for b in w[r, 32 * j:32 * j + 32].tolist()]}): scale {int(s[r, j]):#06x} codes {q[r, j].tolist()}, "
             f"the transcription's scale {int(sc_ref[r, j]):#06x} codes {q_ref[r, j].tolist()}")
 
@@ -127,3 +130,42 @@ def test_hand_computed_groups():
         and copy == q_ref.tobytes() + sc_ref.tobytes() and (scales[:, :10] != 0).all() and not scales[:, 10:].any(), \
         f"HC8-CASES: an up-shaped copy (rows = 4, cols = 320: gpr = 10, srow = 16) has its scales at byte 1280, slots " \
         f"10..15 of every row 0x0000, 1408 bytes; got q {q.shape}, s {s.shape}, {len(copy)} bytes, scales {scales.tolist()}"
+
+
+@pytest.mark.parametrize("matrices", [hc8_parity_matrices], ids=["hc8_parity"])
+def test_matrices_through_both_transcriptions(matrices):
+    """HC8-MATS: hc8_parity's three matrices, each quantized whole by ``quantize``, and ``hc8_quant_scalar`` on the 64
+    outlier groups of ``w_down``, every group of ``w_inject``, 2048 random groups of ``w_down`` and of ``w_up``, and the
+    last group of every row of each matrix with its row's padding scales (``w_up``'s six). The sampled groups' codes and
+    scales and the padding scales are bitwise equal, the 64 outliers set their groups' scales (code 127), and each copy
+    has basalt's byte total. Printed, not gated, as hc8_parity prints the down copy's (``src/kernels/hc8_parity.cpp:
+    107-116``): each copy's relative rms error against its BF16 matrix, through ``dequant_copy``'s exact values."""
+    w_down, w_up, w_inject = matrices()
+    rng, k = np.random.default_rng(11), np.arange(64)
+    top = quantize(w_down)[0].view(np.int8)[5 * k, 101 * k]
+    assert (top == 127).all(), f"HC8-MATS: the 64 outliers w_down[5 k][101 k] = bf16(0.6) set their groups' scales, " \
+        f"each its group's code 127: codes {top.tolist()}"
+    outliers = 5 * k * 320 + 101 * k // 32                                # their groups: w_down has 320 per row
+    for name, w, nbytes, picks in (                                       # picks: groups g, row g // gpr, slot g % gpr
+            ("w_down", w_down, 3_481_600, np.union1d(outliers, rng.choice(320 * 320, 2048, replace=False))),
+            ("w_up", w_up, 3_604_480, rng.choice(10240 * 10, 2048, replace=False)),
+            ("w_inject", w_inject, 43_520, np.arange(4 * 320))):
+        rows, cols = w.shape
+        gpr = cols // 32
+        srow = (gpr + 7) & ~7
+        q, s = quantize(w)
+        groups, codes, scales = w.reshape(-1, 32), q.reshape(-1, 32), s[:, :gpr].reshape(-1, 1)
+        q_ref, sc_ref = hc8_quant_scalar(groups[picks], 1, 1)
+        bad = _differing_groups(groups[picks], codes[picks], scales[picks], q_ref, sc_ref, np.divmod(picks, gpr))
+        q_ref, sc_ref = hc8_quant_scalar(w[:, -32:], 1, srow - gpr + 1)   # each row's last group, then its padding
+        last = _differing_groups(w[:, -32:], q[:, -32:], s[:, gpr - 1:], q_ref, sc_ref,
+                                 (np.arange(rows), np.full(rows, gpr - 1)))
+        assert not bad and not last and np.array_equal(s[:, gpr - 1:], sc_ref.reshape(rows, -1)) \
+            and q.nbytes + s.nbytes == nbytes, \
+            f"HC8-MATS, {name}: the sampled groups' codes and scales bitwise equal hc8_quant_scalar's " \
+            f"({bad or 'they do'}), the last group of every row's too, with the row's padding scales " \
+            f"({last or 'its codes and scale do'}; padding scales {np.unique(s[:, gpr:]).tolist()}), and the copy is " \
+            f"rows * cols + rows * srow * 2 = {nbytes} bytes ({q.nbytes + s.nbytes})"
+        a = bf16_to_f32(w).astype(np.float64)
+        print(f"HC8-MATS: the {name} copy's relative rms error against its BF16 matrix "
+              f"{np.sqrt(((a - dequant_copy(q, s, cols)) ** 2).sum() / (a * a).sum()):.3e}")
