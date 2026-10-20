@@ -9,7 +9,10 @@ test here is the port's own, under the contract's rule for quantizer codes: byte
 (g_blocks[i] != r_blocks[i]) ++byte_bad;``). ``quantize`` is held against ``tests/basalt_hc_ref.py``'s scalar
 transcription of ``hc8_quant_kernel``, written apart from it, and against groups whose scale and codes are worked out
 by hand from basalt's arithmetic and written below. ``copy_list`` is held against basalt's own lists of the copied
-matrices on the official pack's index sections, and against synthetic files with one defect each."""
+matrices on the official pack's index sections, and against synthetic files with one defect each. ``write_pack``'s
+table is read back through a transcription of ``hc8_read``'s checks, and as the ``PackFile`` the programs bind."""
+
+import struct
 
 import numpy as np
 import pytest
@@ -17,8 +20,9 @@ import pytest
 from monolith.formats.basalt_reader import BasaltFile, DenseRow, MtpTensor
 from monolith.formats.fp import bf16_to_f32, f32_to_bf16
 from monolith.packs.basalt import HC8
-from monolith.packs.basalt_hc8 import Hc8Entry, copy_list, quantize
-from tests.basalt_hc_ref import dequant_copy, hc8_parity_matrices, hc8_quant_scalar
+from monolith.packs.basalt_hc8 import Hc8Entry, copy_list, quantize, write_pack
+from monolith.packs.packer import PackFile
+from tests.basalt_hc_ref import dequant_copy, hc8_parity_matrices, hc8_quant_scalar, hc8_read_table
 from tests.contract.test_basalt_reader import write_basalt
 from tests.contract.test_basalt_windows import real_source
 
@@ -305,3 +309,113 @@ def test_refusals():
                    (np.zeros(32, np.uint16), shape + r"uint16 of shape \(32,\)$")]:
         with pytest.raises(ValueError, match=why):
             quantize(w)
+
+
+def _hc8_basalt(path, dense, mtp):
+    """A ``.basalt`` file at ``path`` whose ``dense`` pool holds the BF16 matrices ``dense`` (``{name: bits}``) as
+    kind-4 rows and whose ``mtp/dense`` holds ``mtp``'s as ``bf16`` tensors, each matrix's bytes right after the last's,
+    opened as ``BasaltFile`` maps a real pack."""
+    lines = lambda rows: "".join(" ".join(map(str, r)) + "\n" for r in rows)
+    at = np.cumsum([0] + [w.nbytes for w in dense.values()]).tolist()
+    rows = [DenseRow(n, 0, 4, o, w.nbytes, o, w.nbytes, w.shape[1], w.shape[0], *(0,) * 10)
+            for (n, w), o in zip(dense.items(), at)]
+    mt = np.cumsum([0] + [w.nbytes for w in mtp.values()]).tolist()
+    path.write_bytes(write_basalt({
+        "dense": b"".join(w.tobytes() for w in dense.values()),
+        "dense.index": f"# dense index v3\n# align 64 pool {at[-1]} tensors {len(rows)}\n{lines(rows)}".encode(),
+        "mtp/dense": b"".join(w.tobytes() for w in mtp.values()),
+        "mtp/dense.index": lines(MtpTensor(n, "bf16", *w.shape, o, w.nbytes)
+                                 for (n, w), o in zip(mtp.items(), mt)).encode()}))
+    return BasaltFile(path)
+
+
+@pytest.fixture(scope="module", params=["hc8_parity", "rounded"])
+def hc8_pack(request, tmp_path_factory):
+    """HC8-FILE's input and ``write_pack``'s ``PackFile`` of it, with each copy's table name and BF16 bits in basalt's
+    order. ``hc8_parity``: hc8_parity's three matrices as the kind-4 rows ``blk.0.hc_attn_{down,up,inject}.weight``,
+    plus one ``4 x 64`` ``bf16`` drafter injection, ``attn_hyper_connection.block_inject_weight.weight``. Their copies
+    are whole multiples of 256 bytes but the last, so ``rounded`` takes small matrices whose copies of 160, 3072, 320,
+    160 and 320 bytes put hc8_write's 256-byte rounding, and its zero fill, between payloads."""
+    rng, d = np.random.default_rng(12), tmp_path_factory.mktemp("hc8")
+    bf16 = lambda *shape: f32_to_bf16(np.float32(0.05) * rng.standard_normal(shape, dtype=np.float32))
+    names = [f"blk.0.hc_attn_{m}.weight" for m in ("down", "up", "inject")]
+    if request.param == "hc8_parity":
+        dense = dict(zip(names, hc8_parity_matrices()))
+        mtp = {"attn_hyper_connection.block_inject_weight.weight": bf16(4, 64)}
+    else:
+        dense = dict(zip(names, (bf16(2, 64), bf16(64, 32), bf16(4, 64))))
+        mtp = {"attn_hyper_connection.input_mix_weight_down.weight": bf16(2, 64),
+               "attn_hyper_connection.block_inject_weight.weight": bf16(4, 64)}
+    pack = write_pack(_hc8_basalt(d / "hc.basalt", dense, mtp), d / "pack")
+    return pack, dense | {"mtp." + n: w for n, w in mtp.items()}
+
+
+def test_basalth8_table_round_trip(hc8_pack):
+    """HC8-FILE: ``write_pack``'s ``weights.pack`` read back by ``hc8_read_table`` (``hc8_read``'s checks): the header
+    ``BASALTH8``, version 1 and the entry count; the entries under basalt's names in its order, ``mtp.`` before the
+    drafter's, each name NUL-padded to 128 bytes and reserved 0; each at the offset ``hc8_write`` gives it (the first at
+    ``(16 + 160 n + 255) & ~255``, each next at ``(offset + bytes + 255) & ~255``), with ``srow == (cols // 32 + 7) &
+    ~7``, and its bytes ``quantize``'s of the matrix written into the ``.basalt`` file, padding scales 0 (stricter than
+    ``hc8_read``); every other byte after the entries 0, and the file zero-padded to the next multiple of 16384."""
+    pack, copies = hc8_pack
+    path = pack.dir / "weights.pack"
+    table, raw, n = hc8_read_table(path), path.read_bytes(), len(copies)
+    want, at = {}, (16 + 160 * n + 255) & ~255
+    for name, w in copies.items():
+        q, s = quantize(w)
+        want[name] = (*w.shape, (w.shape[1] // 32 + 7) & ~7, at, q.nbytes + s.nbytes, q.tobytes() + s.tobytes())
+        at = (at + q.nbytes + s.nbytes + 255) & ~255
+    bad = [k for k in want if table.get(k) != want[k]]
+    assert list(table) == list(want) and not bad, \
+        f"HC8-FILE: hc8_read_table accepts the table, {n} entries with basalt's names in its order, each at the " \
+        f"offset hc8_write gives it, srow == (cols // 32 + 7) & ~7, its bytes quantize()'s: names {list(table)}; " \
+        f"{len(bad)} entries differ, the first {bad[:1]}: (rows, cols, srow, offset, bytes) " \
+        f"{table.get(bad[0], ())[:5] if bad else ''} for {want[bad[0]][:5] if bad else ''}"
+
+    entries = [struct.unpack_from("<128sIIIIQQ", raw, 16 + 160 * i) for i in range(n)]
+    padding = {k: np.frombuffer(d, "<u2", offset=r * c).reshape(r, sr)[:, c // 32:]
+               for k, (r, c, sr, _, _, d) in table.items()}
+    rest = np.frombuffer(raw, np.uint8).copy()
+    rest[:16 + 160 * n] = 0
+    for _, _, _, off, nb, _ in table.values():
+        rest[off: off + nb] = 0
+    end = max(off + nb for _, _, _, off, nb, _ in table.values())
+    assert struct.unpack_from("<8sII", raw) == (b"BASALTH8", 1, n) \
+        and [(e[0], e[4]) for e in entries] == [(k.encode().ljust(128, b"\0"), 0) for k in want] \
+        and not any(p.any() for p in padding.values()) and not rest.any() and len(raw) == -(-end // 16384) * 16384, \
+        f"HC8-FILE: the header (BASALTH8, 1, {n}), each name NUL-padded to 128 bytes and reserved 0, padding scales " \
+        f"0, zero bytes between payloads, the size the next multiple of 16384 after {end}: header " \
+        f"{struct.unpack_from('<8sII', raw)}, names and reserved {[(e[0].rstrip(bytes(1)), e[4]) for e in entries]}, " \
+        f"nonzero padding scales in {[k for k, p in padding.items() if p.any()]}, " \
+        f"{int(np.count_nonzero(rest))} nonzero bytes outside them, {len(raw)} bytes"
+
+
+def test_pack_rows_are_the_copies(hc8_pack):
+    """HC8-PACK: the ``PackFile`` ``write_pack`` returned, and the directory opened again as the programs bind it: the
+    manifest of version 2 with no slabs, two aux rows per copy, ``hc8/<name>/q`` ``U8 [rows, cols]`` at the table
+    entry's offset and ``hc8/<name>/s`` ``F16 [rows, srow]`` at that offset plus ``rows * cols``, whose ``aux_array``s
+    are ``quantize``'s codes (as int8) and scales (as uint16 bits) bit for bit, and ``nbytes`` the file's size. The
+    port's own check: basalt's registry gate (``src/kernels/hc8_parity.cpp:101``) is the read's, family 6's."""
+    pack, copies = hc8_pack
+    table = hc8_read_table(pack.dir / "weights.pack")
+    rows = []
+    for name in copies:
+        r, c, sr, off, _, _ = table[name]
+        rows += [dict(name=f"hc8/{name}/q", offset=off, nbytes=r * c, dtype="U8", shape=[r, c]),
+                 dict(name=f"hc8/{name}/s", offset=off + r * c, nbytes=r * sr * 2, dtype="F16", shape=[r, sr])]
+    size = (pack.dir / "weights.pack").stat().st_size
+    for who, pf in (("returned", pack), ("opened again", PackFile(pack.dir))):
+        m = pf.manifest
+        assert m == dict(version=2, alignment=16384, pack="weights.pack", nbytes=size, slabs=[], aux=rows), \
+            f"HC8-PACK ({who}): version 2, alignment 16384, nbytes the file's {size}, no slabs, and the aux rows " \
+            f"hc8/<name>/q U8 [rows, cols] at the entry's offset, hc8/<name>/s F16 [rows, srow] at that plus rows * " \
+            f"cols: {dict(m, aux=m['aux'][:2])}, the first of {len(m['aux'])} aux rows"
+        bad = []
+        for name, w in copies.items():
+            q, s = quantize(w)
+            if not (np.array_equal(pf.aux_array(f"hc8/{name}/q").view(np.int8), q.view(np.int8))
+                    and np.array_equal(pf.aux_array(f"hc8/{name}/s").view(np.uint16), s)):
+                bad.append(name)
+        assert not bad, f"HC8-PACK ({who}): aux_array(f'hc8/{{name}}/q') viewed as int8 equals the codes and " \
+            f"aux_array(f'hc8/{{name}}/s') viewed as uint16 the scales, bit for bit: {len(bad)} copies differ, the " \
+            f"first {bad[:1]}"

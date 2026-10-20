@@ -12,7 +12,11 @@ two cannot share a mistake.
   ``monolith.packs.basalt_hc8.quantize``.
 * ``dequant_copy``: a copy's exact values, ``q * f16(s)`` in float64, the weights the int8 dot products multiply by.
 * ``hc8_parity_matrices``: hc8_parity's down, up and injection matrices, drawn with numpy.
+* ``hc8_read_table``: ``hc8_read``, basalt's reader of a ``BASALTH8`` table, its checks transcribed.
 """
+
+import struct
+from pathlib import Path
 
 import numpy as np
 
@@ -67,3 +71,30 @@ def hc8_parity_matrices(seed=7):
     k = np.arange(64)
     w_down[5 * k, 101 * k] = f32_to_bf16(np.float32(0.6))
     return w_down, w_up, w_inject
+
+
+def hc8_read_table(path):                            # hc8_read, src/core/model_file.cpp:487-513
+    """The ``BASALTH8`` table in the file ``path`` read as ``hc8_read`` reads it, with its checks: the magic and version
+    1, at most 4096 entries, and each entry's ``bytes == rows * cols + rows * srow * 2`` (in uint64), its range inside
+    the file, ``cols % 32 == 0`` and ``srow >= cols / 32``; ``ValueError`` with basalt's message otherwise.
+    ``{name: (rows, cols, srow, offset, bytes, data)}`` in the table's order, ``data`` the entry's bytes, the name up
+    to its first NUL (``strnlen``); a later entry of a name replaces the earlier one, as in basalt's map."""
+    data = Path(path).read_bytes()
+    if len(data) < 16:                               # read_range_at of the header (:490)
+        raise ValueError(f"short read from {path}")
+    magic, version, n = struct.unpack_from("<8sII", data)
+    if magic != b"BASALTH8" or version != 1:
+        raise ValueError(f"hc8: bad magic or version in {path}")
+    if n > 4096:
+        raise ValueError("hc8: implausible entry count")
+    if len(data) < 16 + 160 * n:                     # read_range_at of the entries (:495)
+        raise ValueError(f"short read from {path}")
+    out = {}
+    for i in range(n):
+        raw, rows, cols, srow, _, offset, nbytes = struct.unpack_from("<128sIIIIQQ", data, 16 + 160 * i)
+        name = raw.split(b"\0", 1)[0].decode()
+        want = (rows * cols + rows * srow * 2) % 2 ** 64                                   # :502, uint64_t
+        if nbytes != want or offset > len(data) or want > len(data) - offset or cols % 32 or srow < cols // 32:
+            raise ValueError(f"hc8: entry {name} is malformed")
+        out[name] = (rows, cols, srow, offset, nbytes, data[offset: offset + want])
+    return out

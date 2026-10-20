@@ -38,13 +38,17 @@ offset plus ``rows * cols``.
 
 from __future__ import annotations
 
+import json
 import re
+import struct
 from collections import namedtuple
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
 
 from ..formats.basalt_reader import BasaltFile
+from .packer import ALIGN, PackFile
 
 G8 = 32                                           # values per scale group (hc_fused.cu:343)
 Hc8Entry = namedtuple("Hc8Entry", "name src offset rows cols")   # offset: of the BF16 bytes, from the file's start
@@ -133,3 +137,35 @@ def copy_list(f: BasaltFile) -> Tuple[Hc8Entry, ...]:
                 f"kind {t.kind!r}, not 'bf16'" if t.kind != "bf16" else
                 f"{t.nbytes} bytes, not {t.rows} x {t.cols} BF16" if t.nbytes != t.rows * t.cols * 2 else None)
     return tuple(out)
+
+
+def write_pack(f: BasaltFile, directory) -> PackFile:
+    """The copies pack of the ``.basalt`` file ``f``, written into the new directory ``directory`` (an existing one is
+    refused): every matrix of ``copy_list(f)`` read from its BF16 bytes and quantized, one at a time. ``weights.pack``
+    is basalt's ``BASALTH8`` table as ``hc8_write`` lays it out (``src/core/model_file.cpp:438-485``), zero-padded to
+    a multiple of 16384 bytes; ``manifest.json``, written last, lists each copy's two aux rows (the module's
+    docstring). ``ValueError`` as ``copy_list`` and ``quantize`` raise it."""
+    es = copy_list(f)
+    out = Path(directory)
+    out.mkdir(parents=True)                       # FileExistsError if it exists: a pack is never written over
+    table, aux, at = [], [], (16 + 160 * len(es) + 255) & ~255                   # the first payload (:440)
+    for e in es:
+        srow, codes = (e.cols // G8 + 7) & ~7, e.rows * e.cols
+        nbytes = codes + e.rows * srow * 2                                       # :444
+        table.append(struct.pack("<128sIIIIQQ", e.name.encode(), e.rows, e.cols, srow, 0, at, nbytes))  # :446-452
+        aux += [dict(name=f"hc8/{e.name}/q", offset=at, nbytes=codes, dtype="U8", shape=[e.rows, e.cols]),
+                dict(name=f"hc8/{e.name}/s", offset=at + codes, nbytes=nbytes - codes, dtype="F16",
+                     shape=[e.rows, srow])]
+        at = (at + nbytes + 255) & ~255                                          # :453
+    with open(out / "weights.pack", "wb") as fh:
+        fh.write(struct.pack("<8sII", b"BASALTH8", 1, len(es)) + b"".join(table))           # :455-463
+        for e, row in zip(es, aux[::2]):
+            fh.write(bytes(row["offset"] - fh.tell()))                          # the zero fill (:465-474)
+            w = np.frombuffer(f.data[e.offset: e.offset + 2 * e.rows * e.cols], np.uint16)  # little-endian, as the host
+            q, s = quantize(w.reshape(e.rows, e.cols))
+            fh.write(q.tobytes() + s.tobytes())
+        size = -(-fh.tell() // ALIGN) * ALIGN    # the runtime maps whole pages only; hc8_read reads only each entry
+        fh.write(bytes(size - fh.tell()))
+    (out / "manifest.json").write_text(json.dumps({"version": 2, "alignment": ALIGN, "pack": "weights.pack",
+                                                   "nbytes": size, "slabs": [], "aux": aux}, indent=1))
+    return PackFile(out)
