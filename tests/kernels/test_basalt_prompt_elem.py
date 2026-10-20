@@ -13,6 +13,10 @@ as 0xFF bytes, so an unwritten word fails its comparison.
   probe kernel and from the host twin (basalt_emu.nv_powf), bitwise equal to the 32 words
   docs/research/basalt-nvcc/prefill_kernels.md section 4 records for nvcc 13.0's ``__nv_powf``; and in the same
   launch every pair at theta_scale values across the rope handler's domain [2^(-125/31), 1], bitwise equal to the twin.
+- RO-3h, the slow path: ``nv_trig_slow``, the Payne-Hanek reduction of ``__nv_cosf`` and ``__nv_sinf`` in soft binary64,
+  from a probe kernel, bitwise equal in r and j to the host twin (basalt_emu.nv_trig_slow) at every angle of KE 8.2's
+  three Payne-Hanek chunks that takes it and across the function's domain; and its binary64 conversion
+  ``f64_from_u63`` against Python's correctly rounded int-to-float.
 """
 
 from fractions import Fraction
@@ -26,13 +30,13 @@ from tests.kernels import basalt_gpu as gpu
 F32, U32 = np.float32, np.uint32
 
 
-def probe(src, name, *inputs):
+def probe(src, name, *inputs, words=1):
     """The probe kernel ``name`` (``src``, appended to basalt_sampler_source(), which composes the helpers
     basalt_libdevice.metal needs ahead of it), one thread per element of the equal-length ``inputs`` (buffers 0, 1,
-    ...): one 32-bit word each, starting as 0xFF bytes, then the element count at the next slot."""
+    ...): an output of ``words`` 32-bit words each, starting as 0xFF bytes, then the element count at the next slot."""
     n = len(inputs[0])
     pso = gpu.pipeline(kernels.basalt_sampler_source() + src, name)
-    bufs = [np.ascontiguousarray(v).tobytes() for v in inputs] + [4 * n]
+    bufs = [np.ascontiguousarray(v).tobytes() for v in inputs] + [4 * words * n]
     out = gpu.run(pso, bufs, U32(n).tobytes(), len(inputs) + 1, -(-n // 256), 256, fill=0xFF)
     return np.frombuffer(out[-1], U32)
 
@@ -82,3 +86,62 @@ def test_nv_powf_vector():
                            f"got {got[bad[0]]:#010x}, twin {twin[bad[0]]:#010x}")
     bottom = twin[32 + 31].view(F32)                                 # pair 31 at the lowest theta_scale
     assert 2.0 ** -126 <= bottom < 2.0 ** -124
+
+
+# ---- RO-3h, the slow path: nv_trig_slow ------------------------------------------------------------------------------
+
+TRIG_SLOW = """
+kernel void probe_nv_trig_slow(device const float* x [[buffer(0)]], device uint* out [[buffer(1)]],
+                               constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  int j;
+  out[2 * i] = as_type<uint>(nv_trig_slow(x[i], j));
+  out[2 * i + 1] = uint(j);
+}
+
+kernel void probe_f64_from_u63(device const ulong* v [[buffer(0)]], device ulong* out [[buffer(1)]],
+                               constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  out[i] = f64_from_u63(v[i]);
+}
+"""
+
+SLOW_CHUNKS = (105600, 174720, 261888)    # KE 8.2's Payne-Hanek chunks of 256 positions; the last ends at 262,143
+SLOW_MIN = 0x47CE4780                     # 105615.0f: an |x| below it (setp.ltu) stays off the slow path
+
+
+def test_rope_angle_slow_path_bit_for_bit():
+    """RO-3h, the slow path (KE 8.2 (b)): nv_trig_slow from a probe kernel, r and j bitwise equal to the host twin's,
+    at every angle th = fl32(float(pos) * nv_powf(0x3F1AB32B, pair)) of at least 105615 for pos in [p0, p0 + 256),
+    p0 = 105600, 174720 and 261888 (the last chunk of the trained context, rope_scaling.hpp:72), pairs 0..31: pair 0
+    from position 105615, pair 1 from 174,774, pair 2 never (95,728 at 262,143). In the same launch, the function's
+    whole domain, finite |x| >= 105615, of which the rope's angles (below 2^18) take only the window's word offset
+    k = 0 and bit offsets 15 and 16: both signs of every binade from 2^16 to 2^127 at four fixed and four random
+    significands (k = 0..3, and the bit offset 0 at 2^33, 2^65 and 2^97), the domain's bottom and random words.
+    Its conversion f64_from_u63 is checked alone, since the bits above seldom show its rounding: against Python's
+    int-to-float (nearest even) at 0, every power of two, ties both ways, 2^63 - 1 (the carry to 2^63) and random
+    integers of every length."""
+    ts = U32(THETA_SCALE).view(F32)
+    pos = (np.array(SLOW_CHUNKS)[:, None] + np.arange(256)).astype(F32)
+    th = pos[:, :, None] * emu.nv_powf(ts, np.arange(32, dtype=F32))       # (chunk, row, pair)
+    slow = th.view(U32) >= SLOW_MIN
+    assert slow.sum(axis=1)[:, :3].tolist() == [[241, 0, 0], [256, 202, 0], [256, 256, 0]] and slow.sum() == 1211
+    rng = np.random.default_rng(161)
+    sig = np.r_[np.array([0, 1, 0x400000, 0x7FFFFF], U32), rng.integers(0, 1 << 23, 4, U32)]
+    sweep = ((np.arange(143, 255, dtype=U32) << 23)[:, None] | sig).reshape(-1)
+    sweep = np.r_[U32(SLOW_MIN), sweep[sweep >= SLOW_MIN], rng.integers(SLOW_MIN, 0x7F800000, 1024, U32)]
+    x = np.r_[th[slow], np.r_[sweep, sweep | 0x80000000].view(F32)]
+    got = probe(TRIG_SLOW, "probe_nv_trig_slow", x, words=2).reshape(-1, 2)
+    want = np.array([[F32(r).view(U32), j & 0xFFFFFFFF] for r, j in map(emu.nv_trig_slow, x)], U32)
+    bad = np.flatnonzero((got != want).any(axis=1))
+    assert bad.size == 0, (f"{bad.size} of {len(x)} differ; first x={x.view(U32)[bad[0]]:#010x}: got (r, j) = "
+                           f"({got[bad[0], 0]:#010x}, {got[bad[0], 1]:#x}), twin ({want[bad[0], 0]:#010x}, "
+                           f"{want[bad[0], 1]:#x})")
+    ints = [0, (1 << 53) + 1, (1 << 53) + 3, (1 << 62) + (1 << 9), (1 << 62) + 3 * (1 << 9),
+            (1 << 62) + (1 << 9) + 1, (1 << 63) - 1] + [1 << k for k in range(63)]
+    ints += [int(v) >> (63 - k) | 1 << (k - 1) for k in range(1, 64) for v in rng.integers(0, 1 << 63, 8, np.uint64)]
+    got = probe(TRIG_SLOW, "probe_f64_from_u63", np.array(ints, np.uint64), words=2).view(np.uint64)
+    want = np.array([float(v) for v in ints]).view(np.uint64)
+    bad = np.flatnonzero(got != want)
+    assert bad.size == 0, (f"{bad.size} of {len(ints)} differ; first n={ints[bad[0]]:#x}: got {got[bad[0]]:#018x}, "
+                           f"want {want[bad[0]]:#018x}")

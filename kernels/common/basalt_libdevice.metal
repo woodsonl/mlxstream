@@ -1,6 +1,6 @@
-// Transcribed from NVIDIA libdevice's __nv_exp, __nv_logf and __nv_powf as nvcc 13.0 (V13.0.48, -arch=sm_120
-// -lineinfo -O3 -DNDEBUG) inlined them into basalt's sampler.cu (__nv_exp, __nv_logf) and prefill/kernels.cu
-// (__nv_powf) (jesdga95/basalt src/kernels/cuda/sampler.cu and src/prefill/kernels.cu
+// Transcribed from NVIDIA libdevice's __nv_exp, __nv_logf, __nv_powf, __nv_sinf and __nv_cosf as nvcc 13.0 (V13.0.48,
+// -arch=sm_120 -lineinfo -O3 -DNDEBUG) inlined them into basalt's sampler.cu (__nv_exp, __nv_logf) and
+// prefill/kernels.cu (the others) (jesdga95/basalt src/kernels/cuda/sampler.cu and src/prefill/kernels.cu
 // @ b4c63b55754637f4c72ad53a0f791d425f71eb36; third_party/NOTICE); PTX listings and transcriptions:
 // docs/research/basalt-nvcc/sampler.md sections 2.5-2.6 and docs/research/basalt-nvcc/prefill_kernels.md section 4.
 //
@@ -81,11 +81,11 @@ static inline float nv_logf(float x) {
     return r;
 }
 
-// ---- the prompt rotation's angle (rope_kernel<false>, src/prefill/kernels.cu:751), as nvcc inlines libdevice into
-// that IEEE-built kernel; PTX and transcription: docs/research/basalt-nvcc/prefill_kernels.md section 4. Each
-// fma.rn.f32 is an fma(), each other operation a statement of its own (ptxas contracts nothing further). On the
-// rotation's arguments every intermediate is normal or zero, so the hardware's flush never acts and plain Metal
-// arithmetic rounds as CUDA's does.
+// ---- the prompt rotation's angle (rope_kernel<false>, src/prefill/kernels.cu:751) and its cosf and sinf
+// (include/basalt/kernels/rope_scaling.hpp:161-162), as nvcc inlines libdevice into that IEEE-built kernel; PTX and
+// transcription: docs/research/basalt-nvcc/prefill_kernels.md section 4. Each fma.rn.f32 is an fma(), each other
+// operation a statement of its own (ptxas contracts nothing further). On the rotation's arguments every intermediate
+// is normal or zero, so the hardware's flush never acts and plain Metal arithmetic rounds as CUDA's does.
 
 // powf(x, y) for x = theta_scale in [2^(-125/31), 1] (the rope handler refuses any other: x and every power x^0 ..
 // x^31 are normal) and y = 0, 1, ..., 31, so libdevice's other branches (a subnormal, zero, negative, infinite or NaN
@@ -126,4 +126,39 @@ static inline float nv_powf(float x, float y) {
     q = fma(q, f, 1.0f);                                               // 2^f
     const uint b = n > 0.0f ? 0u : 0x83000000u;                        // 2^127 * 2^(n - 127), or 2^-123 * 2^(n + 123)
     return (q * as_type<float>(b + 0x7F000000u)) * as_type<float>((uint(int(n)) << 23) - b);
+}
+
+// 2/pi's bits for the Payne-Hanek reduction (__cudart_i2opi_f, least significant word first)
+constant uint I2OPI[6] = {0x3C439041u, 0xDB629599u, 0xF534DDC0u, 0xFC2757D1u, 0x4E441529u, 0xA2F9836Eu};
+
+// cosf's and sinf's Payne-Hanek reduction for finite |x| >= 105615 (the callers' range; nv_trig takes the rest):
+// x's significand word times the table's 192 bits of 2/pi, exact in seven words, and the 64-bit window of that
+// product holding the two low integer bits of x * 2/pi and 62 fraction bits (k, sh: the window's word and bit offset
+// from x's exponent). q is those two bits plus one when the fraction is at least one half (0..4, j = -q for a
+// negative x), n the fraction in units of 2^-64, one's-complemented at or above one half (so n < 2^63, and r takes
+// the sign of x flipped); then CUDA's three roundings, n to binary64 (f64_from_u63), its product with pi/2 * 2^-64
+// (0x3BF921FB54442D19, the PTX's literal: one ulp above the binary64 nearest to it) and that to binary32, in the soft
+// binary64 (basalt_f64.metal). Every step is exact or correctly rounded, so the bits are CUDA's.
+static inline float nv_trig_slow(float x, thread int& j) {
+    const uint ix = as_type<uint>(x), m = (ix << 8) | 0x80000000u;
+    uint w[7];
+    ulong c = 0;
+    for (uint i = 0; i < 6; ++i) {                                   // bounded: six words
+        const ulong p = ulong(I2OPI[i]) * m + c;
+        w[i] = uint(p);
+        c = p >> 32;
+    }
+    w[6] = uint(c);
+    const uint e = ix >> 23, sh = e & 31u, k = ((e & 224u) - 128u) >> 5;   // k = 0..3 here
+    uint hi = w[6 - k], lo = w[5 - k];
+    if (sh != 0u) {
+        hi = (hi << sh) | (lo >> (32u - sh));
+        lo = (lo << sh) | (w[4 - k] >> (32u - sh));
+    }
+    const uint f = (hi << 2) | (lo >> 30), s = (f >> 31) != 0u ? 0xFFFFFFFFu : 0u;   // shr.s32 f, 31
+    const uint q = (hi >> 30) + (f >> 31);
+    j = int(ix) < 0 ? -int(q) : int(q);
+    const ulong n = (ulong(f ^ s) << 32) | ulong((lo << 2) ^ s);
+    const float r = as_type<float>(f32_from_f64(f64_mul(f64_from_u63(n), 0x3BF921FB54442D19ul)));
+    return int(f ^ ix) < 0 ? -r : r;
 }

@@ -9,6 +9,8 @@
 // - hi, lo, bits(l, h): the high and low 32-bit words of a binary64, and the binary64 of two words.
 // - f64_from_f32 (float bits in): exact; a float subnormal becomes a normal double. f32_from_f64 (float bits out):
 //   rounded to nearest even, float subnormals produced, never flushed; the caller writes as_type<float>(bits).
+// - f64_from_u63: an integer n < 2^63 rounded to nearest even (cvt.rn.f64.s64 of a nonnegative n), for the prompt
+//   rotation's Payne-Hanek reduction (basalt_libdevice.metal's nv_trig_slow; tests/kernels/test_basalt_prompt_elem.py).
 // - f64_add, f64_sub: the exact sum, rounded once; x + (-x) = +0, -0 + -0 = -0, inf - inf = NaN.
 // - f64_lt, f64_le, f64_ge: ordered compares on order-preserving keys: false when either operand is NaN, -0 == +0.
 // - f64_fma: the exact a * b + c rounded once. f64_mul(a, b) is f64_fma(a, b, -0). f64_div: restoring division in
@@ -257,4 +259,11 @@ static inline ulong f64_div(ulong a, ulong b) {
         r = (ge ? r - d : r) << 1;
     }
     return f64_round(s, e, (q << 8) | ulong(r != 0ul));                     // q's leading bit at 54, moved to 62
+}
+
+// cvt.rn.f64.s64 of n < 2^63: f64_round's m * 2^(e - 1085) with n's leading bit moved to 62, so e - 1085 = -s
+static inline ulong f64_from_u63(ulong n) {
+    if (n == 0ul) return 0ul;
+    const uint s = uint(clz(n)) - 1u;
+    return f64_round(0, 1085 - int(s), n << s);
 }

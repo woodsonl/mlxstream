@@ -8,8 +8,9 @@
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp ggml/src/ggml-common.h (kvalues_iq4nl),
 # ggml/src/ggml-quants.c (get_scale_min_k4), ggml/src/ggml-cuda/quantize.cu and ggml/src/ggml-cuda/mmvf.cu @
 # 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
-# nv_powf: transcribed from NVIDIA libdevice's __nv_powf as nvcc 13.0 (V13.0.48, -arch=sm_120 -lineinfo -O3 -DNDEBUG)
-# inlined it into basalt's src/prefill/kernels.cu (rope_kernel<false>); PTX listing and transcription:
+# nv_powf, nv_trig_slow: transcribed from NVIDIA libdevice's __nv_powf and the Payne-Hanek reduction of __nv_sinf and
+# __nv_cosf as nvcc 13.0 (V13.0.48, -arch=sm_120 -lineinfo -O3 -DNDEBUG) inlined them into basalt's
+# src/prefill/kernels.cu (rope_kernel<false>); PTX listing and transcription:
 # docs/research/basalt-nvcc/prefill_kernels.md section 4.
 """numpy emulation of basalt's float32 arithmetic as nvcc compiles it (docs/research/basalt-nvcc/matvec.md), for the
 bit-for-bit tests of the Metal port. Every float operation rounds once to float32, to nearest even on the float32
@@ -796,7 +797,7 @@ def q5k_proxy_final(cand, part, exact, map_, expf):
     return int(np.asarray(map_)[bi]), rcp_ftz(total), rows
 
 
-# ---- libdevice's powf in the prompt rotation (docs/research/basalt-nvcc/prefill_kernels.md section 4) --------------
+# ---- libdevice in the prompt rotation (docs/research/basalt-nvcc/prefill_kernels.md section 4) ---------------------
 # kernels.cu builds with nvcc's IEEE defaults: no flush, as numpy's float32 operations.
 
 def _w2f(w):
@@ -849,3 +850,28 @@ def nv_powf(x, y):
     b = np.where(n > 0, 0, 0x83000000)                                  # 2^127 * 2^(n - 127), or 2^-123 * 2^(n + 123)
     r = (q * _w2f(b + 0x7F000000)) * _w2f((n.astype(np.int64) << 23) - b)
     return np.where(one, F32(1.0), r).astype(F32)
+
+
+I2OPI = 0xA2F9836E4E441529FC2757D1F534DDC0DB6295993C439041      # 2/pi's 192 bits, the PTX's __cudart_i2opi_f
+PIO2_2M64 = float.fromhex("0x1.921fb54442d19p-64")              # 0x3BF921FB54442D19, the PTX's mul.f64 literal
+
+
+def nv_trig_slow(x):
+    """libdevice's Payne-Hanek reduction in __nv_cosf and __nv_sinf (kernels/common/basalt_libdevice.metal's
+    nv_trig_slow) for one float32 ``x``, finite with |x| >= 105615 (asserted): (r, j), x = j pi/2 + r, j up to a
+    multiple of 4. The integer steps as exact Python ints, derived from the binary point rather than the Metal's word
+    loop: x's significand word (ix << 8 | 2^31) times the table is the PTX's seven-word product P, and x times the
+    table's 2/pi is P * 2^(E - 350) for x's biased exponent E, so its two low integer bits and 62 fraction bits are
+    P >> (288 - E) mod 2^64. Then the PTX's three roundings to nearest even: Python's int-to-float
+    (cvt.rn.f64.s64), the binary64 product (mul.f64) and the float32 cast (cvt.rn.f32.f64)."""
+    ix = int(np.asarray(x, F32).view(np.uint32))
+    assert 0x47CE4780 <= (ix & 0x7FFFFFFF) < 0x7F800000, "outside nv_trig_slow's domain"
+    e, neg = (ix >> 23) & 0xFF, ix >> 31
+    w = ((((ix << 8) | 0x80000000) & 0xFFFFFFFF) * I2OPI >> (288 - e)) & (2 ** 64 - 1)
+    half = (w >> 61) & 1                                               # the fraction is at least one half
+    q = (w >> 62) + half                                               # 0..4
+    n = (w << 2) & (2 ** 64 - 1)                                       # the fraction in units of 2^-64
+    if half:
+        n ^= 2 ** 64 - 1                                               # one's complement, below 2^63
+    r = F32(float(n) * PIO2_2M64)
+    return (-r if half ^ neg else r), (-q if neg else q)
