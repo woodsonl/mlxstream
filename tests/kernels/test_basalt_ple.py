@@ -3,9 +3,10 @@
 # adapted from basalt (jesdga95/basalt) src/kernels/ple_parity.cpp, src/kernels/ple_win_parity.cpp and
 # src/kernels/gr_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): ple_parity's history
 # regression (:177-214), key-row check (:617-637), block check with its seven stages and its log line (:740-783),
-# native key projection check with its host norm, metric and pass criterion (:892-912) and conv cancellation metric
-# (:1139-1165), ple_win_parity's projected-form input scales (:47-55), and gr_parity's scalar activation contract's
-# degenerate norm input and the exactness it relies on (:167-236).
+# native key projection check with its host norm, metric and pass criterion (:892-912), host reference check's
+# per-stage pass criterion and log line (:1114-1122) and conv cancellation metric (:1139-1165), ple_win_parity's
+# projected-form input scales (:47-55), and gr_parity's scalar activation contract's degenerate norm input and the
+# exactness it relies on (:167-236).
 """The n-gram (PLE) block's Metal port on the GPU, kernel by kernel (kernels/common/basalt_gr_norm.metal and
 basalt_ple.metal) and as the per-row chain (``basalt_ple_gpu.chain``: main's q8_1, mmvq and mmvf, then those kernels,
 row by row, as the window op dispatches them). Each norm call runs at its call sites' shape, 4 rows of 2560 with 4
@@ -16,7 +17,10 @@ gamma rows and eps = f32(1e-6) (native_ple_postops.cu:352-353, :358), unless sta
   ``const bool wired = le(rel, 2e-6) && nonfinite(actual_result.data(), hcd) == 0;`` (ple_parity.cpp:910), rel =
   rel_l1(reference, GPU) over one call's 4 x 2560 outputs and the non-finite count over the norm's own output (basalt
   counted it over the block's result). The calls: N(0, σ) rows for σ in {1e-3, 1e-2, 1, 1e2} (at 1e-3 the mean square
-  is about eps) and a zero row, whose output is 0, each with weights f32(1 + 0.1 N(0, 1)).
+  is about eps) and a zero row, whose output is 0, each with weights f32(1 + 0.1 N(0, 1)); and "the GPU's raw key,
+  hidden and the GPU's gated rows from the 12-row C3 fixtures, synthetic and real" (``C3_NORMS``), one call per row
+  at each of the norm's call sites: the chain's raw key with w_nk, the fixture's hidden with w_nq and the chain's
+  gated row with w_nc (``block``).
 - T-NORM ``test_grouped_norm_bitwise_emu``: bit for bit against R-emu, ``basalt_emu.gr_norm`` (the rounding sequence of
   docs/research/basalt-nvcc/ple.md section 1) with the GPU's rsqrtf_ftz (MUFU.RSQ and fast::rsqrt have no bit-exact
   host model), on the calls above plus a row whose squares all lie below 2^-126, each of which .FTZ turns into +0; and
@@ -31,13 +35,23 @@ gamma rows and eps = f32(1e-6) (native_ple_postops.cu:352-353, :358), unless sta
   ``ple_conv``: ple.md sections 1-4, with the GPU's rsqrtf_ftz, sqrtf_ftz and expf_ftz evaluated on the emulation's
   own arguments) fed the GPU's outputs of the launches before it, so that each comparison is its own kernel's: T§7.3
   "compares all six stages of every row of every fixture above with R-emu, byte for byte" (the query norm is compared
-  too). The fixtures: T§7.3's projected form at W1's scales (``projected``), its 12 rows in order, each from the
-  history the GPU's earlier rows leave; and T§7.3's edge cases. The gate's are streams of a direct basalt_ple_gate call
+  too). The fixtures: T§7.3's three 12-row fixtures, each row in order from the GPU's history before it
+  (``postops_rows``): the projected form at W1's scales (``projected``), its history the initial one, then each row's
+  GPU normalized row shifted in; C3's fixtures' GPU projections, synthetic and real, each row's raw key and value the
+  chain's (``block``) and its history the initial one, then the chain's snapshot of the row before; and T§7.3's
+  edge cases. The gate's are streams of a direct basalt_ple_gate call
   (``GATE_EDGES``): s = +0 and s = -0 (sign 0, so the gate is exactly the sigmoid of 0, 0.5), 0 < |s| < 1e-6 (the
   clamp: the same gate as |s| = 1e-6f), |s| = 1e-6f, and |s| = 2e4 (the sigmoid saturates at 1, and at 0 where
   fast::exp2 overflows). The others are the projected form's first row with inputs planted (``EDGE_ROWS``): a SiLU
   whose fast::exp2 overflows (act = acc * rcp(inf) = -0), subnormal key, value, hidden and history inputs (read as
   zero under the flush) beside fp16-subnormal taps (widened exactly), and gated products below 2^-126 (flushed).
+- T-POST ``test_postops_float64`` (spec T§7.3): those three 12-row fixtures' GPU stages, row by row, against
+  R-contract (``r_contract``) fed the row's own inputs, the raw key, the value, hidden and the GPU's history before
+  the row, so that "each row's comparison therefore isolates that row's arithmetic" (propagation across rows is C3's),
+  criterion quoted: ``const bool ok = le(rel, 1e-4) && nf == 0;`` (ple_parity.cpp:1119), rel and nf =
+  rel_l1(R-contract, GPU) per row and stage, on the six stages key (normed), gate, gated, normalized, conv_out and
+  result (the value is an input), logged in :1120-1121's format; and "Each fixture asserts min |s[c]| ≥ 0.1 on
+  R-contract".
 - H1, T-HIST ``test_history_advance_12_steps`` (spec T§7.4): ple_parity's history regression (ple_parity.cpp:177-214)
   as written, on basalt_ple_advance: the initial history ``expected[c * rows + r] = -float(c * 16 + r + 1)``
   (row-fastest) and 12 tokens of ``normalized[c] = float((token + 1) * 1000000 + c)``, one dispatch built once and run
@@ -123,37 +137,53 @@ CALLS = norm_calls()
 # G1a: (x, gamma, n_rows, n_cols, gamma_rows, eps) for gr_parity's n_embd = 2, hc = 1 norm at R = 1, eps = 0
 G1A = {f"G1a gamma={g}": (np.ones(2, F32), np.full(2, g, F32), 1, 2, 1, 0.0) for g in (1.0, 1.00390625)}
 BITWISE = {**{k: (x, w, H, N, H, EPS) for k, (x, w) in CALLS.items()}, **G1A}
+C3_NORMS = {  # call: (C3's fixture, the norm's call site), one call per row of the fixture (spec T§7.2)
+    f"{name} {site}": (name, site) for name in ("synthetic", "real") for site in ("raw key", "hidden", "gated")}
 
 
 def bits(a):
     return np.ascontiguousarray(a, F32).view(np.uint32)
 
 
-@pytest.mark.parametrize("call", [k for k in CALLS if k != TINY])
+def norm_rows(call):
+    """``C3_NORMS[call]``'s 12 norm calls, ``[(x, w)]``: the rows of C3's fixture (``block``) at the call site, the
+    chain's raw key with w_nk (the key norm's), the fixture's hidden with w_nq (the query norm's) or the chain's gated
+    row with w_nc (the conv norm's)."""
+    name, site = C3_NORMS[call]
+    fx, _, out = block(name)
+    x, w = {"raw key": (out["key"], fx.w_nk), "hidden": (fx.hidden, fx.w_nq), "gated": (out["gated"], fx.w_nc)}[site]
+    return [(row, w) for row in x]
+
+
+@pytest.mark.parametrize("call", [k for k in CALLS if k != TINY] + list(C3_NORMS))
 def test_grouped_norm_float64(call):
-    x, w = CALLS[call]
-    actual = ple_gpu.gr_norm(x, w, H, N, H, EPS)
-    rel = rel_l1(gnorm(x, w), actual)[0]
-    nf = nonfinite(actual)
-    print(f"grouped norm [{call}]: rel {rel:.3e}, nf {nf}")
-    assert le(rel, 2e-6) and nf == 0, (
+    calls, bad = [CALLS[call]] if call in CALLS else norm_rows(call), []
+    for i, (x, w) in enumerate(calls):
+        actual = ple_gpu.gr_norm(x, w, H, N, H, EPS)
+        rel = rel_l1(gnorm(x, w), actual)[0]
+        nf = nonfinite(actual)
+        print(f"grouped norm [{call}]{f' row {i}' if call in C3_NORMS else ''}: rel {rel:.3e}, nf {nf}")
+        if not (le(rel, 2e-6) and nf == 0):
+            bad.append((i, float(rel), nf))
+    assert not bad, (
         "`const bool wired = le(rel, 2e-6) && nonfinite(actual_result.data(), hcd) == 0;` (ple_parity.cpp:910), rel = "
-        f"rel_l1(R-struct's gnorm, the GPU) over the call's 4 x 2560 outputs, nf over the norm's output: rel {rel!r}, "
-        f"nf {nf}")
+        "rel_l1(R-struct's gnorm, the GPU) over the call's 4 x 2560 outputs, nf over the norm's output: (call, rel, "
+        f"nf) {bad}")
     if call == "zero":
         assert (actual == 0).all(), f"spec T§7.2, a zero row: \"the output is 0\": {actual[actual != 0][:8]}"
 
 
-@pytest.mark.parametrize("call", list(BITWISE))
+@pytest.mark.parametrize("call", list(BITWISE) + list(C3_NORMS))
 def test_grouped_norm_bitwise_emu(call):
-    x, w, n_rows, n_cols, gamma_rows, eps = BITWISE[call]
-    got = ple_gpu.gr_norm(x, w, n_rows, n_cols, gamma_rows, eps)
-    want = emu.gr_norm(x, w, n_rows, n_cols, gamma_rows, eps, ple_gpu.rsqrtf_ftz)
-    diff = np.flatnonzero(bits(got) != bits(want))
-    assert diff.size == 0, (
-        f"T-NORM, bit for bit against basalt_emu.gr_norm (ple.md section 1): {diff.size} of {got.size} outputs differ; "
-        f"first at {diff[:4].tolist()}: GPU {[hex(v) for v in bits(got).ravel()[diff[:4]]]}, "
-        f"R-emu {[hex(v) for v in bits(want).ravel()[diff[:4]]]}")
+    calls = [BITWISE[call]] if call in BITWISE else [(x, w, H, N, H, EPS) for x, w in norm_rows(call)]
+    for i, (x, w, *shape) in enumerate(calls):
+        got = ple_gpu.gr_norm(x, w, *shape)
+        want = emu.gr_norm(x, w, *shape, ple_gpu.rsqrtf_ftz)
+        diff = np.flatnonzero(bits(got) != bits(want))
+        assert diff.size == 0, (
+            f"T-NORM, bit for bit against basalt_emu.gr_norm (ple.md section 1): call {i}: {diff.size} of {got.size} "
+            f"outputs differ; first at {diff[:4].tolist()}: GPU {[hex(v) for v in bits(got).ravel()[diff[:4]]]}, "
+            f"R-emu {[hex(v) for v in bits(want).ravel()[diff[:4]]]}")
     if call in G1A:
         one = hex(bits(ple_gpu.rsqrtf_ftz(np.ones(1, F32)))[0])
         out, gamma = [hex(v) for v in bits(got).ravel()], [hex(v) for v in bits(w)]
@@ -164,7 +194,7 @@ def test_grouped_norm_bitwise_emu(call):
             "away (spec T§7.2)")
 
 
-# ---- T-POST: native_ple_postops kernel by kernel against R-emu (spec T§7.3) ----------------------------------------
+# ---- T-POST: native_ple_postops kernel by kernel against R-emu, row by row against R-contract (spec T§7.3) ---------
 PROJECTED_SEED = 4      # default_rng(PROJECTED_SEED) draws, in W1's order without its hyper-connection inputs
                         # (ple_win_parity.cpp:50-55): conv1d, hidden's unit draw z, the raw keys, the values, the
                         # history, then w_nk, w_nq and w_nc; the first seed from 0 for which min |s| >= 0.1 holds
@@ -235,16 +265,33 @@ def postops_row(key, value, hidden, hist, fx):
     return out
 
 
-def projected_rows():
-    """The projected form's 12 rows in order, each from the history the GPU's earlier rows leave (T§7.3): the initial
-    history, then each row's GPU normalized row shifted in. basalt's advance moves words, so the host's shift
-    (H-ORACLE's) has its bits."""
-    fx, key, value = projected()
+POSTOPS_ROWS = ("projected", "synthetic", "real")      # T§7.3's 12-row fixtures: the projected form, C3's two
+
+
+@functools.lru_cache(maxsize=None)
+def postops_rows(name):
+    """T§7.3's 12-row fixture ``name`` on ``postops_row``, its rows in order, each from the GPU's history before it,
+    once per process: (fx, rows), row t = (inputs, stages), the row's inputs (raw key, value, hidden, history) and
+    postops_row's stages. The projected form's raw keys and values are its own, its history the initial one, then
+    each row's GPU normalized row shifted in (basalt's advance moves words, so the host's shift, H-ORACLE's, has its
+    bits). C3's fixtures' raw keys and values, synthetic and real, are the chain's projections of the row (``block``),
+    their history the initial one, then "the GPU's snapshot of row t − 1", the chain's."""
+    if name == "projected":
+        (fx, key, value), snap = projected(), None
+    else:
+        fx, _, out = block(name)
+        key, value, snap = out["key"], out["value"], out["snap"]
     hist, rows = np.ascontiguousarray(fx.hist.T).ravel(), []
     for t in range(ROWS):
-        rows.append(postops_row(key[t], value[t], fx.hidden[t], hist, fx))
-        hist = h_oracle(hist, rows[-1]["normalized"][0][None], 1)
-    return rows
+        inputs = key[t], value[t], fx.hidden[t], hist
+        rows.append((inputs, postops_row(*inputs, fx)))
+        hist = h_oracle(hist, rows[-1][1]["normalized"][0][None], 1) if snap is None else snap[t]
+    return fx, rows
+
+
+def postops_stages(name):
+    """``postops_rows(name)``'s stages, row by row."""
+    return [stages for _, stages in postops_rows(name)[1]]
 
 
 def edge_row(case):
@@ -280,7 +327,7 @@ def gate_edges():
             for i in range(0, len(GATE_EDGES), H)]
 
 
-POSTOPS = {"projected": projected_rows, "gate edges": gate_edges,
+POSTOPS = {**{name: functools.partial(postops_stages, name) for name in POSTOPS_ROWS}, "gate edges": gate_edges,
            **{case: functools.partial(edge_row, case) for case in EDGE_ROWS}}
 
 
@@ -318,6 +365,30 @@ def test_postops_bitwise_emu(case):
         flushed = int(np.count_nonzero(rows[0]["gated"][0] == 0))
         assert 0 < flushed < D, (
             f"T§7.3, gated products below 2^-126 are flushed and the others kept: {flushed} of {D} are 0")
+
+
+POST_STAGES = tuple(s for s in STAGES if s != "value")     # T§7.3's six stages: the value is an input
+
+
+@pytest.mark.parametrize("name", POSTOPS_ROWS)
+def test_postops_float64(name):
+    fx, rows = postops_rows(name)
+    bad, min_s = [], np.inf
+    for t, ((key, value, hidden, hist), stages) in enumerate(rows):
+        ref = r_contract(fx._replace(hist=hist.reshape(D, HIST).T, hidden=hidden[None]), key[None], value[None])
+        min_s = min(min_s, float(np.abs(ref.s).min()))
+        for stage in POST_STAGES:
+            rel, _, nf = rel_l1(getattr(ref, stage)[0], stages[stage][0])
+            ok = le(rel, 1e-4) and nf == 0
+            print(f"  postops [{name}] against R-contract, token {t} {stage:<12} rel {rel:.3e} (non-finite {nf})"
+                  f"{'' if ok else '   *** FAIL ***'}")
+            if not ok:
+                bad.append((t, stage, float(rel), nf))
+    assert min_s >= 0.1, f"T§7.3, \"Each fixture asserts min |s[c]| ≥ 0.1 on R-contract\": {name}: {min_s!r}"
+    assert not bad, (
+        "`const bool ok = le(rel, 1e-4) && nf == 0;` (ple_parity.cpp:1119), then `if (!ok) ++bad;` (:1122), rel and "
+        "nf = rel_l1(R-contract, the GPU) per row and stage, R-contract fed the row's raw key, value, hidden and the "
+        f"GPU's history before the row (spec T§7.3): {name}: (row, stage, rel, non-finite) {bad}")
 
 
 # ---- T-HIST, X-H and T-COPY: the history's moves (spec T§7.4-7.5, T§8) ---------------------------------------------
