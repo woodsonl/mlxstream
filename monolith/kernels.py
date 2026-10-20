@@ -737,6 +737,46 @@ def basalt_gr_norm_grid(n_rows: int, macros: Mapping[str, str]) -> Tuple[int, in
     return n_rows, int(macros["NORM_BLOCK"])
 
 
+# ---- basalt's n-gram block (kernels/common/basalt_ple.metal; docs/research/basalt-nvcc/ple.md) ----
+# The launch rules and constants below are adapted from basalt (jesdga95/basalt)
+# src/kernels/cuda/native_ple_postops.cu:36, :352-359, src/kernels/cuda/ple.cu:36, :210,
+# src/kernels/cuda/elementwise.cu:277-287, src/kernels/cuda/verify_kernels.cu:1086-1090,
+# include/basalt/kernels/ngram.hpp:30-41 and include/basalt/kernels/verify_kernels.hpp:21 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+PLE_N = 2560            # a hyper-connection stream's width (NG_N_EMBD)
+PLE_H = 4               # the hyper-connection streams (NG_HC)
+PLE_D = 10240           # their channels, PLE_H * PLE_N (NG_HC_DIM)
+PLE_HIST = 9            # the history's rows (NG_HIST)
+PLE_SNAP_SLOTS = 8      # the per-row snapshots: a verify window's most rows (kVerifyMaxT)
+PLE_RMS_EPS = 1e-6      # the three grouped norms' eps (NG_RMS_EPS)
+
+PLE_GRIDS = {           # entry (basalt_ple_<name>) -> (threadgroups, threads), basalt's launches
+    "gate": (4, 512),           # native_ple_postops.cu:355: gate_kernel<<<H, 512>>>, one block per stream
+    "broadcast": (40, 256),     # native_ple_postops.cu:356: broadcast_kernel<<<D / 256, 256>>>
+    "conv": (40, 256),          # native_ple_postops.cu:359: conv_residual_kernel<<<D / 256, 256>>>
+    "advance": (40, 256),       # ple.cu:210: (NG_HC_DIM + THREADS - 1) / THREADS blocks of THREADS = 256 (:36)
+    "snapshot": (64, 256),      # elementwise.cu:284-285: min(ceil(n4 / 256), 64) blocks of 256, n4 = 23,040 float4s
+    "restore": (64, 256),       # verify_kernels.cu:1087-1088: min(ceil(n / 256), 64) blocks of 256, n = 92,160
+}
+
+
+def basalt_ple_source() -> str:
+    """basalt's ``gate_kernel`` (``basalt_ple_gate``), ``broadcast_kernel`` (``basalt_ple_broadcast``) and
+    ``conv_residual_kernel`` (``basalt_ple_conv``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_ple.metal")
+
+
+def basalt_ple_gate_params() -> bytes:
+    """``PleGateParams``: the gate's scale as float32 bits, basalt's host constant ``1.0f / std::sqrt(float(N))``
+    (native_ple_postops.cu:355; host code, which --use_fast_math leaves IEEE), 0x3CA1E89B."""
+    import numpy as np
+
+    bits = int((np.float32(1) / np.sqrt(np.float32(PLE_N))).view(np.uint32))
+    assert bits == 0x3CA1E89B, hex(bits)
+    return struct.pack("<4I", bits, 0, 0, 0)
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)

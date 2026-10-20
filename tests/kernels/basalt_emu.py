@@ -816,3 +816,65 @@ def gr_norm(x, gamma, n_rows, n_cols, gamma_rows, eps, rsqrt):
     total = butterfly(slots, add_ftz)
     scale = np.asarray(rsqrt(fma_ftz(total, rcp_ftz(F32(n_cols)), F32(eps))), F32)
     return mul_ftz(mul_ftz(scale[:, None], x), g)
+
+
+# ---- the n-gram block's gate, broadcast and convolution (docs/research/basalt-nvcc/ple.md sections 2-4) -------------
+# native_ple_postops.cu builds with --use_fast_math: every multiply, add and FMA is .FTZ.
+
+PLE_N = 2560            # native_ple_postops.cu:36's N: a hyper-connection stream's width
+
+
+def cuda_nan(x):
+    """A NaN as sm_120 stores it, 0x7fffffff; every other value keeps its bits (docs/research/basalt-nvcc/nan.md)."""
+    b = np.asarray(x, F32).view(np.uint32)
+    return np.where((b & 0x7FFFFFFF) > 0x7F800000, np.uint32(0x7FFFFFFF), b).astype(np.uint32).view(F32)
+
+
+def ple_gate(key, query, scale, sqrt, expf):
+    """gate_kernel as ple.md section 2 records it, one 512-thread block per row of PLE_N normalized key and query
+    values: thread t's products fl(k_d q_d) for d = t + 512 j, j < 8 (+0 past the row), each added to +0; its eight
+    partials added in order to +0; the XOR butterfly in each of the 16 warps, then over their 16 sums and 16 zeros;
+    s = fma(scale, sum, +0); sign = (s > 0) - (s < 0), 0 for +-0 and a NaN; mag = sq(max(|s|, 1e-6f));
+    gate = rcp(fl(ex2(fl(fl(mag sign) (-L))) + 1)); all .FTZ, with the correctly rounded reciprocal in place of
+    MUFU.RCP. ``sqrt`` and ``expf`` evaluate the kernel's sqrtf_ftz and expf_ftz (MUFU.SQRT, MUFU.EX2 and their
+    metal::fast counterparts have no bit-exact host model). Returns (rows,) float32."""
+    k, q = (np.asarray(a, F32).reshape(-1, PLE_N) for a in (key, query))
+    rows = len(k)
+    p = np.zeros((rows, 8 * 512), F32)                      # column t + 512 j: thread t's product j
+    p[:, :PLE_N] = mul_ftz(k, q)
+    sums = add_ftz(F32(0.0), p.reshape(rows, 8, 512))
+    acc = np.zeros((rows, 512), F32)
+    for j in range(8):
+        acc = add_ftz(acc, sums[:, j])
+    slots = np.zeros((rows, 32), F32)
+    slots[:, :16] = butterfly(acc.reshape(-1, 32), add_ftz).reshape(rows, 16)
+    s = fma_ftz(F32(scale), butterfly(slots, add_ftz), F32(0.0))
+    with np.errstate(invalid="ignore"):
+        sign = np.where(s > 0, F32(1.0), np.where(s < 0, F32(-1.0), F32(0.0)))
+    mag = np.asarray(sqrt(max_ftz(ftz(np.abs(s)), F32(1e-6))), F32)
+    return rcp_ftz(add_ftz(F32(1.0), np.asarray(expf(-mul_ftz(sign, mag)), F32)))
+
+
+def ple_broadcast(value, gate):
+    """broadcast_kernel (ple.md section 3): gated[i] = fl(value[i % N] gate[i / N]), .FTZ, N = len(value), stored as
+    sm_120 stores a NaN. Returns (len(gate) * N,) float32."""
+    v, g = np.asarray(value, F32).ravel(), np.asarray(gate, F32).ravel()
+    return cuda_nan(mul_ftz(v[None, :], g[:, None]).ravel())
+
+
+def ple_conv(hist, normalized, taps, hidden, gated, expf):
+    """conv_residual_kernel (ple.md section 4), per channel c: the terms t_k = fl(x_k h(w_k)) of history rows 0, 3 and
+    6 (``hist`` in basalt's layout, row r of channel c at c * 9 + r) and of normalized[c], the fp16 taps ``taps``
+    (float16 or their bits, at [k + 4 c]) widened exactly; sum = fl(fl(fl(t_0 + t_1) + t_2) + t_3);
+    act = fl(sum rcp(fl(ex2(fl(sum (-L))) + 1))); result = fl(hidden + fl(gated + act)); all .FTZ, with the correctly
+    rounded reciprocal in place of MUFU.RCP, and conv (act) and result stored as sm_120 stores a NaN. ``expf``
+    evaluates the kernel's expf_ftz. Returns (conv, result), float32."""
+    h = np.asarray(hist, F32).reshape(-1, 9)
+    w = h2f(np.ascontiguousarray(taps).view(np.uint16)).reshape(-1, 4)
+    x = (h[:, 0], h[:, 3], h[:, 6], np.asarray(normalized, F32).ravel())
+    s = mul_ftz(x[0], w[:, 0])
+    for k in (1, 2, 3):
+        s = add_ftz(s, mul_ftz(x[k], w[:, k]))
+    act = mul_ftz(s, rcp_ftz(add_ftz(F32(1.0), np.asarray(expf(-s), F32))))
+    result = add_ftz(np.asarray(hidden, F32).ravel(), add_ftz(np.asarray(gated, F32).ravel(), act))
+    return cuda_nan(act), cuda_nan(result)
