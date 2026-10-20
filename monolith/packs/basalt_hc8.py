@@ -112,7 +112,8 @@ def copy_list(f: BasaltFile) -> Tuple[Hc8Entry, ...]:
 
     Raises ``ValueError`` naming the row or cause for a file with an ``hc8`` section, a target row that is in ``gguf``,
     not kind 4 (BF16 as stored) or not ``ne0 * ne1 * 2`` bytes, a drafter row not ``bf16`` of ``rows * cols * 2``
-    bytes, ``cols % 32 != 0``, and a table name of 128 bytes or more (``hc8_write``'s limit,
+    bytes, an empty matrix (``rows`` or ``cols`` 0, of which basalt makes no copy: ``hc_fused.cu:1253``, ``:1270``),
+    ``cols % 32 != 0``, and a table name of 128 bytes or more (``hc8_write``'s limit,
     ``src/core/model_file.cpp:443``)."""
     if "hc8" in f.sections:
         raise ValueError("copy_list: the file has an 'hc8' section, a table of copies basalt would adopt as it stands: "
@@ -120,7 +121,8 @@ def copy_list(f: BasaltFile) -> Tuple[Hc8Entry, ...]:
     out = []
 
     def add(name, src, offset, rows, cols, why):
-        why = why or (f"{rows} x {cols}: its columns are not whole groups of {G8}" if cols % G8 else
+        why = why or (f"{rows} x {cols}: an empty matrix" if not rows or not cols else
+                      f"{rows} x {cols}: its columns are not whole groups of {G8}" if cols % G8 else
                       f"a table name of {len(name.encode())} bytes; hc8_write's hold at most 127"
                       if len(name.encode()) >= 128 else None)
         if why:

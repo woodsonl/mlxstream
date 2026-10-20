@@ -280,7 +280,7 @@ def test_refusals():
         f"HC8-REFUSE: the valid file passes, its copies in hc8_tensors' order then the drafter's in its index's, each " \
         f"at its row's bytes, the target's alone without the mtp sections, and a 127-byte name taken: {es}"
 
-    edit = lambda rows, i, **kw: rows[:i] + (rows[i]._replace(**kw),) + rows[i + 1:]
+    edit = lambda table, i, **kw: table[:i] + (table[i]._replace(**kw),) + table[i + 1:]
     down = r"^copy_list: dense/blk\.2\.hc_attn_down\.weight: "
     for defect, why in [
             (dict(hc8=b"BASALTH8" + bytes(8)), r"^copy_list: the file has an 'hc8' section"),
@@ -290,6 +290,11 @@ def test_refusals():
              r"^copy_list: dense/blk\.2\.hc_attn_inject\.weight: its bytes are in gguf$"),
             (dict(mtp=edit(MTP, 2, kind="f32", nbytes=512)),
              r"^copy_list: mtp/attn_hyper_connection\.input_mix_weight_down\.weight: kind 'f32', not 'bf16'$"),
+            (dict(dense=edit(DENSE, 5, ne1=0, src_bytes=0, dst_bytes=0)), down + r"0 x 64: an empty matrix$"),
+            (dict(dense=edit(DENSE, 5, ne0=0, ne1=2 ** 33, src_bytes=0, dst_bytes=0)),   # rows past the table's uint32
+             down + r"8589934592 x 0: an empty matrix$"),
+            (dict(mtp=edit(MTP, 2, rows=0, nbytes=0)),
+             r"^copy_list: mtp/attn_hyper_connection\.input_mix_weight_down\.weight: 0 x 64: an empty matrix$"),
             (dict(dense=edit(DENSE, 5, ne0=48, src_bytes=192, dst_bytes=192)),
              down + r"2 x 48: its columns are not whole groups of 32$"),
             (dict(dense=DENSE + (_dense(6, "blk.1" + long[4:], 64, 2),)),
