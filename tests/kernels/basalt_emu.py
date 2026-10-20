@@ -8,6 +8,9 @@
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp ggml/src/ggml-common.h (kvalues_iq4nl),
 # ggml/src/ggml-quants.c (get_scale_min_k4), ggml/src/ggml-cuda/quantize.cu and ggml/src/ggml-cuda/mmvf.cu @
 # 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+# nv_powf: transcribed from NVIDIA libdevice's __nv_powf as nvcc 13.0 (V13.0.48, -arch=sm_120 -lineinfo -O3 -DNDEBUG)
+# inlined it into basalt's src/prefill/kernels.cu (rope_kernel<false>); PTX listing and transcription:
+# docs/research/basalt-nvcc/prefill_kernels.md section 4.
 """numpy emulation of basalt's float32 arithmetic as nvcc compiles it (docs/research/basalt-nvcc/matvec.md), for the
 bit-for-bit tests of the Metal port. Every float operation rounds once to float32, to nearest even on the float32
 grid, subnormals included (gradual underflow): numpy's float32 add, multiply and divide do; ``fma32`` does by rounding
@@ -791,3 +794,58 @@ def q5k_proxy_final(cand, part, exact, map_, expf):
         s[:k] = add_ftz(s[:k], ed[c0:c0 + k])
     total = max_ftz(butterfly(s[None], add_ftz)[0], F32(1.0 if bi in rows else 0.0))
     return int(np.asarray(map_)[bi]), rcp_ftz(total), rows
+
+
+# ---- libdevice's powf in the prompt rotation (docs/research/basalt-nvcc/prefill_kernels.md section 4) --------------
+# kernels.cu builds with nvcc's IEEE defaults: no flush, as numpy's float32 operations.
+
+def _w2f(w):
+    """32-bit words (ints or int64 arrays, taken mod 2^32) as float32."""
+    return np.asarray(np.asarray(w, np.int64) & 0xFFFFFFFF, np.uint32).view(F32)
+
+
+def nv_powf(x, y):
+    """libdevice's __nv_powf as nvcc 13.0 inlines it into rope_kernel<false> (src/prefill/kernels.cu:751), operation
+    for operation as kernels/common/basalt_libdevice.metal's nv_powf, on float32 arrays (broadcast): ``fma32`` at each
+    fma.rn.f32, numpy's float32 at every other operation, and the correctly rounded F32(1) / (m + 1) at
+    rcp.approx.ftz.f32 (invariant 5: CUDA's bits wherever no result depends on its last bits, every pair at this
+    pack's 0x3F1AB32B). Its domain is libdevice's main path, asserted: x positive and normal and |y log2 x| <= 152,
+    unless y == 0 or x == 1, which give 1."""
+    x, y = np.broadcast_arrays(np.asarray(x, F32), np.asarray(y, F32))
+    xi = x.view(np.uint32).astype(np.int64)
+    ex = (xi - 0x3F3504F3) & -8388608                                  # and 0xFF800000 on the signed word
+    m = _w2f(xi - ex)                                                   # in [2^-1/2, 2^1/2)
+    e = fma32(ex.astype(F32), _w2f(0x34000000), F32(0.0))              # the exponent, exact
+    m1, rc = m + F32(-1.0), F32(1.0) / (m + F32(1.0))
+    u = (m1 + m1) * rc
+    uu = u * u
+    d = m1 - u
+    d = d + d
+    ul = rc * fma32(-u, m1, d)
+    p = fma32(uu, _w2f(0x3A2C32E4), _w2f(0x3B52E7DB))
+    p = fma32(p, uu, _w2f(0x3C93BB73))
+    p = fma32(p, uu, _w2f(0x3DF6384F))
+    p = p * uu
+    l2e = _w2f(0x3FB8AA3B)
+    h = fma32(u, l2e, e)
+    t = e - h
+    t = fma32(u, l2e, t)
+    t = fma32(ul, l2e, t)
+    t = fma32(u, _w2f(0x32A55E34), t)
+    t = fma32(p * F32(3.0), ul, t)
+    t = fma32(p, u, t)
+    lh = h + t
+    ll = t - (lh - h)                                                   # log2(x) = lh + ll
+    yh = lh * y
+    yl = fma32(ll, y, fma32(lh, y, -yh))
+    one = (y == 0) | (x == 1)
+    assert np.all(one | ((xi >= 0x00800000) & (xi < 0x7F800000) & (np.abs(yh) <= 152))), "outside nv_powf's main path"
+    n = np.rint(yh)
+    f = (yh - n) + yl
+    q = fma32(f, _w2f(0x391FCB8E), _w2f(0x3AAF85ED))
+    for c in (0x3C1D9856, 0x3D6357BB, 0x3E75FDEC, 0x3F317218):
+        q = fma32(q, f, _w2f(c))
+    q = fma32(q, f, F32(1.0))                                           # 2^f
+    b = np.where(n > 0, 0, 0x83000000)                                  # 2^127 * 2^(n - 127), or 2^-123 * 2^(n + 123)
+    r = (q * _w2f(b + 0x7F000000)) * _w2f((n.astype(np.int64) << 23) - b)
+    return np.where(one, F32(1.0), r).astype(F32)
