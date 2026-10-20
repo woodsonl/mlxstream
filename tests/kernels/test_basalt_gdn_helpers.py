@@ -21,6 +21,15 @@ comparison is bitwise; a NaN result compares by class (the kernels' stores canon
   of at least 2^-100 cancelling to 2^-146, which D6's literal guard returns as the hardware's +0), the two exact
   products that round up to 2^-126, and the signs of zero products on +-0 addends (D10). The hardware's own ``fma``
   must differ from IEEE on many rows, so that the slow path is what the rows check.
+- H.3: ``log1pf_nv`` (libdevice's ``__nv_log1pf``, dec_gdn.md section 6a) against ``basalt_emu.log1pf_nv``, which
+  runs the whole sequence with IEEE subnormals and FADD.RZ through ``Fraction``: [2^-126, 2^-60] of both signs, some
+  below 2^-125 (FMUL p, m, p subnormal); subnormals of both signs, which come back as they are; 64 ulps either side of
+  0.75 * 2^n - 1 for n = -2..29, which holds every float32 x whose round-to-nearest x + 1 steps k where FADD.RZ's does
+  not; [-1, e^20] by bits and by value, [-1, 1] by value; zeros, -1, x < -1, the largest finite values, infinities and
+  NaNs. Fixed rows with their bits: 0x3EFFFFFF, the one float32 whose result FADD.RZ changes (a round-to-nearest sum
+  gives 0x3ECF9920), the smallest subnormals (which this GPU's m + s would flush to +0), +-0, -1 and +inf. The results
+  must also be within 1 ulp of float64's log1p rounded to float32 wherever x >= -1, which catches an error both
+  transcriptions share.
 """
 
 import numpy as np
@@ -246,3 +255,82 @@ def test_fma_ieee_matches_the_emulation():
     assert np.array_equal(hw[sl], c[sl]) and np.array_equal(want[sl], c[sl])
     edge = mag[at["edge"]]
     assert np.count_nonzero(edge < U32(0x0D800000)) > 100 and np.count_nonzero(edge >= U32(0x0D800000)) > 100
+
+
+# ---- H.3: log1pf_nv ------------------------------------------------------------------------------------------------
+
+H3 = """
+kernel void h3_log1p(device const uint* x [[buffer(0)]], device uint* out [[buffer(1)]],
+                     constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  out[i] = as_type<uint>(log1pf_nv(as_type<float>(x[i])));
+}
+"""
+E20 = np.exp(F64(20)).astype(F32)          # e^20: the softplus's x = __expf(u), u <= 20, stays at or below it
+# (x, log1pf's bits); NaN results compare by class (CUDA's FFMA gives 0x7FFFFFFF)
+H3_FIXED = [(0x3EFFFFFF, 0x3ECF991F),      # 0.5 - 2^-25: RN(x + 1) = 1.5 steps k, RZ does not; RN gives 0x3ECF9920
+            (0x00000001, 0x00000001),      # 2^-149 as is: this GPU's m + s would flush it to +0
+            (0x80000001, 0x80000001),
+            (0x00000000, 0x00000000),
+            (0x80000000, 0x80000000),      # -0: the special block's FSEL
+            (0xBF800000, 0xFF800000),      # -1: the sequence's -inf
+            (0x7F800000, 0x7F800000),      # +inf: fma(x, inf, inf)
+            (0xFF800000, 0x7FFFFFFF),      # -inf, x < -1 and NaN: fma(x, inf, inf), NaN
+            (0xC0000000, 0x7FFFFFFF),
+            (0x7FC00000, 0x7FFFFFFF)]
+
+
+def h3_args(rng, n=1 << 12):
+    """H.3's arguments (float32 bits) by class."""
+    tiny = np.r_[rng.integers(0x00800000, F32(2.0 ** -60).view(U32) + 1, n, dtype=U32),
+                 rng.integers(0x00800000, 0x01000000, n // 4, dtype=U32)]      # [2^-126, 2^-125): m * p subnormal
+    sub = rng.integers(1, 1 << 23, n, dtype=U32)
+    x0 = (0.75 * 2.0 ** np.arange(-2, 30) - 1).astype(F32).view(U32)          # where k steps: x + 1 = 0.75 * 2^n
+    top = int(E20.view(U32))
+    domain = [rng.integers(0, top + 1, 1 << 16, dtype=U32),                     # [0, e^20] by bits
+              rng.integers(0x80000000, 0xBF800001, 1 << 15, dtype=U32),         # [-1, -0] by bits
+              rng.uniform(-1, float(E20), 1 << 14).astype(F32).view(U32),
+              rng.uniform(-1, 1, 1 << 14).astype(F32).view(U32)]
+    special = np.array([0x007FFFFF, 0x807FFFFF, 0x00800000, 0x80800000, 0x3F800000, 0xBF7FFFFF, 0xBF800001,
+                        0x41A00000, top, 0x7F7FFFFF, 0xFF7FFFFF, 0xFF800001, 0xFFC00001, 0x7F800001, 0xFFFFFFFF], U32)
+    return {"tiny": np.r_[tiny, tiny | SIGN], "subnormal": np.r_[sub, sub | SIGN],
+            "rz": (x0[:, None].astype(np.int64) + np.arange(-64, 65)).astype(U32).ravel(),
+            "domain": np.concatenate(domain), "special": special}
+
+
+def test_log1pf_nv_matches_the_emulation():
+    args = h3_args(np.random.default_rng(33))
+    fixed = np.array(H3_FIXED, U32)
+    xb = np.concatenate([fixed[:, 0]] + list(args.values()))
+    x = xb.view(F32)
+    got = run_kernel(H3, "h3_log1p", [xb], 1)[:, 0]
+    with np.errstate(invalid="ignore"):                     # the signaling-NaN rows raise the flag in the cast
+        want = emu.log1pf_nv(x)
+    nf = len(H3_FIXED)
+    assert not np.any(differ(want.view(U32)[:nf], fixed[:, 1])), "basalt_emu.log1pf_nv misses a fixed row's bits"
+    assert not np.any(differ(got[:nf], fixed[:, 1])), f"log1pf_nv on the fixed rows: {[hex(g) for g in got[:nf]]}"
+    assert_bits("log1pf_nv", got, want, x)
+    # the rows exercise what they claim: subnormals come back as they are and nonzero, tiny normals as they are, some
+    # below 2^-125; the rz rows hold all five float32 x whose round-to-nearest x + 1 gives another k than FADD.RZ's
+    # (n = 0, 1, 2 and 25: x + 1 is exact for x in [-1, -0.5] and, n = 3..24, where x and x + 1 share a binade;
+    # from n = 26, ulp(x) >= 4 and both sums are x)
+    at, off = {}, nf
+    for name, r in args.items():
+        at[name], off = slice(off, off + len(r)), off + len(r)
+    sl = at["subnormal"]
+    assert np.array_equal(got[sl], xb[sl]) and np.all((got[sl] & U32(0x7FFFFFFF)) != 0)
+    sl = at["tiny"]
+    assert np.array_equal(got[sl], xb[sl])
+    assert np.count_nonzero((xb[sl] & U32(0x7FFFFFFF)) < U32(0x01000000)) > 1000
+    xr = x[at["rz"]]
+    s = xr.astype(F64) + 1.0                                # exact: 2^-26 <= ulp(x) and |x| < 2^29
+    rn = s.astype(F32)
+    rz = np.where(np.abs(rn.astype(F64)) > np.abs(s), np.nextafter(rn, F32(0)), rn)
+    k = lambda t: (t.view(U32) - U32(0x3F400000)) & U32(0xFF800000)
+    assert np.count_nonzero(k(rn) != k(rz)) == 5
+    # near float64: within 1 ulp of log1p rounded to float32 (on ordered keys), wherever x >= -1
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ok = ~np.isnan(x) & (x >= -1)
+        ref = np.log1p(x[ok].astype(F64)).astype(F32).view(U32)
+    key = lambda b: np.where(b >= SIGN, -(b & U32(0x7FFFFFFF)).astype(np.int64), b.astype(np.int64))
+    assert np.max(np.abs(key(got[ok]) - key(ref))) <= 1, "log1pf_nv: more than 1 ulp from float64's log1p"

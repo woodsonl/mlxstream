@@ -9,6 +9,9 @@
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp ggml/src/ggml-common.h (kvalues_iq4nl),
 # ggml/src/ggml-quants.c (get_scale_min_k4), ggml/src/ggml-cuda/quantize.cu and ggml/src/ggml-cuda/mmvf.cu @
 # 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+# log1pf_nv: transcribed from NVIDIA libdevice's __nv_log1pf as nvcc 13.0 (V13.0.48, -arch=sm_120 -lineinfo -O3
+# -DNDEBUG) inlined it into basalt's dec_gdn_rec.cu and verify_kernels.cu; SASS listing and transcription:
+# docs/research/basalt-nvcc/dec_gdn.md section 6a.
 """numpy emulation of basalt's float32 arithmetic as nvcc compiles it (docs/research/basalt-nvcc/matvec.md), for the
 bit-for-bit tests of the Metal port. Every float operation rounds once to float32, to nearest even on the float32
 grid, subnormals included (gradual underflow): numpy's float32 add, multiply and divide do; ``fma32`` does by rounding
@@ -16,6 +19,8 @@ the exact float64 sum to odd before the float32 cast. The ``*_ftz`` forms flush 
 rounded result if it is subnormal, as PTX defines ``.ftz`` (``fma.f32``: the exact value "rounded to single
 precision"; ``.ftz`` flushes "subnormal inputs and results"): an exact result in [2^-126 - 2^-150, 2^-126) gives
 2^-126, the tie 2^-126 - 2^-150 included (2^-126 is the even neighbour)."""
+
+from fractions import Fraction
 
 import numpy as np
 
@@ -833,3 +838,40 @@ def rsqrt_ieee(x, rsqrt):
     with np.errstate(over="ignore", invalid="ignore"):
         r = np.asarray(rsqrt(np.where(small, x * F32(2.0 ** 24), x).astype(F32)), F32)
         return np.where(small, r * F32(4096.0), r).astype(F32)
+
+
+def log1pf_nv(x):
+    """libdevice's __nv_log1pf as nvcc 13.0 inlined it into the softplus (dec_gdn_rec.cu:111, verify_kernels.cu:154
+    and :209), the SASS of dec_gdn.md section 6a operation for operation, on any float32: FADD.RZ t, x, 1 rounds the
+    exact sum (a Fraction) toward zero, the integer steps act on the bits, each FFMA is fma32 and each FADD and FMUL
+    numpy's IEEE operation, and the special block's predicates are ISETP on the bits and FSETP.NEU's IEEE compare
+    (NaN unordered). No pass-through: a zero or subnormal x runs the whole sequence."""
+    x = np.asarray(x, F32)
+    u32, c = np.uint32, lambda b: np.uint32(b).view(F32)
+
+    def add_rz1(v):                                     # FADD.RZ t, v, 1
+        if not np.isfinite(v):
+            return v + F32(1.0)
+        s = Fraction(float(v)) + 1
+        f = F32(float(s))                               # one of the two float32 values around s
+        return np.nextafter(f, F32(0.0)) if abs(Fraction(float(f))) > abs(s) else f
+
+    xb = x.view(u32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        t = np.array([add_rz1(v) for v in x.ravel()], F32).reshape(x.shape)
+        k = (t.view(u32) - u32(0x3F400000)) & u32(0xFF800000)            # IADD3, LOP3.LUT
+        m = (xb - k).view(F32)                                            # IADD3 m, x, -k
+        s = (u32(0x40800000) - k).view(F32)                               # IADD3 s, -k, 0x40800000
+        s = fma32(s, F32(0.25), F32(-1.0))
+        m = m + s
+        kf = k.view(np.int32).astype(F32) * c(0x34000000)                 # I2FP.F32.S32 (exact), FMUL by 2^-23
+        p = fma32(m, c(0xBD39BF78), c(0x3DD80012))
+        for b in (0xBE0778E0, 0x3E146475, 0xBE2A68DD, 0x3E4CAF9E, 0xBE800042, 0x3EAAAAE6, 0xBF000000):
+            p = fma32(p, m, c(b))
+        p = m * p
+        r = fma32(m, p, m)
+        r = fma32(kf, c(0x3F317218), r)                                   # + k ln 2
+        p0 = xb >= u32(0x7F800000)                                         # +inf, NaN, the sign set
+        p2 = p0 & (xb.view(np.int32) > np.int32(-0x40800000))             # and (int) bits > (int) 0xBF800000
+        r = np.where(p2, fma32(x, F32(np.inf), F32(np.inf)), r)
+        return np.where(p0 & (x == 0), F32(-0.0), r).astype(F32)          # FSEL r, r, -RZ, x != 0
