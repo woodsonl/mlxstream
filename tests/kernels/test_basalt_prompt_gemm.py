@@ -36,7 +36,17 @@ The conversion to_f16 (src/prefill/kernels.cu:818-821, hf :40: __float2half_rn),
 the fp32 value, is bitwise, and so is this one:
 - G9-F16: n 100 a row at 37 rows of a 64-row bound, ``F16_SPECIALS`` (+-0, fp32 subnormals, 65504, the overflow tie
   65520 and the float below it, +-inf, three NaNs, the fp16-subnormal ties) among fp32 normals from 2^-30 to 2^20,
-  bit for bit against emu.cuda_half_bits; the elements past 37 * n keep the 0xFF fill."""
+  bit for bit against emu.cuda_half_bits; the elements past 37 * n keep the 0xFF fill.
+
+Gemm::bf16_w on an int8 hyper-connection copy (src/prefill/gemm.cu:134-156) first writes the copy's BF16 image
+(hc8_dequant_bf16, src/kernels/cuda/hc_fused.cu:1229-1244; kernels/common/basalt_prompt_hc8.metal) into the GEMM
+scratch; hc8_parity calls the same dequantizer for its part 1's reference (src/kernels/hc8_parity.cpp:103-105) and
+gates it only through the products:
+- GM-DQ8: the image bit for bit against bf16_bits(f32(q) * f32(f16 s)) on the copies of hc8_parity's three matrices
+  (whole, and the down copy's rows [102, 204) and [306, 320)) and on a special copy whose groups have the scales
+  0x0000, the fp16 subnormals 0x0001 and 0x0155, the largest finite 0x7bf8 and 0x7c00, whose 32 products 0 * inf
+  store 0x7fff (sm_120's NaN), the only non-finite values; the output binding is exactly the image, then a guard of
+  0xFF values past it survives."""
 
 import itertools
 
@@ -45,6 +55,8 @@ import pytest
 
 from monolith import kernels
 from monolith.formats.fp import bf16_to_f32
+from monolith.packs.basalt_hc8 import quantize
+from tests.basalt_hc_ref import hc8_parity_matrices
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu
 from tests.kernels import basalt_prompt_gpu as gpu
@@ -352,3 +364,85 @@ def test_to_f16_is_the_conversion():
         f"against the rounded fp32 value) is bitwise too (R {R} of B {B}, n {n}): {len(miss)} elements differ, as "
         f"(x, y, want) {[(hex(bits[i * n + j]), hex(y[i, j]), hex(want[i, j])) for i, j in miss[:4]]}; "
         f"{np.count_nonzero(y[R:] != 0xFFFF)} past R*n written")
+
+
+# ---- Gemm::bf16_w's first stage: the BF16 image of an int8 hyper-connection copy (basalt_prompt_hc8.metal) ----------
+
+def host_image(q, s):
+    """GM-DQ8's reference: the BF16 image of the copy with codes ``q`` (int8 bit patterns [rows, cols]) and scales
+    ``s`` (fp16 bits [rows, srow]) as bits, uint16 [rows, cols]: bf16_bits(f32(q) * f32(f16 s)) per element (the
+    product is exact: 8 bits times 11), and a NaN (0 * inf: a group whose scale is 0x7c00 has every code 0) as 0x7fff,
+    sm_120's 0x7fffffff through F2FP.BF16.F32.PACK_AB [H] (bf16_bits has no NaN case)."""
+    with np.errstate(invalid="ignore"):                      # 0 * inf
+        f = q.view(np.int8).astype(F32) * s.view(np.float16).astype(F32)[:, np.arange(q.shape[1]) // 32]
+    return np.where(np.isnan(f), np.uint16(0x7FFF), emu.bf16_bits(f))
+
+
+def special_copy():
+    """GM-DQ8's special copy: the hc lane's ``quantize`` of a 3 x 96 BF16 matrix, three groups a row (srow 8: five
+    padding scales a row; 288 values, so 36 of the image's 256 threads store and 220 return at its bound).
+    Row 0: all +-0 (the scale 0x0000, codes 0); k 2^-24, k drawn in [-127, 127] with 127, 1 and -1 planted (amax / 127
+    = 2^-24: the fp16-subnormal scale 0x0001, codes k, the smallest products +-2^-24); 0.02 N(0, 1) with one 2^24
+    (0x4b80: 2^24 / 127 > 65520, so the scale is 0x7c00 and every code 0, hc_fused.cu:1181, :1185).
+    Row 1: 0.02 N(0, 1) with +-0x4afd (8,290,304, the largest BF16 whose group keeps a finite scale: 0x7bf8, codes
+    +-127); a uniform draw in [-1, 1] times 169 2^-16 with 169 2^-16 planted (the fp16-subnormal scale 0x0155);
+    0.05 N(0, 1). Row 2: 0.02, 0.05 and 1 times N(0, 1)."""
+    rng = np.random.default_rng(7)
+    w = np.zeros((3, 96), F32)
+    w[0, :32] = np.where(np.arange(32) % 2, -0.0, 0.0)
+    k = rng.integers(-127, 128, 32)
+    k[:3] = 127, 1, -1
+    w[0, 32:64] = k * 2.0 ** -24
+    w[0, 64:] = F32(0.02) * rng.standard_normal(32, dtype=F32)
+    w[0, 69] = 2.0 ** 24
+    w[1, :32] = F32(0.02) * rng.standard_normal(32, dtype=F32)
+    w[1, 3], w[1, 4] = 8290304.0, -8290304.0
+    w[1, 32:64] = rng.uniform(-1.0, 1.0, 32) * (169 * 2.0 ** -16)
+    w[1, 33] = 169 * 2.0 ** -16
+    w[1, 64:] = F32(0.05) * rng.standard_normal(32, dtype=F32)
+    w[2] = np.repeat(F32([0.02, 0.05, 1.0]), 32) * rng.standard_normal(96, dtype=F32)
+    return quantize(emu.bf16_bits(w))
+
+
+def test_hc8_image_bits():
+    """GM-DQ8 (hc8_dequant_bf16_kernel, src/kernels/cuda/hc_fused.cu:1229-1244, which hc8_parity calls at
+    src/kernels/hc8_parity.cpp:103-105 and Gemm::bf16_w at src/prefill/gemm.cu:150): basalt_hc8_dequant_bf16 bit for
+    bit against ``host_image``, into an output of exactly the image's bytes, on the copies of hc8_parity's three
+    matrices (tests/basalt_hc_ref.py, quantized by the hc lane's ``quantize``) whole, on the down copy's rows
+    [102, 204) and [306, 320) (two of the 102-row slices hc8_parity's 1 Mi-element Gemm takes, :214-215), and on
+    ``special_copy`` whole; then on ``special_copy`` with a guard of 2048 values past the image (the reach of the
+    threadgroup's 220 idle threads), whose 0xFF bytes must survive. No image value is non-finite but the 0x7c00 group's
+    32 NaNs, 0x7fff each. The fixtures' coverage is asserted first, so no special case passes vacuously."""
+    copies = dict(zip(("down", "up", "inject"), (quantize(w) for w in hc8_parity_matrices(seed=7))))
+    copies["special"] = special_copy()
+    (qd, sd), (qx, sx) = copies["down"], copies["special"]
+    k = np.arange(64)
+    assert (qd[5 * k, 101 * k] == 127).all() and (sd[5 * k, 101 * k // 32] == 0x1CDA).all(), (
+        "the down copy lacks hc8_parity's 64 outliers (hc8_parity.cpp:84, wd[(k * 5) * D + k * 101] = bf16(0.6f)): "
+        "code 127 at (5k, 101k) and its group's scale 0x1cda")
+    gs, zero = sx[:, :3], (qx.reshape(3, 3, 32) == 0).all(axis=2)       # each group's scale; its 32 codes all 0
+    assert ((gs == 0) & zero).any(), "the special copy has no group with scale 0x0000 and 32 codes 0"
+    assert (((gs & 0x7C00) == 0) & ((gs & 0x3FF) != 0)).any(), \
+        "the special copy has no group whose scale is an fp16 subnormal (exponent bits 0, a nonzero mantissa)"
+    assert ((gs == 0x7C00) & zero).any(), "the special copy has no group with scale 0x7c00 and 32 codes 0"
+    want = {name: host_image(q, s) for name, (q, s) in copies.items()}
+    assert {0x3380, 0xB380} <= set(want["special"].ravel().tolist()) and (gs == 0x7BF8).any(), (
+        "the special copy's image lacks the smallest products +-2^-24 (0x3380, 0xb380), or no group has the largest "
+        "finite scale 0x7bf8")
+
+    runs = [(name, 0, None, 0) for name in copies] + [("down", 102, 102, 0), ("down", 306, 14, 0),
+                                                      ("special", 0, None, 2048)]
+    for name, row0, n, guard in runs:
+        q, s = copies[name]
+        rows, cols = q.shape
+        n = rows - row0 if n is None else n
+        got = gpu.hc8_image(q, s, rows, cols, row0, n, guard=guard)
+        img, ref, tail = got[:n * cols].reshape(n, cols), want[name][row0:row0 + n], got[n * cols:]
+        nf, nan = (img & 0x7F80) == 0x7F80, ref == 0x7FFF
+        assert (np.array_equal(img, ref) and np.array_equal(nf, nan)
+                and np.count_nonzero(nan) == (32 if name == "special" else 0) and (tail == 0xFFFF).all()), (
+            "port: bitwise equal to bf16_bits(f32(q) * f32(f16 s)) (hc8_dequant_bf16_kernel: I2F.S8, HADD2.F32, FMUL, "
+            "F2FP.BF16.F32.PACK_AB), each of a 0x7c00 scale's 32 products 0 * inf as 0x7fff and no other value "
+            f"non-finite; the 0xFF past n * cols kept ({name} rows [{row0}, {row0 + n}), guard {guard}): "
+            f"{np.count_nonzero(img != ref)} values differ, {np.count_nonzero(nf)} non-finite where "
+            f"{np.count_nonzero(nan)} are 0x7fff, {np.count_nonzero(tail != 0xFFFF)} guard values written")

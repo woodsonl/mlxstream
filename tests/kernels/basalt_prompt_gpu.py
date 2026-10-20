@@ -2,7 +2,8 @@
 kernel reads its rows from StepState at slot 15 (monolith/kernels.py's PROMPT_ROWS), so ``run_rows`` is
 basalt_gpu.run with a StepState record bound there. A source compiles as the emitter registers it (the StepState
 struct spliced in after the prelude) with the dynamic-T program's row macros: STEP_STATE 1, T_SRC 0 and ROWS_MAX the
-compiled bound B; the static form (T_SRC 2) is the contract and program tiers' concern."""
+compiled bound B; the static form (T_SRC 2) is the contract and program tiers' concern. The copy image
+(basalt_prompt_hc8.metal) reads no rows, so ``hc8_image`` is basalt_gpu.run alone."""
 
 import numpy as np
 
@@ -10,7 +11,7 @@ from monolith import kernels
 from monolith.core.step_state import StepStateLayout
 from monolith.runtime import _native as nt
 from tests.contract.test_basalt_ops import spliced
-from tests.kernels.basalt_gpu import device, pipeline
+from tests.kernels.basalt_gpu import device, pipeline, run
 
 
 def prompt_pipeline(source, name, B, macros=()):
@@ -69,3 +70,22 @@ def convert(x, *, bf16, B, rows, fill=0xFF):
     y = run_rows(pso, [x.tobytes(), 2 * B * n], kernels.basalt_prompt_convert_params(n), 2, (-(-B * n // 256), 1, 1),
                  (256, 1, 1), rows, 0, fill=fill)[1]
     return np.frombuffer(y, np.uint16).reshape(B, n)
+
+
+def hc8_image(q, s, rows, cols, row0=0, n=None, guard=0):
+    """basalt_hc8_dequant_bf16: hc8_dequant_bf16's BF16 image (hc_fused.cu:1229-1244, launched as :1328-1333) of rows
+    [row0, row0 + n) (n None: every row from row0) of the ``rows`` x ``cols`` copy with codes ``q`` (int8 bit
+    patterns, [rows, cols]) and scales ``s`` (fp16 bits, uint16 [rows, srow]), each bound as exactly its bytes. One
+    dispatch, compiled as the emitter registers the source, into a buffer of n * cols values and ``guard`` more, every
+    byte 0xFF: with ``guard`` 0 the binding is exactly the image, so shader validation reports any store past it.
+    Returns the buffer's bits, uint16 [n * cols + guard]. The image reads no StepState."""
+    n = rows - row0 if n is None else n
+    q, s = np.ascontiguousarray(q), np.ascontiguousarray(s)
+    assert (q.dtype.itemsize == 1 and q.shape == (rows, cols) and s.dtype == np.uint16
+            and s.shape == (rows, (cols // 32 + 7) & ~7)), \
+        f"q {q.dtype} {q.shape} and s {s.dtype} {s.shape}: not a {rows} x {cols} copy"
+    pso = pipeline(spliced(kernels.basalt_prompt_hc8_source()), "basalt_hc8_dequant_bf16")
+    grid, threads = kernels.basalt_hc8_image_grid(n, cols)
+    out = run(pso, [q.tobytes(), s.tobytes(), 2 * (n * cols + guard)],
+              kernels.basalt_hc8_image_params(rows, cols, row0, n), 3, grid, threads, fill=0xFF)[2]
+    return np.frombuffer(out, np.uint16)
