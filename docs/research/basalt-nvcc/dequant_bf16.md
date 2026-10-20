@@ -65,9 +65,10 @@ over rows · groups_per_row (`:173-174`), the row `row0 + g / groups_per_row` of
 32 outputs at `out + g * 32`. With `VEC` (the launcher's choice when `out` is 16-byte aligned, `:207-240`) the 32
 values are built in registers (`T tmp[32]`) and written as 16-byte stores (`:177-184`); without it `put` stores
 each value. The values do not depend on the store: `dequant_f16_parity` checks the two forms bitwise (section 3).
-Every group is independent, so no value depends on the slice (`row0`, `rows`) or the grid. The trip counts use the
-exact integer division of `__cuda_sm20_div_s64` (`I2F.U64.RP`, `MUFU.RCP`, `F2I.U64.TRUNC`, `:188`) and of its
-32-bit fast path (`I2F.U32.RP`, `MUFU.RCP`, `F2I.FTZ.U32.TRUNC.NTZ`, `:175`): index arithmetic, exact.
+Every group is independent, so no value depends on the slice (`row0`, `rows`) or the grid. The row and group indices
+(`:175`, `g / groups_per_row` and `g % groups_per_row`) use the exact integer division of `__cuda_sm20_div_s64`
+(`I2F.U64.RP`, `MUFU.RCP`, `F2I.U64.TRUNC`, its body charged to `:188`) and of its 32-bit fast path (`UI2F.U32.RP`,
+`MUFU.RCP`, `F2I.FTZ.U32.TRUNC.NTZ`): index arithmetic, exact.
 
 | Line | Expression | SASS | Metal |
 |---|---|---|---|
