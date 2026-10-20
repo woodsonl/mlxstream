@@ -20,9 +20,13 @@
 // image), y [B][N] floats. Rows come from StepState through prompt_rows (monolith/kernels.py's PROMPT_ROWS, ahead of
 // this file with basalt_fp.metal and the StepState struct): R = prompt_rows(st). A threadgroup computes a 64 x 64 tile
 // of y, rows row0 + 64 * gy and columns col0 + 64 * gx onward (row0 and col0 are the slice's, from its params record):
-// 256 threads, each 4 x 4 outputs (rows tr + 16 i, columns tc + 16 j), K in steps of 16 staged as floats. A tile at or
-// past R returns before its first barrier; loads past R or N stage zeros (never read past x's B rows or w's N rows);
-// stores need t < R and n < N. Grid: (ceil(ncols / 64), nrows / 64) threadgroups of 256 per slice. K % 16 == 0.
+// 256 threads, each 4 x 4 outputs (rows 4 tr + i, columns 4 tc + j), K in steps of 16 staged as floats in one 8,192 B
+// threadgroup array (quads of 4 rows as float4, their slots XOR-swizzled by kk), the next step's 16-bit operands
+// loaded into registers while this step's fmas run: the speed a dispatch needs to stay under 1 ms at K 10240 (C4),
+// with every output's chain unchanged. A tile at or past R returns before its first barrier; loads past R or N stage
+// zeros (never read past x's B rows or w's N rows); a thread none of whose outputs is stored skips its fmas but meets
+// every barrier; stores need t < R and n < N. Grid: (ceil(ncols / 64), nrows / 64) threadgroups of 256 per slice.
+// K % 16 == 0.
 //
 // basalt_prompt_convert: to_f16 (kernels.cu:818-821, hf :40) at CV_BF16 0, x [B][n] floats to y [B][n] fp16 bits.
 // One thread per element of the chunk's rows, i < prompt_rows(st) * n (basalt's launcher, :846-850, runs a grid-stride
@@ -43,9 +47,9 @@
 #define CV_BF16 0
 #endif
 
-// ponytail: one geometry for every shape (a 64 x 64 tile, 4 x 4 outputs per thread, K steps of 16, single-buffered);
-// a per-shape geometry macro, gated unchanged by GM-EMU and GM-ROWS (tests/kernels/test_basalt_prompt_gemm.py), when
-// prompt speed is measured to matter.
+// ponytail: one geometry for every shape (a 64 x 64 tile, 4 x 4 outputs per thread, K steps of 16, one single-buffered
+// threadgroup array beside a register prefetch); a per-shape geometry macro, gated unchanged by GM-EMU and GM-ROWS
+// (tests/kernels/test_basalt_prompt_gemm.py), when prompt speed is measured to matter.
 #define PG_TILE 64u
 #define PG_BK 16u
 
@@ -63,30 +67,49 @@ kernel void basalt_prompt_gemm(device const ushort* x [[buffer(0)]], device cons
                                device float* y [[buffer(2)]], constant PromptGemmParams& p [[buffer(3)]],
                                device const StepState* st [[buffer(15)]],
                                uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float s[2][PG_BK][PG_TILE];               // [0][kk][r]: x[t0 + r][k0 + kk]; [1][kk][c]: w[n0 + c][k0 + kk]
+    // [0][kk][q ^ kk]: x[t0 + 4q + 0..3][k0 + kk]; [1][kk][q ^ kk]: w[n0 + 4q + 0..3][k0 + kk] (8,192 B)
+    threadgroup float4 s[2][PG_BK][PG_TILE / 4u];
     const uint t0 = p.row0 + PG_TILE * tg.y, n0 = p.col0 + PG_TILE * tg.x;
     const uint R = prompt_rows(st);
     if (st->done || t0 >= R) return;                      // the whole threadgroup, before any barrier
-    const uint tr = tid / 16u, tc = tid % 16u;
+    const uint tr = tid % 16u, tc = tid / 16u;            // outputs: rows t0 + 4 tr + i, columns n0 + 4 tc + j
+    const uint sq = tid / 16u, skk = tid % 16u;           // staging: quad sq (rows or columns 4 sq + c) at kk = skk
+    const bool live = t0 + 4u * tr < R && n0 + 4u * tc < p.n;  // else none of the thread's 16 outputs is stored
+    device const ushort* xs[4];
+    device const ushort* ws[4];
+    bool xin[4], win[4];
+    for (uint c = 0; c < 4u; ++c) {                       // a row past R or N stages 0 and points at row 0 (in bounds)
+        const uint t = t0 + 4u * sq + c, n = n0 + 4u * sq + c;
+        xin[c] = t < R; win[c] = n < p.n;
+        xs[c] = x + ulong(xin[c] ? t : 0u) * p.k + skk;
+        ws[c] = w + ulong(win[c] ? n : 0u) * p.k + skk;
+    }
+    ushort rx[4], rw[4];                                  // the step's 16-bit operands, loaded a step ahead
+    for (uint c = 0; c < 4u; ++c) { rx[c] = xin[c] ? xs[c][0] : ushort(0); rw[c] = win[c] ? ws[c][0] : ushort(0); }
     float acc[4][4];
     for (uint i = 0; i < 4u; ++i)
         for (uint j = 0; j < 4u; ++j) acc[i][j] = 0.0f;
     for (uint k0 = 0; k0 < p.k; k0 += PG_BK) {
-        for (uint e = tid; e < PG_TILE * PG_BK; e += 256u) {
-            const uint r = e / PG_BK, kk = e % PG_BK, t = t0 + r, n = n0 + r;
-            s[0][kk][r] = t < R ? pg_widen(x[ulong(t) * p.k + k0 + kk]) : 0.0f;
-            s[1][kk][r] = n < p.n ? pg_widen(w[ulong(n) * p.k + k0 + kk]) : 0.0f;
-        }
+        s[0][skk][sq ^ skk] = float4(pg_widen(rx[0]), pg_widen(rx[1]), pg_widen(rx[2]), pg_widen(rx[3]));
+        s[1][skk][sq ^ skk] = float4(pg_widen(rw[0]), pg_widen(rw[1]), pg_widen(rw[2]), pg_widen(rw[3]));
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < PG_BK; ++kk)
-            for (uint i = 0; i < 4u; ++i)
-                for (uint j = 0; j < 4u; ++j) acc[i][j] = fma(s[0][kk][tr + 16u * i], s[1][kk][tc + 16u * j], acc[i][j]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);  // every thread has read the step before the next load
+        const uint k1 = k0 + PG_BK;
+        if (k1 < p.k)
+            for (uint c = 0; c < 4u; ++c) { rx[c] = xin[c] ? xs[c][k1] : ushort(0); rw[c] = win[c] ? ws[c][k1] : ushort(0); }
+        if (live)
+            for (uint k2 = 0; k2 < PG_BK; k2 += 4u) {     // kk = k2 + u increasing: every chain sees k in order
+                float4 a[4], b[4];
+                for (uint u = 0; u < 4u; ++u) { a[u] = s[0][k2 + u][tr ^ (k2 + u)]; b[u] = s[1][k2 + u][tc ^ (k2 + u)]; }
+                for (uint u = 0; u < 4u; ++u)
+                    for (uint i = 0; i < 4u; ++i)
+                        for (uint j = 0; j < 4u; ++j) acc[i][j] = fma(a[u][i], b[u][j], acc[i][j]);
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // every thread has read the step before the next store
     }
     for (uint i = 0; i < 4u; ++i) {
-        const uint t = t0 + tr + 16u * i;
+        const uint t = t0 + 4u * tr + i;
         for (uint j = 0; j < 4u; ++j) {
-            const uint n = n0 + tc + 16u * j;
+            const uint n = n0 + 4u * tc + j;
             if (t < R && n < p.n) y[ulong(t) * p.n + n] = cuda_nan(acc[i][j]);
         }
     }
