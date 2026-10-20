@@ -126,6 +126,36 @@ static inline float gdn_out(float oc, float ss, float eps, float gam, float z) {
 
 // ---- the per-stage kernels: dec_gdn_parity's reference side (test-only) --------------------------------------------
 
+// gdn_conv_l2_multi (verify_kernels.cu:29-57, the launcher :817-826, t_begin 0): the window's h for every channel c
+// and token t < T, h[t C + c], the conv of the taps [history | qkv rows < t] and qkv row t, SiLU'd; on the q and k
+// heads (threadgroups below 2 h_k) L2-normed over the head's 128 channels. The history is the state's conv tail,
+// [C][3] oldest first after the S x h_v x S recurrent state, read only. Grid (C / 128, T) threadgroups of 128 threads,
+// one head of 128 channels each, SIMD-group sg holding channels 32 sg .. 32 sg + 31 (CUDA's warps).
+kernel void gdn_conv_l2_multi(device const float* state [[buffer(0)]], device const float* qkv [[buffer(1)]],
+                              device const float* w [[buffer(2)]], device float* h [[buffer(3)]],
+                              constant BsGdnParams& p [[buffer(16)]], uint2 tg [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[4];
+    const uint t = tg.y, c = 128u * tg.x + 32u * sg + lane;
+    if (t >= min(p.T, 8u)) return;                                 // the whole threadgroup, before the barrier
+    device const float* hist = state + 128u * p.h_v * 128u;        // the conv tail
+    float win[3];
+    for (uint j = 0; j < 3u; ++j) {
+        const uint src = t + j;                                    // into [history(3) | qkv rows]
+        win[j] = src < 3u ? hist[3u * c + src] : qkv[(src - 3u) * p.C + c];
+    }
+    const float x = qkv[t * p.C + c];
+    device const float* wc = w + 4u * c;
+    float y = gdn_silu(gdn_conv(win[0], win[1], win[2], x, wc[0], wc[1], wc[2], wc[3]));
+    if (tg.x < 2u * p.h_k) {                                       // threadgroup-uniform
+        const float sq = warp_sum_ieee(ieee_mul(y, y));
+        if (lane == 0u) part[sg] = sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        y = ieee_mul(y, rsqrt_ieee(ieee_add(gdn_sum4(part[0], part[1], part[2], part[3]), p.eps)));
+    }
+    h[t * p.C + c] = cuda_nan(y);
+}
+
 // gdn_ab_multi (verify_kernels.cu:113-213, the launcher :873-898): the window's gate and beta for every value head
 // r and token t < T, gate[t h_v + r] from the alpha row r of x row t (softplus(v + dt[r]) ssm_a[r], the decay's
 // logarithm) and beta[t h_v + r] = sigmoid(v) from the beta row r. Grid h_v threadgroups of 64 threads: SIMD-group sg
