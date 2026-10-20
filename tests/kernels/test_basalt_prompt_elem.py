@@ -17,6 +17,10 @@ as 0xFF bytes, so an unwritten word fails its comparison.
   from a probe kernel, bitwise equal in r and j to the host twin (basalt_emu.nv_trig_slow) at every angle of KE 8.2's
   three Payne-Hanek chunks that takes it and across the function's domain; and its binary64 conversion
   ``f64_from_u63`` against Python's correctly rounded int-to-float.
+- RO-3h: the rotation's angle ``float(pos) * nv_powf(0x3F1AB32B, pair)`` and its ``nv_cosf`` and ``nv_sinf`` from a
+  probe kernel, bitwise equal to the host twins (basalt_emu.nv_powf, basalt_emu.nv_trig) at positions 0..16383 and
+  the three Payne-Hanek chunks, pairs 0..31; and both functions at NaN, +-inf, +-0, subnormals and across the float
+  range, both signs.
 """
 
 from fractions import Fraction
@@ -145,3 +149,63 @@ def test_rope_angle_slow_path_bit_for_bit():
     bad = np.flatnonzero(got != want)
     assert bad.size == 0, (f"{bad.size} of {len(ints)} differ; first n={ints[bad[0]]:#x}: got {got[bad[0]]:#018x}, "
                            f"want {want[bad[0]]:#018x}")
+
+
+# ---- RO-3h: nv_cosf and nv_sinf of the rotation's angle --------------------------------------------------------------
+
+TRIG = f"#define THETA_SCALE_BITS {THETA_SCALE:#x}u\n" + """
+kernel void probe_rope_angle(device const int* pos [[buffer(0)]], device const int* pair [[buffer(1)]],
+                             device uint* out [[buffer(2)]], constant uint& n [[buffer(3)]],
+                             uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const float th = float(pos[i]) * nv_powf(as_type<float>(THETA_SCALE_BITS), float(pair[i]));
+  out[3 * i] = as_type<uint>(th);
+  out[3 * i + 1] = as_type<uint>(nv_cosf(th));
+  out[3 * i + 2] = as_type<uint>(nv_sinf(th));
+}
+
+kernel void probe_nv_trig(device const float* x [[buffer(0)]], device uint* out [[buffer(1)]],
+                          constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  out[2 * i] = as_type<uint>(cuda_nan(nv_cosf(x[i])));
+  out[2 * i + 1] = as_type<uint>(cuda_nan(nv_sinf(x[i])));
+}
+"""
+
+
+def test_rope_angle_bit_for_bit():
+    """RO-3h (KE 8.2): the rotation's angle th = float(pos) * nv_powf(0x3F1AB32B, float(pair)) and its nv_cosf and
+    nv_sinf from a probe kernel, bitwise equal to the host twins (th = fl32(float(pos) * basalt_emu.nv_powf(...)), then
+    basalt_emu.nv_trig) at positions 0..16383 (one maximal chunk) and KE 8.2's three Payne-Hanek chunks of 256 (p0 =
+    105600, 174720, 261888: the 1,211 slow angles of the slow-path test), pairs 0..31. Then both functions at the
+    arguments no angle takes, from a second probe that stores them through cuda_nan, as a kernel does: NaNs of several
+    payloads and +-inf (KE 5.2.2's two cases: a NaN stays on the fast path, an infinity gives NaN; CUDA's 0x7fffffff
+    for both functions), +-0 and subnormals (cos 1, sin the argument: the port addition), and the whole float range in
+    both signs, every binade at four fixed and four random significands and random words, so that the negative
+    quadrants and the tiny normals (r * r subnormal) run too."""
+    ts = U32(THETA_SCALE).view(F32)
+    pos = np.r_[np.arange(16384), (np.array(SLOW_CHUNKS)[:, None] + np.arange(256)).reshape(-1)].astype(np.int32)
+    pos, pair = np.repeat(pos, 32), np.tile(np.arange(32, dtype=np.int32), len(pos))
+    got = probe(TRIG, "probe_rope_angle", pos, pair, words=3).reshape(-1, 3)
+    th = pos.astype(F32) * emu.nv_powf(ts, pair.astype(F32))
+    assert int((th.view(U32) >= SLOW_MIN).sum()) == 1211
+    want = np.stack([th.view(U32), emu.nv_trig(th, 1).view(U32), emu.nv_trig(th, 0).view(U32)], axis=1)
+    bad = np.flatnonzero((got != want).any(axis=1))
+    assert bad.size == 0, (f"{bad.size} of {len(pos)} differ; first pos={pos[bad[0]]} pair={pair[bad[0]]}: got "
+                           f"(th, c, s) = {[f'{w:#010x}' for w in got[bad[0]]]}, twin "
+                           f"{[f'{w:#010x}' for w in want[bad[0]]]}")
+    rng = np.random.default_rng(162)
+    special = np.array([0x7FC00000, 0xFFC00001, 0x7FA5A5A5, 0x7F800001, 0x7F800000, 0xFF800000,
+                        0, 0x80000000, 1, 0x80000001, 0x00400000, 0x007FFFFF, 0x807FFFFF], U32)
+    sig = np.r_[np.array([0, 1, 0x400000, 0x7FFFFF], U32), rng.integers(0, 1 << 23, 4, U32)]
+    sweep = ((np.arange(255, dtype=U32) << 23)[:, None] | sig).reshape(-1)          # every binade, zeros included
+    sweep = np.r_[sweep, rng.integers(0, 0x7F800000, 2048, U32)]
+    x = np.r_[special, sweep, sweep | 0x80000000].view(F32)
+    got = probe(TRIG, "probe_nv_trig", x, words=2).reshape(-1, 2)
+    want = np.stack([emu.nv_trig(x, 1).view(U32), emu.nv_trig(x, 0).view(U32)], axis=1)
+    assert (want[:6] == 0x7FFFFFFF).all()                                 # NaNs and infinities: NaN, both functions
+    assert (want[6:13, 0] == 0x3F800000).all() and (want[6:13, 1] == special[6:]).all()   # zeros, subnormals
+    bad = np.flatnonzero((got != want).any(axis=1))
+    assert bad.size == 0, (f"{bad.size} of {len(x)} differ; first x={x.view(U32)[bad[0]]:#010x}: got (c, s) = "
+                           f"({got[bad[0], 0]:#010x}, {got[bad[0], 1]:#010x}), twin ({want[bad[0], 0]:#010x}, "
+                           f"{want[bad[0], 1]:#010x})")

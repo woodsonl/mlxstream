@@ -8,8 +8,8 @@
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp ggml/src/ggml-common.h (kvalues_iq4nl),
 # ggml/src/ggml-quants.c (get_scale_min_k4), ggml/src/ggml-cuda/quantize.cu and ggml/src/ggml-cuda/mmvf.cu @
 # 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
-# nv_powf, nv_trig_slow: transcribed from NVIDIA libdevice's __nv_powf and the Payne-Hanek reduction of __nv_sinf and
-# __nv_cosf as nvcc 13.0 (V13.0.48, -arch=sm_120 -lineinfo -O3 -DNDEBUG) inlined them into basalt's
+# nv_powf, nv_trig_slow, nv_trig: transcribed from NVIDIA libdevice's __nv_powf, __nv_sinf and __nv_cosf (with their
+# Payne-Hanek reduction) as nvcc 13.0 (V13.0.48, -arch=sm_120 -lineinfo -O3 -DNDEBUG) inlined them into basalt's
 # src/prefill/kernels.cu (rope_kernel<false>); PTX listing and transcription:
 # docs/research/basalt-nvcc/prefill_kernels.md section 4.
 """numpy emulation of basalt's float32 arithmetic as nvcc compiles it (docs/research/basalt-nvcc/matvec.md), for the
@@ -875,3 +875,39 @@ def nv_trig_slow(x):
         n ^= 2 ** 64 - 1                                               # one's complement, below 2^63
     r = F32(float(n) * PIO2_2M64)
     return (-r if half ^ neg else r), (-q if neg else q)
+
+
+def nv_trig(x, add):
+    """libdevice's __nv_cosf (``add`` 1) and __nv_sinf (``add`` 0) as nvcc 13.0 inlines them into rope_kernel<false>
+    (include/basalt/kernels/rope_scaling.hpp:161-162), the PTX's sequence on a float32 array, in IEEE float32 (the
+    kernel is IEEE-built: subnormals kept, so this twin needs none of the Metal nv_trig's port addition): below 105615,
+    and for a NaN (setp.ltu), j = rint(x 2/pi) (cvt.rni.s32.f32: 0 for a NaN) and r = x - j pi/2 in three ``fma32``
+    steps, vectorized; an infinite x gives r = x * 0 (NaN) and j = 0; every other x takes the scalar ``nv_trig_slow``.
+    Then the polynomial of the quadrant q = j + add, and every NaN result as sm_120's 0x7fffffff (cuda_nan)."""
+    x = np.asarray(x, F32)
+    shape, x = x.shape, x.reshape(-1)
+    fast = ~(np.abs(x) >= F32(105615.0))                              # setp.ltu |x|, 105615
+    xf = np.where(fast, x, F32(0.0))
+    with np.errstate(invalid="ignore"):
+        y = np.rint(xf * _w2f(0x3F22F983))                              # mul.f32 by 2/pi, nearest even
+        j = np.where(np.isnan(y), 0, y).astype(np.int64)
+        jf = j.astype(F32)
+        r = fma32(jf, _w2f(0xBFC90FDA), xf)
+        r = fma32(jf, _w2f(0xB3A22168), r)
+        r = fma32(jf, _w2f(0xA7C234C5), r)
+        for i in np.flatnonzero(~fast):
+            if np.isinf(x[i]):
+                r[i], j[i] = x[i] * F32(0.0), 0                         # mul.rn x, 0: NaN
+            else:
+                r[i], j[i] = nv_trig_slow(x[i])
+        q = j + add
+        cq = (q & 1) != 0                                               # the cosine's polynomial
+        r2 = r * r
+        p = np.where(cq, F32(1.0), r)
+        t = fma32(r2, p, F32(0.0))
+        k = np.where(cq, fma32(r2, _w2f(0x37CBAC00), _w2f(0xBAB607ED)), _w2f(0xB94D4153))
+        k = fma32(k, r2, np.where(cq, _w2f(0x3D2AAABB), _w2f(0x3C0885E4)))
+        k = fma32(k, r2, np.where(cq, _w2f(0xBEFFFFFF), _w2f(0xBE2AAAA8)))
+        v = fma32(k, t, p)
+        v = np.where((q & 2) != 0, F32(0.0) - v, v)                     # sub.f32 from +0
+    return np.where(np.isnan(v), _w2f(0x7FFFFFFF), v).astype(F32).reshape(shape)

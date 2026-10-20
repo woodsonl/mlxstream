@@ -162,3 +162,43 @@ static inline float nv_trig_slow(float x, thread int& j) {
     const float r = as_type<float>(f32_from_f64(f64_mul(f64_from_u63(n), 0x3BF921FB54442D19ul)));
     return int(f ^ ix) < 0 ? -r : r;
 }
+
+// cosf (add = 1) and sinf (add = 0) of any float x: x = j pi/2 + r, then the quadrant q = j + add picks the cosine's
+// polynomial (q odd) or the sine's, and the sign (q & 2). Below 105615, and for a NaN (setp.ltu keeps it here), j is
+// rint(x 2/pi) and r = x - j pi/2 in three fmas (pi/2 in three parts); an infinite x gives r = x * 0 (NaN) and j = 0,
+// the PTX's own case; any other x takes nv_trig_slow (these two cases are KE 5.2.2's corrections to
+// prefill_kernels.md section 4's code). One port addition: a subnormal x returns sin = x and cos = 1, CUDA's bits
+// (j = 0, r = x, and the polynomial's last fma adds k * +0 to x), where this GPU would flush r to zero; the word is
+// tested on bits, as a compare reads a subnormal as zero. Every other intermediate is normal or zero, or too small to
+// move a result (a subnormal r * r, which this GPU flushes, adds under half an ulp to 1 or r), so plain Metal
+// arithmetic rounds as CUDA's.
+// A NaN result has this GPU's NaN bits; a kernel storing one applies cuda_nan (sm_120's 0x7fffffff).
+static inline float nv_trig(float x, int add) {
+    const uint ax = as_type<uint>(x) & 0x7fffffffu;
+    if (ax != 0u && ax < 0x00800000u) return add != 0 ? 1.0f : x;   // a subnormal (port addition, above)
+    int j;
+    float r;
+    if (!(fabs(x) >= 105615.0f)) {                                     // setp.ltu |x|, 105615: a NaN stays here
+        j = int(rint(x * as_type<float>(0x3F22F983u)));              // FMUL by 2/pi, F2I (nearest even; NaN gives 0)
+        const float jf = float(j);
+        r = fma(jf, as_type<float>(0xBFC90FDAu), x);
+        r = fma(jf, as_type<float>(0xB3A22168u), r);
+        r = fma(jf, as_type<float>(0xA7C234C5u), r);
+    } else if (fabs(x) == INFINITY) {                                  // setp.neu |x|, inf
+        j = 0;
+        r = x * 0.0f;                                                  // mul.rn x, 0: NaN
+    } else {
+        r = nv_trig_slow(x, j);
+    }
+    const int q = j + add;
+    const bool cq = (q & 1) != 0;                                      // the cosine's polynomial
+    const float r2 = r * r, p = cq ? 1.0f : r, t = fma(r2, p, 0.0f);
+    float k = cq ? fma(r2, as_type<float>(0x37CBAC00u), as_type<float>(0xBAB607EDu)) : as_type<float>(0xB94D4153u);
+    k = fma(k, r2, cq ? as_type<float>(0x3D2AAABBu) : as_type<float>(0x3C0885E4u));
+    k = fma(k, r2, cq ? as_type<float>(0xBEFFFFFFu) : as_type<float>(0xBE2AAAA8u));
+    const float v = fma(k, t, p);
+    return (q & 2) != 0 ? 0.0f - v : v;                                // sub.f32 from +0: a zero stays +0
+}
+
+static inline float nv_cosf(float x) { return nv_trig(x, 1); }
+static inline float nv_sinf(float x) { return nv_trig(x, 0); }
