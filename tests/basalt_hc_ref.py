@@ -69,7 +69,7 @@ def hc8_parity_matrices(seed=7):
     w_down, w_up, w_inject = (f32_to_bf16(np.float32(sc) * rng.standard_normal(shape, dtype=np.float32))
                               for sc, shape in ((0.02, (320, 10240)), (0.05, (10240, 320)), (0.02, (4, 10240))))
     k = np.arange(64)
-    w_down[5 * k, 101 * k] = f32_to_bf16(np.float32(0.6))
+    w_down[5 * k, 101 * k] = f32_to_bf16(np.float32([0.6]))
     return w_down, w_up, w_inject
 
 
