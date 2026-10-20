@@ -16,15 +16,17 @@ tokens (``fixture(edges=False)`` has none), each kind seeing the classes on its 
   column 7 (a signalling NaN, planted and compared as bits only).
 - token 1: E3 a NaN and E4 +inf in r (stream 0 and stream 1, column 3), lo (columns 3 and 4) and inj (streams 0, 1).
 - token 2: E6, the tie row (stream 1): r[k] = 2^-70 s, r[k + 256] = (1 + 2^-12) s at k = 0, the rest 0, so thread
-  k's first square is subnormal and decides the rounding of its sum (s: ``E6_S``); inj 0 on stream 0 (E5: 2 sigmoid
-  = 1, gr_parity.cpp:641's plain add).
+  k's first square is subnormal and decides the rounding of its sum (s = ``E6_S`` = 1, for which the IEEE and
+  flushing twins' rs differ); inj 0 on stream 0 (E5: 2 sigmoid = 1, gr_parity.cpp:641's plain add).
 - token 3: E1, an all-zero r row (stream 0: rs = fast::rsqrt(1e-6)), with E5's inj (-352, -400, 100, -100): -352 / 4
   = -88 has a subnormal sigmoid, -400 / 4 = -100 a zero one; gated -88 and -100 on all four streams of columns 0 and 1.
 
 - HC-3 (``test_hc_twin``): at 1, 7 and 256 live rows every output word of the live rows equals the kind's twin
-  (broadcast: e's 32-bit words in each stream), the rows past them keep the 0xFF fill, the inputs keep their bytes,
-  and a run with done = 1 stores nothing; the twin's words differ from their flushed values on E2 (a flushing copy
-  fails). ``test_hc_probe_specials`` (K1): the probe's fast::rsqrt and expf_ieee(sign_flip(x)) on the specials match
+  (broadcast: e's 32-bit words in each stream; norm: basalt_emu.hc_norm, whose rs is the probe's fast::rsqrt of the
+  argument fl(fl(S / n) + eps) the twin computes), the rows past them keep the 0xFF fill, the inputs keep their bytes,
+  and a run with done = 1 stores nothing. Discrimination, so a flushing kernel fails: broadcast's words differ from
+  their flushed values on E2; norm's IEEE and flushing twins differ in token 0's xn16 (E2) and in token 2's stream-1
+  rs (E6). ``test_hc_probe_specials`` (K1): the probe's fast::rsqrt and expf_ieee(sign_flip(x)) on the specials match
   PTX's documented rsqrt.approx and ex2.approx: rsqrt(+inf) = +0, rsqrt(NaN) NaN, exp_neg(+inf) = +0, exp_neg(-100)
   and exp_neg(-inf) +inf, exp_neg(NaN) NaN.
 - HC-4 (``test_hc_rows_invariant``): bitwise, tokens 0, 1 and 255 of the 256-row run equal each token alone at one
@@ -41,12 +43,14 @@ from tests.kernels import basalt_prompt_gpu as gpu
 
 F32 = np.float32
 B, N, LR = 256, 2560, 320
-E6_S = 1.0                   # E6's scale s
+EPS = F32(1e-6)              # the handler's HC_EPS, 0x358637BD (prompt_hc's)
+E6_S = 1.0                   # E6's s: twins' rs 0x424a13f8 (IEEE) vs 0x424a13f9 (flush) on the M3 Max; 2^-4 ties them
 E8_NAN = 0x7FA00001
 WORD = {4: np.uint32, 2: np.uint16}
 
 # kind: (entry, inputs, outputs as (words per token, bytes per word)), in the kernel's slot order
-KINDS = {"broadcast": ("prompt_gr_broadcast", ("e",), ((4 * N, 4),))}
+KINDS = {"broadcast": ("prompt_gr_broadcast", ("e",), ((4 * N, 4),)),
+         "norm": ("prompt_gr_norm_rs", ("r", "w"), ((4, 4), (4 * N, 2)))}          # rs, xn16
 
 
 def fixture(edges=True):
@@ -94,10 +98,14 @@ def run(kind, d, rows, **kw):
     return [np.frombuffer(b, WORD[s]).reshape(B, w) for b, (w, s) in zip(res[len(ins):], outs)]
 
 
-def twin(kind, d):
-    """The kind's outputs' words for every token, from the host: broadcast copies e's 32-bit words into each stream."""
+def twin(kind, d, flush=False):
+    """The kind's outputs' words for every token, from the host: broadcast copies e's 32-bit words into each stream;
+    the others are basalt_emu's twins (``flush``: their flushing forms), with this GPU's fast::rsqrt from hc_probe, so
+    norm's rs is the probe's rsqrt of the argument the twin computes."""
     if kind == "broadcast":
         return [np.tile(d["e"].view(np.uint32), (1, 4))]
+    if kind == "norm":
+        return list(emu.hc_norm(d["r"], d["w"], EPS, lambda a: gpu.hc_probe("rsqrt", a), flush))
     raise KeyError(kind)
 
 
@@ -118,6 +126,10 @@ def test_hc_twin(kind):
     if kind == "broadcast":                       # E2's subnormal words are live at every row count
         e = d["e"][:1]
         assert (emu.ftz(e).view(np.uint32) != e.view(np.uint32)).any(), "no live word a flushing copy would change"
+    if kind == "norm":                            # a flushing kernel fails on E2 (token 0) and E6 (token 2, stream 1)
+        flushed = twin(kind, d, flush=True)
+        assert (flushed[1][0] != want[1][0]).any(), "E2: no xn16 word of token 0 differs from a flushing kernel's"
+        assert flushed[0][2, 1] != want[0][2, 1], "E6: the flushing twin's rs equals the IEEE twin's (E6_S)"
 
 
 def test_hc_probe_specials():

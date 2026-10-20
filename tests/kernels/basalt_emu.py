@@ -4,7 +4,7 @@
 # adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu, src/kernels/cuda/iq_kernels.cu,
 # src/kernels/cuda/native_bf16.cu, src/kernels/cuda/dense_tc.cu, src/kernels/cuda/q5k_head.cu,
 # src/kernels/cuda/head_proxy.cuh, src/kernels/cuda/quantize_act.cu, src/kernels/cuda/s2_expert_grouped.cu,
-# src/kernels/cuda/dec_gdn_rec.cu, src/kernels/cuda/verify_kernels.cu,
+# src/kernels/cuda/dec_gdn_rec.cu, src/kernels/cuda/verify_kernels.cu, src/prefill/kernels.cu,
 # include/basalt/kernels/q8_1_finite.hpp and include/basalt/kernels/f16_bits.hpp @
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp ggml/src/ggml-common.h (kvalues_iq4nl),
 # ggml/src/ggml-quants.c (get_scale_min_k4), ggml/src/ggml-cuda/quantize.cu and ggml/src/ggml-cuda/mmvf.cu @
@@ -887,3 +887,46 @@ def rel_norm(y, ref):
     e = np.fmax.reduce(d.ravel(), initial=0.0)
     r = np.fmax.reduce(np.abs(b).astype(np.float64).ravel(), initial=0.0)
     return float(e / r) if r > 0 else float(e)
+
+
+# ---- the prompt path's hyper-connection kernels (kernels/common/basalt_prompt_hc.metal) -----------------------------
+# src/prefill/kernels.cu:85-204 builds with nvcc's IEEE defaults: each product, quotient and sum is numpy's float32
+# operation (the ieee_* helpers' semantics, subnormals kept) and each FFMA fma32, in the order
+# docs/research/basalt-nvcc/prefill_kernels.md section 1 records. fast::rsqrt has no bit-exact host model: ``rsqrt``
+# evaluates the GPU's on a float32 array (basalt_prompt_gpu.hc_probe). ``flush=True`` flushes every operation's inputs
+# and result (ftz): a flushing kernel's model, which the tests' discrimination checks compare against.
+
+def hc_bits(x):
+    """fp32 store bits with a NaN as sm_120's 0x7fffffff (basalt_fp.metal's cuda_nan)."""
+    return np.where(np.isnan(x), np.uint32(0x7FFFFFFF), np.asarray(x, F32).view(np.uint32))
+
+
+def hc_block_sum(v, flush=False):
+    """block_sum (kernels.cu:45-58) of each row of ``v`` [rows, ntg], thread k's value in column k: each SIMD-group's
+    butterfly, then SIMD-group 0's over the ntg / 32 partials padded with zeros to 32 lanes; lane 0's value, which
+    thread 0 stores. At ntg = 256: ((p0 + p4) + (p2 + p6)) + ((p1 + p5) + (p3 + p7)). IEEE adds (warp_sum_ieee), or
+    flushing ones with ``flush``."""
+    add = add_ftz if flush else np.add
+    v = np.asarray(v, F32)
+    t = np.zeros((len(v), 32), F32)
+    t[:, : v.shape[1] // 32] = butterfly(v.reshape(-1, 32), add).reshape(len(v), -1)
+    return butterfly(t, add)
+
+
+def hc_norm(r, w, eps, rsqrt, flush=False):
+    """prompt_gr_norm_rs's stores for the residual ``r`` [T, 4n] and the weights ``w`` [4n]: rs [T, 4] as fp32 bits and
+    xn16 [T, 4n] as BF16 bits. Row (t, c): thread k sums r[d]^2 over d = k + 256 j, j ascending, by fma32 from +0;
+    hc_block_sum; rs = rsqrt(fl(fl(S / n) + eps)), the argument computed here in basalt's order; xn16 =
+    bf(cuda_nan(fl(fl(r rs) w[c]))). ``flush``: every operation's inputs and result flushed."""
+    fma, add, mul = (fma_ftz, add_ftz, mul_ftz) if flush else (fma32, np.add, np.multiply)
+    div = (lambda a, b: ftz(ftz(a) / ftz(b))) if flush else np.divide
+    r = np.asarray(r, F32)
+    T, n = len(r), r.shape[1] // 4
+    x = r.reshape(4 * T, n // 256, 256)                         # [row, j, k]: d = k + 256 j
+    ss = np.zeros((4 * T, 256), F32)
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN rows
+        for j in range(n // 256):
+            ss = fma(x[:, j], x[:, j], ss)
+        rs = np.asarray(rsqrt(add(div(hc_block_sum(ss, flush), F32(n)), F32(eps))), F32).reshape(T, 4)
+        xn = mul(mul(r.reshape(T, 4, n), rs[..., None]), np.asarray(w, F32).reshape(4, n))
+    return hc_bits(rs), bf16_bits(hc_bits(xn).view(F32)).reshape(T, 4 * n)
