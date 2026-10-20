@@ -1,7 +1,8 @@
 // Copyright (c) 2023-2026 The ggml authors (MIT)
 // Copyright (c) 2026 Jesús Gulfo (MIT)
-// Adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu:146-177, src/kernels/cuda/iq_kernels.cu:1880-1900
-// and include/basalt/kernels/q8_1_finite.hpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE),
+// Adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu:146-177,
+// src/kernels/cuda/iq_kernels.cu:1880-1900, src/kernels/cuda/dec_gdn_rec.cu:115-132 and
+// include/basalt/kernels/q8_1_finite.hpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE),
 // which adapt ggml-org/llama.cpp ggml/src/ggml-cuda/quantize.cu @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT;
 // third_party/NOTICE).
 //
@@ -26,6 +27,9 @@
 //   on the subnormal grid by integer division. Above 2^-100 every one of these is the plain operation. The IEEE
 //   helpers (basalt_ieee.metal's ieee_add and ieee_mul; ieee_div127, ieee_rcp, ieee_fma, ieee_div and
 //   warp_sum_ieee here) serve every IEEE-built port kernel.
+// - q8_1_store_rec: dec_gdn_rec's q8_1 rows (norm_q8; docs/research/basalt-nvcc/dec_gdn.md section 6c), which nvcc
+//   builds with IEEE defaults but for the two div.approx.ftz: native's d and codes, the block sum by unflushed adds
+//   (warp_sum_ieee).
 #pragma STDC FP_CONTRACT OFF
 
 struct Q81Params { uint n; uint pad0; uint pad1; uint pad2; };   // n: values (ncols * n_in), a multiple of 32
@@ -146,6 +150,17 @@ static inline float ieee_div(float a, float b) {
 static inline float warp_sum_ieee(float x) {
     for (ushort o = 16; o > 0; o >>= 1) x = ieee_add(x, shfl_xor(x, o));
     return x;
+}
+
+// dec_gdn_rec's q8_1 (dec_gdn_rec.cu:115-132): unflushed sum butterfly (FADD), native's div.approx.ftz tail. The max
+// butterfly may stay flushed: a subnormal block max gives d = +0 and code 0 on both sides
+// (docs/research/basalt-nvcc/dec_gdn.md section 6c).
+static inline void q8_1_store_rec(float xi, device uchar* y, uint i) {
+    const float amax = warp_max_ftz(abs_ftz(xi));
+    const float sum = warp_sum_ieee(xi);
+    const float d = q8_1_finite(mul_ftz(amax, as_type<float>(0x3C010204u)));   // fl(1/127)
+    const char code = amax == 0.0f ? char(0) : q8_1_code(round(mul_ftz(xi, rcp_ftz(d))));
+    q8_1_put(y, i, code, d, sum);
 }
 
 static inline void q8_1_store_ieee(float xi, device uchar* y, uint i) {
