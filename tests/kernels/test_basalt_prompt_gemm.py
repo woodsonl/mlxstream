@@ -15,15 +15,31 @@ fix no summation order; the port computes each output as one fp32 fma chain from
   (hc8_parity.cpp:57-61's Err) over every output under hc8_parity.cpp:269's 5e-3, and no output non-finite, at the
   pack's BF16 shapes (Gemm::bf16's own gate, which hc8_parity applies at hc8's shapes) and FP16 ones (Gemm::native's
   second stage: the nearest bound, as no basalt test launches it), 1, 17 and 512 rows (attn_q's 12288 outputs at 1
-  and 17), activations N(0, 1) and weights 0.02 N(0, 1)."""
+  and 17), activations N(0, 1) and weights 0.02 N(0, 1).
+
+basalt promises no invariance (cuBLAS picks the kernel per product, hc8_parity.cpp:263); the chain gives each by
+construction, and these gates keep it bit for bit against one whole-product dispatch (``whole``):
+- GM-ROWS (row invariance), BF16 (48, 2560) and FP16 (2560, 640): rows 0, 63, 64, 255 and 511 each alone, the first
+  63, 65, 17 and 37 rows at those bounds, the 512 rows permuted, row 5 at row 300 of fresh rows, explicit row slices of
+  64 and of 192 rows give the same rows as B 512; FP16 (2560, 6144) at B 512 in the handler's slices (more than one).
+- GM-STEP (the rows are StepState data, invariant 4): compiled at B 512 and run with t_this_step 1, 17, 65, 511, 512
+  and 600 (prompt_rows clamps to B), the rows below min(r, B) are the B 512 rows and the rest keep 0xFF, every row at
+  done 1; at B 37 and t_this_step 600 only the clamp keeps the row tile's loads and stores inside x and y.
+- GM-COLS (column invariance), BF16 (512, 2560) (48 columns hold neither n 65 at 37 nor a 192-column slice) and FP16
+  (2560, 640), 37 rows: the w rows [r0, r0 + n) alone (n 1, 63, 65 at r0 0 and 37), the w rows permuted, explicit
+  column slices of 64 and of 192 give the whole product's columns.
+- GM-REPEAT (determinism), FP16 (6144, 2560) at B 512 in the handler's slices: y prefilled 0x00, then 0xFF, on one
+  pipeline, then on a freshly compiled one, every run the same bits."""
 
 import itertools
 
 import numpy as np
 import pytest
 
+from monolith import kernels
 from monolith.formats.fp import bf16_to_f32
 from tests.kernels import basalt_emu as emu
+from tests.kernels import basalt_gpu
 from tests.kernels import basalt_prompt_gpu as gpu
 
 F32 = np.float32
@@ -175,3 +191,120 @@ def test_product_against_double(bf16, n, k, B):
     bad, rel = np.count_nonzero(~np.isfinite(y)), emu.rel_norm(y, ref)
     print(f"GM-REF {'bf16' if bf16 else 'fp16'} N {n} K {k} B {B}: rel_norm {rel:.3e}")
     assert bad == 0 and rel < 5e-3, f"{REF_GATE[bf16]} (N {n}, K {k}, B {B}): rel_norm {rel:.3e}, {bad} not finite"
+
+
+def whole(xb, wb, bf16):
+    """The reference of the invariance gates: the product as one dispatch over every row and column (never the
+    handler's slices), asserted live: every output finite (so no 0xFF word) and one nonzero."""
+    B, n = len(xb), len(wb)
+    y = gpu.prompt_gemm(xb, wb, bf16=bf16, B=B, slices=[(0, B, 0, n)])
+    assert np.isfinite(y.view(F32)).all() and np.count_nonzero(y), f"a vacuous reference (B {B}, N {n})"
+    return y
+
+
+def differ(y, want):
+    """How the outputs ``y`` miss ``want``, for an assert message: those that differ, those not finite."""
+    return f"{np.count_nonzero(y != want)} outputs differ, {np.count_nonzero(~np.isfinite(y.view(F32)))} not finite"
+
+
+# GM-ROWS' and GM-STEP's shapes (N, K): BF16 ssm_alpha and ssm_beta (prefill.cpp:1587-1588), FP16 the shared expert's
+# down (:1705).
+ROW_SHAPES = {True: (48, 2560), False: (2560, 640)}
+ROWS = ("port: every row bitwise equal to the same row of one whole-product dispatch at B 512 (row invariance: an "
+        "output depends only on its x row, its w row and K)")
+
+
+@pytest.mark.parametrize("bf16", [True, False], ids=["bf16", "fp16"])
+def test_rows_do_not_depend_on_the_batch(bf16):
+    """GM-ROWS: each run's rows against the same rows of the whole product at B 512 (equal to a live reference, so
+    finite); for FP16 also (2560, 6144) at B 512 in the handler's own slices, more than one, against its whole
+    product."""
+    (n, k), tag = ROW_SHAPES[bf16], "bf16" if bf16 else "fp16"
+    rng = np.random.default_rng(43 if bf16 else 47)
+    xb, wb = operands(rng, bf16, 512, n, k)
+    ref, perm = whole(xb, wb, bf16), rng.permutation(512)
+    runs = [(f"row {i} alone", xb[i:i + 1], None, ref[i:i + 1]) for i in (0, 63, 64, 255, 511)]
+    runs += [(f"the first {b} rows at B {b}", xb[:b], None, ref[:b]) for b in (63, 65, 17, 37)]
+    runs += [("the 512 rows permuted", xb[perm], None, ref[perm])]
+    runs += [(f"row slices of {rb}", xb, [(r0, min(rb, 512 - r0), 0, n) for r0 in range(0, 512, rb)], ref)
+             for rb in (64, 192)]
+    for what, x, slices, want in runs:
+        y = gpu.prompt_gemm(x, wb, bf16=bf16, B=len(x), slices=slices)
+        assert np.array_equal(y, want), f"{ROWS} ({what}; {tag} N {n} K {k}): {differ(y, want)}"
+
+    fresh = operands(rng, bf16, 512, 1, k)[0]
+    fresh[300] = xb[5]
+    assert np.delete((fresh != xb).any(axis=1), 300).all(), "a fresh row equals the batch's row"
+    y = gpu.prompt_gemm(fresh, wb, bf16=bf16, B=512)
+    assert np.array_equal(y[300], ref[5]) and np.isfinite(y.view(F32)).all(), (
+        f"{ROWS} (row 5 at row 300 of fresh rows; {tag} N {n} K {k}): {differ(y[300], ref[5])} in row 300, "
+        f"{np.count_nonzero(~np.isfinite(y.view(F32)))} not finite in the run")
+
+    if not bf16:                                 # F7: a product the handler's own rule slices
+        x7, w7 = operands(rng, False, 512, 2560, 6144)
+        assert len(kernels.basalt_prompt_gemm_slices(512, 2560, 6144)) > 1, "FP16 (2560, 6144) at B 512 is one slice"
+        want, y = whole(x7, w7, False), gpu.prompt_gemm(x7, w7, bf16=False, B=512)
+        assert np.array_equal(y, want), f"{ROWS} (FP16 N 2560 K 6144 in the handler's slices): {differ(y, want)}"
+
+
+@pytest.mark.parametrize("bf16", [True, False], ids=["bf16", "fp16"])
+def test_rows_from_step_state(bf16):
+    """GM-STEP: compiled at B 512 and run with t_this_step 1, 17, 65, 511, 512 and 600, then done 1 at 511; and the
+    first 37 rows compiled at B 37 with t_this_step 600, where the row tile reaches row 63 (at B 512 the grid ends at
+    row 511) and only prompt_rows' clamp keeps its loads and stores inside x and y."""
+    (n, k), tag = ROW_SHAPES[bf16], "bf16" if bf16 else "fp16"
+    rng = np.random.default_rng(53 if bf16 else 59)
+    xb, wb = operands(rng, bf16, 512, n, k)
+    ref = whole(xb, wb, bf16)
+    for B, r, done in [(512, r, 0) for r in (1, 17, 65, 511, 512, 600)] + [(512, 511, 1), (37, 600, 0)]:
+        y = gpu.prompt_gemm(xb[:B], wb, bf16=bf16, B=B, rows=r, done=done)
+        m = 0 if done else min(r, B)
+        assert np.array_equal(y[:m], ref[:m]) and (y[m:] == FILL).all(), (
+            "port: rows < min(r, B) equal the B 512 rows bitwise; rows >= r, and every row at done 1, keep 0xFF (the "
+            f"rows are StepState data, the program the same) (B {B}, t_this_step {r}, done {done}; {tag} N {n} K {k}): "
+            f"{differ(y[:m], ref[:m])} below row {m}, {np.count_nonzero(y[m:] != FILL)} at or past it written")
+
+
+# GM-COLS' shapes (N, K): BF16 indexer q and the router (prefill.cpp:1609, :1698), as GM-ROWS' 48 columns hold neither
+# n 65 at r0 37 nor a slice of 192; FP16 the shared expert's down (:1705).
+COL_SHAPES = {True: (512, 2560), False: (2560, 640)}
+
+
+@pytest.mark.parametrize("bf16", [True, False], ids=["bf16", "fp16"])
+def test_columns_do_not_depend_on_the_matrix_rows(bf16):
+    """GM-COLS at 37 rows (a partial row tile): the w rows [r0, r0 + n) as their own matrix, the w rows permuted, and
+    explicit column slices of 64 and of 192, against the matching columns of the whole product."""
+    (n, k), tag, B = COL_SHAPES[bf16], "bf16" if bf16 else "fp16", 37
+    rng = np.random.default_rng(61 if bf16 else 67)
+    xb, wb = operands(rng, bf16, B, n, k)
+    full, perm = whole(xb, wb, bf16), rng.permutation(n)
+    runs = [(f"w rows [{r0}, {r0 + c}) alone", wb[r0:r0 + c], None, full[:, r0:r0 + c])
+            for r0 in (0, 37) for c in (1, 63, 65)]
+    runs += [("the w rows permuted", wb[perm], None, full[:, perm])]
+    runs += [(f"column slices of {cb}", wb, [(0, B, c0, min(cb, n - c0)) for c0 in range(0, n, cb)], full)
+             for cb in (64, 192)]
+    for what, w, slices, want in runs:
+        y = gpu.prompt_gemm(xb, w, bf16=bf16, B=B, slices=slices)
+        assert np.array_equal(y, want), (
+            "port: bitwise equal to the matching columns of the full product, computed as one dispatch (column "
+            f"invariance: an output depends only on its x row, its w row and K) ({what}; {tag} N {n} K {k}, B {B}): "
+            f"{differ(y, want)}")
+
+
+def test_repeats_are_bit_identical():
+    """GM-REPEAT (FP16): FP16 (6144, 2560) at B 512 in the handler's slices, into a y prefilled 0x00, then 0xFF, on one
+    pipeline, then into 0xFF on a freshly compiled one (basalt_gpu.pipeline's cache cleared)."""
+    rng = np.random.default_rng(71)
+    xb, wb = operands(rng, False, 512, 6144, 2560)
+    key = (kernels.basalt_prompt_gemm_source(), "basalt_prompt_gemm", 512, {"GEMM_BF16": "0"})
+    pso = gpu.prompt_pipeline(*key)
+    runs = [gpu.prompt_gemm(xb, wb, bf16=False, B=512, fill=f) for f in (0x00, 0xFF)]
+    assert gpu.prompt_pipeline(*key) is pso, "the second run compiled a pipeline of its own"
+    basalt_gpu.pipeline.cache_clear()
+    runs.append(gpu.prompt_gemm(xb, wb, bf16=False, B=512))
+    assert gpu.prompt_pipeline(*key) is not pso, "the third run reused the first pipeline"
+    assert np.isfinite(runs[0].view(F32)).all() and np.count_nonzero(runs[0]), "a vacuous first run"
+    for i, y in enumerate(runs[1:], 2):
+        assert np.array_equal(y, runs[0]), (
+            "port: every run bitwise identical (deterministic: no atomics, no split of K, no dependence on scheduling "
+            f"or on y's prior bytes) (run {i} against run 1; fp16 N 6144 K 2560, B 512): {differ(y, runs[0])}")

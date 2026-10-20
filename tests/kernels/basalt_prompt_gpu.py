@@ -40,12 +40,12 @@ def run_rows(pso, buffers, params, slot, grid, threads, rows, position, fill=Non
     return [b.read(0, len(src) if isinstance(src, (bytes, bytearray)) else src) for b, src in zip(bufs, srcs)]
 
 
-def prompt_gemm(xb, wb, *, bf16, B, rows=None, slices=None, fill=0xFF):
+def prompt_gemm(xb, wb, *, bf16, B, rows=None, slices=None, fill=0xFF, done=0):
     """basalt_prompt_gemm: ``Gemm::bf16``'s product (``bf16``) or ``Gemm::native``'s FP16 product of the 16-bit bits
     ``xb`` [B, K] and ``wb`` [N, K] (gemm.cu:122-132, :158-185), compiled at bound ``B`` and run with ``rows`` (default
-    B) in StepState: one run_rows per slice ``(row0, nrows, col0, ncols)`` into one y of exactly B * N floats whose
-    bytes start as ``fill``. ``slices`` default to the handler's rule, kernels.basalt_prompt_gemm_slices(B, N, K).
-    Returns y's bits, uint32 [B, N]."""
+    B) and ``done`` in StepState: one run_rows per slice ``(row0, nrows, col0, ncols)`` into one y of exactly B * N
+    floats whose bytes start as ``fill``. ``slices`` default to the handler's rule, kernels.basalt_prompt_gemm_slices(B,
+    N, K). Returns y's bits, uint32 [B, N]."""
     xb, wb = np.ascontiguousarray(xb, np.uint16), np.ascontiguousarray(wb, np.uint16)
     (nx, k), (n, kw) = xb.shape, wb.shape
     assert nx == B and kw == k, f"x {xb.shape} and w {wb.shape} at bound {B}"
@@ -53,5 +53,5 @@ def prompt_gemm(xb, wb, *, bf16, B, rows=None, slices=None, fill=0xFF):
     y = bytes([fill]) * (4 * B * n)
     for row0, nrows, col0, ncols in kernels.basalt_prompt_gemm_slices(B, n, k) if slices is None else slices:
         y = run_rows(pso, [xb.tobytes(), wb.tobytes(), y], kernels.basalt_prompt_gemm_params(n, k, row0, col0), 3,
-                     (-(-ncols // 64), -(-nrows // 64), 1), (256, 1, 1), B if rows is None else rows, 0)[2]
+                     (-(-ncols // 64), -(-nrows // 64), 1), (256, 1, 1), B if rows is None else rows, 0, done=done)[2]
     return np.frombuffer(y, np.uint32).reshape(B, n)
