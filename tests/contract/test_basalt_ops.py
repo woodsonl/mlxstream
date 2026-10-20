@@ -25,7 +25,7 @@ from tests.contract.test_basalt_reader import write_basalt
 from tests.contract.test_basalt_windows import PROFILE
 
 F32, U8 = DType.F32, DType.U8
-KINDS = ("basalt_q8_1", "basalt_mmvq", "basalt_mmvf", "basalt_dense_tc", "basalt_dense_tc_pair")
+KINDS = ("basalt_q8_1", "basalt_mmvq", "basalt_mmvf", "basalt_dense_tc", "basalt_dense_tc_pair", "basalt_gr_post")
 Q8_1_FUNCTIONS = {"native": "native_quantize_q8_1", "swiglu": "native_swiglu_quantize_q8_1", "ieee": "quantize_q8_1"}
 QK = kernels.Q8_1_BLOCK_BYTES
 
@@ -113,6 +113,16 @@ def gemv(g, kind, name, x, *ws, rows=T, widths=None):
     return ys
 
 
+def gr_post(g, block_out, r=None, inject=None):
+    """``basalt_gr_post`` of the residual ``r`` (default: an input ``r`` [T, 10240]), ``block_out`` [T, 2560] and the
+    injections ``inject`` (default: an input ``inject`` [T, 4]) into ``r_out`` [T, 10240]."""
+    r = g.input("r", (T, 10240), F32) if r is None else r
+    inject = g.input("inject", (T, 4), F32) if inject is None else inject
+    y = g.value("r_out", (T, 10240), F32)
+    op(g, "basalt_gr_post", [r, block_out, inject], [y])
+    return y
+
+
 def emit(g, src, t=1, packs=(), **kw):
     return emit_program(g, pack=[src, *packs], profile=PROFILE, t=t, tail=None, **kw)
 
@@ -128,7 +138,7 @@ def spliced(source):
 
 def all_ops(g, src):
     """Every kind over every tensor: one native q8_1 per input width, the SwiGLU into the Q8_0 down, the IEEE rows on
-    their own."""
+    their own, the hyper-connection write with the 2560-value input as its block output."""
     widths = sorted({e[2] for e in GGUF.values()})
     xs = {n: g.input(f"x{n}", (T, n), F32) for n in widths}
     xq = {n: q8_1(g, f"xq{n}", [xs[n]]) for n in widths}
@@ -143,6 +153,7 @@ def all_ops(g, src):
              *[weight(g, f"gguf/pair.{a}.{b}.{m}", src) for m in (0, 1)])
     for name in BF16:
         gemv(g, "basalt_mmvf", f"y.{name}", xs[2560], weight(g, f"dense/{name}", src))
+    gr_post(g, xs[2560])
 
 
 # ---- registration, and each dispatch against the builders ----------------------------------------------------------
@@ -158,12 +169,18 @@ def test_registered_and_covered(src):
 
 
 def test_grid_builders_are_the_launchers():
-    """The two grid builders this PR adds, against the harness's own formulas (tests/kernels/basalt_gpu.py)."""
+    """The q8_1 and BF16 grid builders against the harness's own formulas (tests/kernels/basalt_gpu.py); the write's
+    against basalt's ``blocks`` of 256 threads over T tokens' elements (native_gr_postops.cu:83, :111), and its record
+    refusing a dimension of 0 (``check_shape``, :79-82)."""
     for n in (32, 256, 2560, 8 * 23040):
         assert kernels.basalt_q8_1_grid(n) == (-(-n // 256), 256)
     for n_in, n_out, t in ((2560, 128, 1), (2560, 1, 5), (640, 7, 8)):
         m = kernels.basalt_mmvf_macros(n_in, n_out, t)
         assert kernels.basalt_mmvf_grid(m, n_out) == (n_out, kernels.basalt_mmvf_block(n_in))
+    assert [kernels.basalt_gr_post_grid(n, 4, t) for n, t in ((2560, 1), (2560, 8), (100, 3))] == \
+        [(40, 256), (320, 256), (5, 256)]
+    with pytest.raises(ValueError, match=r"unsupported shape \(n_embd 2560, hc 0, T 1\)"):
+        kernels.basalt_gr_post_params(2560, 0, 1)
 
 
 def expected(gop, src, t):
@@ -172,6 +189,9 @@ def expected(gop, src, t):
         n = t * gop.inputs[0].shape[1]
         return (Q8_1_FUNCTIONS[gop.attrs["quantizer"]], {}, kernels.basalt_q8_1_source(), kernels.basalt_q8_1_params(n),
                 -(-n // 256), 256)
+    if gop.kind == "basalt_gr_post":
+        return ("basalt_gr_post", {}, kernels.basalt_gr_post_source(), kernels.basalt_gr_post_params(2560, 4, t),
+                *kernels.basalt_gr_post_grid(2560, 4, t))
     ws = [src.entries[w.name] for w in gop.inputs[1:]]
     tid, (n_out, n_in) = ws[0].type_id, ws[0].shape
     if gop.kind == "basalt_mmvq":
@@ -276,6 +296,8 @@ def one_op(kind, g, src):
         return q8_1(g, "xq", [x])
     if kind == "basalt_mmvf":
         return gemv(g, kind, "y", x, weight(g, "dense/mmvf.q", src))
+    if kind == "basalt_gr_post":
+        return gr_post(g, x)
     ws = [weight(g, f"gguf/pair.14.23.{m}", src) for m in (0, 1)]
     return gemv(g, kind, "y", q8_1(g, "xq", [x]), *(ws if kind == "basalt_dense_tc_pair" else ws[:1]))
 
@@ -421,6 +443,24 @@ def _entry_rows(kind, rows):
     return build
 
 
+def _gr_post_value(name, shape, dtype):
+    """The write of ``one_op`` with its input ``name`` (``r`` or ``inject``) of ``shape`` and ``dtype`` instead."""
+    def build(g, src, bad, tmp):
+        gr_post(g, g.input("x", (T, 2560), F32), **({name: g.input(name, shape, dtype)} if bad else {}))
+        return {}
+    return build
+
+
+def _gr_post_over_residual(g, src, bad, tmp):
+    """Two writes in a chain through views of one base: the second stores into its residual's rows (basalt's in-place
+    call, which an SSA graph cannot express: r's other readers would see the new bytes) or into the next rows."""
+    base, x, inject = g.value("rb", (4, 10240), F32), g.input("x", (2, 2560), F32), g.input("inject", (2, 4), F32)
+    r = g.view("r", base, 0, 2)
+    op(g, "basalt_gr_post", [g.input("r0", (2, 10240), F32), x, inject], [r])
+    op(g, "basalt_gr_post", [r, x, inject], [g.view("r_out", base, 0 if bad else 2, 2)])
+    return {}
+
+
 REFUSALS = [
     *[(f"dynamic-T {k}", _dynamic(k), "a dynamic-T program cannot run them") for k in KINDS],
     ("native q8_1 of 16 columns", _q8_1_columns("native"), "16 columns; basalt quantizes 1 to 8"),
@@ -456,6 +496,11 @@ REFUSALS = [
       for k in ("basalt_mmvq", "basalt_dense_tc", "basalt_dense_tc_pair")],
     ("mmvf weight entry a row long", _entry_rows("basalt_mmvf", 1),
      r"'p' is 655360 bytes of bf16 \[128, 2560\], but its pack entry holds 660480"),
+    ("gr post residual of another width", _gr_post_value("r", (T, 4 * 2560 + 32), F32),
+     r"'r' is f32 \[2, 10272\], not f32 \[2, 10240\] \(4 streams of the block output's 2560 values\)"),
+    ("gr post residual not f32", _gr_post_value("r", (T, 10240), DType.BF16), r"'r' is bf16 \[2, 10240\], not f32"),
+    ("gr post of no streams", _gr_post_value("inject", (T, 0), F32), r"unsupported shape \(n_embd 2560, hc 0, T 2\)"),
+    ("gr post output over its residual", _gr_post_over_residual, "'r_out' and 'r' overlap in rb"),
 ]
 
 

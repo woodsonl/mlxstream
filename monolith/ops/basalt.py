@@ -31,6 +31,10 @@ is refused (it binds StepState, which none of these kernels reads).
 * ``basalt_mmvf`` (``bf16_gemv_fp32_mmvf``, ``bf16_gemv_fp32_mmvf_multi``): ``(x [T, n_in] F32, w [n_out, n_in] bf16)``
   → ``y [T, n_out] F32``; the one-row kernel at T = 1, the multi-row kernel above, which gives every row the one-row
   kernel's bits.
+* ``basalt_gr_post`` (``native_gr_post``): ``(r [T, hc * n_embd], block_out [T, n_embd], inject [T, hc] F32)`` →
+  ``r_out [T, hc * n_embd] F32``, ``r_out = r + block_out * 2 sigmoid(inject / hc)`` per stream in basalt's fast-math
+  rounding; n_embd and hc from ``block_out`` and ``inject``; any T >= 1 (the write has no width bound); ``r_out`` a
+  fresh value whose bytes overlap none of the inputs.
 
 Alignment, checked at every binding: 4 bytes for each q8_1, ``basalt_mmvq`` and ``basalt_dense_tc`` binding, and for
 the BF16 GEMV's weight and output; 8 for the BF16 GEMV's activation (read as float2); 16 for both pair weights.
@@ -52,3 +56,4 @@ BASALT_MMVF = register_op(OpDef("basalt_mmvf", OpClass.MAP, "rows").bind("*", Ke
 BASALT_DENSE_TC = register_op(OpDef("basalt_dense_tc", OpClass.MAP, "rows").bind("*", KernelBinding("basalt_dense_tc")))
 BASALT_DENSE_TC_PAIR = register_op(OpDef("basalt_dense_tc_pair", OpClass.MAP, "rows")
                                    .bind("*", KernelBinding("basalt_dense_tc_pair")))
+BASALT_GR_POST = register_op(OpDef("basalt_gr_post", OpClass.MAP, "rows").bind("*", KernelBinding("basalt_gr_post")))
