@@ -12,6 +12,15 @@ comparison is bitwise; a NaN result compares by class (the kernels' stores canon
   exercise what they claim: subnormal results of the halved branch (which a plain square would flush) and a finite
   rsqrt of every positive subnormal (which a plain prescale would flush to an infinity). The results must also be
   within 1e-4 of float64's exp and 1/sqrt (relative; plus 2^-149 for exp), which catches an error both sides share.
+- H.2: ``fma_ieee`` (``fma.rn.f32`` with subnormals) against ``basalt_emu.fma32``: random normals; subnormal operands
+  beside products of 2^-149 to 2^-85; results that cancel into the subnormal range (c = -RN(a * b) moved by up to 4
+  ulps) or round into it or up to 2^-126; products below 2^-126 of operands at least 2^-100 beside a c of 2^-100 to
+  2^-97 (the fast path's premise: such a product cannot move the result); operands at the 2^-100 guard's edges with
+  results on both sides of it; every triple of zeros, ones, a subnormal, the edges, infinities and NaN. Fixed rows
+  with their bits: engineering review E3's two (a subnormal product of normal operands on a zero addend, and operands
+  of at least 2^-100 cancelling to 2^-146, which D6's literal guard returns as the hardware's +0), the two exact
+  products that round up to 2^-126, and the signs of zero products on +-0 addends (D10). The hardware's own ``fma``
+  must differ from IEEE on many rows, so that the slow path is what the rows check.
 """
 
 import numpy as np
@@ -38,12 +47,18 @@ def nan32(b):
     return (b & U32(0x7FFFFFFF)) > U32(0x7F800000)
 
 
-def assert_bits(name, got, want, x):
-    """``got`` (float32 bits) is ``want`` bit for bit; a NaN matches a NaN of any payload."""
+def differ(got, want):
+    """Rows where float32 bits ``got`` are not ``want``; a NaN matches a NaN of any payload."""
+    return (nan32(got) != nan32(want)) | (~nan32(got) & (got != want))
+
+
+def assert_bits(name, got, want, *x):
+    """``got`` (float32 bits) is ``want`` bit for bit; a NaN matches a NaN of any payload. ``x``: the operands."""
     want = np.asarray(want, F32).view(U32)
-    bad = np.flatnonzero((nan32(got) != nan32(want)) | (~nan32(got) & (got != want)))
-    assert bad.size == 0, (f"{name}: {bad.size} of {len(got)} differ; first x={x.view(U32)[bad[0]]:#010x}: "
-                           f"got {got[bad[0]]:#010x}, want {want[bad[0]]:#010x}")
+    bad = np.flatnonzero(differ(got, want))
+    assert bad.size == 0, (f"{name}: {bad.size} of {len(got)} differ; first x="
+                           + ", ".join(f"{v.view(U32)[bad[0]]:#010x}" for v in x)
+                           + f": got {got[bad[0]]:#010x}, want {want[bad[0]]:#010x}")
 
 
 # ---- H.1: sign_flip, expf_ieee, rsqrt_ieee -------------------------------------------------------------------------
@@ -123,3 +138,111 @@ def test_sign_flip_expf_ieee_rsqrt_ieee_match_the_emulation():
     p = (xb > 0) & (xb < U32(0x7F800000))
     want = 1 / np.sqrt(xf[p])
     assert np.all(np.abs(r[p, 3] - want) <= 1e-4 * want)
+
+
+# ---- H.2: fma_ieee -------------------------------------------------------------------------------------------------
+
+H2 = """
+kernel void h2_fma(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]],
+                   device const uint* c [[buffer(2)]], device uint* out [[buffer(3)]],
+                   constant uint& n [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const float x = as_type<float>(a[i]), y = as_type<float>(b[i]), z = as_type<float>(c[i]);
+  out[2 * i] = as_type<uint>(fma_ieee(x, y, z));
+  out[2 * i + 1] = as_type<uint>(fma(x, y, z));             // the hardware's alone
+}
+"""
+SIGN = U32(0x80000000)
+EDGE = np.array([0x0D7FFFFF, 0x0D800000, 0x0D800001], U32)   # just below 2^-100, 2^-100, just above
+# (a, b, c, IEEE's bits), checked exactly with Fraction
+FIXED = [(0x1C800000, 0x1C800000, 0x00000000, 0x00000200),   # E3: 2^-70 * 2^-70 + 0 = 2^-140, a subnormal
+         (0x3F800001, 0x0D800001, 0x8D800002, 0x00000008),   # E3: operands >= 2^-100 cancelling to 2^-146
+         (0x1EF80000, 0x21042108, 0x00000000, 0x00800000),   # 31 2^-70 * 1082401 2^-81 = 2^-126 - 2^-151: up
+         (0x1FFFF000, 0x20000800, 0x00000000, 0x00800000),   # 4095 2^-75 * 4097 2^-75 = 2^-126 - 2^-150: the tie
+         (0xBF800000, 0x00000000, 0x00000000, 0x00000000),   # D10: -1 * 0 + 0 = +0
+         (0x3F800000, 0x80000000, 0x00000000, 0x00000000),   # 1 * -0 + 0 = +0
+         (0xBF800000, 0x00000000, 0x80000000, 0x80000000),   # -1 * 0 + -0 = -0
+         (0x80000000, 0x3F800000, 0x80000000, 0x80000000),   # -0 * 1 + -0 = -0
+         (0xBF800000, 0x80000000, 0x80000000, 0x00000000),   # -1 * -0 + -0 = +0
+         (0x00000000, 0x00000000, 0x80000000, 0x00000000)]   # 0 * 0 + -0 = +0
+
+
+def floats(rng, exp):
+    """Random signs and fractions on the biased exponents ``exp`` (float32 bits)."""
+    exp = np.asarray(exp)
+    return (rng.integers(0, 1 << 32, exp.shape, dtype=U32) & U32(0x807FFFFF)) | (exp.astype(U32) << U32(23))
+
+
+def f32(v):
+    """float64 values as float32 bits, rounded to nearest even."""
+    return np.asarray(v, F64).astype(F32).view(U32)
+
+
+def h2_rows(rng, n=4096):
+    """H.2's operand triples (float32 bits) by class."""
+    k = np.arange(n)
+    sign = lambda: rng.integers(0, 2, n).astype(U32) << U32(31)
+    swap = lambda x, y: (np.where(k % 2 == 0, x, y), np.where(k % 2 == 0, y, x))
+    rows = {}
+    ea, eb = rng.integers(64, 191, n), rng.integers(64, 191, n)
+    ec = np.clip(ea + eb - 127 + rng.integers(-30, 31, n), 1, 254)                   # within 30 binades of a * b
+    rows["normal"] = (floats(rng, ea), floats(rng, eb), floats(rng, ec))
+    # a subnormal or lowest-binade a (or b) times 1 to 2^40; c +-0, subnormal or near the product
+    lo, hi = floats(rng, rng.choice([0, 0, 1, 2], n)), floats(rng, rng.integers(127, 168, n))
+    c = np.select([k % 3 == 0, k % 3 == 1], [sign(), floats(rng, np.zeros(n, int))],
+                  floats(rng, rng.integers(1, 42, n)))
+    rows["subnormal"] = (*swap(lo, hi), c)
+    # products of 2^-126 to 2^-57 less their own rounding, moved by up to 4 ulps
+    ea, pe = rng.integers(64, 128, n), rng.integers(1, 71, n)
+    a, b = floats(rng, ea), floats(rng, pe + 127 - ea)
+    p = f32(a.view(F32).astype(F64) * b.view(F32).astype(F64))
+    rows["cancel"] = (a, b, (p.astype(np.int64) + rng.integers(-4, 5, n)).astype(U32) ^ SIGN)
+    # c = +-0, b = RN(target / a): products within about 2^-146 of +-2^-126, or at 2^-127 to 2^-150
+    u = np.where(k % 2 == 0, 0, rng.integers(1, 25, n))
+    target = np.ldexp(1 + rng.integers(-40, 41, n) * 2.0 ** -26, -126 - u) * np.where(k % 4 < 2, 1.0, -1.0)
+    a = floats(rng, rng.integers(77, 101, n))
+    rows["round"] = (a, f32(target / a.view(F32).astype(F64)), sign())
+    # products below 2^-126 of operands at least 2^-100, beside a c of 2^-100 to 2^-97: IEEE's result is c
+    ea = rng.integers(27, 64, n)
+    rows["tiny_product"] = (floats(rng, ea), floats(rng, rng.integers(27, 127 - ea)),
+                            floats(rng, rng.integers(27, 30, n)))
+    # one of a, b at the guard's edge, the other in [0.5, 2), c at the edge or +-0: results on both sides of 2^-100
+    e, m = rng.choice(EDGE, n) | sign(), floats(rng, rng.integers(126, 128, n))
+    rows["edge"] = (*swap(e, m), np.where(k % 4 == 0, sign(), rng.choice(EDGE, n) | sign()))
+    v = np.array([0, 0x80000000, 0x3F800000, 0xBF800000, 0x00080000, 0x80080000, 0x0D800000, 0x8D7FFFFF,
+                  0x7F800000, 0xFF800000, 0x7FC00000], U32)   # +-0, +-1, +-2^-130, the edges, +-inf, NaN
+    rows["specials"] = tuple(g.ravel() for g in np.meshgrid(v, v, v, indexing="ij"))
+    return rows
+
+
+def test_fma_ieee_matches_the_emulation():
+    rows = h2_rows(np.random.default_rng(32))
+    fixed = np.array(FIXED, U32)
+    a, b, c = (np.concatenate([fixed[:, i]] + [r[i] for r in rows.values()]) for i in range(3))
+    got = run_kernel(H2, "h2_fma", [a, b, c], 2)
+    with np.errstate(invalid="ignore"):                     # the signaling-NaN rows raise the flag in the cast
+        want = emu.fma32(a.view(F32), b.view(F32), c.view(F32)).view(U32)
+    nf = len(FIXED)
+    assert np.array_equal(want[:nf], fixed[:, 3]), "basalt_emu.fma32 misses a fixed row's bits"
+    assert np.array_equal(got[:nf, 0], fixed[:, 3]), f"fma_ieee on the fixed rows: {[hex(g) for g in got[:nf, 0]]}"
+    assert_bits("fma_ieee", got[:, 0], want.view(F32), a, b, c)
+    # the rows exercise what they claim: D6's literal guard returns the hardware's +0 on E3's rows; the hardware
+    # differs from IEEE on many rows, many results are subnormal, and some round up to 2^-126 from below
+    hw = got[:, 1]
+    assert np.all(hw[:2] == 0), f"the hardware's fma on E3's rows: {hw[0]:#010x}, {hw[1]:#010x}"
+    assert np.count_nonzero(differ(hw, want)) > 1000
+    mag = want & U32(0x7FFFFFFF)
+    assert np.count_nonzero((mag != 0) & (mag < U32(0x00800000))) > 1000
+    at, off = {}, nf
+    for name, r in rows.items():
+        at[name], off = slice(off, off + len(r[0])), off + len(r[0])
+    with np.errstate(invalid="ignore"):
+        prod = np.abs(a.view(F32).astype(F64) * b.view(F32).astype(F64))      # exact
+    sl = at["round"]
+    assert np.count_nonzero((prod[sl] < 2.0 ** -126) & (mag[sl] == U32(0x00800000))) > 0
+    # the fast path's premise: a product below 2^-126 beside a c of at least 2^-100 does not move it
+    sl = at["tiny_product"]
+    assert np.all(prod[sl] < 2.0 ** -126)
+    assert np.array_equal(hw[sl], c[sl]) and np.array_equal(want[sl], c[sl])
+    edge = mag[at["edge"]]
+    assert np.count_nonzero(edge < U32(0x0D800000)) > 100 and np.count_nonzero(edge >= U32(0x0D800000)) > 100
