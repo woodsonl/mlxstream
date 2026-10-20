@@ -45,8 +45,9 @@ def hc8_quant_scalar(w, gpr, srow):                  # hc8_quant_kernel, hc_fuse
 def dequant_copy(q, s, cols):
     """The exact values of a copy: ``q * f16(s)`` in float64, ``[rows, cols]``, each scale broadcast over its group's 32
     columns. ``q`` holds the codes' int8 bit patterns (int8 or uint8, ``rows * cols`` of them), ``s`` the scales' f16
-    bits or values (``uint16`` or ``float16``, ``[rows, srow]``). A code times an f16 scale has at most 18 significant
-    bits, so every product is exact in double: hc8_parity's "the copy's exact values in double", ``(double) q * (double)
+    bits or values (``uint16`` or ``float16``, ``[rows, srow]``). A code times a finite f16 scale has at most 18
+    significant bits, so every such product is exact in double (an inf scale, a group whose absmax exceeds ``127 *
+    65504``, has codes 0 and gives NaN): hc8_parity's "the copy's exact values in double", ``(double) q * (double)
     f16f(s)`` (``src/kernels/hc8_parity.cpp:254-259``), without the BF16 rounding of its part 1's dequantized copies."""
     q = np.asarray(q).view(np.int8).reshape(-1, cols)
     sc = np.asarray(s).view(np.float16).reshape(q.shape[0], -1).astype(np.float64)
