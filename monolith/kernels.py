@@ -828,6 +828,56 @@ def basalt_gdn_params(t: int, c: int, n_embd: int, h_k: int, h_v: int, eps: floa
     return struct.pack("<IIIIIfII", t, c, n_embd, h_k, h_v, eps, 0, 0)
 
 
+# ---- basalt's GDN commit (kernels/common/basalt_gdn_commit.metal; docs/research/basalt-nvcc/verify_gdn.md) ---------
+# The record and the threadgroup count below are adapted from basalt (jesdga95/basalt)
+# src/kernels/cuda/verify_kernels.cu:333-336 and :859-865 and include/basalt/kernels/verify_kernels.hpp:32-38 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+def basalt_gdn_commit_source() -> str:
+    """basalt's GDN commit: the shared helpers, the IEEE binary32 operations, the software binary64 and the IEEE
+    operations built on it (``basalt_ieee_f64.metal``), then the commit kernel (``basalt_gdn_commit.metal``), in that
+    order. The commit divides nothing, so the q8_1 quantizers and libdevice's transcriptions stay out."""
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
+            + template("basalt_ieee_f64.metal") + template("basalt_gdn_commit.metal"))
+
+
+def basalt_gdn_commit_params(c: int, h_v: int, mt: int, *, n_layers: int = 1, state_stride: Optional[int] = None,
+                             h_stride: Optional[int] = None, gb_stride: Optional[int] = None) -> bytes:
+    """The 48-byte ``GdnCommitParams`` (basalt_gdn_commit.metal): basalt's GdnCommitLayers without its pointers and
+    n_keep (the strides in floats, then C, h_k, h_v and n_layers), the launcher's conv_blocks = ceil(C / 128), the
+    window buffers' row count mt, which clamps n_keep, and three zero words. The strides default to the dense layout:
+    a layer's S x h_v x S state then its C x 3 history, mt rows of C, mt rows of h_v; h_k is (C - 128 * h_v) / 256
+    (q, k, then v). Refuses h_v below 1, C - 128 * h_v not a positive multiple of 256, mt outside 1..8, n_layers below
+    1 (basalt's launcher returns at n_layers <= 0, which no caller passes), a stride below its dense value (the kernel
+    would read and write past a layer's rows), and n_layers times the widest stride reaching 2^32 (the kernel indexes
+    in uint)."""
+    if h_v < 1:
+        raise ValueError(f"basalt_gdn_commit: h_v must be at least 1, got {h_v}")
+    qk = c - GDN_S * h_v
+    if qk <= 0 or qk % (2 * GDN_S):
+        raise ValueError(f"basalt_gdn_commit: C - {GDN_S} * h_v must be a positive multiple of {2 * GDN_S}, got {qk} "
+                         f"(C {c}, h_v {h_v})")
+    if not 1 <= mt <= GDN_MT:
+        raise ValueError(f"basalt_gdn_commit: mt must be 1 to {GDN_MT}, got {mt}")
+    if n_layers < 1:
+        raise ValueError(f"basalt_gdn_commit: n_layers must be at least 1, got {n_layers}")
+    dense = (GDN_S * GDN_S * h_v + 3 * c, mt * c, mt * h_v)
+    strides = tuple(d if s is None else s for s, d in zip((state_stride, h_stride, gb_stride), dense))
+    for name, s, d in zip(("state_stride", "h_stride", "gb_stride"), strides, dense):
+        if s < d:
+            raise ValueError(f"basalt_gdn_commit: {name} {s} is below its dense value {d}")
+    if n_layers * max(strides) >= 2 ** 32:
+        raise ValueError(f"basalt_gdn_commit: n_layers {n_layers} times the widest stride {max(strides)} reaches 2^32 "
+                         "floats; the kernel indexes in uint")
+    return struct.pack("<12I", *strides, c, qk // (2 * GDN_S), h_v, n_layers, -(-c // 128), mt, 0, 0, 0)
+
+
+def basalt_gdn_commit_grid(c: int, h_v: int, n_layers: int = 1) -> int:
+    """The commit's threadgroup count, one per item (commit_layers_body's ``total``): a layer's 4 * h_v state items,
+    one per head and 32-column block, and its ceil(C / 128) conv items; 272 per layer at C = 10240, h_v = 48."""
+    return n_layers * (4 * h_v + -(-c // 128))
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
