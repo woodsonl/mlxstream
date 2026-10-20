@@ -41,6 +41,20 @@ comparison is bitwise; a NaN result compares by class (the kernels' stores canon
   cancel to -2^-148. Also ``q8_1_store_native``'s bytes on every block whose values are each 0 or at least 2^-102
   (G6's precondition), and its d and codes on every block (a flushed max changes no bit); the two ds.y must differ on
   many blocks, and only in the sign of a zero, and the tie blocks' codes must depend on the quotient's rounding.
+- H.5: the GDN window's first steps (basalt_gdn.metal: ``gdn_conv``, ``gdn_silu``, ``gdn_sum4``, ``gdn_ab_dot``,
+  ``gdn_beta``, ``gdn_gate``; the L2 scale as the kernels write it at the call site) against ``basalt_emu``'s twins,
+  which follow the SASS rows (dec_gdn.md section 1, verify_gdn.md sections 2-5), the GPU's ``fast::exp2`` and
+  ``fast::rsqrt`` injected; ``gdn_ab_dot`` one SIMD-group per row of 2560 (the window's n_embd). Classes: random
+  model-like rows; conv products below 2^-126 of operands near 2^-63, subnormal taps or weights beside large ones, and
+  tap 0 cancelling tap 1's rounded product into the subnormal range; SiLU and beta arguments that are subnormal or
+  tiny, in (-88.73, -87.33) (a subnormal beta) and at the edges where ``__expf(-x)`` halves or overflows; partials,
+  and adjacent dot elements, that cancel below 2^-126; L2 operands with a subnormal y or a zero or subnormal
+  ``ss + eps``; gate arguments with ``u = v + dt`` in [-104, -87] (a subnormal ``__expf(u)``) against ``ssm_a`` on both
+  sides of 1, and u at 20; whole rows of subnormal bf16 weights against activations near 2^100, tiny weights against
+  tiny activations, and zero weights (a dot of +0: the chains start from +0); infinities and NaNs. Each kernel also
+  stores the step in this GPU's plain operations, which must differ from IEEE's on many rows of each class built for
+  a subnormal path; the other order of the conv's taps 0 and 1 must differ on many random rows, and the random rows
+  must be near float64.
 """
 
 import numpy as np
@@ -461,3 +475,321 @@ def test_q8_1_store_rec_matches_the_emulation():
     v = xb[names == "tie"].view(F32)
     d = emu.mul_ftz(np.abs(v[:, :1]), emu.RCP127)
     assert np.count_nonzero(emu.roundf(v / d) != emu.roundf(emu.mul_ftz(v, emu.rcp_ftz(d)))) > 100
+
+
+# ---- H.5: gdn_conv, gdn_silu, gdn_sum4, the L2 scale, gdn_ab_dot, gdn_beta, gdn_gate --------------------------------
+
+H5 = """
+// each step, then its plain form: this GPU's own operations, which read and write subnormals as zero
+kernel void h5_conv(device const uint* a [[buffer(0)]], device uint* out [[buffer(1)]],
+                    constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  float v[8];
+  for (uint k = 0; k < 8; ++k) v[k] = as_type<float>(a[8 * i + k]);
+  out[2 * i] = as_type<uint>(gdn_conv(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]));
+  out[2 * i + 1] = as_type<uint>(fma(v[3], v[7], fma(v[2], v[6], fma(v[0], v[4], v[1] * v[5]))));
+}
+
+kernel void h5_unary(device const uint* a [[buffer(0)]], device uint* out [[buffer(1)]],
+                     constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const float s = as_type<float>(a[i]);
+  device uint* o = out + 4 * i;
+  o[0] = as_type<uint>(gdn_silu(s));
+  o[1] = as_type<uint>(s / (1.0f + expf_neg(s)));
+  o[2] = as_type<uint>(gdn_beta(s));
+  o[3] = as_type<uint>(1.0f / (1.0f + expf_neg(s)));
+}
+
+kernel void h5_sum4(device const uint4* a [[buffer(0)]], device uint* out [[buffer(1)]],
+                    constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const float4 p = as_type<float4>(a[i]);
+  out[2 * i] = as_type<uint>(gdn_sum4(p.x, p.y, p.z, p.w));
+  out[2 * i + 1] = as_type<uint>(((p.x + p.y) + p.z) + p.w);
+}
+
+// the L2 scale, which the kernels write at its call sites (dec_gdn_rec.cu:228-229, verify_kernels.cu:53)
+kernel void h5_l2(device const uint* a [[buffer(0)]], device uint* out [[buffer(1)]],
+                  constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const float y = as_type<float>(a[3 * i]), ss = as_type<float>(a[3 * i + 1]), eps = as_type<float>(a[3 * i + 2]);
+  out[2 * i] = as_type<uint>(ieee_mul(y, rsqrt_ieee(ieee_add(ss, eps))));
+  out[2 * i + 1] = as_type<uint>(y * fast::rsqrt(ss + eps));
+}
+
+kernel void h5_gate(device const uint* a [[buffer(0)]], device uint* out [[buffer(1)]],
+                    constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const float v = as_type<float>(a[3 * i]), dt = as_type<float>(a[3 * i + 1]), sa = as_type<float>(a[3 * i + 2]);
+  out[2 * i] = as_type<uint>(gdn_gate(v, dt, sa));
+  const float u = v + dt;
+  out[2 * i + 1] = as_type<uint>((u > 20.0f ? u : log1pf_nv(expf_ftz(u))) * sa);
+}
+
+// one SIMD-group per row of 8 * n8 bf16 weights and as many activations: lane 0 stores the dot and the plain chain's
+kernel void h5_dot(device const uint4* w [[buffer(0)]], device const float4* x [[buffer(1)]],
+                   device uint* out [[buffer(2)]], constant uint2& p [[buffer(3)]],
+                   uint i [[thread_position_in_grid]]) {
+  const uint row = i / 32, lane = i % 32, n8 = p.y;
+  if (row >= p.x) return;                                   // whole SIMD-groups return
+  const float v = gdn_ab_dot(w + row * n8, x + 2 * row * n8, lane, n8);
+  device const ushort* wr = (device const ushort*) (w + row * n8);
+  device const uint* xr = (device const uint*) (x + 2 * row * n8);
+  float u = 0.0f;
+  for (uint j = lane; j < n8; j += 32)
+    for (uint e = 0; e < 8; ++e) u = fma(as_type<float>(uint(wr[8 * j + e]) << 16), as_type<float>(xr[8 * j + e]), u);
+  u = warp_sum(u);
+  if (lane == 0) {
+    out[2 * row] = as_type<uint>(v);
+    out[2 * row + 1] = as_type<uint>(u);
+  }
+}
+"""
+H5_N = 2560                # n_embd, the one width the window takes: 320 words of 8 bf16 weights, 10 per lane
+H5_SPECIAL = np.array([0, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC00000, 0x7F7FFFFF, 0x00000001], U32)
+
+
+def stack(classes):
+    """The classes' rows concatenated, and each class's slice of them."""
+    at, off = {}, 0
+    for name, r in classes.items():
+        at[name], off = slice(off, off + len(r)), off + len(r)
+    return np.concatenate(list(classes.values())), at
+
+
+def subnormal32(b):
+    """Nonzero float32 bits below 2^-126 (subnormal)."""
+    m = b & U32(0x7FFFFFFF)
+    return (m != 0) & (m < U32(0x00800000))
+
+
+def exercised(plain, at, least):
+    """``plain`` (the rows where the plain form differs from IEEE's) holds more than ``least[c]`` rows of class c."""
+    n = {c: int(np.count_nonzero(plain[at[c]])) for c in least}
+    assert all(n[c] > least[c] for c in least), f"the plain form differs on too few rows: {n}, want more than {least}"
+
+
+def h5_conv_rows(rng, n=2048):
+    """H.5's conv operands by class: rows of v0, v1, v2, x, w0, w1, w2, w3 (float32 bits)."""
+    k = np.arange(n)[:, None]
+    big, sub = floats(rng, rng.integers(147, 187, (n, 4))), floats(rng, np.zeros((n, 4), int))
+    # v0 = -v1 and w0 = w1 moved by up to 4 ulps: tap 0 cancels tap 1's rounded product (2^-126 to 2^-61) down to the
+    # subnormal range; the other two taps zero, or products of 2^-154 to 2^-132
+    ea, pe = rng.integers(64, 128, n), rng.integers(1, 67, n)
+    a, b = floats(rng, ea), floats(rng, pe + 127 - ea)
+    w0 = (b.astype(np.int64) + rng.integers(-4, 5, n)).astype(U32)
+    tail = np.where(k % 2 == 0, floats(rng, np.zeros((n, 4), int)) & SIGN, floats(rng, rng.integers(50, 61, (n, 4))))
+    special = rng.standard_normal((n // 8, 8)).astype(F32).view(U32)
+    special[np.arange(n // 8), rng.integers(0, 8, n // 8)] = rng.choice(H5_SPECIAL, n // 8)
+    return {"random": np.c_[rng.standard_normal((n, 4)) * 2, rng.standard_normal((n, 4)) * 0.3].astype(F32).view(U32),
+            "tiny": floats(rng, rng.integers(52, 66, (n, 8))),        # 2^-75 to 2^-62: products below 2^-123
+            "subnormal": np.c_[np.where(k % 2 == 0, big, sub), np.where(k % 2 == 0, sub, big)],   # beside 2^20 to 2^60
+            "cancel": np.c_[a ^ SIGN, a, tail[:, :2], w0, b, tail[:, 2:]],
+            "special": special}
+
+
+def test_gdn_conv_matches_the_emulation():
+    rows, at = stack(h5_conv_rows(np.random.default_rng(35)))
+    v = rows.view(F32)
+    got = run_kernel(H5, "h5_conv", [rows], 2)
+    with np.errstate(invalid="ignore"):                     # the signaling-NaN rows raise the flag in the casts
+        want = emu.gdn_conv(*v.T)
+    assert_bits("gdn_conv", got[:, 0], want, *v.T)
+    # the rows exercise what they claim: the plain fma chain differs on the small classes, and the other order of taps
+    # 0 and 1 (tap 0's product rounded alone) on the random rows (dec_gdn.md section 6d)
+    exercised(differ(got[:, 1], want.view(U32)), at, {"tiny": 1000, "subnormal": 1500, "cancel": 300})
+    r = v[at["random"]]
+    other = emu.fma32(r[:, 3], r[:, 7], emu.fma32(r[:, 2], r[:, 6], emu.fma32(r[:, 1], r[:, 5], r[:, 0] * r[:, 4])))
+    assert np.count_nonzero(other != want[at["random"]]) > 150, "taps 0 and 1 in the other order: too few rows differ"
+    # near float64 on the random rows: an error both sides share cannot hide
+    t = r[:, :4].astype(F64) * r[:, 4:].astype(F64)
+    s = got[at["random"], 0].view(F32).astype(F64)
+    assert np.all(np.abs(s - t.sum(1)) <= 2.0 ** -21 * np.abs(t).sum(1))
+
+
+def h5_unary_args(rng, n=1 << 12):
+    """H.5's SiLU and beta arguments (float32 bits) by class."""
+    sign = rng.integers(0, 2, n, dtype=U32) << U32(31)
+    # where -x * log2(e) crosses 126 (beta's divisor passes 2^126), -126 (__expf(-x) halves) and 128 (it overflows)
+    cross = (np.array([-126.0, 126.0, -128.0]) / F64(emu.L2E)).astype(F32).view(U32)
+    edge = (cross[:, None].astype(np.int64) + np.arange(-128, 129)).astype(U32).ravel()
+    special = np.array([0, SIGN, 1, 0x80000001, 0x00800000, 0x80800000, 0x7F7FFFFF, 0xFF7FFFFF, 0x7F800000,
+                        0xFF800000, 0x7FC00000, 0xFFC00001, 0x7F800001], U32)
+    return {"uniform": rng.uniform(-110, 110, n).astype(F32).view(U32),
+            "subnormal": rng.integers(1, 1 << 23, n, dtype=U32) | sign,
+            "tiny": rng.integers(0x00800000, 0x0D800000, n, dtype=U32) | sign,     # [2^-126, 2^-100)
+            "beta_sub": rng.uniform(-88.73, -87.33, n).astype(F32).view(U32),     # beta below 2^-126
+            "edge": edge, "special": special}
+
+
+def test_gdn_silu_and_gdn_beta_match_the_emulation():
+    args, at = stack(h5_unary_args(np.random.default_rng(36)))
+    x = args.view(F32)
+    got = run_kernel(H5, "h5_unary", [args], 4)
+    with np.errstate(invalid="ignore"):
+        silu, beta = emu.gdn_silu(x, fast_exp2), emu.gdn_beta(x, fast_exp2)
+    assert_bits("gdn_silu", got[:, 0], silu, x)
+    assert_bits("gdn_beta", got[:, 2], beta, x)
+    exercised(differ(got[:, 1], silu.view(U32)), at, {"subnormal": 3000, "tiny": 50})
+    exercised(differ(got[:, 3], beta.view(U32)), at, {"beta_sub": 3000, "edge": 100})
+    assert np.count_nonzero(subnormal32(got[at["beta_sub"], 2])) > 3000, "too few subnormal betas"
+    # near float64 (where float32's __expf(-x) does not overflow)
+    with np.errstate(invalid="ignore"):
+        xf, r = x.astype(F64), got.view(F32).astype(F64)
+    with np.errstate(over="ignore", invalid="ignore"):
+        for col, lo, ref in [(0, -88.0, xf / (1 + np.exp(-xf))), (2, -88.7, 1 / (1 + np.exp(-xf)))]:
+            m = np.zeros(len(x), bool)
+            m[at["uniform"]] = True
+            m &= xf >= lo
+            assert np.all(np.abs(r[m, col] - ref[m]) <= 1e-5 * np.abs(ref[m]) + 2.0 ** -149), col
+
+
+def h5_sum4_rows(rng, n=2048):
+    """H.5's gdn_sum4 partials by class: rows of p0..p3 (float32 bits)."""
+    # p0 + p1 = -e 2^-149 (|e| <= 4) exactly, p2 and p3 below 2^-129: every partial sum subnormal or zero
+    k = rng.integers(1 << 20, (1 << 24) - 4, n) * rng.choice([-1, 1], n)
+    m = np.c_[k, -(k + rng.integers(-4, 5, n)), rng.integers(-(1 << 20), 1 << 20, (n, 2))]
+    special = np.array([[0x7F800000, 0xFF800000, 0, 0], [0x7FC00000, 0x3F800000, 0, 0], [0x7F7FFFFF, 0x7F7FFFFF, 0, 0],
+                        [SIGN, SIGN, SIGN, SIGN], [0x3F800000, 0xBF800000, SIGN, SIGN],
+                        [0x00800001, 0x80800000, 0, 0]], U32)               # the last: 2^-149, which a flush loses
+    return {"random": (rng.standard_normal((n, 4)) * np.exp(rng.uniform(-3, 3, (n, 1)))).astype(F32).view(U32),
+            "cancel": np.ldexp(m.astype(F64), -149).astype(F32).view(U32),
+            "subnormal": floats(rng, np.zeros((n, 4), int)), "special": special}
+
+
+def test_gdn_sum4_matches_the_emulation():
+    rows, at = stack(h5_sum4_rows(np.random.default_rng(37)))
+    p = rows.view(F32)
+    got = run_kernel(H5, "h5_sum4", [rows], 2)
+    with np.errstate(invalid="ignore"):
+        want = emu.gdn_sum4(*p.T)
+    assert_bits("gdn_sum4", got[:, 0], want, *p.T)
+    assert got[at["special"].stop - 1, 0] == 1, "gdn_sum4(2^-126 + 2^-149, -2^-126, 0, 0) is not 2^-149"
+    exercised(differ(got[:, 1], want.view(U32)), at, {"cancel": 1500, "subnormal": 1500})
+    r = p[at["random"]].astype(F64)
+    s = got[at["random"], 0].view(F32).astype(F64)
+    assert np.all(np.abs(s - r.sum(1)) <= 2.0 ** -21 * np.abs(r).sum(1))
+
+
+def h5_l2_rows(rng, n=2048):
+    """H.5's L2-scale operands by class: rows of y, ss, eps (float32 bits)."""
+    sign = rng.integers(0, 2, n, dtype=U32) << U32(31)
+    one, eps = 0x3F800000, int(F32(1e-6).view(U32))
+    # y subnormal or below 2^-112 times rsqrt(ss + 1e-6) of 31 to 1000: products a flushed y loses
+    y = np.where(np.arange(n) % 2 == 0, rng.integers(1, 1 << 23, n, dtype=U32),
+                 rng.integers(0x00800000, 0x07800000, n, dtype=U32)) | sign
+    ss = np.exp(rng.uniform(np.log(1e-9), np.log(1e-3), n)).astype(F32).view(U32)
+    # ss + eps zero or subnormal (eps 0 or subnormal; the kernels' is 1e-6): rsqrt_ieee's scaled branch
+    lo = np.where(rng.random((n, 2)) < 0.2, U32(0), rng.integers(1, 1 << 23, (n, 2), dtype=U32))
+    special = np.array([[0x7FC00000, one, eps], [0x7F800000, one, eps], [one, 0x7F800000, eps], [one, 0xBF800000, eps],
+                        [0, 0, 0], [one, 0, 0], [SIGN, one, eps]], U32)
+    return {"random": np.c_[(rng.standard_normal(n) * 0.3).astype(F32).view(U32),
+                            (rng.chisquare(128, n) * 0.09).astype(F32).view(U32), np.full(n, eps, U32)],
+            "small_y": np.c_[y, ss, np.full(n, eps, U32)],
+            "small_ss": np.c_[rng.standard_normal(n).astype(F32).view(U32), lo],
+            "special": special}
+
+
+def test_the_l2_scale_matches_the_emulation():
+    rows, at = stack(h5_l2_rows(np.random.default_rng(38)))
+    y, ss, eps = rows.view(F32).T
+    got = run_kernel(H5, "h5_l2", [rows], 2)
+    with np.errstate(invalid="ignore"):
+        want = emu.gdn_l2_scale(y, ss, eps, fast_rsqrt)
+    assert_bits("the L2 scale", got[:, 0], want, y, ss, eps)
+    exercised(differ(got[:, 1], want.view(U32)), at, {"small_y": 500, "small_ss": 1000})
+    sl = at["random"]
+    ref = y[sl].astype(F64) / np.sqrt(ss[sl].astype(F64) + eps[sl].astype(F64))
+    assert np.all(np.abs(got[sl, 0].view(F32).astype(F64) - ref) <= 1e-5 * np.abs(ref))
+
+
+def h5_gate_rows(rng, n=2048):
+    """H.5's gate operands by class: rows of v, dt, sa (float32 bits)."""
+    dt = rng.standard_normal(n)
+    sa = rng.choice([-1, 1], n) * np.exp2(rng.uniform(-10, 30, n))      # |sa| on both sides of 1
+    v20 = (np.int64(F32(20.0).view(U32)) + np.arange(-64, 65)).astype(U32).view(F32)
+    edge = np.c_[np.r_[v20, 19.5, 10.0], np.r_[np.zeros(len(v20)), 0.5, 10.0], np.full(len(v20) + 2, -2.0)]
+    special = np.array([[np.nan, 0, -1], [0, np.nan, -1], [1, 0, np.nan], [np.inf, 0, -1], [-np.inf, 0, -1],
+                        [1, 0, np.inf], [-np.inf, 0, np.inf], [np.inf, -np.inf, -1], [0, 0, 0], [-0.0, -0.0, -1]])
+    u = rng.uniform(-104, -87, n)
+    rows = {"random": np.c_[rng.standard_normal(n) * 1.5, dt, -np.exp(rng.uniform(-1, 3, n))],
+            "subnormal_exp": np.c_[u - dt, dt, sa],                  # u = v + dt in [-104, -87]: __expf(u) subnormal
+            "large": np.c_[rng.uniform(20, 100, n // 4), dt[:n // 4], sa[:n // 4]],
+            "edge": edge, "special": special}
+    with np.errstate(invalid="ignore"):
+        return {c: r.astype(F32).view(U32) for c, r in rows.items()}
+
+
+def test_gdn_gate_matches_the_emulation():
+    rows, at = stack(h5_gate_rows(np.random.default_rng(39)))
+    v, dt, sa = rows.view(F32).T
+    got = run_kernel(H5, "h5_gate", [rows], 2)
+    with np.errstate(invalid="ignore"):
+        want = emu.gdn_gate(v, dt, sa, fast_exp2)
+    assert_bits("gdn_gate", got[:, 0], want, v, dt, sa)
+    exercised(differ(got[:, 1], want.view(U32)), at, {"subnormal_exp": 1000})
+    g = got[at["subnormal_exp"], 0]
+    assert np.count_nonzero(subnormal32(g)) > 200 and np.count_nonzero((g & U32(0x7F800000)) != 0) > 200
+    sl = at["random"]
+    u = v[sl].astype(F64) + dt[sl].astype(F64)
+    ref = np.where(u > 20, u, np.log1p(np.exp(u))) * sa[sl].astype(F64)
+    assert np.all(np.abs(got[sl, 0].view(F32).astype(F64) - ref) <= 1e-5 * np.abs(ref))
+
+
+def bf16(x):
+    """float32 values as bf16 bits, truncated."""
+    return (np.asarray(x, F32).view(U32) >> U32(16)).astype(np.uint16)
+
+
+def h5_dot_rows(rng, r=128, n=H5_N):
+    """H.5's gdn_ab_dot rows by class: (bf16 weight bits, activations), n of each per row."""
+    sgn = lambda *s: rng.choice([-1.0, 1.0], s)
+    # adjacent elements cancel to -e_i 2^-149 (|e_i| <= 4; weights 1): subnormal chains and butterflies
+    k = rng.integers(1, (1 << 24) - 4, (r, n // 2)) * sgn(r, n // 2)
+    m = np.stack([k, -(k + rng.integers(-4, 5, (r, n // 2)))], axis=2).reshape(r, n)
+    # zero weights, every product -0 in the first two rows: the chains start from +0 (the first FFMA's RZ)
+    zw = np.repeat(np.array([0, 0x8000, 0, 0], np.uint16)[:, None], n, axis=1)
+    zw[3] = rng.choice(np.array([0, 0x8000], np.uint16), n)
+    zx = np.abs(rng.standard_normal((4, n))) * np.array([-1, 1, 1, 1])[:, None]
+    zx[3] *= sgn(n)
+    sw, sx = bf16(rng.standard_normal((8, n)) * 0.03), rng.standard_normal((8, n))
+    col = rng.integers(0, n, 8)
+    sx[np.arange(4), col[:4]] = [np.inf, -np.inf, np.nan, np.inf]
+    sw[np.arange(4, 8), col[4:]] = [0x7F80, 0xFF80, 0x7FC0, 0x7F80]          # bf16 inf, -inf, NaN
+    sub = (rng.integers(1, 128, (r, n)) | (rng.integers(0, 2, (r, n)) << 15)).astype(np.uint16)   # bf16 subnormals
+    return {"random": (bf16(rng.standard_normal((r, n)) * 0.03), rng.standard_normal((r, n))),
+            "subnormal_w": (sub, sgn(r, n) * np.exp2(rng.uniform(90, 110, (r, n)))),
+            "tiny": (bf16(sgn(r, n) * np.exp2(rng.uniform(-75, -60, (r, n)))),
+                     sgn(r, n) * np.exp2(rng.uniform(-80, -65, (r, n)))),        # products of 2^-155 to 2^-125
+            "cancel": (np.full((r, n), 0x3F80, np.uint16), np.ldexp(m.astype(F64), -149)),
+            "zero": (zw, zx), "special": (sw, sx)}
+
+
+def h5_dot_run(w, x):
+    """gdn_ab_dot of each row of bf16 weight bits ``w`` against the same row of ``x``, and the plain chain's (float32
+    bits, rows of 2): one SIMD-group per row."""
+    rows, n = w.shape
+    pso = gpu.pipeline(kernels.basalt_gdn_source() + H5, "h5_dot")
+    out = gpu.run(pso, [np.ascontiguousarray(w, np.uint16).tobytes(), np.ascontiguousarray(x, F32).tobytes(), 8 * rows],
+                  np.array([rows, n // 8], U32).tobytes(), 3, -(-rows // 8), 256, fill=0xFF)
+    return np.frombuffer(out[2], U32).reshape(rows, 2)
+
+
+def test_gdn_ab_dot_matches_the_emulation():
+    classes = h5_dot_rows(np.random.default_rng(40))
+    w, at = stack({c: r[0] for c, r in classes.items()})
+    x = np.concatenate([np.asarray(r[1], F32) for r in classes.values()])
+    names = np.repeat(list(classes), [len(r[0]) for r in classes.values()])
+    got = h5_dot_run(w, x)
+    with np.errstate(invalid="ignore"):
+        want = emu.gdn_ab_dot(w, x).view(U32)
+    bad = np.flatnonzero(differ(got[:, 0], want))
+    assert bad.size == 0, (f"gdn_ab_dot: {bad.size} of {len(w)} rows differ; first row {bad[0]} ({names[bad[0]]}): "
+                           f"got {got[bad[0], 0]:#010x}, want {want[bad[0]]:#010x}")
+    assert np.all(got[at["zero"], 0] == 0), f"zero weights: {[hex(g) for g in got[at['zero'], 0]]}, not +0"
+    exercised(differ(got[:, 1], want), at, {"subnormal_w": 64, "tiny": 64, "cancel": 64})
+    sl = at["random"]
+    t = ((w[sl].astype(U32) << U32(16)).view(F32).astype(F64)) * x[sl].astype(F64)
+    s = got[sl, 0].view(F32).astype(F64)
+    assert np.all(np.abs(s - t.sum(1)) <= 1e-5 * np.abs(t).sum(1))

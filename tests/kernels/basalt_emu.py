@@ -891,3 +891,70 @@ def q8_1_rec(x):
         d = q8_1_finite(mul_ftz(amax, RCP127))
         q = roundf(mul_ftz(v, rcp_ftz(d)[:, None]))
     return q8_1_pack(d, s, q8_1_codes(q, amax))
+
+
+# The shared steps of kernels/common/basalt_gdn.metal, each from the SASS rows of dec_gdn.md section 1 and
+# verify_gdn.md sections 2-5 (every FFMA an fma32, every FMUL, FADD and div.rn or rcp.rn numpy's float32 operation).
+
+def gdn_conv(v0, v1, v2, x, w0, w1, w2, w3):
+    """The conv sum (dec_gdn_rec.cu:64, verify_kernels.cu:45): FMUL p, w1, v1; FFMA s, w0, v0, p; FFMA s, w2, v2, s;
+    FFMA sum, x, w3, s (dec_gdn.md section 6d)."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        p = np.asarray(w1, F32) * np.asarray(v1, F32)
+        return fma32(x, w3, fma32(w2, v2, fma32(w0, v0, p)))
+
+
+def gdn_silu(s, exp2):
+    """SiLU (dec_gdn_rec.cu:65, verify_kernels.cu:46): FMUL e, s, -log2(e); ex2n; FADD d, r, 1; div.rn(s, d), the
+    correctly rounded quotient."""
+    s = np.asarray(s, F32)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        return (s / (ex2n(s * -L2E, exp2) + F32(1.0))).astype(F32)
+
+
+def gdn_sum4(p0, p1, p2, p3):
+    """FADD a, p0, p1; FADD a, a, p2; FADD a, a, p3."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return ((np.asarray(p0, F32) + np.asarray(p1, F32)) + np.asarray(p2, F32)) + np.asarray(p3, F32)
+
+
+def gdn_l2_scale(y, ss, eps, rsqrt):
+    """The q/k L2 scale (dec_gdn_rec.cu:228-229, verify_kernels.cu:53), which the kernels write at the call site: FADD
+    x, ss, eps; rsqn(x); FMUL y, y, r."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return (np.asarray(y, F32) * rsqrt_ieee(np.asarray(ss, F32) + np.asarray(eps, F32), rsqrt)).astype(F32)
+
+
+def gdn_ab_dot(w, x):
+    """The alpha or beta logit (dec_gdn_rec.cu:89-108, verify_kernels.cu:183-203) of each row of bf16 weights ``w``
+    (uint16, a multiple of 8 per row) against the same row of float32 activations ``x``: lane L's FFMA chain, the
+    first on RZ, over the words j = L, L + 32, ... below n / 8, the word's elements 8j .. 8j + 7 in order (a weight
+    widened by its bits, << 16); then the butterfly's FADDs, lane 0's sum."""
+    w, x = np.asarray(w, np.uint16), np.asarray(x, F32)
+    n = w.shape[1]
+    wf = (w.astype(np.uint32) << np.uint32(16)).view(F32)
+    v = np.zeros((len(w), 32), F32)
+    for j0 in range(0, n // 8, 32):
+        j = j0 + np.arange(32)
+        for e in range(8):
+            k = np.minimum(8 * j + e, n - 1)
+            v = np.where(j < n // 8, fma32(wf[:, k], x[:, k], v), v)
+    with np.errstate(over="ignore", invalid="ignore"):
+        return butterfly(v, np.add)
+
+
+def gdn_beta(v, exp2):
+    """beta (dec_gdn_rec.cu:109, verify_kernels.cu:151, :206): FMUL e, v, -log2(e); ex2n; FADD d, r, 1; rcp.rn(d), the
+    correctly rounded reciprocal."""
+    v = np.asarray(v, F32)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        return (F32(1.0) / (ex2n(v * -L2E, exp2) + F32(1.0))).astype(F32)
+
+
+def gdn_gate(v, dt, sa, exp2):
+    """The gate (dec_gdn_rec.cu:110-112, verify_kernels.cu:153-155, :208-210): FADD u, dt, v; FSETP.GT u, 20 keeps u,
+    else libdevice's log1pf of __expf(u); FMUL g, sa, sp."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        u = np.asarray(dt, F32) + np.asarray(v, F32)
+        sp = np.where(u > F32(20.0), u, log1pf_nv(expf_ieee(u, exp2)))
+        return (np.asarray(sa, F32) * sp).astype(F32)
