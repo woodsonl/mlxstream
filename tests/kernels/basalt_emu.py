@@ -854,9 +854,15 @@ def rel_norm(y, ref):
 # mmq_launches and mmq_walk transcribe the launch rules and the stream-k walk of basalt's src/prefill/mmq/mmq.cuh
 # (:487-629, :654-698, :765, :801-833, :867-889) and the per-group launch of prefill.cpp:2242-2248 @ b4c63b5; mmq.cuh is
 # ggml-org/llama.cpp ggml/src/ggml-cuda/mmq.cuh @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+# mmq_quantize, mmq_product and mmq_moe emulate the chain the port computes (spec-tests-moe.md 5.4): basalt's
+# src/prefill/mmq/quantize.cu:10-84, mmq_load_tiles.cuh:11-75, mmq_vec_dot.cuh:14-92 and mmq.cuh's fixup :632-767 (the
+# same llama.cpp files at that commit) and src/prefill/moe_mmq.cu:85-93's SwiGLU.
 
 MMQ_GROUP = 16                                       # experts per MMQ launch (prefill.cpp:607)
 MMQ_J = (8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128)   # Q2_0's tile widths with fallback false (mmq_config.cuh:15-25)
+# Each product's weights in a native Q2_0/Q2_0 blob at 2560 / 640 (native_expert.cpp:49-55; spec-kernels-mmq.md 4.2):
+# (byte offset in the blob, rows, K): gate then up, 1280 rows of 2560 at 0; down, 2560 rows of 640 at 921,600.
+MMQ_PRODUCTS = {"gate_up": (0, 1280, 2560), "down": (921600, 2560, 640)}
 
 
 def moe_plan(ids, n_expert, cpu=()):
@@ -980,3 +986,133 @@ def mmq_walk(ntiles, bpne, grid, bpi=4):
         p = sorted(mmq_pieces(tiles[t]))
         assert p[0][0] == 0 and p[-1][1] == bpne and all(a[1] == c[0] for a, c in zip(p, p[1:])), (t, tiles[t])
     return tiles
+
+
+def mmq_fixup(*pieces):
+    """A tile's expression in mmq_walk's terms when its k range splits into ``pieces`` (k order): P_0 alone, else
+    ((+0 + P_{m-1}) + ... + P_0) + P_m, the fixup's order (mmq.cuh:646, :689, :765)."""
+    *rest, last = [("P", lo, hi) for lo, hi in pieces]
+    s = ("zero",)
+    for p in reversed(rest):
+        s = ("add", s, p)
+    return ("add", s, last) if rest else last
+
+
+def cuda_nan(x):
+    """basalt_fp.metal's cuda_nan: every NaN as sm_120 stores it, 0x7fffffff (docs/research/basalt-nvcc/nan.md)."""
+    x = np.asarray(x, F32)
+    return np.where(np.isnan(x), np.uint32(0x7FFFFFFF).view(F32), x)
+
+
+def mmq_code(v):
+    """basalt_mmq.metal's mmq_code (spec-kernels-mmq.md 3.2): quantize.cu:53-56's ``roundf(v)`` stored to a char as
+    sm_120 runs it, FADD.FTZ.RZ by copysign(0.5, v) then F2I.TRUNC.NTZ (s32, saturating, NaN to 0) and the low byte: a
+    NaN gives 0, r >= 2^31 gives -1 (INT_MAX's low byte), r <= -2^31 gives 0 (INT_MIN's), else (char) (int) r."""
+    r = roundf(v).astype(np.float64)
+    hi, lo = r >= 2.0 ** 31, r <= -2.0 ** 31
+    return np.where(hi, -1, np.where(np.isnan(r) | hi | lo, 0.0, r).astype(np.int64)).astype(np.int8)
+
+
+def mmq_quantize(x):
+    """quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4> (quantize.cu:10-84; spec-kernels-mmq.md 3.2, 9.7) of float32 rows
+    [R, n], n a multiple of 128, as basalt_mmq.metal stores them: per row n / 128 block_q8_1_mmq of 144 bytes, its
+    d4[4] (each 32-value group's d, through cuda_nan) then its 128 int8 codes. Per group, in fast math: amax the max of
+    abs_ftz over the values (FMNMX.FTZ: max is exact and order-free, fmax drops a NaN), d_inv = mul_ftz(127,
+    rcp_ftz(amax)) (MUFU.RCP, FMUL.FTZ), the codes mmq_code(mul_ftz(x, d_inv)), d = rcp_ftz(d_inv) (MUFU.RCP); rcp_ftz
+    is the contract's correctly rounded reciprocal for MUFU.RCP."""
+    x = np.asarray(x, F32)
+    v = x.reshape(-1, 32)
+    amax = np.fmax.reduce(ftz(np.abs(v)), axis=1)
+    d_inv = mul_ftz(F32(127.0), rcp_ftz(amax))
+    out = np.empty((x.shape[0], x.shape[1] // 128, 144), np.uint8)
+    out[..., :16] = cuda_nan(rcp_ftz(d_inv)).reshape(out.shape[:2] + (4,)).view(np.uint8)
+    out[..., 16:] = mmq_code(mul_ftz(v, d_inv[:, None])).reshape(out.shape[:2] + (128,)).view(np.uint8)
+    return out
+
+
+def mmq_product(xq, plan, buf, offsets, product, nsm):
+    """One MoE product, ``product`` "gate_up" or "down" (MMQ_PRODUCTS), over every launch of a plan (moe_plan's), as
+    basalt_mmq.metal computes each output element (spec-kernels-mmq.md 6, 9.2-9.6): mul_mat_q<Q2_0> and its stream-k
+    fixup (mmq.cuh:390-864) at ``nsm`` multiprocessors, on the activation rows ``xq`` (rows_local rows of
+    mmq_quantize's blocks), with the weights read in place from the blob of expert e at ``buf[offsets[e]:]`` (the
+    address table). Returns float32 [rows_local, rows] through cuda_nan.
+
+    Per element, each piece of its tile (mmq_walk's expression, asserted to be mmq_fixup's form) is a chain from +0 over
+    whole k iterations of 4 blocks, per 32-value sub-block s: t = mul_ftz(dA, float(c)) (I2FP, FMUL.FTZ) and sum =
+    fma_ftz(dB, t, sum) (FFMA.FTZ; mmq_vec_dot.cuh:87), c the exact integer dot of the weight codes (crumb - 1) with the
+    activation codes, dA the weight block's fp16 d, dB the activation group's d4; the pieces then fold in the fixup's
+    order. The down product's last iteration also runs sub-blocks 20-23, past each 640-value row: c = 0 (the activation
+    codes there are 0), dB xq's (Hq's padding, +0), dA what basalt's group buffer holds there (prefill.cpp:608-611,
+    :2249-2251; spec-kernels-mmq.md 9.6): blocks 0 and 1 of the next row; past an expert's last row the next launch
+    slot's row 0; past the group's last slot the zeroed MMQ_TAIL, +0. Nothing past a blob is read."""
+    from tests.kernels.basalt_cpu_emu import unpack64_q2_0     # basalt_cpu_emu imports this module
+    off, nout, k = MMQ_PRODUCTS[product]
+    bpne, nty = k // 64, nout // 128
+    bounds, order, offsets = np.asarray(plan.bounds, np.int64), np.asarray(plan.order), np.asarray(offsets)
+    xq = np.asarray(xq, np.uint8).reshape(len(xq), -1)
+    out = np.full((bounds[-1], nout), np.uint32(0xFFFFFFFF).view(F32), F32)      # a row never computed stays NaN
+    for la in mmq_launches(bounds, nty, nsm):
+        tiles = mmq_walk(la.ntiles, bpne, la.grid)
+        r0, r1 = bounds[la.j0], bounds[la.j0 + la.ngx]
+        rel = bounds[la.j0: la.j0 + la.ngx + 1] - r0
+        starts = np.zeros((r1 - r0, nty), np.int64)            # bit q: a piece of its tile starts at iteration q
+        for zt in range(la.ngx):
+            for jt in range(-(-(rel[zt + 1] - rel[zt]) // la.J)):     # a column tile without rows stores nothing
+                rows = slice(rel[zt] + jt * la.J, min(rel[zt] + (jt + 1) * la.J, rel[zt + 1]))
+                for it in range(nty):
+                    expr = tiles[(it * la.ngx + zt) * la.ntx + jt]
+                    p = sorted(mmq_pieces(expr))
+                    assert expr == mmq_fixup(*p) and all(lo % 4 == 0 for lo, _ in p), expr
+                    starts[rows, it] = sum(1 << (lo // 4) for lo, _ in p[1:])
+        mask = np.repeat(starts, 128, axis=1)
+        blk = [buf[o + off: o + off + nout * bpne * 18].reshape(nout, bpne, 18)
+               for o in offsets[order[la.j0: la.j0 + la.ngx]]]
+        codes = [unpack64_q2_0(b[..., 2:]).reshape(nout, 2 * bpne, 32).astype(np.int8) - 1 for b in blk]
+        dA = [h2f(b[..., :2].copy().view("<u2")[..., 0]) for b in blk]              # (nout, bpne): exact
+        a = xq[r0:r1]
+        sm, ends = np.zeros((r1 - r0, nout), F32), {}
+        for q in range(-(-bpne // 4)):
+            on = ((mask >> q) & 1).astype(bool)
+            if q and on.any():                                 # a piece starts: keep the one ending here, restart at +0
+                ends[q], sm = sm, np.where(on, F32(0.0), sm)
+            for s in range(8 * q, 8 * q + 8):
+                kb, g = divmod(s, 4)                           # block_q8_1_mmq kb, its 32-value group g
+                dB = a[:, 144 * kb + 4 * g: 144 * kb + 4 * g + 4].copy().view(F32)
+                qa = a[:, 144 * kb + 16 + 32 * g: 144 * kb + 48 + 32 * g].view(np.int8).astype(np.float64)
+                if s < 2 * bpne:
+                    c = np.empty((r1 - r0, nout), F32)
+                    for zt in range(la.ngx):                   # exact: |c| <= 32 * 2 * 127
+                        c[rel[zt]: rel[zt + 1]] = qa[rel[zt]: rel[zt + 1]] @ codes[zt][:, s].T.astype(np.float64)
+                    da = np.stack([d[:, s // 2] for d in dA])
+                else:                                          # the down product's padded sub-blocks
+                    assert not qa.any(), "the padded sub-blocks' activation codes are not 0"
+                    c, b = np.zeros((r1 - r0, nout), F32), s // 2 - bpne
+                    da = np.stack([np.append(dA[zt][1:, b], dA[zt + 1][0, b] if zt + 1 < la.ngx else F32(0.0))
+                                   for zt in range(la.ngx)])
+                sm = fma_ftz(dB, mul_ftz(np.repeat(da, np.diff(rel), axis=0), c), sm)
+        acc, split = np.zeros_like(sm), np.zeros(sm.shape, bool)
+        for q in sorted(ends, reverse=True):                   # the fixup: +0, then the earlier pieces nearest first
+            on = ((mask >> q) & 1).astype(bool)
+            acc, split = np.where(on, add_ftz(acc, ends[q]), acc), split | on
+        out[r0:r1] = cuda_nan(np.where(split, add_ftz(acc, sm), sm))    # dst, the last piece, += that sum (:765)
+    return out
+
+
+def mmq_moe(x, plan, buf, offsets, *, expf, nsm):
+    """The routed experts' MMQ chain of one MoE half on Q2_0/Q2_0 blobs at 2560 / 640, as basalt_mmq.metal's four
+    kernels compute it (spec-tests-moe.md 5.4 steps 1-7): the tier-1 gates' emulator. ``x`` [T, 2560] float32,
+    ``plan`` moe_plan's for the chunk's ids (CPU-held experts excluded), expert e's blob at ``buf[offsets[e]:]``, at
+    ``nsm`` multiprocessors (basalt's 170, never this GPU's). ``expf`` evaluates the kernel's expf_ftz on an array
+    (MUFU.EX2 and fast::exp2 have no bit-exact host model; GPU tests pass basalt_gpu.expf_ftz). Returns, rows the
+    plan's rows_local in sorted order: ``xq`` [rows, 20, 144], kernel 1 (each slot's token through mmq_quantize; the
+    K copies of a token are byte-identical, so each token is quantized once); ``gu`` [rows, 1280], kernel 2; ``hq``
+    [rows, 8, 144], kernel 3: h = mul_ftz(mul_ftz(rcp_ftz(add_ftz(e, 1)), g), u) with e = expf(-g), g and u the split
+    halves of GU's stored row (moe_mmq.cu:85-93, interleaved false), then mmq_quantize of h and 384 zeros (pad512(640));
+    ``d`` [rows, 2560], kernel 4."""
+    xq = mmq_quantize(x)[plan.src[:plan.rows_local]]
+    gu = mmq_product(xq, plan, buf, offsets, "gate_up", nsm)
+    ff = MMQ_PRODUCTS["down"][2]
+    g, u = gu[:, :ff], gu[:, ff:]
+    h = mul_ftz(mul_ftz(rcp_ftz(add_ftz(expf(-g), F32(1.0))), g), u)
+    hq = mmq_quantize(np.pad(h, ((0, 0), (0, -ff % 512))))
+    return SimpleNamespace(xq=xq, gu=gu, hq=hq, d=mmq_product(hq, plan, buf, offsets, "down", nsm))

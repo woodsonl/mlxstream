@@ -2,7 +2,8 @@
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) tests/cuda/prefill_cpu_share_test.cpp and tests/cuda/prefill_mmq_kq_test.cpp @
 # b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): their fixtures (fill_matrix, make_blob, make_x,
-# make_ids, the blobs' allocations), their double reference and their compare.
+# make_ids, the blobs' allocations), their double reference and their compare, and prefill_mmq_kq_test's MK-4 batches
+# and gate (:379-434).
 """The fixture of the prompt path's MoE MMQ tests on Q2_0/Q2_0 expert blobs at 2560/640 (tests/kernels/
 test_basalt_moe_mmq.py; the expert-tier lane's CPU-pool test reuses it unchanged). numpy only, no Metal.
 
@@ -24,7 +25,9 @@ the generator keeps basalt's distributions, parameters and order of draws (the b
   allocation of BYTES + 64 bytes, odd experts 2 bytes in), every other byte 0xFF: an fp16 NaN scale wherever a read
   strays past a blob, which basalt's group buffers never meet.
 - ``reference`` is both tests' double reference (cpu_share :332-360, mmq_kq :337-365), ``compare`` their compare
-  (cpu_share :211-236; mmq_kq :259-282's rmax, printed and never gated)."""
+  (cpu_share :211-236; mmq_kq :259-282's rmax, printed and never gated).
+- ``mk4`` is mmq_kq's batch-independence check (:379-434) with the chain injected as ``run``: the host emulator
+  (basalt_emu.mmq_moe) or the Metal chain, so the bound measured on the one is computed by the code the other runs."""
 
 import functools
 from types import SimpleNamespace
@@ -212,3 +215,40 @@ def compare(dm, ref, row_of):
     return SimpleNamespace(rms=float(np.sqrt((d * d).sum() / r2)) if r2 > 0 else 0.0,
                            worst=float(np.fmax.reduce(row, initial=0.0)),
                            rmax=float(np.fmax.reduce(np.abs(d[big]) / np.abs(b[big]), initial=0.0)))
+
+
+def mk4(cfg, run):
+    """MK-4 (prefill_mmq_kq_test.cpp:379-434) on configuration ``cfg`` with ``run(x, ids)`` returning Dm [rows, N] in
+    sorted-row order (moe_plan's, whose ``slot`` places a pair's row): the configuration's own run, then for t = 0..7
+    token t alone and as the last token of a 3-token batch whose other tokens u = 0, 1 take x rows 100 + u and ten
+    experts scanned from E - 1 down, none of token t's, even for u = 0 and odd for u = 1 (:383-404). Returns ``em``
+    (the full run's compare against the reference: G3's numbers), ``worst_alone`` (:416-423: per row of token t the
+    largest float difference |a - b| over the largest |b|, b its row in the full run; std::max never takes a NaN),
+    ``differ`` (:422, rows with any difference) and ``nonfinite`` (the small runs' non-finite values, which MK-4 lets
+    through). basalt's gate: ``if (worst_alone > 0.1 * em.worst)`` fails (:433)."""
+    dm = run(cfg.x, cfg.ids)
+    em = compare(dm, reference(cfg.name), cfg.plan.slot)
+    worst, differ, nonfinite = 0.0, 0, 0
+    for t in range(8):
+        for tn in (1, 3):                                  # variant 0: token t alone; 1: token t last of three
+            ids1, x1 = np.zeros((tn, K), np.int32), np.zeros((tn, N), F32)
+            ids1[-1], x1[-1] = cfg.ids[t], cfg.x[t]
+            for u in range(tn - 1):                        # another token's activations and experts not routed for t
+                filled = 0
+                for e in range(E - 1, -1, -1):             # for (int e = E - 1; filled < K; --e)
+                    if filled < K and e not in cfg.ids[t] and e not in ids1[u, :filled] and (e + u) % 2 == 0:
+                        ids1[u, filled] = e
+                        filled += 1
+                assert filled == K, (t, u)
+                x1[u] = cfg.x[100 + u]
+            d1 = run(x1, ids1)
+            nonfinite += np.count_nonzero(~np.isfinite(d1))
+            slot1 = emu.moe_plan(ids1, E).slot
+            for k in range(K):
+                a, b = d1[slot1[-1, k]], dm[cfg.plan.slot[t, k]]
+                with np.errstate(over="ignore", invalid="ignore"):
+                    md = np.fmax.reduce(np.abs(a - b).astype(np.float64), initial=0.0)
+                mr = np.fmax.reduce(np.abs(b).astype(np.float64), initial=0.0)
+                differ += int(md > 0)
+                worst = max(worst, md / mr if mr > 0 else md)
+    return SimpleNamespace(em=em, worst_alone=float(worst), differ=differ, nonfinite=nonfinite)
