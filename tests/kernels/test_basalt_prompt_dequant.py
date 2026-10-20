@@ -29,6 +29,7 @@ from monolith.formats.fp import f32_to_bf16
 from monolith.formats.gguf import GGML_TYPES
 from monolith.runtime import _native as nt
 from tests.contract import gguf_reference
+from tests.contract.test_basalt_pack import PACK, rows_of
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
 
@@ -192,6 +193,31 @@ def run_e(e, out):
     return got, cls
 
 
+# TG 4.2's table: the tensor dequant_bf16_test.cpp:58-64 picks for each type, the pack's tensor table in its order
+P_TENSORS = {2: "blk.2.ffn_down_shexp.weight", 6: "blk.0.ffn_down_shexp.weight", 8: "blk.14.ffn_down_shexp.weight",
+             11: "token_embd.weight", 12: "blk.0.attn_gate.weight", 13: "output.weight",
+             14: "blk.5.ffn_up_shexp.weight", 20: "blk.10.ffn_down_shexp.weight", 23: "blk.0.attn_qkv.weight",
+             42: "blk.1.ffn_down_shexp.weight"}
+
+
+@pytest.fixture(scope="module")
+def p():
+    """Fixture P (TG 4.2, 4.4; plan D7): dequant_bf16_test.cpp:58-64's choice on the committed pack fixture
+    (tests/contract/fixtures/basalt_pack.safetensors, read with test_basalt_pack.py's PACK and rows_of): per type the
+    first 2-D GGUF tensor in the pack's order, skipping the types the kernel does not take (:60); the experts entries
+    are the pack's own section, not GGUF tensors. Of each, rows 0 and n-1 and their first whole blocks, at most 1,024
+    bytes a row, where basalt reads the whole of the first four rows: the same tensors and per-value criteria on fewer
+    values, always on (D7). {type id: (tensor, blocks [2, row bytes], host values [2, cols])}."""
+    tensors = {}
+    for entry in PACK["entries"]:
+        t = entry["type_id"]
+        if entry["source"] == "gguf" and t in kernels.DEQUANT16_TYPES and len(entry["meta"]["shape"]) == 2 \
+                and t not in tensors:                                                   # :60, done.count(type)
+            raw = rows_of(entry)[0]
+            tensors[t] = (entry["tensor"], raw, reference(t, raw))
+    return tensors
+
+
 def test_f16_is_the_f32_rounded(f):
     """F16-1 (dequant_f16_parity.cpp:73), over all 10240 x 2560 values of fixture F: the fp16 output (dequant_f16) bit
     for bit the fp32 output (dequant_f32) rounded to half (basalt_emu.cuda_half_bits, __float2half_rn),
@@ -250,6 +276,65 @@ def test_f16_non_finite_scales(e):
     tiny = h[np.isin(cls, ["2^-24", "0x03ff"])] & 0x7FFF
     assert ((tiny > 0) & (tiny < 0x400)).any(), "no nonzero fp16 subnormal in class E-tiny"
     run_e(e, "f32")
+
+
+def test_f32_against_the_cpu(p, f):
+    """B16-1 (dequant_bf16_test.cpp:90-92): the fp32 output (dequant_f32, :74) against the CPU dequantizer
+    (gguf_reference, bit for bit basalt's cpu_block, TG 4.1) in double, ``const double e = std::fabs((double) gf[i] -
+    ref[i]);`` ``const double tol = 1e-6 * std::fabs((double) ref[i]) + 1e-30;`` ``if (e > tol) ++bad_f;``, and no
+    non-finite output (a NaN's e compares false), on fixture P's tensor of the type and on fixture F. On F: basalt's
+    bound, extended beyond its fixture (D5)."""
+    t = f[0]
+    for name, raw, ref in (p[t], ("F",) + f[1:]):
+        gf = run_dq(t, "f32", raw, *ref.shape).view(np.float32).astype(np.float64)
+        v = ref.ravel().astype(np.float64)
+        bad_f = np.count_nonzero(np.abs(gf - v) > 1e-6 * np.abs(v) + 1e-30)
+        nonfinite = np.count_nonzero(~np.isfinite(gf))
+        assert bad_f == 0 and nonfinite == 0, f"{name}: bad_f {bad_f}, non-finite {nonfinite}"
+
+
+def test_bf16_within_the_bound(p, f):
+    """B16-2 (:94-95): the BF16 output (dequant_bf16, :75), widened by bf16_to_f32 (:40-45, ``(uint32_t) h << 16``),
+    against the CPU dequantizer in double, ``const double eh = std::fabs((double) bf16_to_f32(gh[i]) - ref[i]);``
+    ``if (eh > std::ldexp(std::fabs((double) ref[i]), -8) + 1e-30) ++bad_h;``, and no non-finite output, on fixtures P
+    and F. On F: basalt's bound, extended beyond its fixture (D5)."""
+    t = f[0]
+    for name, raw, ref in (p[t], ("F",) + f[1:]):
+        gh = (run_dq(t, "bf16", raw, *ref.shape).astype(np.uint32) << 16).view(np.float32).astype(np.float64)
+        v = ref.ravel().astype(np.float64)
+        bad_h = np.count_nonzero(np.abs(gh - v) > np.ldexp(np.abs(v), -8) + 1e-30)
+        nonfinite = np.count_nonzero(~np.isfinite(gh))
+        assert bad_h == 0 and nonfinite == 0, f"{name}: bad_h {bad_h}, non-finite {nonfinite}"
+
+
+def test_outputs_bitwise(p, f):
+    """B16, added (TG 4.4): on fixtures P and F, the fp32 output bit for bit the host dequantizer's value and the BF16
+    output its f2bf (``stored``: monolith.formats.fp.f32_to_bf16 of the cuda_nan'd value). B16-2's bound also passes a
+    tie broken away from zero and some truncations (TG 4.3); this pins f2bf's ties to even."""
+    t = f[0]
+    for name, raw, ref in (p[t], ("F",) + f[1:]):
+        for out in ("f32", "bf16"):
+            bad = np.count_nonzero(run_dq(t, out, raw, *ref.shape) != stored(ref, out).ravel())
+            assert bad == 0, f"{name} {out}: {bad} of {ref.size} values differ"
+
+
+def test_pack_has_every_type(p):
+    """B16-3 (:97-100, :106-107): basalt gates each type it finds, ``const bool ok = bad_f == 0 && bad_h == 0;``, and
+    prints, ungated, how many types it checked, so a file without a type passes. The port's pack fixture is fixed, so
+    fixture P must hold every type of DEQUANT16_TYPES (TG 4.4), each from TG 4.2's tensor."""
+    assert set(p) == set(kernels.DEQUANT16_TYPES)
+    assert {t: tensor for t, (tensor, _, _) in p.items()} == P_TENSORS
+
+
+def test_bf16_non_finite_scales(e):
+    """B16, added (TG 4.4; eng-review D25): fixture E through the fp32 store (dequant_f32) and the BF16 one
+    (dequant_bf16), bit for bit the twins (run_e): a NaN scale's values 0x7fffffff and 0x7fff (f2bf of sm_120's NaN;
+    of this GPU's own NaN, 0x7fc00000, it would be 0x7fc0), an infinite one's signed infinities (0x7f800000, 0xff800000;
+    0x7f80, 0xff80) or that NaN, the -0 scale's 0x80000000 and 0x8000; 65504 on extreme codes stays finite in both, and
+    class E-tiny's nonzero values, n * 2^-24, are normal in both. basalt's fixtures have none of these scales:
+    dequant_bf16_test reads real tensors, and dequant_f16_parity.cpp:45 gives every block a normal one."""
+    run_e(e, "f32")
+    run_e(e, "bf16")
 
 
 BF16_PROBE = """
