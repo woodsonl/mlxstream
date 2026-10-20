@@ -59,38 +59,37 @@ NAN_R = 0xFFC00001
 W_COL = len(PAIRS)                 # block output 1 and residual +0 in every stream: the output is the weight itself
 
 
-def planted(n_embd, T, plant):
-    """gr_fixture's residuals (stream scales 1, 4, 16, 64) and block outputs with uniform injections in [-100, 100];
-    ``plant``: PLANTS in the injections' first slots, PAIRS in token 0's stream 0, and column W_COL of every token
-    reading out each stream's weight (``fma(1, w, +0) = w``: a weight of +0 and an unflushed reciprocal's 2^-125 store
-    the same bits against a residual of order 1). Also the planted slot count."""
+def planted(n_embd, T):
+    """gr_fixture's residuals (stream scales 1, 4, 16, 64) and block outputs with uniform injections in [-100, 100],
+    then PLANTS in the injections' first slots (at T = 1 its first four: +0, -350, 70, NaN), PAIRS in token 0's stream
+    0, and column W_COL of every token reading out each stream's weight (``fma(1, w, +0) = w``: a weight of +0 and an
+    unflushed reciprocal's 2^-125 store the same bits against a residual of order 1). Also the planted slot count."""
     R, bo, _ = ref.gr_fixture(n_embd, HC, T)
     inj = np.random.default_rng(5).uniform(-100.0, 100.0, (T, HC)).astype(F32)
-    k = min(len(PLANTS), T * HC) if plant else 0
+    k = min(len(PLANTS), T * HC)
     inj.reshape(-1)[:k] = [v for v, _ in PLANTS[:k]]
-    if plant:
-        for d, (b, r, _) in enumerate(PAIRS):
-            bo[0, d] = b
-            R[0, 0, d] = np.nan if r is None else r
-        R.view(U32)[0, 0, len(PAIRS) - 1] = NAN_R
-        bo[:, W_COL], R[:, :, W_COL] = 1.0, 0.0
+    for d, (b, r, _) in enumerate(PAIRS):
+        bo[0, d] = b
+        R[0, 0, d] = np.nan if r is None else r
+    R.view(U32)[0, 0, len(PAIRS) - 1] = NAN_R
+    bo[:, W_COL], R[:, :, W_COL] = 1.0, 0.0
     return R, bo, inj, k
 
 
 @pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "separate_output"])
-@pytest.mark.parametrize("n_embd, T, plant", [(2560, 1, False), (2560, 8, True), (100, 3, True)])
-def test_matches_emulation_bit_for_bit(n_embd, T, plant, in_place):
+@pytest.mark.parametrize("n_embd, T", [(2560, 1), (2560, 8), (100, 3)])
+def test_matches_emulation_bit_for_bit(n_embd, T, in_place):
     """HG-EMU. Every element of rows < T has the emulation's bits; each planted injection's stream has the bits of
     its exact weight (``fma(w, bo, R)``, ``.FTZ``, with no exponential; at column W_COL the weight's own bits); token
     0's stream 0 the PAIRS' bits; the non-finite outputs are exactly the planted NaN stream and residual. The separate
     output equals basalt's in-place call byte for byte, all 8 rows."""
-    R, bo, inj, k = planted(n_embd, T, plant)
+    R, bo, inj, k = planted(n_embd, T)
     out = write(R, bo, inj, T, n_embd, in_place)
     got = out[:T]
     want = ref.gr_post_emulation(R, bo, inj, HC, gpu.expf_ftz)
     bad = np.argwhere(got.view(U32) != want.view(U32))
     nonfinite = np.count_nonzero(~np.isfinite(got))
-    planted_nan = (n_embd + 1) if plant else 0               # the NaN injection's stream, and the NaN residual
+    planted_nan = n_embd + 1                                  # the NaN injection's stream, and the NaN residual
     print(f"HG-EMU n_embd {n_embd} T {T} {'in place' if in_place else 'separate output'}: {len(bad)} of {got.size} "
           f"elements differ; {nonfinite} non-finite ({planted_nan} planted)")
     if len(bad):
@@ -104,8 +103,7 @@ def test_matches_emulation_bit_for_bit(n_embd, T, plant, in_place):
         exact = np.full(n_embd, 0x7FFFFFFF, U32) if w is None else \
             ref.cuda_nan(emu.fma_ftz(F32(w), bo[t], R[t, c])).view(U32)
         assert np.array_equal(got[t, c].view(U32), exact), f"inject {PLANTS[j][0]} does not give w = {w}"
-    if plant:
-        assert [int(v) for v in got[0, 0, : len(PAIRS)].view(U32)] == [p[2] for p in PAIRS]
+    assert [int(v) for v in got[0, 0, : len(PAIRS)].view(U32)] == [p[2] for p in PAIRS]
     assert nonfinite == planted_nan, "a non-finite output nothing planted"
     if not in_place:
         assert np.array_equal(out.view(U32), write(R, bo, inj, T, n_embd, True).view(U32)), \
