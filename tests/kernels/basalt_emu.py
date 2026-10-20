@@ -791,3 +791,28 @@ def q5k_proxy_final(cand, part, exact, map_, expf):
         s[:k] = add_ftz(s[:k], ed[c0:c0 + k])
     total = max_ftz(butterfly(s[None], add_ftz)[0], F32(1.0 if bi in rows else 0.0))
     return int(np.asarray(map_)[bi]), rcp_ftz(total), rows
+
+
+# ---- the n-gram block's grouped RMSNorm (docs/research/basalt-nvcc/ple.md section 1) --------------------------------
+# native_gr_norm.cu builds with --use_fast_math: every FMA, add and multiply is .FTZ.
+
+def gr_norm(x, gamma, n_rows, n_cols, gamma_rows, eps, rsqrt):
+    """weighted_rms_norm<block> (native_gr_rms_norm_weighted) as ple.md section 1 records it, on ``n_rows`` rows of
+    ``n_cols`` float32 values ``x``, row r with row r % ``gamma_rows`` of ``gamma``; block = 256 below 1024 columns,
+    else 1024 (native_gr_norm.cu:93-96). Thread t squares columns t, t + block, ... in order, fma(v, v, acc) from +0;
+    the XOR butterfly per warp; every warp's butterfly over the 32 slots (the block / 32 warp sums, then +0s); scale =
+    rsq(fma(sum, rcp(f(n_cols)), eps)); y = fl(fl(scale * x) * gamma), all .FTZ, with the correctly rounded reciprocal
+    in place of MUFU.RCP. ``rsqrt`` evaluates the kernel's rsqrtf_ftz (MUFU.RSQ and fast::rsqrt have no bit-exact host
+    model). Returns (n_rows, n_cols) float32."""
+    block = 1024 if n_cols >= 1024 else 256
+    x = np.asarray(x, F32).reshape(n_rows, n_cols)
+    g = np.asarray(gamma, F32).reshape(gamma_rows, n_cols)[np.arange(n_rows) % gamma_rows]
+    acc = np.zeros((n_rows, block), F32)
+    for c0 in range(0, n_cols, block):
+        c = np.arange(c0, min(c0 + block, n_cols))
+        acc[:, c - c0] = fma_ftz(x[:, c], x[:, c], acc[:, c - c0])
+    slots = np.zeros((n_rows, 32), F32)
+    slots[:, : block // 32] = butterfly(acc.reshape(-1, 32), add_ftz).reshape(n_rows, block // 32)
+    total = butterfly(slots, add_ftz)
+    scale = np.asarray(rsqrt(fma_ftz(total, rcp_ftz(F32(n_cols)), F32(eps))), F32)
+    return mul_ftz(mul_ftz(scale[:, None], x), g)

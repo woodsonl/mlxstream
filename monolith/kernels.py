@@ -701,6 +701,42 @@ def basalt_q5k_proxy_params(n_cap: int, *, row0: int = 0, n: int = 0, n_rows: Op
     return struct.pack("<IIII", row0, n, n_cap, n_rows or 0)
 
 
+# ---- basalt's grouped RMSNorm (kernels/common/basalt_gr_norm.metal; docs/research/basalt-nvcc/ple.md) ----
+# The launch rules below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_gr_norm.cu:85-100 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+def basalt_gr_norm_source() -> str:
+    """basalt's ``native_gr_rms_norm_weighted``, ``weighted_rms_norm<256>`` and ``<1024>`` (``basalt_gr_norm``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_gr_norm.metal")
+
+
+def basalt_gr_norm_macros(n_cols: int) -> Dict[str, str]:
+    """basalt's block choice (native_gr_norm.cu:93-96): 256 threads below 1024 columns, 1024 from there."""
+    return {"NORM_BLOCK": "1024" if n_cols >= 1024 else "256"}
+
+
+def basalt_gr_norm_params(n_cols: int, gamma_rows: int, eps: float) -> bytes:
+    """``GrNormParams``: n_cols, gamma_rows (row r is normalized with gamma row r % gamma_rows) and eps as float32
+    bits. basalt's refusals (native_gr_norm.cu:87), eps taken as its float: n_cols outside its int's 1..INT_MAX (which
+    also keeps the column loop's counter from wrapping), or eps not finite or below 0; and a gamma_rows below 1."""
+    import numpy as np
+
+    with np.errstate(over="ignore"):
+        e = np.float32(eps)
+    if not 0 < n_cols < 2 ** 31 or gamma_rows <= 0 or not np.isfinite(e) or e < 0:
+        raise ValueError(f"basalt_gr_norm: require 1 <= n_cols <= INT_MAX, gamma_rows >= 1 and a finite eps >= 0 "
+                         f"(n_cols {n_cols}, gamma_rows {gamma_rows}, eps {eps})")
+    return struct.pack("<4I", n_cols, gamma_rows, int(e.view(np.uint32)), 0)
+
+
+def basalt_gr_norm_grid(n_rows: int, macros: Mapping[str, str]) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup): one threadgroup of NORM_BLOCK threads per row; basalt refuses
+    n_rows below 1 (native_gr_norm.cu:87)."""
+    if n_rows <= 0:
+        raise ValueError(f"basalt_gr_norm: n_rows must be positive, got {n_rows}")
+    return n_rows, int(macros["NORM_BLOCK"])
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
