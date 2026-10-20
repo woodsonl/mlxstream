@@ -47,7 +47,7 @@ from __future__ import annotations
 import json
 import re
 import struct
-from collections import namedtuple
+from collections import Counter, namedtuple
 from pathlib import Path
 from typing import Tuple
 
@@ -111,10 +111,12 @@ def copy_list(f: BasaltFile) -> Tuple[Hc8Entry, ...]:
     is refused by ``emit_program``, where basalt's read ends the process (``hc_fused.cu:1442-1445``).
 
     Raises ``ValueError`` naming the row or cause for a file with an ``hc8`` section, a target row that is in ``gguf``,
-    not kind 4 (BF16 as stored) or not ``ne0 * ne1 * 2`` bytes, a drafter row not ``bf16`` of ``rows * cols * 2``
-    bytes, an empty matrix (``rows`` or ``cols`` 0, of which basalt makes no copy: ``hc_fused.cu:1253``, ``:1270``),
-    ``cols % 32 != 0``, and a table name of 128 bytes or more (``hc8_write``'s limit,
-    ``src/core/model_file.cpp:443``)."""
+    not kind 4 (BF16 as stored) or not ``ne0 * ne1 * 2`` bytes, a drafter row not ``bf16`` of ``rows * cols * 2`` bytes,
+    a copied matrix that two rows of its index name (``BasaltSource`` refuses two entries of one name,
+    ``monolith/packs/basalt.py:106``; basalt would copy the first of two injections, ``mtp.cpp:189-193``, ``:495``, and
+    both of two down or up matrices, ``:257-267``), an empty matrix (``rows`` or ``cols`` 0, of which basalt makes no
+    copy: ``hc_fused.cu:1253``, ``:1270``), ``cols % 32 != 0``, and a table name of 128 bytes or more (``hc8_write``'s
+    limit, ``src/core/model_file.cpp:443``)."""
     if "hc8" in f.sections:
         raise ValueError("copy_list: the file has an 'hc8' section, a table of copies basalt would adopt as it stands: "
                          "this port builds its own copies from the BF16 rows and does not read a precomputed hc8 table")
@@ -129,20 +131,24 @@ def copy_list(f: BasaltFile) -> Tuple[Hc8Entry, ...]:
             raise ValueError(f"copy_list: {src}: {why}")
         out.append(Hc8Entry(name, src, offset, rows, cols))
 
-    rows, base = {r.name: r for r in f.dense_index().rows}, f.section("dense").offset
+    dense = f.dense_index().rows
+    rows, named, base = {r.name: r for r in dense}, Counter(r.name for r in dense), f.section("dense").offset
     hc = sorted((int(m[1]), ("attn", "ffn").index(m[2]), ("down", "up", "inject").index(m[3]), n)
                 for n in rows if (m := TARGET.fullmatch(n)))
     for n in [n for *_, n in hc] + [n for n in OUTPUT if n in rows]:
         r = rows[n]
         add(n, f"dense/{n}", base + r.src_off, r.ne1, r.ne0,
+            f"{named[n]} rows of dense.index are named {n!r}" if named[n] > 1 else
             "its bytes are in gguf" if r.in_gguf else
             f"kind {r.kind}, not 4 (BF16 as stored)" if r.kind != 4 else
             f"{r.src_bytes} bytes, not {r.ne1} x {r.ne0} BF16" if r.src_bytes != r.ne0 * r.ne1 * 2 else None)
     mtp, base = (f.mtp_dense_index(), f.section("mtp/dense").offset) \
         if "mtp/dense.index" in f.sections else ((), 0)                          # a file with no drafter
+    named = Counter(t.name for t in mtp)
     for t in mtp:                                 # the index's line order, hc8_keys' (mtp.cpp:516-521)
         if t.name in DRAFTER:
             add("mtp." + t.name, f"mtp/{t.name}", base + t.offset, t.rows, t.cols,
+                f"{named[t.name]} rows of mtp/dense.index are named {t.name!r}" if named[t.name] > 1 else
                 f"kind {t.kind!r}, not 'bf16'" if t.kind != "bf16" else
                 f"{t.nbytes} bytes, not {t.rows} x {t.cols} BF16" if t.nbytes != t.rows * t.cols * 2 else None)
     return tuple(out)

@@ -265,7 +265,8 @@ def _basalt(dense=DENSE, mtp=MTP, **sections):
 def test_refusals():
     """HC8-REFUSE: ``copy_list`` on a valid synthetic file lists its copies in basalt's order, each at its BF16 bytes
     (and the target's alone when the file has no drafter); the same file with one defect is refused, each defect by
-    its own message naming its row or cause; then ``quantize``'s own refusals."""
+    its own message naming its row or cause (a copied matrix named twice among them, as ``BasaltSource`` refuses two
+    entries of one name); then ``quantize``'s own refusals."""
     f = _basalt()
     d, m = f.section("dense").offset, f.section("mtp/dense").offset
     target, drafter = (5, 4, 2, 0, 1), (1, 2, 3)                        # DENSE's and MTP's rows in basalt's order
@@ -284,6 +285,11 @@ def test_refusals():
     down = r"^copy_list: dense/blk\.2\.hc_attn_down\.weight: "
     for defect, why in [
             (dict(hc8=b"BASALTH8" + bytes(8)), r"^copy_list: the file has an 'hc8' section"),
+            (dict(dense=DENSE + (_dense(6, "blk.2.hc_attn_down.weight", 64, 2),)),            # a copied name twice
+             down + r"2 rows of dense\.index are named 'blk\.2\.hc_attn_down\.weight'$"),
+            (dict(mtp=MTP + (MtpTensor("mlp_hyper_connection.block_inject_weight.weight", "bf16", 4, 64, 16384, 512),)),
+             r"^copy_list: mtp/mlp_hyper_connection\.block_inject_weight\.weight: 2 rows of mtp/dense\.index are named "
+             r"'mlp_hyper_connection\.block_inject_weight\.weight'$"),
             (dict(dense=edit(DENSE, 5, kind=2)), down + r"kind 2, not 4 \(BF16 as stored\)$"),
             (dict(dense=edit(DENSE, 5, src_bytes=255)), down + r"255 bytes, not 2 x 64 BF16$"),
             (dict(dense=edit(DENSE, 4, kind=0, src_bytes=0, dst_bytes=0, code_bits=8)),
