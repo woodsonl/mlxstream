@@ -10,7 +10,7 @@ from monolith import kernels
 from monolith.core.step_state import StepStateLayout
 from monolith.runtime import _native as nt
 from tests.contract.test_basalt_ops import spliced
-from tests.kernels.basalt_gpu import device, pipeline
+from tests.kernels.basalt_gpu import device, pipeline, run
 
 
 def prompt_pipeline(source, name, B, macros=()):
@@ -69,3 +69,45 @@ def convert(x, *, bf16, B, rows, fill=0xFF):
     y = run_rows(pso, [x.tobytes(), 2 * B * n], kernels.basalt_prompt_convert_params(n), 2, (-(-B * n // 256), 1, 1),
                  (256, 1, 1), rows, 0, fill=fill)[1]
     return np.frombuffer(y, np.uint16).reshape(B, n)
+
+
+
+def prompt_hc(entry, ins, out_bytes, *, B, rows, n=2560, lr=320, mix_bf=1, static=False, slices=None, fill=0xFF,
+              done=0):
+    """basalt_prompt_hc's kernel ``entry`` compiled at bound ``B`` with the handler's macros (HC_N ``n``, HC_LR
+    ``lr``, MIX_BF ``mix_bf``, HC_EPS 1e-6f), dynamic (``rows`` and ``done`` in StepState) or, with ``static``, a
+    static program's (T_STATIC_ROWS ``rows``; t_this_step 1, as its advance leaves it). ``ins`` (bytes) bind at slots
+    0, 1, ... and the outputs (``out_bytes`` byte counts, exactly B rows each, starting as ``fill`` bytes) after them,
+    the kernel's slots; one run_rows per slice ``(row0, S)`` (default the handler's, kernels.basalt_prompt_hc_slices(B))
+    on the same outputs, 4 S threadgroups of 256 for a row kernel, ceil(S * W / 256) for an element kernel. Returns
+    every input's and output's bytes as the last run left them."""
+    eps = int(np.float32(1e-6).view(np.uint32))
+    macros = {"HC_N": str(n), "HC_LR": str(lr), "MIX_BF": str(mix_bf), "HC_EPS": f"as_type<float>(0x{eps:08X}u)"}
+    if static:
+        macros.update(T_SRC="2", T_STATIC_ROWS=f"{rows}u")
+    pso = prompt_pipeline(kernels.basalt_prompt_hc_source(), entry, B, macros)
+    width = {"prompt_gr_mix_r": n, "prompt_gr_silu": lr, "prompt_gr_write": 4 * n,   # an element kernel's W
+             "prompt_gr_broadcast": 4 * n}.get(entry)                                   # (row kernels: None)
+    bufs = [*ins, *(bytes([fill]) * k for k in out_bytes)]
+    for row0, s in kernels.basalt_prompt_hc_slices(B) if slices is None else slices:
+        grid = (4 * s, 1, 1) if width is None else (-(-s * width // 256), 1, 1)
+        bufs = run_rows(pso, bufs, kernels.basalt_prompt_hc_params(row0), 7, grid, (256, 1, 1), 1 if static else rows,
+                        0, done=done)[:-1]
+    return bufs
+
+
+def hc_probe(fn, x):
+    """``fast::rsqrt`` ("rsqrt"), ``expf_ieee(sign_flip(x))`` ("exp_neg") or ``fast::exp2`` ("exp2") of each float of
+    ``x`` on this GPU, one thread per value (a test-only kernel, no op kind): the approximate operations' values the
+    host twins take. Returns float32 of ``x``'s shape."""
+    probe = {"rsqrt": "fast::rsqrt(v)", "exp_neg": "expf_ieee(sign_flip(v))", "exp2": "fast::exp2(v)"}[fn]
+    src = (kernels.PRELUDE + kernels.template("basalt_fp.metal") + kernels.template("basalt_ieee.metal")
+           + f"#define PROBE(v) {probe}\n"
+           + "kernel void hc_probe(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],\n"
+           + "                     uint i [[thread_position_in_grid]]) { y[i] = PROBE(x[i]); }\n")
+    x = np.ascontiguousarray(x, np.float32)
+    m = -(-max(x.size, 1) // 256) * 256                      # whole threadgroups of 256: x padded with zeros
+    xp = np.zeros(m, np.float32)
+    xp.view(np.uint32)[: x.size] = x.view(np.uint32).ravel()   # bits, NaN payloads included
+    y = run(pipeline(src, "hc_probe"), [xp.tobytes(), 4 * m], None, 0, m // 256, 256)[1]
+    return np.frombuffer(y, np.float32)[: x.size].reshape(x.shape)

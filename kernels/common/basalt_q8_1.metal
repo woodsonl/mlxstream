@@ -3,7 +3,8 @@
 // Adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu:146-177, src/kernels/cuda/iq_kernels.cu:1880-1900
 // and include/basalt/kernels/q8_1_finite.hpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE),
 // which adapt ggml-org/llama.cpp ggml/src/ggml-cuda/quantize.cu @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT;
-// third_party/NOTICE).
+// third_party/NOTICE). block_sum is adapted from basalt src/prefill/kernels.cu:45-58 (basalt's own code)
+// @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 //
 // basalt's q8_1 activation quantizers. A q8_1 block is 36 bytes: the fp16 scale d (bytes 0-1), the fp16 sum s of the
 // block's 32 raw values (bytes 2-3), 32 int8 codes (bytes 4-35); column j's blocks follow column j - 1's, so a vector
@@ -24,8 +25,8 @@
 //   (tests/kernels/test_basalt_platform.py), so wherever a subnormal can occur the IEEE result is rebuilt from integer
 //   operations: amax as the largest bit pattern, the block sum and the codes on operands scaled by 2^64, d = amax / 127
 //   on the subnormal grid by integer division. Above 2^-100 every one of these is the plain operation. The IEEE
-//   helpers (basalt_ieee.metal's ieee_add and ieee_mul; ieee_div127, ieee_rcp, ieee_fma, ieee_div and
-//   warp_sum_ieee here) serve every IEEE-built port kernel.
+//   helpers (basalt_ieee.metal's ieee_add and ieee_mul; ieee_div127, ieee_rcp, ieee_fma, ieee_div, warp_sum_ieee
+//   and block_sum here) serve every IEEE-built port kernel.
 #pragma STDC FP_CONTRACT OFF
 
 struct Q81Params { uint n; uint pad0; uint pad1; uint pad2; };   // n: values (ncols * n_in), a multiple of 32
@@ -146,6 +147,25 @@ static inline float ieee_div(float a, float b) {
 static inline float warp_sum_ieee(float x) {
     for (ushort o = 16; o > 0; o >>= 1) x = ieee_add(x, shfl_xor(x, o));
     return x;
+}
+
+// basalt's block_sum (src/prefill/kernels.cu:45-58): the sum of v over a threadgroup of ntg <= 1024 threads (1-D),
+// returned to every thread; warp_sum_ieee for warp_sum and a threadgroup barrier for each __syncthreads. Each
+// SIMD-group's lane 0 stores its sum in sh[w]; SIMD-group 0 sums sh[0 .. nw) and zeros, nw = (ntg + 31) >> 5 (:52).
+// At ntg = 256 the eight partials fold as ((p0 + p4) + (p2 + p6)) + ((p1 + p5) + (p3 + p7)). Every thread of the
+// threadgroup calls it; callers pass their dispatch width and declare threadgroup float sh[32].
+static inline float block_sum(float v, threadgroup float* sh, uint tid, uint ntg) {
+    const uint lane = tid & 31u, w = tid >> 5;
+    v = warp_sum_ieee(v);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) sh[w] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint nw = (ntg + 31u) >> 5;
+    float t = tid < nw ? sh[tid] : 0.0f;
+    if (w == 0u) t = warp_sum_ieee(t);
+    if (tid == 0u) sh[0] = t;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return sh[0];
 }
 
 static inline void q8_1_store_ieee(float xi, device uchar* y, uint i) {

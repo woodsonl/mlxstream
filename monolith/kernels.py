@@ -939,6 +939,36 @@ def basalt_dequant16_grid(rows: int, cols: int) -> Tuple[int, int]:
     return grid, DEQUANT16_THREADS
 
 
+# ---- basalt's prompt path: the hyper-connection kernels (kernels/common/basalt_prompt_hc.metal; docs/research/basalt-nvcc/prefill_kernels.md) ----
+
+PROMPT_HC_ROWS = 1 << 30   # a placeholder until measured on this Mac: the rows one hyper-connection dispatch covers
+
+
+def basalt_prompt_hc_source() -> str:
+    """basalt's prompt hyper-connection kernels (src/prefill/kernels.cu:85-204): the shared helpers, the IEEE binary32
+    operations, the software binary64 and ``fma_ieee`` on it, the q8_1 file (``ieee_div``, ``warp_sum_ieee``,
+    ``block_sum``; its quantizers compile along), the rows, then ``basalt_prompt_hc.metal``'s ``prompt_gr_*``."""
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
+            + template("basalt_ieee_f64.metal") + template("basalt_q8_1.metal") + PROMPT_ROWS
+            + template("basalt_prompt_hc.metal"))
+
+
+def basalt_prompt_hc_slices(rows: int, slice_rows: Optional[int] = None) -> List[Tuple[int, int]]:
+    """The static row slices ``(row0, S)`` of a hyper-connection op at bound ``rows`` (B), each its own dispatch and
+    params record: S = min(slice_rows, B - row0), ``slice_rows`` a positive multiple of 64, by default PROMPT_HC_ROWS
+    as it is at the call. So every slice but the last is a multiple of 64 rows. Slices change no bit (rows are
+    independent)."""
+    slice_rows = PROMPT_HC_ROWS if slice_rows is None else slice_rows
+    if slice_rows <= 0 or slice_rows % 64:
+        raise ValueError(f"basalt_prompt_hc: a slice must be a positive multiple of 64 rows, got {slice_rows}")
+    return [(row0, min(slice_rows, rows - row0)) for row0 in range(0, rows, slice_rows)]
+
+
+def basalt_prompt_hc_params(row0: int) -> bytes:
+    """``PromptHcParams``: the slice's first row (a compile-time value: the rows come from StepState)."""
+    return struct.pack("<I", row0)
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
