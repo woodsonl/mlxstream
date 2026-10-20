@@ -8,13 +8,14 @@ of tests/basalt_gdn_ref.py.
   output's bytes from row T on must keep their 0xFF: an activation's row T, the window stores' rows T..7 and their row
   8. ``launch`` reports that as ``sentinel_ok``, asserts the run's error empty and returns its result (``gpu_ms``)
   with every buffer's bytes after the run, the inputs' included (the state's: the window must leave it untouched).
+- ``ab``: ``gdn_ab_multi``, the window's gate and beta from x's rows.
 """
 
 import numpy as np
 
 from monolith import kernels
 from monolith.runtime import _native as nt
-from tests.basalt_gdn_ref import C, EPS, HK, HV, N
+from tests.basalt_gdn_ref import C, EPS, F32, HK, HV, N
 from tests.kernels import basalt_gpu as gpu
 
 PARAMS_SLOT = 16
@@ -49,3 +50,13 @@ def launch(pso, t, inputs, outputs, grid, threads):
     assert not r.error, r.error
     got = {k: np.frombuffer(b.read(0, b.nbytes), np.uint8) for k, b in bufs.items()}
     return r, got, all((got[k][t * row_bytes:] == FILL).all() for k, (_, row_bytes) in outputs.items())
+
+
+def ab(layer, x):
+    """``gdn_ab_multi`` over the window of x's rows (T = len(x), each of N floats; x bound at exactly those rows) with
+    ``layer``'s w_alpha, w_beta, dt and ssm_a: (gate, beta), (T, HV) float32 each, and sentinel_ok."""
+    t = len(x)
+    _, got, ok = launch(pipeline("gdn_ab_multi"), t, {0: np.asarray(x, F32), 1: layer.wa, 2: layer.wb, 3: layer.dt,
+                                                      4: layer.ssm_a}, {5: (t, 4 * HV), 6: (t, 4 * HV)}, (HV,), 64)
+    gate, beta = (got[k][: 4 * HV * t].view(F32).reshape(t, HV) for k in (5, 6))
+    return gate, beta, ok
