@@ -953,15 +953,14 @@ def basalt_prompt_hc_source() -> str:
             + template("basalt_prompt_hc.metal"))
 
 
-def basalt_prompt_hc_slices(rows: int, slice_rows: Optional[int] = None) -> List[Tuple[int, int]]:
-    """The static row slices ``(row0, S)`` of a hyper-connection op at bound ``rows`` (B), each its own dispatch and
-    params record: S = min(slice_rows, B - row0), ``slice_rows`` a positive multiple of 64, by default PROMPT_HC_ROWS
-    as it is at the call. So every slice but the last is a multiple of 64 rows. Slices change no bit (rows are
-    independent)."""
-    slice_rows = PROMPT_HC_ROWS if slice_rows is None else slice_rows
-    if slice_rows <= 0 or slice_rows % 64:
-        raise ValueError(f"basalt_prompt_hc: a slice must be a positive multiple of 64 rows, got {slice_rows}")
-    return [(row0, min(slice_rows, rows - row0)) for row0 in range(0, rows, slice_rows)]
+def basalt_prompt_hc_slices(B: int, rows: Optional[int] = None) -> List[Tuple[int, int]]:
+    """The static row slices ``(row0, S)`` of a hyper-connection op at bound ``B``, each its own dispatch and params
+    record: S = min(rows, B - row0), ``rows`` a positive multiple of 64, by default PROMPT_HC_ROWS as it is at the
+    call. So every slice but the last is a multiple of 64 rows. Slices change no bit (rows are independent)."""
+    rows = PROMPT_HC_ROWS if rows is None else rows
+    if rows <= 0 or rows % 64:
+        raise ValueError(f"basalt_prompt_hc: a slice must be a positive multiple of 64 rows, got {rows}")
+    return [(row0, min(rows, B - row0)) for row0 in range(0, B, rows)]
 
 
 def basalt_prompt_hc_params(row0: int) -> bytes:
