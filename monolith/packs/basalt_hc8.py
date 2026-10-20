@@ -38,11 +38,20 @@ offset plus ``rows * cols``.
 
 from __future__ import annotations
 
+import re
+from collections import namedtuple
 from typing import Tuple
 
 import numpy as np
 
+from ..formats.basalt_reader import BasaltFile
+
 G8 = 32                                           # values per scale group (hc_fused.cu:343)
+Hc8Entry = namedtuple("Hc8Entry", "name src offset rows cols")   # offset: of the BF16 bytes, from the file's start
+TARGET = re.compile(r"blk\.(\d+)\.hc_(attn|ffn)_(down|up|inject)\.weight")       # hc8_tensors (verify.cpp:566-581)
+OUTPUT = ("output_hc_down.weight", "output_hc_up.weight")                        # its last two (:578-579)
+DRAFTER = tuple(p + m for p in ("attn_hyper_connection.", "mlp_hyper_connection.", "hyper_connection_mixer.")
+                for m in ("input_mix_weight_down.weight", "input_mix_weight_up.weight", "block_inject_weight.weight"))
 
 
 def quantize(w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -75,3 +84,52 @@ def quantize(w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     sc = np.zeros((rows, (gpr + 7) & ~7), np.uint16)                            # hc8_make's memset (:1223)
     sc[:, :gpr] = h.view(np.uint16).reshape(rows, gpr)                          # :1183
     return q, sc
+
+
+def copy_list(f: BasaltFile) -> Tuple[Hc8Entry, ...]:
+    """The matrices basalt copies on one GPU, in its order, from the file's index sections alone (no weight byte is
+    read). ``name`` is basalt's table name, ``src`` the IR name of the BF16 row (for messages), ``offset`` its byte
+    offset in the file, ``rows`` x ``cols`` the copy's shape. The target's come first, in ``hc8_tensors``' order
+    (``src/core/verify.cpp:566-581``): per layer, ascending, ``blk.L.hc_attn_{down,up,inject}.weight`` then
+    ``blk.L.hc_ffn_{down,up,inject}.weight``, then ``output_hc_{down,up}.weight``, each a ``dense/`` row of
+    ``ne1`` x ``ne0`` (``generate.cpp:2326``, ``:2350``); then the drafter's, named ``"mtp." + name``, in its load's
+    order (``mtp.cpp:488-503``): per hyper-connection (attention, MLP, the final mixer) the ``input_mix_weight_down``,
+    ``input_mix_weight_up`` and ``block_inject_weight`` tensors of ``mtp/dense.index``. A matrix the file lacks is left
+    out, as basalt's ``prepare_hc8`` leaves it (``verify.cpp:604``); a graph that reads its copy is refused by
+    ``emit_program``, where basalt's read ends the process (``hc_fused.cu:1442-1445``).
+
+    Raises ``ValueError`` naming the row or cause for a file with an ``hc8`` section, a target row that is in ``gguf``,
+    not kind 4 (BF16 as stored) or not ``ne0 * ne1 * 2`` bytes, a drafter row not ``bf16`` of ``rows * cols * 2``
+    bytes, ``cols % 32 != 0``, and a table name of 128 bytes or more (``hc8_write``'s limit,
+    ``src/core/model_file.cpp:443``)."""
+    if "hc8" in f.sections:
+        raise ValueError("copy_list: the file has an 'hc8' section, a table of copies basalt would adopt as it stands: "
+                         "this port builds its own copies from the BF16 rows and does not read a precomputed hc8 table")
+    out = []
+
+    def add(name, src, offset, rows, cols, why):
+        why = why or (f"{rows} x {cols}: its columns are not whole groups of {G8}" if cols % G8 else
+                      f"a table name of {len(name.encode())} bytes; hc8_write's hold at most 127"
+                      if len(name.encode()) >= 128 else None)
+        if why:
+            raise ValueError(f"copy_list: {src}: {why}")
+        out.append(Hc8Entry(name, src, offset, rows, cols))
+
+    rows, base = {r.name: r for r in f.dense_index().rows}, f.section("dense").offset
+    hc = sorted((int(m[1]), ("attn", "ffn").index(m[2]), ("down", "up", "inject").index(m[3]), n)
+                for n in rows if (m := TARGET.fullmatch(n)))
+    for n in [n for *_, n in hc] + [n for n in OUTPUT if n in rows]:
+        r = rows[n]
+        add(n, f"dense/{n}", base + r.src_off, r.ne1, r.ne0,
+            "its bytes are in gguf" if r.in_gguf else
+            f"kind {r.kind}, not 4 (BF16 as stored)" if r.kind != 4 else
+            f"{r.src_bytes} bytes, not {r.ne1} x {r.ne0} BF16" if r.src_bytes != r.ne0 * r.ne1 * 2 else None)
+    mtp, base = ({t.name: t for t in f.mtp_dense_index()}, f.section("mtp/dense").offset) \
+        if "mtp/dense.index" in f.sections else ({}, 0)                          # a file with no drafter
+    for n in DRAFTER:
+        if n in mtp:
+            t = mtp[n]
+            add("mtp." + n, f"mtp/{n}", base + t.offset, t.rows, t.cols,
+                f"kind {t.kind!r}, not 'bf16'" if t.kind != "bf16" else
+                f"{t.nbytes} bytes, not {t.rows} x {t.cols} BF16" if t.nbytes != t.rows * t.cols * 2 else None)
+    return tuple(out)

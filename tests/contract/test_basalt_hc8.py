@@ -8,14 +8,17 @@ the copies' bits (hc8_parity prints the down copy's relative rms error and gates
 test here is the port's own, under the contract's rule for quantizer codes: byte for byte (quantize_act_parity's ``if
 (g_blocks[i] != r_blocks[i]) ++byte_bad;``). ``quantize`` is held against ``tests/basalt_hc_ref.py``'s scalar
 transcription of ``hc8_quant_kernel``, written apart from it, and against groups whose scale and codes are worked out
-by hand from basalt's arithmetic and written below."""
+by hand from basalt's arithmetic and written below. ``copy_list`` is held against basalt's own lists of the copied
+matrices on the official pack's index sections, and against synthetic files with one defect each."""
 
 import numpy as np
 import pytest
 
 from monolith.formats.fp import bf16_to_f32, f32_to_bf16
-from monolith.packs.basalt_hc8 import quantize
+from monolith.packs.basalt import HC8
+from monolith.packs.basalt_hc8 import copy_list, quantize
 from tests.basalt_hc_ref import dequant_copy, hc8_parity_matrices, hc8_quant_scalar
+from tests.contract.test_basalt_windows import real_source
 
 
 def _differing_groups(w, q, s, q_ref, sc_ref, at=None):
@@ -169,3 +172,46 @@ def test_matrices_through_both_transcriptions(matrices):
         a = bf16_to_f32(w).astype(np.float64)
         print(f"HC8-MATS: the {name} copy's relative rms error against its BF16 matrix "
               f"{np.sqrt(((a - dequant_copy(q, s, cols)) ** 2).sum() / (a * a).sum()):.3e}")
+
+
+def test_copy_list_on_the_pack_index():
+    """HC8-INDEX: ``copy_list`` on the official pack's header and index sections (``real_source``, whose range reader
+    raises on any other byte: the list reads no weight byte). The 290 target copies in ``hc8_tensors``' order
+    (``src/core/verify.cpp:566-581``), then the drafter's 8 in its load's order (``src/core/mtp.cpp:488-503``; the final
+    mixer has no injection), each of its shape (down ``320 x 10240``, up ``10240 x 320``, injection ``4 x 10240``), with
+    basalt's byte totals; the down and up matrices are exactly those the source refuses as ``HC8`` (basalt holds them
+    only as their copies), and every injection is a bindable BF16 entry at the copy's offset and shape."""
+    src, _ = real_source()
+    es = copy_list(src.file)
+    names = [f"blk.{l}.{p}{m}.weight" for l in range(48) for p in ("hc_attn_", "hc_ffn_") for m in ("down", "up", "inject")]
+    names += ["output_hc_down.weight", "output_hc_up.weight"] + [
+        "mtp." + p + m for p in ("attn_hyper_connection.", "mlp_hyper_connection.", "hyper_connection_mixer.")
+        for m in ("input_mix_weight_down.weight", "input_mix_weight_up.weight", "block_inject_weight.weight")
+        if p + m != "hyper_connection_mixer.block_inject_weight.weight"]
+    got = [e.name for e in es]
+    at = next((i for i, (a, b) in enumerate(zip(got, names)) if a != b), min(len(got), len(names)))
+    assert got == names and [e.src for e in es] == [f"mtp/{n[4:]}" if n.startswith("mtp.") else f"dense/{n}"
+                                                    for n in names], \
+        f"HC8-INDEX: 298 entries, blk.0.hc_attn_down.weight, blk.0.hc_attn_up.weight, blk.0.hc_attn_inject.weight, " \
+        f"blk.0.hc_ffn_down.weight ..., output_hc_down.weight and output_hc_up.weight 289th and 290th, then the 8 mtp. " \
+        f"names, each src its dense/ or mtp/ row: {len(got)} entries, the first difference at {at}: " \
+        f"{es[at:at + 1]} for {names[at:at + 1]}"
+
+    role = lambda n: "inject" if "inject" in n else "down" if n.endswith("down.weight") else "up"
+    shape = {"down": (320, 10240), "up": (10240, 320), "inject": (4, 10240)}
+    nbytes = lambda e: e.rows * e.cols + e.rows * ((e.cols // 32 + 7) & ~7) * 2
+    totals = sum(map(nbytes, es[:290])), sum(map(nbytes, es[290:]))
+    off = [e for e in es if (e.rows, e.cols) != shape[role(e.name)]]
+    assert not off and totals == (691_527_680, 21_345_280), \
+        f"HC8-INDEX: down 320 x 10240, up 10240 x 320, injection 4 x 10240, and sum(rows * cols + rows * srow * 2) = " \
+        f"691,527,680 over the target and 21,345,280 over the drafter: {off[:1]} of another shape, totals {totals}"
+
+    held = {e.src for e in es if role(e.name) != "inject"}
+    refused = {n for n, why in src.refused.items() if why == HC8 and n.startswith(("dense/", "mtp/"))}
+    inject = [e for e in es if role(e.name) == "inject"]
+    unbound = [e.src for e in inject if src.entries.get(e.src, ())[1:] != (e.offset, 2 * e.rows * e.cols, 30,
+                                                                           (e.rows, e.cols))]
+    assert held == refused and len(held) == 200 and len(inject) == 98 and not unbound, \
+        f"HC8-INDEX: every down/up/output src is refused by BasaltSource with HC8, and every one so refused has a copy " \
+        f"(copies only: {sorted(held - refused)[:3]}, refused only: {sorted(refused - held)[:3]}); every inject src " \
+        f"is a bindable BF16 entry at the copy's offset and shape (not: {unbound[:3]})"
