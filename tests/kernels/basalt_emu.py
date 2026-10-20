@@ -16,6 +16,8 @@ rounded result if it is subnormal, as PTX defines ``.ftz`` (``fma.f32``: the exa
 precision"; ``.ftz`` flushes "subnormal inputs and results"): an exact result in [2^-126 - 2^-150, 2^-126) gives
 2^-126, the tie 2^-126 - 2^-150 included (2^-126 is the even neighbour)."""
 
+from types import SimpleNamespace
+
 import numpy as np
 
 F32 = np.float32
@@ -845,3 +847,136 @@ def rel_norm(y, ref):
     e = np.fmax.reduce(d.ravel(), initial=0.0)
     r = np.fmax.reduce(np.abs(b).astype(np.float64).ravel(), initial=0.0)
     return float(e / r) if r > 0 else float(e)
+
+
+# ---- the prompt path's routed experts: the host expert walk and MMQ's launches (kernels/common/basalt_mmq.metal) -----
+# moe_plan transcribes basalt's host walk (src/prefill/prefill.cpp:1840-1932, :1993-1996 @ b4c63b5); pick_j,
+# mmq_launches and mmq_walk transcribe the launch rules and the stream-k walk of basalt's src/prefill/mmq/mmq.cuh
+# (:487-629, :654-698, :765, :801-833, :867-889) and the per-group launch of prefill.cpp:2242-2248 @ b4c63b5; mmq.cuh is
+# ggml-org/llama.cpp ggml/src/ggml-cuda/mmq.cuh @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+
+MMQ_GROUP = 16                                       # experts per MMQ launch (prefill.cpp:607)
+MMQ_J = (8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128)   # Q2_0's tile widths with fallback false (mmq_config.cuh:15-25)
+
+
+def moe_plan(ids, n_expert, cpu=()):
+    """basalt's host walk over one chunk's routed ids ``ids`` [T, K] on one GPU (no peer): the counts with the range
+    check (prefill.cpp:1840-1845), ``off`` (:1896-1909), ``slot`` and ``src`` (:1911-1917), ``order`` (:1926-1932) and
+    the absolute bounds (:1995-1996). ``cpu`` holds the experts basalt's ``on_cpu`` marks: their rows a last block in
+    id order (:1907-1908), out of ``rows_local`` (:1893) and of ``order``. An id outside [0, n_expert) raises basalt's
+    error (:1843). Returns ``slot`` [T, K] (pair (t, k) to its sorted row), ``src`` [T * K] (sorted row to token),
+    ``n``, ``order`` [n], ``rows_local``, ``bounds`` [n + 1] and ``wpre`` [n + 1], the port's work map: the exclusive
+    prefix of ceil(cnt / 8) in launch order, one work item per 8 rows of an expert."""
+    ids = np.asarray(ids)
+    T, K = ids.shape
+    cnt = np.zeros(n_expert, np.int64)
+    for e in ids.ravel():                                  # :1840-1845
+        if e < 0 or e >= n_expert:
+            raise ValueError("prefill: routed id out of range")
+        cnt[e] += 1
+    on_cpu = np.zeros(n_expert, bool)
+    on_cpu[list(cpu)] = True
+    off, r = np.zeros(n_expert + 1, np.int64), 0
+    for e in range(n_expert):                              # :1898-1902, the GPU's experts in id order
+        if not on_cpu[e]:
+            off[e], r = r, r + cnt[e]
+    for e in range(n_expert):                              # :1907-1908, the CPU's block, last
+        if on_cpu[e]:
+            off[e], r = r, r + cnt[e]
+    off[n_expert] = r
+    rows_local = T * K - int(cnt[on_cpu].sum())            # :1849, :1893
+    fill = off[:-1].copy()
+    slot, src = np.zeros(T * K, np.int32), np.zeros(T * K, np.int32)
+    for i, e in enumerate(ids.ravel()):                    # :1912-1917
+        p = fill[e]
+        fill[e] += 1
+        slot[i], src[p] = p, i // K
+    order = np.array([e for e in range(n_expert) if cnt[e] > 0 and not on_cpu[e]], np.int32)   # :1926-1932
+    bounds = np.append(off[order], rows_local).astype(np.int32)                                 # :1995-1996
+    wpre = np.append(0, np.cumsum(-(-cnt[order] // 8))).astype(np.int32)
+    return SimpleNamespace(slot=slot.reshape(T, K), src=src, n=len(order), order=order, rows_local=rows_local,
+                           bounds=bounds, wpre=wpre)
+
+
+def pick_j(maxr):
+    """mul_mat_q_switch_J (mmq.cuh:867-889) with ncols_opt = max_rows (prefill.cpp never sets opt_rows,
+    moe_mmq.cu:173): the first configured tile width reaching the fewest column tiles. Its shared-memory test never
+    refuses a width on basalt's GPU (57,856 B at most against sm_120's 99 KiB opt-in), so it has no term here."""
+    best, nbest = 0, 2 ** 31 - 1
+    for j in range(8, 129, 8):                             # for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8)
+        if nbest <= 1:
+            break
+        if j in MMQ_J and -(-maxr // j) < nbest:           # a configured J with fewer column tiles
+            best, nbest = j, -(-maxr // j)
+    return best
+
+
+def mmq_launches(bounds, nty, nsm):
+    """The launches of one MoE product over a plan's absolute ``bounds`` [n + 1]: groups of MMQ_GROUP consecutive
+    experts of ``order`` (prefill.cpp:2242-2248: ``ngx``, ``maxr`` the group's largest row count, here a bounds
+    difference), each with its tile width ``J`` (pick_j), column tiles ``ntx`` (mmq.cuh:802), ``ntiles = ntx * nty *
+    ngx`` and the stream-k grid at ``nsm`` multiprocessors (:830-833); ``nty`` is the weight's 128-row tiles (:801)."""
+    cnt = np.diff(np.asarray(bounds, np.int64))
+    out = []
+    for j0 in range(0, len(cnt), MMQ_GROUP):
+        c = cnt[j0:j0 + MMQ_GROUP]
+        ngx, maxr = len(c), int(c.max())
+        J = pick_j(maxr)
+        ntx = -(-maxr // J)
+        ntiles = ntx * nty * ngx
+        nwaves = -(-ntiles // nsm)
+        grid = ntiles if 100 * ntiles // (nsm * nwaves) >= 90 else nsm
+        out.append(SimpleNamespace(j0=j0, ngx=ngx, maxr=maxr, J=J, ntx=ntx, ntiles=ntiles, grid=grid))
+    return out
+
+
+def mmq_pieces(expr):
+    """The chains (lo, hi) of a tile's mmq_walk expression in the order they are added."""
+    return [expr[1:]] if expr[0] == "P" else [] if expr[0] == "zero" else mmq_pieces(expr[1]) + mmq_pieces(expr[2])
+
+
+def mmq_walk(ntiles, bpne, grid, bpi=4):
+    """Every tile's output in one stream-k launch of ``grid`` CTAs over ``ntiles`` tiles of ``bpne`` weight blocks
+    each (``bpi`` blocks per 256-value k iteration), walked over the CTAs as mul_mat_q (mmq.cuh:487-629) and
+    mul_mat_q_stream_k_fixup (:654-698, :765) are written. Tile ``t = (it * ngx + zt) * ntx + jt`` maps to an
+    expression: ``("P", lo, hi)`` one chain from +0 over the tile's k iterations covering blocks [lo, hi) in k order
+    (whole iterations: the down product's last one runs blocks 8 to 11), ``("add", a, b)`` FADD.FTZ, ``("zero",)``
+    +0. A tile a CTA finishes is stored (``=``); the piece a CTA ends inside goes to the fixup's scratch, and the CTA
+    that finishes that tile adds the earlier pieces, nearest first from +0, onto its own. An empty column tile
+    (``jt * J`` at or past its expert's rows) is skipped without a store but keeps its expression here."""
+    W = ntiles * bpne
+    kb = [k - (k % bpne) % bpi for k in (b * W // grid for b in range(grid + 1))]    # :487-491
+    direct, tmp = {}, {}
+    for b in range(grid):
+        kbc, stop = kb[b], kb[b + 1]
+        k0 = kbc % bpne
+        k1 = min(bpne, k0 + stop - kbc)
+        while kbc < stop and k1 == bpne:                   # :496-566, the tiles this CTA finishes
+            direct[kbc // bpne] = ("P", k0, k1)
+            kbc += bpne
+            kbc -= kbc % bpne
+            k0, k1 = 0, min(bpne, stop - kbc)
+        if kbc < stop:                                     # :568-629, the piece it ends inside
+            tmp[b] = (kbc // bpne, ("P", k0, k1))
+    tiles = dict(direct)
+    for b in range(grid):                                  # the fixup, one CTA each (:654-698)
+        k0, k1 = kb[b], kb[b + 1]
+        if k0 == k1 or k0 % bpne == 0 or (k0 // bpne == k1 // bpne and k1 % bpne != 0):
+            continue
+        s, bidx, kstop = ("zero",), b - 1, k0
+        while True:
+            kbc = kb[bidx]
+            if kbc == kstop:                               # no data
+                bidx, kstop = bidx - 1, kbc
+                continue
+            assert tmp[bidx][0] == k0 // bpne
+            s = ("add", s, tmp[bidx][1])
+            if kbc % bpne == 0 or kbc // bpne < k0 // bpne:
+                break
+            bidx, kstop = bidx - 1, kbc
+        t = k0 // bpne
+        tiles[t] = ("add", s, tiles[t])                    # dst += sum (:765): FADD.FTZ commutes
+    for t in range(ntiles):                                # every tile's k range covered once
+        p = sorted(mmq_pieces(tiles[t]))
+        assert p[0][0] == 0 and p[-1][1] == bpne and all(a[1] == c[0] for a, c in zip(p, p[1:])), (t, tiles[t])
+    return tiles
