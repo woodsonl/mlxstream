@@ -825,3 +825,23 @@ def gemm_chain(xb, wb, bf16, flush=True):
     for k in range(xf.shape[1]):
         acc = fma(xf[:, k, None], wf[None, :, k], acc)
     return np.where(np.isnan(acc), np.uint32(0x7FFFFFFF), acc.view(np.uint32))
+
+
+def rel_norm(y, ref):
+    """The GEMM gate's metric: src/kernels/hc8_parity.cpp:57-61's Err folded over every element of the float32 values
+    ``y`` (Err::add's a) against ``ref`` (its b), as part 2 feeds it (``ex.add(y1[t * ldy + n], (float) ref);``,
+    :261): ``ref`` cast to float32, |y - ref| in float32 widened to float64, each fold std::max's (a NaN never replaces
+    the running value, which starts at 0, so callers count non-finite outputs themselves), then rel():
+
+        struct Err {
+            double abs = 0, ref = 0;
+            void add(float a, float b) { abs = std::max(abs, (double) std::fabs(a - b)); ref = std::max(ref, (double) std::fabs(b)); }
+            double rel() const { return ref > 0 ? abs / ref : abs; }
+        };
+    """
+    with np.errstate(over="ignore", invalid="ignore"):
+        b = np.asarray(ref).astype(F32)
+        d = np.abs(np.asarray(y, F32) - b).astype(np.float64)
+    e = np.fmax.reduce(d.ravel(), initial=0.0)
+    r = np.fmax.reduce(np.abs(b).astype(np.float64).ravel(), initial=0.0)
+    return float(e / r) if r > 0 else float(e)

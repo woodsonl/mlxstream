@@ -10,13 +10,19 @@ fix no summation order; the port computes each output as one fp32 fma chain from
   48 and 72 (partial column tiles), K 320 and 640, BF16 operands (+-0 or magnitudes in [2^-20, 2^10]) and FP16 ones
   (activations N(0, 1), weights 0.02 N(0, 1)); the rows at and past the chunk's keep the 0xFF fill. A NaN at x[3][7]
   or w[5][9] gives 0x7fffffff in its row or its column only. ``PLANTED`` on the GPU: the flushed partial sums ((a),
-  (b)) and the subnormal operands read as zero ((c)) give the twin's bits, where the IEEE fold gives others."""
+  (b)) and the subnormal operands read as zero ((c)) give the twin's bits, where the IEEE fold gives others.
+- GM-REF: the product (the handler's slices) against float64 on the same operand bits, ``emu.rel_norm``
+  (hc8_parity.cpp:57-61's Err) over every output under hc8_parity.cpp:269's 5e-3, and no output non-finite, at the
+  pack's BF16 shapes (Gemm::bf16's own gate, which hc8_parity applies at hc8's shapes) and FP16 ones (Gemm::native's
+  second stage: the nearest bound, as no basalt test launches it), 1, 17 and 512 rows (attn_q's 12288 outputs at 1
+  and 17), activations N(0, 1) and weights 0.02 N(0, 1)."""
 
 import itertools
 
 import numpy as np
 import pytest
 
+from monolith.formats.fp import bf16_to_f32
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_prompt_gpu as gpu
 
@@ -129,3 +135,43 @@ def test_product_emulates_the_order(bf16):
                 "0x01000000; (c) gives 0x00800000 at (0, 0) and (1, 1) on the GPU and in the twin, where a chain that "
                 "keeps subnormal operands (emu.fma32's) gives 2^-117 + 2^-126 (0x05004000) and 2^-123 + 2^-126 "
                 f"(0x02100000); ({case}): GPU {[hex(v) for v in y.ravel()]}, twin {[hex(v) for v in np.ravel(twin)]}")
+
+
+# GM-REF's rows (TG 7.4: the pack's shapes, KG 3) as (BF16 operands, N, K, B). BF16, Gemm::bf16's product: the shared
+# expert's gate (prefill.cpp:1707), ssm_alpha and ssm_beta (:1587-1588), indexer k (:1608), indexer q and the router
+# (:1609, :1698), the PLE value (:1538), hc inject (:1572). FP16, Gemm::native's second stage (Gemm::f16's product):
+# the shared expert's gate and up (:1702-1703), its down (:1705), ssm_out and attn_output (:1592, :1688), attn_gate
+# (:1586), attn_q (:1607; at B 1 and 17 only).
+REF_BF16 = ((1, 2560), (48, 2560), (128, 2560), (512, 2560), (2560, 2560), (4, 10240))
+REF_FP16 = ((640, 2560), (2560, 640), (2560, 6144), (6144, 2560), (12288, 2560))
+REF_ROWS = [(bf16, n, k, b) for bf16, shapes in ((True, REF_BF16), (False, REF_FP16)) for n, k in shapes
+            for b in ((1, 17) if (n, k) == (12288, 2560) else (1, 17, 512))]
+REF_GATE = {   # the bound's standing per entry (ER-D5's label) with hc8_parity.cpp:269's criterion
+    True: "hc8_parity.cpp:269, Gemm::bf16's gate at this pack's plain-BF16 shapes: "
+          'expect(ex.rel() < 5e-3, "the product against the copy in double");',
+    False: "nearest bound; no basalt test launches Gemm::native or Gemm::f16: hc8_parity.cpp:269 "
+           'expect(ex.rel() < 5e-3, "the product against the copy in double");',
+}
+
+
+@pytest.mark.parametrize("bf16, n, k, B", REF_ROWS,
+                         ids=[f"{'bf16' if b else 'fp16'}-{n}x{k}-B{B}" for b, n, k, B in REF_ROWS])
+def test_product_against_double(bf16, n, k, B):
+    """GM-REF: y against x64 @ w64.T on the operands' exact values, emu.rel_norm over all B x N outputs (basalt
+    samples 256, hc8_parity.cpp:253-262). The fixture keeps every operand at most 2^10 and every nonzero BF16 one at
+    least 2^-40 (TG 7.1: nothing overflows, no partial sum is subnormal). Prints the measured value."""
+    rng = np.random.default_rng((n, k, B))
+    to16, widen = (emu.bf16_bits, bf16_to_f32) if bf16 else (emu.half_bits, emu.h2f)
+    xb = to16(rng.standard_normal((B, k)).astype(F32))
+    wb = to16(F32(0.02) * rng.standard_normal((n, k)).astype(F32))
+    x64, w64 = widen(xb).astype(np.float64), widen(wb).astype(np.float64)
+    for v in (x64, w64):
+        mag = np.abs(v)
+        assert mag.max() <= 2.0 ** 10 and (not bf16 or mag[mag > 0].min(initial=np.inf) >= 2.0 ** -40), \
+            "an operand above 2^10 in magnitude (or not finite), or a nonzero BF16 operand below 2^-40"
+    ref = x64 @ w64.T
+    assert np.abs(ref).max() > 0, "a vacuous reference: every output 0"
+    y = gpu.prompt_gemm(xb, wb, bf16=bf16, B=B).view(F32)
+    bad, rel = np.count_nonzero(~np.isfinite(y)), emu.rel_norm(y, ref)
+    print(f"GM-REF {'bf16' if bf16 else 'fp16'} N {n} K {k} B {B}: rel_norm {rel:.3e}")
+    assert bad == 0 and rel < 5e-3, f"{REF_GATE[bf16]} (N {n}, K {k}, B {B}): rel_norm {rel:.3e}, {bad} not finite"
