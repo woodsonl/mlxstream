@@ -6,7 +6,7 @@ down items (`cn_x`, `cn_dot`, `cn_lo`), the up items (`hc_up_pre`, `hc_up_main_m
 (`hc_q8_1_store_native`, `hc_up_q8`), the router items (`hc_router_rows`, `warp_sum16_ftz`, the IEEE `hc_q8_1_store`)
 and the top-10 item (`hc_top10`), read from the sm_120 PTX and SASS, with the Metal form the port writes at each site.
 This page is the authority the Metal kernels follow (`docs/design/flash-next.md`, invariant 5), as `matvec.md` is for
-the q8_1 quantizers and `bf16.md` for MMVF; `native_gr_postops.md` covers the hyper-connection write.
+the q8_1 quantizers and `bf16.md` for MMVF; `native_gr_postops.md` (not yet on main) covers the hyper-connection write.
 
 Basalt paths are relative to commit `b4c63b55754637f4c72ad53a0f791d425f71eb36`; `path:a-b` means lines a to b there,
 and a bare `:N` is a line of `src/kernels/cuda/hc_fused.cu` unless another file was named last.
@@ -145,9 +145,9 @@ token's column do not change (section 9), so a port that keeps them meets the wi
 
 **Two kinds of q8_1 row on decode.** Decode's first read of a layer, without the router, writes
 `hc_q8_1_store_native`'s rows, and its second read, with the router, `hc_q8_1_store`'s IEEE rows (section 6); the
-drafter's attention and mixer reads write native rows. The contract's no-reference row for the q8_1 rows
-(`docs/design/flash-next.md:453`) names only the native arithmetic (`hc_fused.cu:80-101`) and `iq_multi_parity`'s rule
-for it, which accepts the scale within one fp16 step and each code within one (`near`,
+drafter's attention and mixer reads write native rows. The contract's no-reference row "The q8_1 rows the fused read
+writes for the projections" (`docs/design/flash-next.md`) names only the native arithmetic (`hc_fused.cu:80-101`) and
+`iq_multi_parity`'s rule for it, which accepts the scale within one fp16 step and each code within one (`near`,
 `src/kernels/iq_multi_parity.cpp:465-466`). The router read's rows are `quantize_q8_1_kernel`'s arithmetic, which the
 same test holds to the host formula bit for bit (`std::memcmp(want, g, 36) == 0`, `:467`, its path 0,
 `quantize_q8_1_rows`, `:479`), so a test of the rows needs both rules.
@@ -234,7 +234,7 @@ here comes from the source's own operators and `fmaf`: the PTX has `add.f32`, `d
 | s | `:525` `ld(cns + k * CN_HS + 2 * c) + ld(cns + k * CN_HS + 2 * c + 1)` | `FADD R16, R17, R16` (row 742, IEEE) | `s = s0 + s1` (`ieee_add` where a half-stream's sum of squares can be subnormal, which needs every R' value of it below 2^-63) |
 | s / N | `:526` `s / (float) N` | `div.rn.f32` by 2560: `UFFMA UR5, UR6, -UR5, 1` and `UFFMA UR5, UR5, UR6, 0.000390625...` refine r0 = `0x39cccccd` = fl(1/2560) to c = fma(fma(r0, −2560, 1), r0, r0) (rows 737-741); `FCHK P0, R16, 2560`; `FFMA R17 = s·c + 0`; `FFMA R8 = R17·(−2560) + s`; `FFMA R8 = R8·c + R17` (rows 743-746); `CALL __cuda_sm3x_div_rn_noftz_f32_slowpath` when `FCHK` flags (row 750). Correctly rounded, subnormal quotients kept | `s / 2560.0f`: Metal's division is correctly rounded (measured); it flushes a quotient below 2^-126, which the add below turns into eps on both |
 | + eps | `:526` `+ a.eps` | `FADD R8, R8, UR5` (row 756, IEEE; eps = 1e-6f at every call, `src/core/verify.cpp:1135`, `:1147`, `include/basalt/kernels/hc_fused.hpp:37`) | `u = q + eps`: half an ulp of 1e-6 is 2^-44, so a quotient below 2^-126 leaves eps on both |
-| `rsqrtf` | `:526` | `FSETP.GEU.AND P0, PT, \|R8\|, 1.175494350822287508e-38, PT`; `@!P0 FMUL R8, R8, 16777216`; `MUFU.RSQ R13, R8`; `@!P0 FMUL R13, R13, 4096` (rows 757-760): `rsqrt.approx.f32` without `.ftz` (a subnormal input scaled by 2^24 and the result by 2^12) | `rs = fast::rsqrt(u)` (contract invariant 5, `docs/design/flash-next.md:136`): u ≥ 1e-6 is normal, so only `MUFU.RSQ` acts. `MUFU.RSQ` is approximate and unspecified bit for bit, so the last bits may differ from CUDA's; the one helper at every site keeps invariant 1 |
+| `rsqrtf` | `:526` | `FSETP.GEU.AND P0, PT, \|R8\|, 1.175494350822287508e-38, PT`; `@!P0 FMUL R8, R8, 16777216`; `MUFU.RSQ R13, R8`; `@!P0 FMUL R13, R13, 4096` (rows 757-760): `rsqrt.approx.f32` without `.ftz` (a subnormal input scaled by 2^24 and the result by 2^12) | `rs = fast::rsqrt(u)` (`docs/design/flash-next.md`, invariant 5): u ≥ 1e-6 is normal, so only `MUFU.RSQ` acts. `MUFU.RSQ` is approximate and unspecified bit for bit, so the last bits may differ from CUDA's; the one helper at every site keeps invariant 1 |
 | pair sums | `:536` `p[i][2 * c] + p[i][2 * c + 1]`, c = 0..3 | `FADD R39, R39, R38`; `FADD R37, R37, R36`; `FADD R34, R34, R35`; `FADD R33, R32, R33` (rows 768-771) | `p0 + p1` per c (`ieee_add` where a subnormal dot product can occur) |
 | v | `:536` `v = fmaf(rs_s[k * HC + c], ..., v)` from `0.0f`, c ascending | `FFMA R16, R12, R39, RZ` (rs0 · pair0 + +0, rs from `LDS.128 R12`, row 775); `FFMA R37, R37, R13, R16`; `FFMA R34, R34, R14, R37`; `FFMA R16, R33, R15, R34` (rows 776-779) | `v = fma(rs0, q0, 0.0f); v = fma(rs1, q1, v); v = fma(rs2, q2, v); v = fma(rs3, q3, v)` (the +0 addend makes a −0 first product +0). rs is +0 or normal (at most 1000); a pair sum or partial below 2^-126 needs a general IEEE fma, which the tree does not have (`ieee_fma` takes an integer multiplier) |
 | x | `:537` `v / (float) HC` | `FMUL R16, R16, 0.25` (row 780; PTX `mul.f32 %f159, %f158, 0f3E800000`: the division by 4 folded into a multiply, exact, the same real rounded once, subnormals included) | `x = v * 0.25f`; where \|v\| < 2^-124 CUDA's x is subnormal and Metal's ±0 (`ieee_mul(v, 0.25f)`) |
