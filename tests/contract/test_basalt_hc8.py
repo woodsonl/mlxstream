@@ -14,10 +14,12 @@ matrices on the official pack's index sections, and against synthetic files with
 import numpy as np
 import pytest
 
+from monolith.formats.basalt_reader import BasaltFile, DenseRow, MtpTensor
 from monolith.formats.fp import bf16_to_f32, f32_to_bf16
 from monolith.packs.basalt import HC8
-from monolith.packs.basalt_hc8 import copy_list, quantize
+from monolith.packs.basalt_hc8 import Hc8Entry, copy_list, quantize
 from tests.basalt_hc_ref import dequant_copy, hc8_parity_matrices, hc8_quant_scalar
+from tests.contract.test_basalt_reader import write_basalt
 from tests.contract.test_basalt_windows import real_source
 
 
@@ -215,3 +217,91 @@ def test_copy_list_on_the_pack_index():
         f"HC8-INDEX: every down/up/output src is refused by BasaltSource with HC8, and every one so refused has a copy " \
         f"(copies only: {sorted(held - refused)[:3]}, refused only: {sorted(refused - held)[:3]}); every inject src " \
         f"is a bindable BF16 entry at the copy's offset and shape (not: {unbound[:3]})"
+
+
+def _dense(i, name, ne0, ne1, kind=4):
+    """A ``dense.index`` row basalt copies as stored, BF16 (kind 4) or F32 (kind 2), ``ne1`` 0 for a vector; its bytes
+    at ``4096 i`` in the pool."""
+    n = ne0 * max(ne1, 1) * (2 if kind == 4 else 4)
+    return DenseRow(name, 0, kind, 4096 * i, n, 4096 * i, n, ne0, ne1, *(0,) * 10)
+
+
+# HC8-REFUSE's valid file: its matrices out of hc8_tensors' order (layer 10 before layer 2, an injection before its
+# layer's down matrix, the drafter's final mixer first), beside rows copy_list leaves alone (an F32 norm, a Q8_0 matrix)
+DENSE = (_dense(0, "blk.10.hc_attn_down.weight", 64, 2), _dense(1, "output_hc_up.weight", 32, 64),
+         _dense(2, "blk.2.hc_ffn_up.weight", 32, 64), _dense(3, "blk.2.attn_norm.weight", 64, 0, kind=2),
+         _dense(4, "blk.2.hc_attn_inject.weight", 64, 4), _dense(5, "blk.2.hc_attn_down.weight", 64, 2))
+MTP = (MtpTensor("fc.weight", "q8_0", 2, 64, 0, 136),
+       MtpTensor("hyper_connection_mixer.input_mix_weight_up.weight", "bf16", 64, 32, 4096, 4096),
+       MtpTensor("attn_hyper_connection.input_mix_weight_down.weight", "bf16", 2, 64, 8192, 256),
+       MtpTensor("mlp_hyper_connection.block_inject_weight.weight", "bf16", 4, 64, 12288, 512))
+
+
+def _basalt(dense=DENSE, mtp=MTP, **sections):
+    """A ``.basalt`` file (``write_basalt``) whose ``dense`` pool holds the rows ``dense`` and, unless ``mtp`` is None,
+    whose ``mtp/dense`` holds the tensors ``mtp``, each row's bytes all its index plus 1 (``mtp``: plus 0x80), and the
+    extra ``sections``."""
+    pool, blob = bytearray(4096 * len(dense)), bytearray(4096 * len(mtp or ()))
+    for i, r in enumerate(dense):
+        pool[r.src_off: r.src_off + r.src_bytes] = bytes([1 + i]) * r.src_bytes
+    for i, t in enumerate(mtp or ()):
+        blob[t.offset: t.offset + t.nbytes] = bytes([0x80 + i]) * t.nbytes
+    lines = lambda rows: "".join(" ".join(map(str, r)) + "\n" for r in rows)
+    secs = {"dense": bytes(pool),
+            "dense.index": f"# dense index v3\n# align 64 pool {len(pool)} tensors {len(dense)}\n{lines(dense)}".encode()}
+    if mtp is not None:
+        secs |= {"mtp/dense": bytes(blob), "mtp/dense.index": lines(mtp).encode()}
+    return BasaltFile(bytes(write_basalt(secs | sections)))
+
+
+def test_refusals():
+    """HC8-REFUSE: ``copy_list`` on a valid synthetic file lists its copies in basalt's order, each at its BF16 bytes
+    (and the target's alone when the file has no drafter); the same file with one defect is refused, each defect by
+    its own message naming its row or cause; then ``quantize``'s own refusals."""
+    f = _basalt()
+    d, m = f.section("dense").offset, f.section("mtp/dense").offset
+    target, drafter = (5, 4, 2, 0, 1), (2, 3, 1)                        # DENSE's and MTP's rows in basalt's order
+    want = tuple(Hc8Entry(r.name, f"dense/{r.name}", d + r.src_off, r.ne1, r.ne0) for r in (DENSE[i] for i in target)) \
+        + tuple(Hc8Entry(f"mtp.{t.name}", f"mtp/{t.name}", m + t.offset, t.rows, t.cols) for t in (MTP[i] for i in drafter))
+    es = copy_list(f)
+    held = [bytes(f.data[e.offset: e.offset + 2 * e.rows * e.cols]) for e in es]
+    fill = [bytes([v]) * 2 * e.rows * e.cols for v, e in zip([1 + i for i in target] + [0x80 + i for i in drafter], es)]
+    long = "blk." + "1" * 103 + ".hc_attn_down.weight"                  # 127 bytes, the longest hc8_write takes
+    assert es == want and held == fill and copy_list(_basalt(mtp=None)) == want[:5] \
+        and copy_list(_basalt(DENSE + (_dense(6, long, 64, 2),)))[4].name == long, \
+        f"HC8-REFUSE: the valid file passes, its copies in hc8_tensors' order then the drafter's, each at its row's " \
+        f"bytes, the target's alone without the mtp sections, and a 127-byte name taken: {es}"
+
+    edit = lambda rows, i, **kw: rows[:i] + (rows[i]._replace(**kw),) + rows[i + 1:]
+    down = r"^copy_list: dense/blk\.2\.hc_attn_down\.weight: "
+    for defect, why in [
+            (dict(hc8=b"BASALTH8" + bytes(8)), r"^copy_list: the file has an 'hc8' section"),
+            (dict(dense=edit(DENSE, 5, kind=2)), down + r"kind 2, not 4 \(BF16 as stored\)$"),
+            (dict(dense=edit(DENSE, 5, src_bytes=255)), down + r"255 bytes, not 2 x 64 BF16$"),
+            (dict(dense=edit(DENSE, 4, kind=0, src_bytes=0, dst_bytes=0, code_bits=8)),
+             r"^copy_list: dense/blk\.2\.hc_attn_inject\.weight: its bytes are in gguf$"),
+            (dict(mtp=edit(MTP, 2, kind="f32", nbytes=512)),
+             r"^copy_list: mtp/attn_hyper_connection\.input_mix_weight_down\.weight: kind 'f32', not 'bf16'$"),
+            (dict(dense=edit(DENSE, 5, ne0=48, src_bytes=192, dst_bytes=192)),
+             down + r"2 x 48: its columns are not whole groups of 32$"),
+            (dict(dense=DENSE + (_dense(6, "blk.1" + long[4:], 64, 2),)),
+             r"^copy_list: dense/blk\.1{104}\.hc_attn_down\.weight: a table name of 128 bytes; hc8_write's hold at most "
+             r"127$")]:
+        with pytest.raises(ValueError, match=why):
+            copy_list(_basalt(**defect))
+
+    def one(r, c, bits):                                               # a valid 2 x 32 matrix but for one weight
+        w = np.full((2, 32), 0x3F80, np.uint16)
+        w[r, c] = bits
+        return w
+
+    shape = r"^quantize: the weights must be a 2-D uint16 array of BF16 bits, not ndarray "
+    for w, why in [(np.zeros((2, 31), np.uint16), r"^quantize: a 2 x 31 matrix; rows and cols must be positive and cols "
+                                                  r"a multiple of 32"),
+                   (np.zeros((2, 33), np.uint16), r"^quantize: a 2 x 33 matrix; "),
+                   (one(1, 7, 0x7F80), r"^quantize: 1 non-finite weights, the first at row 1, column 7 \(bits 0x7F80\)"),
+                   (one(0, 31, 0xFFC1), r"^quantize: 1 non-finite weights, the first at row 0, column 31 \(bits 0xFFC1\)"),
+                   (np.zeros((2, 32), np.float32), shape + r"float32 of shape \(2, 32\)$"),
+                   (np.zeros(32, np.uint16), shape + r"uint16 of shape \(32,\)$")]:
+        with pytest.raises(ValueError, match=why):
+            quantize(w)
