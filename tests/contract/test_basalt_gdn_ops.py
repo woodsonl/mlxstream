@@ -5,8 +5,8 @@ tests/basalt_gdn_ref.py.
   default_rng((97, trial, nseg)), which a caller drawing past x (the commit's recorded inputs) passes itself; every
   configuration keeps parity_seg's layout rules (dec_gdn_parity.cpp:422-429).
 - ``cpu_seg`` is finite on a segment of eight rows fed ``ab64``'s gate and beta, and on its first two rows equals
-  basalt's loops (:314-368, transcribed below in Python floats) for three value heads whose q/k head is hd % 16, not
-  hd // 3; ``ab64`` equals the plain dot of the bf16 rows there.
+  basalt's loops (``cpu_seg_loops``) for three value heads whose q/k head is hd % 16, not hd // 3; ``ab64`` equals
+  the plain dot of the bf16 rows there.
 - ``conv_tail`` is the bit copy of the last three rows of [history | window rows] for 0 to 6 rows, subnormals, -0,
   infinities and NaN payloads included.
 """
@@ -17,8 +17,8 @@ import math
 import numpy as np
 import pytest
 
-from tests.basalt_gdn_ref import (C, COMBOS, EPS, HK, HV, LAYER, MT, N, NL, REC, S, SEG_CASES, SEG_SEED, SF, ZV, ab64,
-                                  combo_case, conv_tail, cpu_seg, max_err, n_bad, seg_layer, segments)
+from tests.basalt_gdn_ref import (C, COMBOS, LAYER, MT, N, NL, S, SEG_CASES, SEG_SEED, SF, ZV, ab64, combo_case,
+                                  conv_tail, cpu_seg, cpu_seg_loops, max_err, n_bad, seg_layer, segments)
 
 
 def digest(*arrays):
@@ -48,53 +48,6 @@ def test_gdn_ref_fixtures_give_the_same_bytes_for_one_seed():
         assert st0.shape == (nseg, NL, SF) and qkv.shape == (R, C) and z.shape == (R, ZV) and x.shape == (R, N)
 
 
-def _cpu_seg_loops(st0, qkv, z, cw, gamma, gate, beta, n, heads):
-    """cpu_seg as dec_gdn_parity.cpp:314-368 writes it, in Python floats (binary64), for the value heads ``heads``:
-    returns h (n, C) and {(t, hd): y of head hd at token t}."""
-    f = lambda v: float(np.float32(v))
-    st, qkv, z, cw = (np.asarray(a, np.float32).reshape(-1).tolist() for a in (st0, qkv, z, cw))
-    hist, eps, qk = st[REC:], float(EPS), S * HK
-    h = [[0.0] * C for _ in range(n)]
-    for t in range(n):
-        for c in range(C):
-            win = [hist[c * 3 + t + j] if t + j < 3 else qkv[(t + j - 3) * C + c] for j in range(4)]
-            s = 0.0
-            for j in range(4):
-                s += win[j] * cw[c * 4 + j]
-            h[t][c] = f(s / (1.0 + math.exp(-s)))
-        for hd in range(2 * HK):
-            ss = 0.0
-            for i in range(S):
-                ss += h[t][hd * S + i] * h[t][hd * S + i]
-            sc = 1.0 / math.sqrt(ss + eps)
-            for i in range(S):
-                h[t][hd * S + i] = f(h[t][hd * S + i] * sc)
-    sd = {hd: [[st[(i * HV + hd) * S + j] for j in range(S)] for i in range(S)] for hd in heads}
-    y = {}
-    for t in range(n):
-        for hd in heads:
-            qh, ht = hd % HK, h[t]
-            g, b = math.exp(float(gate[t][hd])), float(beta[t][hd])
-            oc = []
-            for j in range(S):
-                kv = 0.0
-                for i in range(S):
-                    kv += sd[hd][i][j] * ht[qk + qh * S + i]
-                delta = (ht[2 * qk + hd * S + j] - g * kv) * b
-                o = 0.0
-                for i in range(S):
-                    sd[hd][i][j] = g * sd[hd][i][j] + ht[qk + qh * S + i] * delta
-                    o += sd[hd][i][j] * ht[qh * S + i]
-                oc.append(o / math.sqrt(S))
-            ss = 0.0
-            for j in range(S):
-                ss += oc[j] * oc[j]
-            scale = 1.0 / math.sqrt(ss / S + eps)
-            y[t, hd] = [f(oc[j] * scale * float(gamma[j]) * (1.0 / (1.0 + math.exp(-z[t * ZV + hd * S + j]))))
-                        for j in range(S)]
-    return np.array(h, np.float32), y
-
-
 def test_cpu_seg_is_finite_on_one_segment_and_follows_basalts_loops():
     layer, case, k, heads = seg_layer(), segments(2, 2), 1, (0, 17, 40)
     rows = slice(case.row0[k], case.row0[k] + case.T[k])
@@ -104,7 +57,7 @@ def test_cpu_seg_is_finite_on_one_segment_and_follows_basalts_loops():
     ref = cpu_seg(st0, qkv, z, layer.conv_w, layer.gamma, gate, beta, MT)
     assert ref.h.shape == (MT, C) and ref.y.shape == (MT, ZV)
     assert n_bad(ref.h) == n_bad(ref.y) == n_bad(gate) == n_bad(beta) == 0, "cpu_seg or ab64 is not finite"
-    h, y = _cpu_seg_loops(st0, qkv[:2], z[:2], layer.conv_w, layer.gamma, gate, beta, 2, heads)
+    h, y = cpu_seg_loops(st0, qkv[:2], z[:2], layer.conv_w, layer.gamma, gate, beta, 2, heads)
     assert max_err(ref.h[:2], h) < 1e-6, max_err(ref.h[:2], h)
     for (t, hd), want in y.items():
         err = max_err(ref.y[t, hd * S: (hd + 1) * S], want)

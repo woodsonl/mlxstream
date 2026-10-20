@@ -16,12 +16,14 @@ import ...``.
 - The fixtures, each from its own seeded stream (basalt's mt19937 draws cannot be replayed; only the distributions,
   shapes and layouts carry over, spec T§2.3): ``combo_case(i)``, parity_gdnf's layer and 8-row x for combo i (seed
   43); ``seg_layer()`` and ``segments(trial, nseg)``, parity_seg's layer and its 12 configurations (seed 97).
-- The references: ``cpu_seg`` (:309-368) in float64, vectorized per token over heads and columns; ``max_err``
+- The references: ``cpu_seg`` (:309-368) in float64, vectorized per token over heads and columns, and
+  ``cpu_seg_loops``, the same in basalt's loops for chosen heads, against which the contract test checks it; ``max_err``
   (:403-407) and ``n_bad``, the count of non-finite values every float64 check asserts is 0 (``std::max`` drops a
   NaN); ``ab64``, the port's float64 gates (spec T§5.5 A1: basalt grades them against nothing); ``conv_tail``, the
   conv history after a window's rows, a bit copy (the one-token calls' history, spec T§5.1).
 """
 
+import math
 from typing import NamedTuple
 
 import numpy as np
@@ -167,6 +169,54 @@ def cpu_seg(st0, qkv, z, cw, gamma, gate, beta, n):
         scale = 1.0 / np.sqrt((oc * oc).sum(1) / S + eps)
         y[t] = (oc * scale[:, None] * gam * (1.0 / (1.0 + np.exp(-zz[t])))).reshape(-1)
     return CpuSeg(h, y)
+
+
+def cpu_seg_loops(st0, qkv, z, cw, gamma, gate, beta, n, heads):
+    """cpu_seg as :314-368 writes it, loop for loop in Python floats (binary64), for the value heads ``heads`` only:
+    returns h (n, C) float32 and {(t, hd): head hd's y at token t}. Slow; the contract test checks ``cpu_seg``'s
+    vectorized form against it."""
+    f = lambda v: float(F32(v))
+    st, qkv, z, cw = (np.asarray(a, F32).reshape(-1).tolist() for a in (st0, qkv, z, cw))
+    hist, eps, qk = st[REC:], float(EPS), S * HK
+    h = [[0.0] * C for _ in range(n)]
+    for t in range(n):
+        for c in range(C):
+            win = [hist[c * 3 + t + j] if t + j < 3 else qkv[(t + j - 3) * C + c] for j in range(4)]
+            s = 0.0
+            for j in range(4):
+                s += win[j] * cw[c * 4 + j]
+            h[t][c] = f(s / (1.0 + math.exp(-s)))
+        for hd in range(2 * HK):
+            ss = 0.0
+            for i in range(S):
+                ss += h[t][hd * S + i] * h[t][hd * S + i]
+            sc = 1.0 / math.sqrt(ss + eps)
+            for i in range(S):
+                h[t][hd * S + i] = f(h[t][hd * S + i] * sc)
+    sd = {hd: [[st[(i * HV + hd) * S + j] for j in range(S)] for i in range(S)] for hd in heads}
+    y = {}
+    for t in range(n):
+        for hd in heads:
+            qh, ht = hd % HK, h[t]
+            g, b = math.exp(float(gate[t][hd])), float(beta[t][hd])
+            oc = []
+            for j in range(S):
+                kv = 0.0
+                for i in range(S):
+                    kv += sd[hd][i][j] * ht[qk + qh * S + i]
+                delta = (ht[2 * qk + hd * S + j] - g * kv) * b
+                o = 0.0
+                for i in range(S):
+                    sd[hd][i][j] = g * sd[hd][i][j] + ht[qk + qh * S + i] * delta
+                    o += sd[hd][i][j] * ht[qh * S + i]
+                oc.append(o / math.sqrt(S))
+            ss = 0.0
+            for j in range(S):
+                ss += oc[j] * oc[j]
+            scale = 1.0 / math.sqrt(ss / S + eps)
+            y[t, hd] = [f(oc[j] * scale * float(gamma[j]) * (1.0 / (1.0 + math.exp(-z[t * ZV + hd * S + j]))))
+                        for j in range(S)]
+    return np.array(h, F32), y
 
 
 def max_err(a, b):
