@@ -179,7 +179,7 @@ def _float64_gates(cfg, dm):
 
 @pytest.mark.parametrize("name", ["share-plain", "share-outliers", "kq-plain", "kq-outliers"])
 def test_mmq_q2_emulator_float64(name):
-    """Nearest bound; no basalt test launches this kernel: G3 is prefill_mmq_kq_test.cpp:375's
+    """nearest bound; no basalt test launches this kernel: G3 is prefill_mmq_kq_test.cpp:375's
     ``const double lim_rms = outliers ? 3e-2 : 2e-2, lim_worst = outliers ? 0.15 : 0.1;``, which basalt gates on its
     K-quant MMQ and never on Q2_0 (the contract's MMQ-on-Q2_0 row, docs/design/flash-next.md:451). The host emulator
     basalt_emu.mmq_moe, which the Metal chain must equal bit for bit (E1-E4), meets G1-G3 as
@@ -189,7 +189,7 @@ def test_mmq_q2_emulator_float64(name):
 
 @pytest.mark.parametrize("kind", ["plain", "outliers"])
 def test_mmq_q2_batch_independence_emulator(kind):
-    """Nearest bound; no basalt test launches this kernel: MK-4's ``if (worst_alone > 0.1 * em.worst)``
+    """nearest bound; no basalt test launches this kernel: MK-4's ``if (worst_alone > 0.1 * em.worst)``
     (prefill_mmq_kq_test.cpp:433), which basalt runs only on its K-quant pairs (:525-527), measured on Q2_0 with the
     host emulator before any Metal (L13; eng-review D24): the fixture's mk4 on the kq configuration, tokens 0..7 alone
     and last of three against the 256-token run, basalt_emu.mmq_moe as the runner. Also counts the small runs'
