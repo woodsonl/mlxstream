@@ -237,6 +237,12 @@ kernel void gdn_step_norm_multi(device const float* state [[buffer(0)]], device 
 #define GDN_MAXT 8
 #endif
 
+// 1 where the caller binds dec_gdn_rec's optional fp32 y at buffer 17 (basalt's `if (a.y)`, dec_gdn_rec.cu:121): the
+// tests' build. The engine binds none, as basalt's call site passes none, and builds 0.
+#ifndef GDN_Y_BOUND
+#define GDN_Y_BOUND 0
+#endif
+
 // conv_silu (dec_gdn_rec.cu:53-66): token t of one channel, the conv of [hist(3) | xs rows 0..t-1] with xs row t (the
 // channel's raw projections, oldest first) and its SiLU: gdn_conv_l2_multi's sequence on the channel's registers.
 static inline float gdn_conv_silu(thread const float* hist, thread const float* w, thread const float* xs, uint t) {
@@ -253,11 +259,13 @@ static inline float gdn_conv_silu(thread const float* hist, thread const float* 
 // state, then the conv history [C][3]; read only) and the token rows of qkv, x and z. It writes rows t < T of the
 // window stores the commit replays: win_qkv, the qkv rows as they are (the commit's conv history; basalt's projection
 // writes them in place, spec-engine.md section 9.3), win_h, gdn_conv_l2_multi's h, and win_gate and win_beta,
-// gdn_ab_multi's gate and beta. Grid h_v threadgroups of 512 threads, one value head each: basalt's cluster of four
-// 128-thread blocks as one threadgroup, thread tid = 128 rank + 32 rg + lane of SIMD-group sg = 4 rank + rg playing
-// lane `lane` of warp rg of block `rank`, the head's state column col = 32 rank + lane, rows 32 rg .. 32 rg + 31. What
-// the four blocks compute alike runs once: the 2 T gate jobs over the 16 SIMD-groups, the key head's q and k (head
-// % h_k) on rank 0's 128 threads in basalt's partition; SIMD-group 4 rank + 1 takes the v channel of column col.
+// gdn_ab_multi's gate and beta; and yq, the q8_1 rows of gdn_step_norm_multi's y, y[t 128 h_v + 128 head + col] the
+// gated RMS norm of the recurrence's read-out (and, built with GDN_Y_BOUND 1, y itself at buffer 17). Grid h_v
+// threadgroups of 512 threads, one value head each: basalt's cluster of four 128-thread blocks as one threadgroup,
+// thread tid = 128 rank + 32 rg + lane of SIMD-group sg = 4 rank + rg playing lane `lane` of warp rg of block `rank`,
+// the head's state column col = 32 rank + lane, rows 32 rg .. 32 rg + 31. What the four blocks compute alike runs
+// once: the 2 T gate jobs over the 16 SIMD-groups, the key head's q and k (head % h_k) on rank 0's 128 threads in
+// basalt's partition; SIMD-group 4 rank + 1 takes the v channel of column col, SIMD-group 4 rank the output.
 kernel void dec_gdn_rec(device const float* state [[buffer(0)]], device const float* qkv [[buffer(1)]],
                         device const float* w [[buffer(2)]], device const float4* x [[buffer(3)]],
                         device const uint4* wa [[buffer(4)]], device const uint4* wb [[buffer(5)]],
@@ -265,10 +273,14 @@ kernel void dec_gdn_rec(device const float* state [[buffer(0)]], device const fl
                         device const float* z [[buffer(8)]], device const float* gamma [[buffer(9)]],
                         device float* win_qkv [[buffer(10)]], device float* win_h [[buffer(11)]],
                         device float* win_gate [[buffer(12)]], device float* win_beta [[buffer(13)]],
-                        device uchar* yq [[buffer(14)]], constant BsGdnParams& p [[buffer(16)]],
-                        uint head [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
-                        uint sg [[simdgroup_index_in_threadgroup]]) {
+                        device uchar* yq [[buffer(14)]],
+#if GDN_Y_BOUND
+                        device float* y [[buffer(17)]],
+#endif
+                        constant BsGdnParams& p [[buffer(16)]], uint head [[threadgroup_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float qn[8][128], kn[8][128], v[8][128], part[2][8][4], gm[8], bm[8];
+    threadgroup float oc[8][128], red_kv[4][4][32], red_o[4][4][32], wsum[8][4];
     const uint tid = 32u * sg + lane, rank = sg / 4u, rg = sg % 4u, col = 32u * rank + lane;
     const uint qh = head % p.h_k, qk = 128u * p.h_k, n8 = p.n_embd / 8u, T = min(p.T, uint(GDN_MAXT));
     const uint cq = qh * 128u + tid, ck = qk + cq, cv = 2u * qk + head * 128u + col;   // cq, ck: rank 0's
@@ -357,4 +369,44 @@ kernel void dec_gdn_rec(device const float* state [[buffer(0)]], device const fl
     if (tid < T) win_gate[tid * p.h_v + head] = cuda_nan(gm[tid]);
     if (tid >= 128u && tid - 128u < T) win_beta[(tid - 128u) * p.h_v + head] = cuda_nan(bm[tid - 128u]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // G: the recurrence over the tokens t < T on the thread's 32 state rows, dropped at the end (the window never
+    // writes the state); kv and o summed over the rank's four row groups, two barriers per token (dec_gdn_rec.cu:245-
+    // 275). SIMD-group 4 rank keeps the column's oc and, on lane 0, the rank's sum of squares of the token, which every
+    // lane's butterfly holds: basalt's lane-t keep and cluster push (:270-285) as one threadgroup store
+    for (uint t = 0; t < T; ++t) {
+        const float g = expf_ieee(gm[t]);
+        red_kv[rank][rg][lane] = gdn_kv(s, &kn[t][32u * rg]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float kv_col = gdn_sum4(red_kv[rank][0][lane], red_kv[rank][1][lane], red_kv[rank][2][lane],
+                                      red_kv[rank][3][lane]);
+        const float delta = gdn_delta(g, kv_col, v[t][col], bm[t]);
+        red_o[rank][rg][lane] = gdn_update(s, &kn[t][32u * rg], &qn[t][32u * rg], g, delta);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (rg == 0u) {                                            // SIMD-group 4 rank: basalt's warp 0
+            const float o = gdn_oc(red_o[rank][0][lane], red_o[rank][1][lane], red_o[rank][2][lane],
+                                   red_o[rank][3][lane]);
+            const float sq = gdn_sq32(o);
+            oc[t][col] = o;
+            if (lane == 0u) wsum[t][rank] = sq;
+        }
+    }
+
+    // H: every rank's sums of squares in wsum; one barrier for the cluster arrive, wait and sync (:177, :280, :286)
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // I: the gated RMS norm and the q8_1 rows (norm_q8, :290-297 and :115-132), SIMD-group 4 rank's 32-value block of
+    // each token, block t 4 h_v + 4 head + rank, lane i % 32; the head's sum of squares in rank order. z is read here
+    // (basalt's phase C preloads it, :198)
+    if (rg == 0u) {
+        for (uint t = 0; t < T; ++t) {
+            const uint i = t * 128u * p.h_v + head * 128u + col;
+            const float yv = gdn_out(oc[t][col], gdn_sum4(wsum[t][0], wsum[t][1], wsum[t][2], wsum[t][3]), p.eps, gam,
+                                     z[i]);
+#if GDN_Y_BOUND
+            y[i] = cuda_nan(yv);
+#endif
+            q8_1_store_rec(yv, yq, i);
+        }
+    }
 }
