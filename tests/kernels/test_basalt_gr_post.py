@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/gr_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
-# (MIT; third_party/NOTICE): its write fixture (tests/basalt_hc_ref.py's gr_fixture).
+# (MIT; third_party/NOTICE): its write fixture (tests/basalt_hc_ref.py's gr_fixture) and its write checks
+# (:620-692), their criteria verbatim.
 """basalt's hyper-connection write, ``native_gr_post``, on Metal (kernels/common/basalt_gr_post.metal). Basalt gates
 none of its values; these are the contract's tests (docs/design/flash-next.md, the no-reference table).
 
@@ -12,6 +13,12 @@ none of its values; these are the contract's tests (docs/design/flash-next.md, t
   the weight out) and residual/block-output pairs whose sum is subnormal or cancels; each planted weight's exact
   value (1, +0 or 2) checked apart from the exponential; in basalt's in-place call and in the program's separate
   output, which give the same bytes.
+- HG-PLAIN, HG-DELTA, HG-STREAM: gr_parity's three write checks (gr_parity.cpp:620-692) on its fixture (n_embd 256, T =
+  1) and at the real shape (T = 8), into a separate output as gr_parity writes: a zero injection is the plain residual
+  add, the rival reading ``1 * sigmoid`` is visible on the delta ``out - R``, and injections of sd 3 (gr_parity's) and
+  2 (ple_win_parity's) give the double write's values, by gr_parity's term-relative rule.
+- HG-WIN: the window rule in ple_win_parity's call shape (one token row, in place): each row of a T-row dispatch, T =
+  1..8, has the bits of its token's one-row dispatch, and the reversed window gives every token the same bits.
 
 Every test checks the sentinels (the output's rows T..7 keep their 0xFF bytes, the block output's and injections'
 buffers their input bytes) and counts the output's non-finite values."""
@@ -108,3 +115,76 @@ def test_matches_emulation_bit_for_bit(n_embd, T, in_place):
     if not in_place:
         assert np.array_equal(out.view(U32), write(R, bo, inj, T, n_embd, True).view(U32)), \
             "the separate output's bytes differ from basalt's in-place call"
+
+
+def n_nonfinite(got):
+    """The non-finite count of ``got``, output rows of a gr_fixture run: its inputs are finite, so any is a fault."""
+    return np.count_nonzero(~np.isfinite(got))
+
+
+@pytest.mark.parametrize("n_embd, T", [(256, 1), (2560, 8)], ids=["S1", "S2"])
+def test_zero_injection_is_the_plain_residual_add(n_embd, T):
+    """HG-PLAIN, gr_parity's zero-injection check (gr_parity.cpp:620-648): ``want = double(R) + double(bo)``, each
+    element's error over its terms ``|R| + |bo|``; the worst below 1e-6 (numpy's max keeps a NaN, so a NaN fails)."""
+    R, bo, inj = ref.gr_fixture(n_embd, HC, T, inj_sd=0.0)
+    got = write(R, bo, inj, T, n_embd, in_place=False)[:T]
+    want = R.astype(np.float64) + bo.astype(np.float64)[:, None, :]
+    worst_plain = ref.rel_terms(want, got, R, bo[:, None, :]).max()
+    print(f"HG-PLAIN n_embd {n_embd} T {T}: worst_plain {worst_plain:.3e}, {n_nonfinite(got)} non-finite")
+    assert n_nonfinite(got) == 0, "a non-finite output"
+    assert worst_plain < 1e-6, "const bool plain = worst_plain < 1e-6;"
+
+
+def test_the_rival_gate_reading_is_visible():
+    """HG-DELTA, gr_parity's rival reading (gr_parity.cpp:650-670) on HG-PLAIN's S1 run: on the delta ``out - R``,
+    ``2 sigmoid(0) = 1`` (``want_delta = bo``) and ``1 sigmoid(0) = 0.5`` (``wrong_delta = bo * 0.5f``) are more than
+    5 % apart, and the kernel's delta is within 5 % of the right one."""
+    R, bo, inj = ref.gr_fixture(256, HC, 1, inj_sd=0.0)
+    got = write(R, bo, inj, 1, 256, in_place=False)[:1]
+    got_delta = (got.astype(np.float64) - R.astype(np.float64)).astype(F32)   # (float) ((double) got - (double) R)
+    want_delta = np.broadcast_to(bo[:, None, :], R.shape)
+    wrong_delta = want_delta * F32(0.5)
+    rel, rel_got = ref.rel_diff(want_delta, wrong_delta), ref.rel_diff(want_delta, got_delta)
+    print(f"HG-DELTA: readings {rel * 100:.0f}% apart, kernel within {rel_got:.2e}, {n_nonfinite(got)} non-finite")
+    assert n_nonfinite(got) == 0, "a non-finite output"
+    assert rel > 0.05 and rel_got < 0.05, "const bool visible = rel > 0.05 && rel_got < 0.05;"
+
+
+@pytest.mark.parametrize("n_embd, T, inj_sd", [(256, 1, 3.0), (2560, 8, 3.0), (2560, 8, 2.0)],
+                         ids=["S1-sd3", "S2-sd3", "S2-sd2"])
+def test_injection_weights_against_double(n_embd, T, inj_sd):
+    """HG-STREAM, gr_parity's nonzero-injection check (gr_parity.cpp:673-692): the double write (``gr_write_double``),
+    each element's error over its terms ``|R| + |bo w|``; the worst below 1e-6. The injections stay far inside the
+    rule's range, ``|inject| < 80`` (beyond it the float32 rounding of ``x log2 e`` that basalt shares dominates where
+    ``|R|`` is small; HG-EMU holds the extremes by bits)."""
+    R, bo, inj = ref.gr_fixture(n_embd, HC, T, inj_sd=inj_sd)
+    got = write(R, bo, inj, T, n_embd, in_place=False)[:T]
+    want, bo_w = ref.gr_write_double(R, bo, inj, HC)
+    worst_stream = ref.rel_terms(want, got, R, bo_w).max()
+    print(f"HG-STREAM n_embd {n_embd} T {T} inj_sd {inj_sd}: worst_stream {worst_stream:.3e} (max |inject| "
+          f"{np.abs(inj).max():.2f}), {n_nonfinite(got)} non-finite")
+    assert n_nonfinite(got) == 0, "a non-finite output"
+    assert worst_stream < 1e-6, "const bool streams_ok = worst_stream < 1e-6;"
+
+
+def test_rows_of_a_window_equal_one_row_dispatches():
+    """HG-WIN, the window rule (invariant 1) in ple_win_parity's call shape, one token row in place: for T = 1..8, row t
+    of the T-row dispatch has the bits of the one-row dispatch of token t alone (its rows copied to row 0 of fresh
+    buffers), and the 8-row dispatch of the reversed window (token k at row 7 - k) gives every token the forward one's
+    bits. Each dispatch's sentinels checked, and its output finite."""
+    n_embd = 2560
+    R, bo, inj = ref.gr_fixture(n_embd, HC, 8, inj_sd=3.0)
+
+    def run(R, bo, inj, T):
+        got = write(R, bo, inj, T, n_embd)[:T]
+        assert n_nonfinite(got) == 0, f"a non-finite output in a {T}-row dispatch"
+        return got.view(U32)
+
+    alone = [run(R[t:t + 1], bo[t:t + 1], inj[t:t + 1], 1)[0] for t in range(8)]
+    for T in range(1, 9):
+        got = run(R, bo, inj, T)
+        for t in range(T):
+            assert np.array_equal(got[t], alone[t]), f"row {t} of the {T}-row window differs from its one-row dispatch"
+    rev = run(R[::-1], bo[::-1], inj[::-1], 8)
+    for k in range(8):                                  # got: the last window's, the forward 8-row dispatch
+        assert np.array_equal(rev[7 - k], got[k]), f"token {k} at row {7 - k} of the reversed window differs"

@@ -3,8 +3,8 @@
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/cuda/hc_fused.cu:1171-1197 (hc8_quant_kernel),
 # src/core/model_file.cpp:487-513 (hc8_read), src/kernels/hc8_parity.cpp:69-99 (hc8_parity's matrices),
-# src/kernels/gr_parity.cpp:433-454, :621-623, :675 (gr_parity's write fixture) and
-# src/kernels/cuda/native_gr_postops.cu:65-74 (native_gr_post's arithmetic) @
+# src/kernels/gr_parity.cpp:136-156 (gr_parity's metrics), :433-454, :621-623, :675 (its write fixture), :679-688
+# (its double write) and src/kernels/cuda/native_gr_postops.cu:65-74 (native_gr_post's arithmetic) @
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, the last of which adapts ggml-org/llama.cpp
 # ggml/src/ggml-cuda/{dsv4-hc.cu,scale.cu,unary.cu,unary.cuh} @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT;
 # third_party/NOTICE).
@@ -19,6 +19,8 @@ two cannot share a mistake.
 * ``hc8_parity_matrices``: hc8_parity's down, up and injection matrices, drawn with numpy.
 * ``hc8_read_table``: ``hc8_read``, basalt's reader of a ``BASALTH8`` table, its checks transcribed.
 * ``gr_fixture``: gr_parity's write fixture, drawn with numpy, for any shape and window.
+* ``gr_write_double``: gr_parity's double write, ``R + bo * 2 / (1 + exp(-inj / hc))`` in float64, with its block-output
+  term; ``rel_terms`` and ``rel_diff``: gr_parity's metrics (term-relative per element; normalised L1), in float64.
 * ``gr_post_emulation``: ``native_gr_post`` as nvcc compiles it (docs/research/basalt-nvcc/native_gr_postops.md
   section 1), every operation ``.FTZ`` through ``tests/kernels/basalt_emu.py``'s helpers, with the approximate
   exponential the caller's; ``cuda_nan``: a stored NaN as sm_120's.
@@ -123,6 +125,30 @@ def gr_fixture(n_embd=256, hc=4, T=1, inj_sd=0.0, seed=1234):    # gr_parity.cpp
     bo = rng.standard_normal((T, n_embd), dtype=np.float32)
     inj = np.float32(inj_sd) * rng.standard_normal((T, hc), dtype=np.float32)
     return R, bo, inj
+
+
+def gr_write_double(R, bo, inj, hc):                 # gr_parity.cpp:679-688
+    """gr_parity's double write of ``R [T][hc][n_embd]``, ``bo [T][n_embd]`` and ``inj [T][hc]``: ``(want, bo_w)``,
+    ``want = R + bo_w`` and the term ``bo_w = bo * w``, ``w = 2.0 / (1.0 + exp(-inj / hc))`` per stream (``:681``,
+    ``:684-686``), every operand float64. A zero injection gives ``w = 1`` exactly, so ``want = R + bo``."""
+    w = 2.0 / (1.0 + np.exp(-np.asarray(inj, np.float64) / hc))
+    bo_w = np.asarray(bo, np.float64)[:, None, :] * w[:, :, None]
+    return np.asarray(R, np.float64) + bo_w, bo_w
+
+
+def rel_terms(want, got, term_a, term_b):           # gr_parity.cpp:147-156, elementwise
+    """``|want - got| / (|term_a| + |term_b|)``, the denominator floored at 1e-30, with every argument converted to
+    float64 first, as basalt's ``double`` parameters are: a float32 denominator would round in binary32."""
+    want, got, term_a, term_b = (np.asarray(v, np.float64) for v in (want, got, term_a, term_b))
+    den = np.abs(term_a) + np.abs(term_b)
+    return np.abs(want - got) / np.where(den > 1e-30, den, 1e-30)
+
+
+def rel_diff(a, b):                                 # gr_parity.cpp:136-145
+    """The normalised L1 difference ``sum |a - b| / sum |a|`` in float64, the denominator floored at 1e-30."""
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    d, mag = np.abs(a - b).sum(), np.abs(a).sum()
+    return d / (mag if mag > 1e-30 else 1e-30)
 
 
 def gr_post_emulation(R, bo, inj, hc, exp_of):      # native_gr_postops.cu:65-74, native_gr_postops.md section 1
