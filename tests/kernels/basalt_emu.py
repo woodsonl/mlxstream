@@ -875,3 +875,19 @@ def log1pf_nv(x):
         p2 = p0 & (xb.view(np.int32) > np.int32(-0x40800000))             # and (int) bits > (int) 0xBF800000
         r = np.where(p2, fma32(x, F32(np.inf), F32(np.inf)), r)
         return np.where(p0 & (x == 0), F32(-0.0), r).astype(F32)          # FSEL r, r, -RZ, x != 0
+
+
+def q8_1_rec(x):
+    """dec_gdn_rec's q8_1 rows (norm_q8, dec_gdn_rec.cu:115-132) as nvcc compiles them (dec_gdn.md section 6c): the
+    absolute values, the max butterfly (FMNMX without FTZ or NAN: a NaN lane loses, a signaling one too, nan.md; the
+    host's fmax returns NaN for a signaling operand, so the NaNs are quieted first), the sum butterfly (FADD) and the
+    amax == 0 test without flushing; d by FMUL.FTZ with fl(1/127) and the codes by MUFU.RCP then FMUL.FTZ, as
+    q8_1_native's; roundf, the clamp, and a NaN code 0. A subnormal amax gives d = +0 and codes rcp(+0) = inf times a
+    flushed value: NaN, code 0."""
+    v = np.asarray(x, F32).reshape(-1, 32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        amax = butterfly(np.where(np.isnan(v), F32(np.nan), np.abs(v)), np.fmax)
+        s = butterfly(v, np.add)
+        d = q8_1_finite(mul_ftz(amax, RCP127))
+        q = roundf(mul_ftz(v, rcp_ftz(d)[:, None]))
+    return q8_1_pack(d, s, q8_1_codes(q, amax))

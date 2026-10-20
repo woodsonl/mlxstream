@@ -30,6 +30,17 @@ comparison is bitwise; a NaN result compares by class (the kernels' stores canon
   gives 0x3ECF9920), the smallest subnormals (which this GPU's m + s would flush to +0), +-0, -1 and +inf. The results
   must also be within 1 ulp of float64's log1p rounded to float32 wherever x >= -1, which catches an error both
   transcriptions share.
+- H.4: ``q8_1_store_rec`` (dec_gdn_rec's q8_1 rows: native's d and codes, the block sum by unflushed adds) against
+  ``basalt_emu.q8_1_rec``, which follows the SASS (dec_gdn.md section 6c: the max, the sum and the amax == 0 test
+  unflushed), one thread per value and a SIMD-group per block: N(0, 1) blocks, values spread over e^-80 to e^80, whole
+  blocks scaled from 2^-150 to 2^125, all-subnormal and subnormal-or-zero blocks (with NaN lanes too), values below
+  2^-120 (d flushes to +0), lanes that cancel to subnormal sums of either sign, codes at rounding ties (an amax whose
+  correctly rounded amax / 127 is not native's d, values within 2 ulps of (k + 1/2) d), NaN lanes of every payload
+  (signaling too) and infinite ones (inf - inf too), all-NaN, zero and overflowing blocks. Fixed blocks with their
+  bytes: a lone -1e-40, whose IEEE sum stores ds.y 0x8000 where the flushed one stores 0x0000, and two normals that
+  cancel to -2^-148. Also ``q8_1_store_native``'s bytes on every block whose values are each 0 or at least 2^-102
+  (G6's precondition), and its d and codes on every block (a flushed max changes no bit); the two ds.y must differ on
+  many blocks, and only in the sign of a zero, and the tie blocks' codes must depend on the quotient's rounding.
 """
 
 import numpy as np
@@ -334,3 +345,119 @@ def test_log1pf_nv_matches_the_emulation():
         ref = np.log1p(x[ok].astype(F64)).astype(F32).view(U32)
     key = lambda b: np.where(b >= SIGN, -(b & U32(0x7FFFFFFF)).astype(np.int64), b.astype(np.int64))
     assert np.max(np.abs(key(got[ok]) - key(ref))) <= 1, "log1pf_nv: more than 1 ulp from float64's log1p"
+
+
+# ---- H.4: q8_1_store_rec -------------------------------------------------------------------------------------------
+
+H4 = """
+kernel void h4_q8_1(device const uint* x [[buffer(0)]], device uchar* rec [[buffer(1)]],
+                    device uchar* native [[buffer(2)]], constant uint& n [[buffer(3)]],
+                    uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;                                       // n is a multiple of 32: whole SIMD-groups return
+  const float v = as_type<float>(x[i]);
+  q8_1_store_rec(v, rec, i);
+  q8_1_store_native(v, native, i);
+}
+"""
+NANS = np.array([0x7FC00000, 0xFFC00000, 0x7F800001, 0xFFFFFFFF], U32)
+# ({lane: bits}, the other lanes +0; q8_1_store_rec's ds.x, ds.y and {lane: code}, the other codes 0); the flushed sum
+# of q8_1_store_native is +0 on both, its ds.y 0x0000
+H4_FIXED = [({0: 0x800116C2}, 0x0000, 0x8000, {}),                  # -1e-40 alone: the IEEE sum's half is -0
+            ({0: 0x81000001, 16: 0x01000000}, 0x0000, 0x8000,      # -(2^-125 + 2^-148) + 2^-125 = -2^-148; d flushes
+             {0: -127, 16: 127})]                                   # to +0, so the quotients are +-inf, clamped
+
+
+def h4_run(xb):
+    """q8_1_store_rec's and q8_1_store_native's blocks (rows of 36 bytes, starting as 0xFF) of the float32 bits ``xb``,
+    a multiple of 32 of them: one thread per value, a SIMD-group per block."""
+    n = len(xb)
+    assert n % 32 == 0
+    pso = gpu.pipeline(kernels.basalt_gdn_source() + H4, "h4_q8_1")
+    out = gpu.run(pso, [np.ascontiguousarray(xb, U32).tobytes(), 36 * n // 32, 36 * n // 32], np.uint32(n).tobytes(),
+                  3, -(-n // 256), 256, fill=0xFF)
+    return [np.frombuffer(b, np.uint8).reshape(-1, 36) for b in out[1:]]
+
+
+def h4_blocks(rng, nb=256):
+    """H.4's blocks (rows of 32 float32 bits) by class."""
+    sub = lambda *s: rng.integers(1, 1 << 23, s, dtype=U32) | (rng.integers(0, 2, s, dtype=U32) << U32(31))
+    zero = lambda *s: rng.integers(0, 2, s, dtype=U32) << U32(31)
+    normal = lambda *s: rng.standard_normal(s).astype(F32).view(U32)
+    rows = np.arange(nb)
+    b = {"random": (rng.standard_normal((2048, 32)) * 3).astype(F32).view(U32),
+         "wide": (rng.standard_normal((nb, 32)) * np.exp(rng.uniform(-80, 80, (nb, 32)))).astype(F32).view(U32),
+         "scaled": np.ldexp(rng.standard_normal((4 * nb, 32)), rng.integers(-150, 126, (4 * nb, 1))).astype(F32)
+         .view(U32),                                                # whole blocks from the subnormals to 2^127
+         "subnormal": sub(nb, 32),
+         "sub_or_zero": np.where(rng.random((nb, 32)) < rng.choice([0.03, 0.2, 0.5], (nb, 1)), sub(nb, 32),
+                                 zero(nb, 32)),
+         "sub_nan": np.where(rng.random((nb, 32)) < 0.1, rng.choice(NANS, (nb, 32)),
+                             np.where(rng.random((nb, 32)) < 0.5, sub(nb, 32), zero(nb, 32))),
+         "flush_d": floats(rng, rng.integers(0, 7, (nb, 32)))}     # below 2^-120: amax * fl(1/127) flushes to +0
+    # lane j + 16 cancels lane j to (k_j + e_j) 2^-149 with |e_j| <= 4: subnormal sums of either sign
+    k = rng.integers(1 << 20, (1 << 24) - 4, (nb, 16)) * rng.choice([-1, 1], (nb, 16))
+    m = np.concatenate([k, -(k + rng.integers(-4, 5, (nb, 16)))], axis=1)
+    b["cancel"] = np.ldexp(m.astype(F64), -149).astype(F32).view(U32)
+    # codes at rounding ties: lane 0 an amax whose fl(amax / 127) is not native's d = fl(amax * fl(1/127)), the others
+    # within 2 ulps of (k + 1/2) d, where the quotient's rounding decides the code
+    a = np.abs(rng.standard_normal(1 << 14)).astype(F32)
+    a = a[a / F32(127.0) != emu.mul_ftz(a, emu.RCP127)][:nb]
+    near = ((rng.integers(-127, 127, (nb, 31)) + 0.5) * emu.mul_ftz(a, emu.RCP127)[:, None]).astype(F32).view(U32)
+    near = (near.astype(np.int64) + rng.integers(-2, 3, (nb, 31))).astype(U32)
+    b["tie"] = np.c_[(a * rng.choice([-1, 1], nb).astype(F32)).view(U32), near]
+    x = normal(nb, 32)
+    x[rows, rng.integers(0, 32, nb)] = rng.choice(NANS, nb)
+    x[rows[::2], rng.integers(0, 32, nb // 2)] = rng.choice(NANS, nb // 2)
+    b["nan"] = np.r_[x, np.repeat(NANS, 32).reshape(-1, 32)]       # one or two NaN lanes; all NaN
+    x = normal(nb, 32)
+    x[rows, rng.integers(0, 32, nb)] = rng.choice([0x7F800000, 0xFF800000], nb)
+    x[rows[::4], 7], x[rows[::4], 23] = 0x7F800000, 0xFF800000      # inf - inf: a NaN sum
+    b["inf"] = x
+    b["zero"] = np.r_[np.zeros((1, 32), U32), np.full((1, 32), SIGN), zero(6, 32)]
+    b["overflow"] = np.r_[(rng.standard_normal((nb, 32)) * 1e5).astype(F32).view(U32),          # sums past 65504
+                          (rng.uniform(1e38, 3.4e38, (nb, 32)) * rng.choice([-1, 1], (nb, 32))).astype(F32)
+                          .view(U32)]                                                         # past FLT_MAX
+    return b
+
+
+def test_q8_1_store_rec_matches_the_emulation():
+    blocks = h4_blocks(np.random.default_rng(34))
+    fixed = np.zeros((len(H4_FIXED), 32), U32)
+    lit = np.zeros((len(H4_FIXED), 36), np.uint8)
+    for r, (lanes, dsx, dsy, codes) in enumerate(H4_FIXED):
+        fixed[r, list(lanes)] = list(lanes.values())
+        lit[r, :4] = np.array([dsx, dsy], np.uint16).view(np.uint8)
+        lit[r, [4 + j for j in codes]] = np.array(list(codes.values()), np.int8).view(np.uint8)
+    xb = np.concatenate([fixed] + list(blocks.values()))
+    names = np.repeat(["fixed"] + list(blocks), [len(fixed)] + [len(v) for v in blocks.values()])
+    rec, nat = h4_run(xb.ravel())
+    with np.errstate(invalid="ignore"):                     # the signaling-NaN lanes raise the flag in the casts
+        want = emu.q8_1_rec(xb.view(F32).ravel()).reshape(-1, 36)
+    nf = len(H4_FIXED)
+    assert np.array_equal(want[:nf], lit), "basalt_emu.q8_1_rec misses a fixed block's bytes"
+    assert np.array_equal(rec[:nf], lit), f"q8_1_store_rec on the fixed blocks: {[r.tobytes().hex() for r in rec[:nf]]}"
+    bad = np.flatnonzero(np.any(rec != want, axis=1))
+    assert bad.size == 0, (f"q8_1_store_rec: {bad.size} of {len(rec)} blocks differ; first block {bad[0]} "
+                           f"({names[bad[0]]}): got {rec[bad[0]].tobytes().hex()}, want {want[bad[0]].tobytes().hex()}")
+    # G6's precondition (every value 0 or at least 2^-102): q8_1_store_native stores the same bytes, so dec_gdn_parity's
+    # comparison of dec_gdn_rec's yq with the native q8_1 of the per-stage y holds
+    mag = xb & U32(0x7FFFFFFF)
+    g6 = np.all((mag == 0) | ((mag >= U32(0x0C800000)) & (mag <= U32(0x7F800000))), axis=1)
+    assert np.array_equal(rec[g6], nat[g6]), "q8_1_store_rec and q8_1_store_native differ under G6's precondition"
+    # the d and the codes are native's on every block (the SASS's unflushed max and zero test change no bit), and the
+    # sum's half differs only in the sign of a zero (dec_gdn.md section 6c); the rows exercise what they claim: many
+    # blocks meet the precondition, many have a ds.y the flushed sum changes, the fixed ones among them, and many have
+    # a subnormal largest |x| (the SASS's codes are then NaN quotients, 0) or a normal one whose d flushes
+    keep = np.r_[0:2, 4:36]
+    assert np.array_equal(rec[:, keep], nat[:, keep]), "q8_1_store_rec's d or codes are not native's"
+    dsy = lambda q: q[:, 2:4].copy().view(np.uint16)[:, 0]
+    diff = dsy(rec) != dsy(nat)
+    assert np.all((dsy(rec) | dsy(nat))[diff] == 0x8000), "a ds.y differs in more than the sign of a zero"
+    assert np.count_nonzero(g6) > 2000 and np.count_nonzero(diff) > 200 and np.all(diff[:nf])
+    top = np.max(np.where(nan32(xb), U32(0), mag), axis=1)
+    assert np.count_nonzero((top > 0) & (top < U32(0x00800000))) > 100
+    assert np.count_nonzero((top >= U32(0x00800000)) & (top < U32(0x03800000))) > 100     # below 2^-120
+    # and the tie blocks' codes depend on the tail: the correctly rounded quotient gives others on many lanes
+    v = xb[names == "tie"].view(F32)
+    d = emu.mul_ftz(np.abs(v[:, :1]), emu.RCP127)
+    assert np.count_nonzero(emu.roundf(v / d) != emu.roundf(emu.mul_ftz(v, emu.rcp_ftz(d)))) > 100
