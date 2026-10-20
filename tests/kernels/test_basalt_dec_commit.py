@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/dec_commit_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
-# (MIT; third_party/NOTICE): its geometry, its GDN fixture and set_commit's record.
+# (MIT; third_party/NOTICE): its geometry, its GDN fixture, set_commit's record, the threadgroup counts and the GDN
+# half's criterion.
 """dec_commit_parity's GDN half (basalt src/kernels/dec_commit_parity.cpp) on the Metal commit
 (kernels/common/basalt_gdn_commit.metal's ``gdn_commit_layers``), through tests/kernels/basalt_gdn_gpu.py's
 ``gdn_commit``, which binds a sentinel tail past the state and checks it and the ``used`` word after every dispatch.
@@ -14,6 +15,15 @@
   GPU with itself or with an exact host copy). The conv history a commit of n rows must leave is
   tests/basalt_gdn_ref.py's ``conv_tail`` of the history and the layer's first n qkv rows, a word copy
   (gdn_conv_commit_n, verify_kernels.cu:88-101).
+- DCM.1, parity's GDN criterion (:163-178, ``if (ra != rb)``): for n_keep 0..7 and p0 in {0, 1, 5, 6, 1001}, each run
+  from a fresh state0, the 3 layers' state and history at threadgroup counts {1, 7, 24, 32, 170} (basalt's, :171), 816
+  (one item per threadgroup) and 1000 (idle threadgroups) equal the 1-threadgroup run at p0 = 0 bit for bit. p0 reaches
+  no GDN word (the commit reads word 0 only), so every count also repeats 5 times on the same kept rows.
+- DCM.2, the commit against its own one-row calls (the contract's tier-1 substitute for basalt's per-stage reference,
+  which the port does not build): a commit of n = 1..7 rows equals n one-row commits in turn, the k-th fed a window
+  whose row 0 is row k and whose rows 1..6 are NaN in all four buffers, so a row past n that is read shows in the
+  state or the history; and the 3-layer launch equals each layer committed alone (n_layers = 1), as basalt's
+  reference commits layer by layer (:75-82).
 - DCM.5, the keep count's edges (none in basalt): ``commit[0]`` of -1, 0 and -2^31 stores nothing but ``used`` = 0,
   and 8 and 100 give the bits of 7, the window's rows, with ``used`` = 7 (basalt clamps to kVerifyMaxT = 8 and would
   read row 7 past this window). The 7-row commit must store: every thread's rows of the state change and every
@@ -34,7 +44,14 @@ C = 2 * HK * S + HV * S              # 10240: q at [0, 2048), k at [2048, 4096),
 REC = S * HV * S                     # a layer's recurrent state; its conv history follows
 GDN_FLOATS = REC + C * 3             # 817152 (:30)
 NL = 3                               # parity's GDN layers (make_gdn(rng, 3), :159)
+P0S = (0, 1, 5, 6, 1001)             # parity's p0 (:164)
+TGS = (1, 7, 24, 32, 170, 816, 1000) # parity's blocks (:171), then one item per threadgroup (3 x 272) and idle ones
 
+CRIT1 = ("for `n_keep = 0..7` × `p0 in {0, 1, 5, 6, 1001}` (3 layers, fresh `state0` each time), state + history bytes "
+         "(`GDN_FLOATS` per layer) at threadgroup counts `{1, 7, 24, 32, 170, 816, 1000}` equal the 1-threadgroup "
+         "result, and every run repeats bit for bit")
+CRIT2 = ("a commit of `n = 1..7` rows equals `n` successive one-row commits, the `k`-th fed row `k` (rows 1..6 NaN), "
+         "byte for byte in state and history; the 3-layer launch equals each layer committed alone (`n_layers = 1`)")
 CRIT5 = ("`commit[0] in {-1, 0}` leaves state and history equal to `state0` bitwise; `commit[0] in {8, 100}` gives "
          "the bits of `commit[0] = 7` (the window's static row count) with no shader-validation report")
 
@@ -82,6 +99,42 @@ def assert_bits(what, got, want, crit):
 
 def layer(a, l):
     return a[l * GDN_FLOATS:(l + 1) * GDN_FLOATS]
+
+
+# ---- DCM.1: the threadgroup count changes no bit --------------------------------------------------------------------
+
+def test_gdn_commit_is_bitwise_the_same_at_every_threadgroup_count(gdn):
+    for n in range(MT + 1):
+        ref = None                                    # the first run, p0 = 0 at 1 threadgroup
+        for p0 in P0S:
+            for tgs in TGS:
+                st, _ = gdn_gpu.gdn_commit(gdn.state0, gdn.h, gdn.qkv, gdn.gate, gdn.beta, commit_record(n, p0), c=C,
+                                           h_v=HV, mt=MT, n_layers=NL, threadgroups=tgs)
+                if ref is None:
+                    ref = st
+                    continue
+                assert_bits(f"n_keep {n}, p0 {p0}, {tgs} threadgroups against 1 at p0 0: the state and history", st,
+                            ref, CRIT1)
+
+
+# ---- DCM.2: n rows against n one-row commits, and each layer alone --------------------------------------------------
+
+def test_gdn_commit_of_n_rows_equals_n_one_row_commits(gdn):
+    win = [a.reshape(NL, MT, -1) for a in (gdn.h, gdn.qkv, gdn.gate, gdn.beta)]     # per layer, MT rows
+    st = gdn.state0
+    for n in range(1, MT + 1):
+        rows = [np.full_like(w, np.nan) for w in win]                 # the window of row n - 1: rows 1..6 NaN
+        for r, w in zip(rows, win):
+            r[:, 0] = w[:, n - 1]
+        st, _ = gdn_gpu.gdn_commit(st, *rows, commit_record(1, 0), c=C, h_v=HV, mt=MT, n_layers=NL)
+        full, _ = gdn_gpu.gdn_commit(gdn.state0, gdn.h, gdn.qkv, gdn.gate, gdn.beta, commit_record(n, 0), c=C, h_v=HV,
+                                     mt=MT, n_layers=NL)
+        assert_bits(f"{n} rows in one commit against {n} one-row commits: the state and history", full, st, CRIT2)
+        for l in range(NL):
+            alone, _ = gdn_gpu.gdn_commit(layer(gdn.state0, l), *(w[l] for w in win), commit_record(n, 0), c=C,
+                                          h_v=HV, mt=MT)
+            assert_bits(f"layer {l} committed alone against the {NL}-layer launch, {n} rows", alone, layer(full, l),
+                        CRIT2)
 
 
 # ---- DCM.5: the keep count's edges ----------------------------------------------------------------------------------
