@@ -227,3 +227,134 @@ kernel void gdn_step_norm_multi(device const float* state [[buffer(0)]], device 
         }
     }
 }
+
+// ---- dec_gdn_rec: the window ----------------------------------------------------------------------------------------
+
+// The window's most tokens a dec_gdn_rec pipeline keeps in registers (basalt's MAXT; 8 = kDecMaxT unless a program
+// of at most that many tokens builds it lower). Every bit is the same whatever it is; the threadgroup arrays keep
+// kDecMaxT rows, as RecSmem does.
+#ifndef GDN_MAXT
+#define GDN_MAXT 8
+#endif
+
+// conv_silu (dec_gdn_rec.cu:53-66): token t of one channel, the conv of [hist(3) | xs rows 0..t-1] with xs row t (the
+// channel's raw projections, oldest first) and its SiLU: gdn_conv_l2_multi's sequence on the channel's registers.
+static inline float gdn_conv_silu(thread const float* hist, thread const float* w, thread const float* xs, uint t) {
+    float win[3];
+    for (uint j = 0; j < 3u; ++j) {
+        const uint src = t + j;
+        win[j] = src < 3u ? hist[src] : xs[src - 3u];
+    }
+    return gdn_silu(gdn_conv(win[0], win[1], win[2], xs[t], w[0], w[1], w[2], w[3]));
+}
+
+// dec_gdn_rec (dec_gdn_rec.cu:141-307, rec_block<MAXT, false> of rec_kernel; host dec_gdn_rec's checks, :355-367, are
+// basalt_gdn_params'): the window of T tokens of one GDN layer, from the layer's state (the S x h_v x S recurrent
+// state, then the conv history [C][3]; read only) and the token rows of qkv, x and z. It writes rows t < T of the
+// window stores the commit replays: win_qkv, the qkv rows as they are (the commit's conv history; basalt's projection
+// writes them in place, spec-engine.md section 9.3), win_h, gdn_conv_l2_multi's h, and win_gate and win_beta,
+// gdn_ab_multi's gate and beta. Grid h_v threadgroups of 512 threads, one value head each: basalt's cluster of four
+// 128-thread blocks as one threadgroup, thread tid = 128 rank + 32 rg + lane of SIMD-group sg = 4 rank + rg playing
+// lane `lane` of warp rg of block `rank`, the head's state column col = 32 rank + lane, rows 32 rg .. 32 rg + 31. What
+// the four blocks compute alike runs once: the 2 T gate jobs over the 16 SIMD-groups, the key head's q and k (head
+// % h_k) on rank 0's 128 threads in basalt's partition; SIMD-group 4 rank + 1 takes the v channel of column col.
+kernel void dec_gdn_rec(device const float* state [[buffer(0)]], device const float* qkv [[buffer(1)]],
+                        device const float* w [[buffer(2)]], device const float4* x [[buffer(3)]],
+                        device const uint4* wa [[buffer(4)]], device const uint4* wb [[buffer(5)]],
+                        device const float* dt [[buffer(6)]], device const float* ssm_a [[buffer(7)]],
+                        device const float* z [[buffer(8)]], device const float* gamma [[buffer(9)]],
+                        device float* win_qkv [[buffer(10)]], device float* win_h [[buffer(11)]],
+                        device float* win_gate [[buffer(12)]], device float* win_beta [[buffer(13)]],
+                        device uchar* yq [[buffer(14)]], constant BsGdnParams& p [[buffer(16)]],
+                        uint head [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float qn[8][128], kn[8][128], v[8][128], part[2][8][4], gm[8], bm[8];
+    const uint tid = 32u * sg + lane, rank = sg / 4u, rg = sg % 4u, col = 32u * rank + lane;
+    const uint qh = head % p.h_k, qk = 128u * p.h_k, n8 = p.n_embd / 8u, T = min(p.T, uint(GDN_MAXT));
+    const uint cq = qh * 128u + tid, ck = qk + cq, cv = 2u * qk + head * 128u + col;   // cq, ck: rank 0's
+    device const float* hist = state + 128u * p.h_v * 128u;        // the conv tail
+
+    // A: the thread's 32 state rows of column col, the head's constants
+    float s[32];
+    for (uint r = 0; r < 32u; ++r) s[r] = state[((32u * rg + r) * p.h_v + head) * 128u + col];
+    const float dth = dt[head], sa = ssm_a[head], gam = gamma[col];
+
+    // B: the (gate, token) jobs, job 2 t the alpha gate of token t, 2 t + 1 its beta; a job's bits are its SIMD-group's
+    // alone (gdn_ab_multi's dot)
+    for (uint job = sg; job < 2u * T; job += 16u) {
+        const uint t = job >> 1;
+        const bool is_beta = (job & 1u) != 0u;
+        const float a = gdn_ab_dot((is_beta ? wb : wa) + head * n8, x + 2u * n8 * t, lane, n8);
+        if (lane == 0u) {
+            if (is_beta) bm[t] = gdn_beta(a);
+            else gm[t] = gdn_gate(a, dth, sa);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // C, D: the conv and SiLU of the tokens t < T; rank 0's SIMD-group rg holds channels 32 rg .. 32 rg + 31 of the
+    // key head's q and k (q, k: basalt's yq, yk), lane 0 keeping the butterflies of their squares
+    float xq[GDN_MAXT], xk[GDN_MAXT], q[GDN_MAXT], k[GDN_MAXT];
+    if (rank == 0u) {                                              // SIMD-groups 0..3
+        float hq[3], hk[3], wq[4], wk[4];
+        for (uint j = 0; j < 3u; ++j) { hq[j] = hist[3u * cq + j]; hk[j] = hist[3u * ck + j]; }
+        for (uint j = 0; j < 4u; ++j) { wq[j] = w[4u * cq + j]; wk[j] = w[4u * ck + j]; }
+        for (uint t = 0; t < GDN_MAXT; ++t) {
+            if (t >= T) break;
+            xq[t] = qkv[t * p.C + cq];
+            xk[t] = qkv[t * p.C + ck];
+        }
+        for (uint t = 0; t < GDN_MAXT; ++t) {
+            if (t >= T) break;
+            q[t] = gdn_conv_silu(hq, wq, xq, t);
+            k[t] = gdn_conv_silu(hk, wk, xk, t);
+            const float sq = warp_sum_ieee(ieee_mul(q[t], q[t])), sk = warp_sum_ieee(ieee_mul(k[t], k[t]));
+            if (lane == 0u) {
+                part[0][t][rg] = sq;
+                part[1][t][rg] = sk;
+            }
+        }
+    }
+    if (rg == 1u) {                                                // SIMD-group 4 rank + 1: the v channel cv
+        float hv[3], wv[4], xv[GDN_MAXT];
+        for (uint j = 0; j < 3u; ++j) hv[j] = hist[3u * cv + j];
+        for (uint j = 0; j < 4u; ++j) wv[j] = w[4u * cv + j];
+        for (uint t = 0; t < GDN_MAXT; ++t) {
+            if (t >= T) break;
+            xv[t] = qkv[t * p.C + cv];
+        }
+        for (uint t = 0; t < GDN_MAXT; ++t) {
+            if (t >= T) break;
+            const float yv = gdn_conv_silu(hv, wv, xv, t);
+            v[t][col] = yv;
+            win_h[t * p.C + cv] = cuda_nan(yv);
+            win_qkv[t * p.C + cv] = xv[t];                         // a copy: its bits
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // E: the L2 norms of q and k; rank 0 of value head qh (head < h_k) writes the key head's channels, once each
+    if (rank == 0u) {
+        const bool write_qk = head < p.h_k;
+        for (uint t = 0; t < GDN_MAXT; ++t) {
+            if (t >= T) break;
+            q[t] = ieee_mul(q[t], rsqrt_ieee(ieee_add(gdn_sum4(part[0][t][0], part[0][t][1], part[0][t][2],
+                                                               part[0][t][3]), p.eps)));
+            k[t] = ieee_mul(k[t], rsqrt_ieee(ieee_add(gdn_sum4(part[1][t][0], part[1][t][1], part[1][t][2],
+                                                               part[1][t][3]), p.eps)));
+            qn[t][tid] = q[t];
+            kn[t][tid] = k[t];
+            if (write_qk) {
+                win_h[t * p.C + cq] = cuda_nan(q[t]);
+                win_h[t * p.C + ck] = cuda_nan(k[t]);
+                win_qkv[t * p.C + cq] = xq[t];
+                win_qkv[t * p.C + ck] = xk[t];
+            }
+        }
+    }
+
+    // F: the gates, for the commit: thread t (rank 0) and thread 128 + t (rank 1) of token t
+    if (tid < T) win_gate[tid * p.h_v + head] = cuda_nan(gm[tid]);
+    if (tid >= 128u && tid - 128u < T) win_beta[(tid - 128u) * p.h_v + head] = cuda_nan(bm[tid - 128u]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}

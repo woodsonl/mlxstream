@@ -12,17 +12,23 @@ of tests/basalt_gdn_ref.py.
 - ``ab``: ``gdn_ab_multi``, the window's gate and beta from x's rows.
 - ``step_norm``: ``gdn_step_norm_multi``, the window's y from a layer's state (its recurrent state) and the window's
   h, gate, beta and z rows.
+- ``rec``: ``dec_gdn_rec``, the window itself: its four window stores (win_qkv, win_h, win_gate, win_beta, rows
+  t < T of MT) and its q8_1 rows yq from a layer's state and the window's qkv, x and z rows, with the state's bytes
+  after the run and the run's result.
 """
+
+from typing import NamedTuple
 
 import numpy as np
 
 from monolith import kernels
 from monolith.runtime import _native as nt
-from tests.basalt_gdn_ref import C, EPS, F32, HK, HV, N, S, ZV
+from tests.basalt_gdn_ref import C, EPS, F32, HK, HV, MT, N, S, ZV
 from tests.kernels import basalt_gpu as gpu
 
 PARAMS_SLOT = 16
 FILL = 0xFF
+YQ_ROW = ZV // 32 * kernels.Q8_1_BLOCK_BYTES               # one token's q8_1 row of the ZV outputs: 6912 bytes
 
 
 def params(t):
@@ -83,3 +89,31 @@ def step_norm(state, h, gate, beta, z, gamma):
     ins = dict(enumerate(np.asarray(a, F32) for a in (state, h, gate, beta, z, gamma)))     # slots 0..5
     _, got, ok = launch(pipeline("gdn_step_norm_multi"), t, ins, {6: (t, 4 * ZV)}, (HV,), 512)
     return got[6][: 4 * ZV * t].view(F32).reshape(t, ZV), ok
+
+
+class Rec(NamedTuple):
+    """``rec``'s results: rows t < T of the window stores, win_qkv and win_h (T, C), win_gate and win_beta (T, HV),
+    float32; yq, (T, YQ_ROW) q8_1 bytes; the state's SF floats after the run; sentinel_ok; the RunResult."""
+    qkv: np.ndarray
+    h: np.ndarray
+    gate: np.ndarray
+    beta: np.ndarray
+    yq: np.ndarray
+    state: np.ndarray
+    ok: bool
+    run: object
+
+
+def rec(layer, state, qkv, x, z):
+    """``dec_gdn_rec`` over the window of qkv's rows (T = len(qkv); qkv (T, C), x (T, N) and z (T, ZV), each bound at
+    exactly those rows) from one layer's ``state`` (SF floats, bound alone at exactly its bytes) with ``layer``'s
+    conv_w, w_alpha, w_beta, dt, ssm_a and gamma; the four window stores bound as MT rows plus the sentinel row, as a
+    session's states hold them (rows T..7 and the sentinel must keep their 0xFF), yq as T rows plus one. A ``Rec``."""
+    t = len(qkv)
+    ins = {0: np.asarray(state, F32), 1: np.asarray(qkv, F32), 2: layer.conv_w, 3: np.asarray(x, F32), 4: layer.wa,
+           5: layer.wb, 6: layer.dt, 7: layer.ssm_a, 8: np.asarray(z, F32), 9: layer.gamma}
+    outs = {10: (MT, 4 * C), 11: (MT, 4 * C), 12: (MT, 4 * HV), 13: (MT, 4 * HV), 14: (t, YQ_ROW)}
+    r, got, ok = launch(pipeline("dec_gdn_rec"), t, ins, outs, (HV,), kernels.GDN_THREADS)
+    rows = lambda k, n: got[k][: 4 * n * t].view(F32).reshape(t, n)
+    return Rec(rows(10, C), rows(11, C), rows(12, HV), rows(13, HV), got[14][: YQ_ROW * t].reshape(t, YQ_ROW),
+               got[0].view(F32), ok, r)
