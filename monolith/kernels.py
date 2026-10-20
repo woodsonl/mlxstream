@@ -11,7 +11,7 @@ from typing import List, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 from .formats import FORMATS
 from .formats.blm import PackInfo
-from .formats.gguf import GGML_TYPES, ggml_row_bytes
+from .formats.gguf import ggml_row_bytes
 from .backends.metal.context import current_backend
 
 from .resources import kernel_root
