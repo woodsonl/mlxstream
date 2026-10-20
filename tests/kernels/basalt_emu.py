@@ -4,6 +4,7 @@
 # adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu, src/kernels/cuda/iq_kernels.cu,
 # src/kernels/cuda/native_bf16.cu, src/kernels/cuda/dense_tc.cu, src/kernels/cuda/q5k_head.cu,
 # src/kernels/cuda/head_proxy.cuh, src/kernels/cuda/quantize_act.cu, src/kernels/cuda/s2_expert_grouped.cu,
+# src/kernels/cuda/dec_gdn_rec.cu, src/kernels/cuda/verify_kernels.cu,
 # include/basalt/kernels/q8_1_finite.hpp and include/basalt/kernels/f16_bits.hpp @
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp ggml/src/ggml-common.h (kvalues_iq4nl),
 # ggml/src/ggml-quants.c (get_scale_min_k4), ggml/src/ggml-cuda/quantize.cu and ggml/src/ggml-cuda/mmvf.cu @
@@ -791,3 +792,44 @@ def q5k_proxy_final(cand, part, exact, map_, expf):
         s[:k] = add_ftz(s[:k], ed[c0:c0 + k])
     total = max_ftz(butterfly(s[None], add_ftz)[0], F32(1.0 if bi in rows else 0.0))
     return int(np.asarray(map_)[bi]), rcp_ftz(total), rows
+
+
+# ---- the GDN window (docs/research/basalt-nvcc/dec_gdn.md, verify_gdn.md) -----------------------------------------
+# dec_gdn_rec.cu and verify_kernels.cu build with nvcc's IEEE defaults: no flush, as numpy's float32 operations.
+# MUFU.EX2 and MUFU.RSQ have no bit-exact host model: ``exp2`` and ``rsqrt`` evaluate the port's stand-ins, the GPU's
+# fast::exp2 and fast::rsqrt, on a float32 array.
+
+L2E = np.uint32(0x3FB8AA3B).view(F32)      # log2(e) rounded: __expf's FMUL constant (-L2E, 0xBFB8AA3B, for __expf(-x))
+
+
+def sign_flip(x):
+    """-x by its bits: the sign flipped, every other bit kept."""
+    return (np.asarray(x, F32).view(np.uint32) ^ np.uint32(0x80000000)).view(F32)
+
+
+def ex2n(e, exp2):
+    """nvcc's non-ftz ex2.approx.f32 (dec_gdn.md, Notation): FSETP.GEU e, -126, so an argument below -126 (ordered) is
+    halved and MUFU.EX2's result squared by an IEEE multiply, which keeps a subnormal result."""
+    e = np.asarray(e, F32)
+    s = e < F32(-126.0)
+    r = np.asarray(exp2(np.where(s, e * F32(0.5), e).astype(F32)), F32)
+    with np.errstate(over="ignore"):                    # r * r of an unhalved row is discarded
+        return np.where(s, r * r, r).astype(F32)
+
+
+def expf_ieee(x, exp2):
+    """__expf(x) in an IEEE-built file: FMUL e, x, 0x3FB8AA3B (no FTZ), then ex2n(e). An __expf(-x) site is ex2n of
+    x * -L2E, the constant nvcc folds the negation into."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        e = np.asarray(x, F32) * L2E
+    return ex2n(e, exp2)
+
+
+def rsqrt_ieee(x, rsqrt):
+    """rsqrtf in an IEEE-built file (rsqn, dec_gdn.md Notation): FSETP.GEU |x|, 2^-126, so a zero or subnormal argument
+    (ordered: not NaN) is scaled by 2^24 before MUFU.RSQ and the result by 2^12."""
+    x = np.asarray(x, F32)
+    small = np.abs(x) < F32(2.0 ** -126)
+    with np.errstate(over="ignore", invalid="ignore"):
+        r = np.asarray(rsqrt(np.where(small, x * F32(2.0 ** 24), x).astype(F32)), F32)
+        return np.where(small, r * F32(4096.0), r).astype(F32)

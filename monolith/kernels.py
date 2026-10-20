@@ -789,6 +789,45 @@ def basalt_coupled_node(nv: int, id_vocab: int, cap: int, j: int, *, id_to_sub: 
     return struct.pack("<IIIIIIII", nv, id_vocab, cap, j, flags, 0, 0, 0)
 
 
+# ---- basalt's GDN decode window (kernels/common/basalt_gdn.metal; docs/research/basalt-nvcc/dec_gdn.md) ------------
+# The constants and the checks below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/dec_gdn_rec.cu:30-33
+# and :355-367 and include/basalt/kernels/dec_gdn.hpp:16-39 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT;
+# third_party/NOTICE).
+
+GDN_S = 128                   # the key and value head dim, the recurrent state's side (basalt's S)
+GDN_MT = 8                    # the window's most rows (kDecMaxT, kVerifyMaxT)
+GDN_THREADS = 512             # dec_gdn_rec's threadgroup: basalt's cluster of four 128-thread blocks
+GDN_N_EMBD = 2560             # the gate rows' width, 32 lanes x 8 bf16 x NJ = 10 (the only one basalt accepts)
+
+
+def basalt_gdn_source() -> str:
+    """basalt's GDN decode window: the shared helpers, the IEEE binary32 operations, the software binary64 and the
+    IEEE operations built on it (``basalt_ieee_f64.metal``), the q8_1 quantizers, libdevice's transcriptions and the
+    GDN steps and kernels (``basalt_gdn.metal``), in that order."""
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
+            + template("basalt_ieee_f64.metal") + template("basalt_q8_1.metal") + template("basalt_libdevice.metal")
+            + template("basalt_gdn.metal"))
+
+
+def basalt_gdn_params(t: int, c: int, n_embd: int, h_k: int, h_v: int, eps: float) -> bytes:
+    """The 32-byte ``BsGdnParams`` (basalt_gdn.metal): the window's width t, the channels c, n_embd, the key and value
+    heads h_k and h_v and eps, then two zero words. Refuses what host ``dec_gdn_rec`` exits on (dec_gdn_rec.cu:356): t
+    outside 1..8, n_embd other than 2560, no key head, value heads not a multiple of the key heads; and c other than
+    2 * 128 * h_k + 128 * h_v (q, k, then v), which basalt's DecRecArgs carries unchecked but every index assumes."""
+    if not 1 <= t <= GDN_MT:
+        raise ValueError(f"basalt_gdn: the window's width must be 1 to {GDN_MT}, got {t}")
+    if n_embd != GDN_N_EMBD:
+        raise ValueError(f"basalt_gdn: n_embd must be {GDN_N_EMBD}, got {n_embd}")
+    if h_k <= 0:
+        raise ValueError(f"basalt_gdn: h_k must be positive, got {h_k}")
+    if h_v % h_k != 0:
+        raise ValueError(f"basalt_gdn: h_v must be a multiple of h_k, got h_v {h_v} and h_k {h_k}")
+    want = 2 * GDN_S * h_k + GDN_S * h_v
+    if c != want:
+        raise ValueError(f"basalt_gdn: C must be 2 * {GDN_S} * h_k + {GDN_S} * h_v = {want}, got {c}")
+    return struct.pack("<IIIIIfII", t, c, n_embd, h_k, h_v, eps, 0, 0)
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
