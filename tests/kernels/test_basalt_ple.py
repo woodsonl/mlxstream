@@ -2,12 +2,14 @@
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/ple_parity.cpp, src/kernels/ple_win_parity.cpp and
 # src/kernels/gr_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): ple_parity's history
-# regression (:177-214) and native key-norm check's metric and pass criterion (:899-910), ple_win_parity's
-# projected-form input scales (:47-55), and gr_parity's scalar activation contract's degenerate norm input and the
-# exactness it relies on (:167-236).
+# regression (:177-214), key-row check (:617-637), block check with its seven stages and its log line (:740-783),
+# native key projection check with its host norm, metric and pass criterion (:892-912) and conv cancellation metric
+# (:1139-1165), ple_win_parity's projected-form input scales (:47-55), and gr_parity's scalar activation contract's
+# degenerate norm input and the exactness it relies on (:167-236).
 """The n-gram (PLE) block's Metal port on the GPU, kernel by kernel (kernels/common/basalt_gr_norm.metal and
-basalt_ple.metal). Each norm call runs at its call sites' shape, 4 rows of 2560 with 4 gamma rows and eps = f32(1e-6)
-(native_ple_postops.cu:352-353, :358), unless stated.
+basalt_ple.metal) and as the per-row chain (``basalt_ple_gpu.chain``: main's q8_1, mmvq and mmvf, then those kernels,
+row by row, as the window op dispatches them). Each norm call runs at its call sites' shape, 4 rows of 2560 with 4
+gamma rows and eps = f32(1e-6) (native_ple_postops.cu:352-353, :358), unless stated.
 
 - T-NORM ``test_grouped_norm_float64`` (spec T§7.2): basalt_gr_norm against R-struct's float64 ``gnorm``
   (tests/basalt_ple_ref.py), criterion quoted:
@@ -52,7 +54,28 @@ basalt_ple.metal). Each norm call runs at its call sites' shape, 4 rows of 2560 
   source and leaves the other slots' 0xA5; the restore by the commit record's word 1 (``commit_record``: every
   (T, n_keep) with n_keep - 1 = word 1 has the same record, so words 0 to 7 cover T = 1..8 and n_keep = 1..T) equals
   that slot, a negative word leaves the history unchanged, and a word above 7 restores slot 7 (the port's bound, plan
-  D5). The words are slot-tagged random words (``copy_words``), so that a missed, stray or misplaced store shows."""
+  D5). The words are slot-tagged random words (``copy_words``), so that a missed, stray or misplaced store shows.
+- C8 ``test_key_projection_into_grouped_norm`` (ple_parity.cpp:892-912, spec T§6.4), on every row of C3's fixtures
+  (basalt runs two): the raw key of basalt's native_q2_0_f32, native_quantize_q8_1 then native_mmvq type 42 at one
+  column (basalt_gpu.q8_1 and mmvq), is the chain's own bit for bit, and so are its q8_1 image and its value
+  (basalt_gpu.mmvf): the chain composes main's kernels. Then the chain's key norm against the host norm of that raw
+  key (:899-904, ``host_norm``), criterion quoted:
+  ``const bool wired = le(rel, 2e-6) && nonfinite(actual_result.data(), hcd) == 0;`` (:910), rel = rel_l1(host norm,
+  GPU key norm), the non-finite count over the row's result.
+- C3 ``test_block_vs_float64_graph[synthetic]``, ``[real]`` (ple_parity.cpp:740-783, spec T§6.4): the chain over
+  T§6.3's fixtures, 12 rows from one initial history (the key's Q8_1 rounding the only contract between them), against
+  R-struct, rel = rel_l1(R-struct, GPU) per row and stage (the capture's seven slices), criterion quoted:
+  ``if (last && !le(rel, 1e-2)) ++bad;`` (:782), on result. The other six stages are logged in :771-772's format,
+  with the row's block share (T§6.3 rule 3) and C16's metric (:1139-1165), never gated: the conv_out error against
+  its terms' magnitude, sum |R-struct - GPU| / sum_c sum_k |w v| and sum |R-struct| / sum_c sum_k |w v|, the terms
+  w v from R-struct's taps and padded rows. Every stage's non-finite count must be 0 (spec T§8, X-NF rule 1).
+- C1 ``test_real_key_row0_decodes_like_ggml`` (ple_parity.cpp:617-637, spec T§6.4), real weights only: the committed
+  row 0 of the key (720 B of type-42 blocks) decoded by basalt_dequant_f32 (basalt_gpu.dequant) against ggml's
+  dequantize_row_q2_0 of the same bytes (tests/contract/gguf_reference.py's ``q2_0``), criterion quoted:
+  ``if (!le(worst, 0.0) || nf) ++bad;`` (:636), worst the NaN-safe largest |GPU - ggml| and nf the non-finite pairs;
+  the decoded row finite with 1e-4 < rms < 10 (weights, not padding: tests/contract/test_basalt_pack.py's
+  ``test_real_rows_match_the_reference``); and row 0 of the key the real fixture binds (gguf/blk.1.ple_key.weight, cut
+  from its full range at T§5's offset) equal to the committed slice, byte for byte."""
 
 import functools
 
@@ -60,8 +83,10 @@ import numpy as np
 import pytest
 
 from monolith import kernels
-from tests.basalt_ple_ref import (D, EPS, H, HIST, KERN, N, ROWS, T_MAX, Fixture, commit_record, gnorm, h_oracle, le,
-                                  nonfinite, r_contract, rel_l1)
+from tests.basalt_ple_ref import (D, DIL, EPS, H, HIST, KERN, KEY_BLOCK, N, ROWS, STAGES, T_MAX, Fixture,
+                                  commit_record, committed, gnorm, h_oracle, host_norm, le, nonfinite, r_contract,
+                                  r_struct, real, real_tensors, rel_l1, synthetic, taps)
+from tests.contract.gguf_reference import q2_0
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
 from tests.kernels import basalt_ple_gpu as ple_gpu
@@ -413,3 +438,102 @@ def test_commit_restore_exact(case):
         "is unchanged; ... guard bytes are untouched\" (spec T§7.5), and word 1 above 7 restores slot 7 (plan D5): "
         f"record {commit.tolist()}, the history equals {'itself' if slot is None else f'slot {slot}'}: {equal}; "
         f"guards intact: {guards}")
+
+
+# ---- C8, C3 (with C16) and C1: the block on the per-row chain (spec T§6.4) -----------------------------------------
+KEY = "gguf/blk.1.ple_key.weight"
+FIXTURES = {"synthetic": synthetic, "real": real}
+STAGE_OUT = {  # R-struct's slice: the chain's output for it, and basalt's name for the stage (ple_parity.cpp:752-758)
+    "key": ("key_norm", "key        (grouped_norm of ple_key @ emb)"),
+    "value": ("value", "value      (ple_value @ emb, BF16)"),
+    "gate": ("gate", "gate       (signed sqrt, sigmoid)"),
+    "gated": ("gated", "gated      (value broadcast * gate)"),
+    "normalized": ("normalized", "normalized (grouped_norm(gated, ple_norm_conv))"),
+    "conv_out": ("conv", "conv_out   (dilated conv, then SiLU)"),
+    "result": ("result", "result     (hidden + gated + conv)"),
+}
+
+
+@functools.lru_cache(maxsize=None)
+def block(name):
+    """C3's fixture ``name`` (spec T§6.3: 12 rows from one initial history), its R-struct, and the chain's run of its
+    12 rows (``basalt_ple_gpu.chain``), once per process: (fx, ref, out)."""
+    fx = FIXTURES[name]()
+    out = ple_gpu.chain(fx.emb, fx.hidden, np.ascontiguousarray(fx.hist.T).ravel(), fx)
+    return fx, r_struct(fx), out
+
+
+@pytest.mark.parametrize("name", list(FIXTURES))
+def test_key_projection_into_grouped_norm(name):
+    fx, _, out = block(name)
+    differ, bad = [], []
+    for t in range(ROWS):
+        xq = gpu.q8_1(fx.emb[t])                                    # native_q2_0_f32 (ple_parity.cpp:896)
+        raw = gpu.mmvq(42, fx.key, xq, N, D, 1)[0]
+        main = {"q8_1": xq, "key": raw, "value": gpu.mmvf(fx.value, fx.emb[t], N, N)}
+        differ += [(t, k) for k, a in main.items() if a.tobytes() != out[k][t].tobytes()]
+        rel = rel_l1(host_norm(raw, fx.w_nk), out["key_norm"][t])[0]
+        wired = le(rel, 2e-6) and nonfinite(out["result"][t]) == 0
+        print(f"  native PLE key projection->existing norm input {t}: {'pass' if wired else 'FAIL'} (rel {rel:.3e})")
+        if not wired:
+            bad.append((t, rel, nonfinite(out["result"][t])))
+    assert not differ, (
+        "C8's raw key is basalt's native_q2_0_f32 (native_quantize_q8_1, then native_mmvq type 42; basalt_gpu.q8_1 and "
+        "mmvq), and the chain's q8_1 image, raw key and value (basalt_gpu.mmvf) must be main's kernels' own, bit for "
+        f"bit: (row, output) {differ} differ")
+    assert not bad, (
+        "`const bool wired = le(rel, 2e-6) && nonfinite(actual_result.data(), hcd) == 0;` (ple_parity.cpp:910), then "
+        "`if (!wired) ++bad;` (:912), rel = rel_l1(the host norm of the raw key (:899-904), the chain's key norm), the "
+        f"non-finite count over the row's result: (row, rel, non-finite) {bad}")
+
+
+@pytest.mark.parametrize("name", list(FIXTURES))
+def test_block_vs_float64_graph(name):
+    fx, ref, out = block(name)
+    P = np.concatenate([np.asarray(fx.hist, F64), ref.normalized])     # R-struct's padded rows (spec T§6.2)
+    w = taps(fx.conv1d)
+    rels, over, nf_all = {stage: [] for stage in STAGES}, [], []
+    for t in range(ROWS):
+        for stage in STAGES:
+            got, label = STAGE_OUT[stage]
+            rel, mag, nf = rel_l1(getattr(ref, stage)[t], out[got][t])
+            last = stage == "result"
+            print(f"  token {t} {label:<46} rel {rel:.3e}   (mean |ref| {mag:.4f}, non-finite {nf})"
+                  f"{'   *** over 1e-2 ***' if last and not le(rel, 1e-2) else ''}")
+            rels[stage].append(rel)
+            if last and not le(rel, 1e-2):
+                over.append((t, rel))
+            if nf:
+                nf_all.append((t, stage, nf))
+        share = np.abs(ref.gated[t] + ref.conv_out[t]).sum() / np.abs(ref.result[t]).sum()
+        terms = sum(np.abs(w[:, k] * P[t + DIL * k]) for k in range(KERN)).sum()
+        num, res = np.abs(ref.conv_out[t] - out["conv"][t]).sum(), np.abs(ref.conv_out[t]).sum()
+        print(f"  token {t} block share {share:.4f}; conv_out against the TERM magnitude, not the result: rel "
+              f"{num / terms:.3e}   (|result|/|terms| = {res / terms:.4f})")
+    print(f"C3 [{name}]: worst rel per stage", {stage: f"{np.max(v):.3e}" for stage, v in rels.items()})
+    assert not over and not nf_all, (
+        "`if (last && !le(rel, 1e-2)) ++bad;` (ple_parity.cpp:782), rel = rel_l1(R-struct, the chain) on result: "
+        f"(row, rel) {over}; and spec T§8, X-NF rule 1, \"Every comparison in sections 6-8 counts non-finite outputs "
+        "in every stage, including the six that C3 only prints. With finite fixtures the count must be 0.\": (row, "
+        f"stage, non-finite) {nf_all}")
+
+
+def test_real_key_row0_decodes_like_ggml():
+    row0 = np.frombuffer(committed()[0][KEY], np.uint8)
+    v = gpu.dequant(42, row0, N)
+    want = q2_0(row0.reshape(-1, KEY_BLOCK)).ravel()
+    ok = np.isfinite(v) & np.isfinite(want)
+    nf = int(np.count_nonzero(~ok))
+    diff = np.abs(v[ok].astype(F64) - want[ok].astype(F64))
+    worst = float(diff.max()) if diff.size else 0.0              # NaN-safe: the non-finite pairs are nf's
+    rms = float(np.sqrt(np.mean(v.astype(F64) ** 2)))
+    same = le(worst, 0.0) and nf == 0
+    print(f"  {'ple_key row 0: the GPU decode == ggml dequantize_row_q2_0':<46} {'yes' if same else '*** NO ***'} "
+          f"(worst |d| {worst:.3e}, non-finite {nf}); rms {rms:.4e}")
+    assert same, f"`if (!le(worst, 0.0) || nf) ++bad;` (ple_parity.cpp:636): worst |d| {worst!r}, non-finite {nf}"
+    assert np.isfinite(v).all() and 1e-4 < rms < 10, (
+        f"spec T§6.4, C1: the row is finite with 1e-4 < rms < 10 (weights, not padding): rms {rms!r}")
+    bound = real_tensors()[KEY][:row0.size]
+    assert bound == row0.tobytes(), (
+        f"spec T§6.4, C1: \"the bound key's row 0 equals the committed slice byte for byte\": {KEY} row 0 differs at "
+        f"bytes {np.flatnonzero(np.frombuffer(bound, np.uint8) != row0)[:8].tolist()}")
