@@ -13,6 +13,17 @@ float64 references. In every test every output is finite and every sentinel inta
   h, win_qkv the qkv rows (the port's copy, spec E§9.3); and by ``cmp_b`` its yq rows are the native q8_1 of
   gdn_step_norm_multi's y on that h, gate and beta, byte for byte, after G6's precondition on that y (``g6_blocks``),
   every half of yq finite; rows T..7 of every store and yq's row T keep their pre-fill.
+- G8-G9 (dec_gdn_parity.cpp:293-294), on the same inputs: dec_gdn_rec at every window width T = 1..8 (T from the
+  dispatch's params record, decision D16) against the 8-row window, run once per combo before the widths (``w8``,
+  :277-278): rows t < T of every output bitwise (invariant 1), by ``cmp_f`` win_h (basalt's h@8) and the stores
+  basalt leaves out, win_gate, win_beta and win_qkv, by ``cmp_b`` yq (yq@8); at T = 8, two runs of one window.
+- G11 (:296-297): the state's bytes after every dec_gdn_rec dispatch, the T-wide window's and the 8-row window's,
+  equal the layer's state (``st_ok``; invariant 3: the window never writes its state).
+- W.1, the port's addition (decision D15; flash-next.md's tier-1 rule, the kernel against its own one-token calls):
+  each row t of the 8-row window equals dec_gdn_rec run on row t alone (T = 1), bitwise: its gate and beta, which read
+  x row t and the layer's constants only, and its win_h and win_qkv over the conv history the rows before t leave
+  (``conv_tail``, a bit copy); row 0, run from the layer's own state, in every output, yq included (yq of a row t > 0
+  needs the state after the commit of rows < t: PR B, spec-tests-commit.md DCM.8).
 - A1, the port's addition (spec T§5.5: no basalt test grades gdn_ab_multi's gate and beta against a reference): on
   parity_gdnf's inputs, combo by combo and for every window width T = 1..8 of the 8-row x, gdn_ab_multi's gate and
   beta within ``max_err < 1e-4`` of the float64 ``ab64``, the bound of the nearest stage (``ec``,
@@ -38,8 +49,8 @@ import functools
 import numpy as np
 import pytest
 
-from tests.basalt_gdn_ref import (COMBOS, C, F32, HV, LAYER, MT, N, SEG_CASES, ZV, ab64, combo_case, cpu_seg, max_err,
-                                  n_bad, seg_layer, segments)
+from tests.basalt_gdn_ref import (COMBOS, C, F32, HV, LAYER, MT, N, REC, SEG_CASES, ZV, ab64, combo_case, conv_tail,
+                                  cpu_seg, max_err, n_bad, seg_layer, segments)
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gdn_gpu as gg
 from tests.kernels import basalt_gpu as gpu
@@ -82,6 +93,29 @@ def g6_blocks(y):
     return int(np.count_nonzero(np.any(nat != rec, axis=1)))
 
 
+def yq_halves(yq):
+    """The d and sum halves of q8_1 rows (block_q8_1: half2 ds, then the 32 int8 codes), (blocks, 2) float16."""
+    return np.ascontiguousarray(np.asarray(yq, np.uint8).reshape(-1, 36)[:, :4]).view(np.float16)
+
+
+def check_run(where, run):
+    """Every test's rule on one dec_gdn_rec run: every sentinel intact, every output finite (yq's d and sum halves)."""
+    assert run.ok, f"{where}: dec_gdn_rec wrote past its window's rows (a sentinel byte changed)"
+    for what, a in (("win_qkv", run.qkv), ("win_h", run.h), ("win_gate", run.gate), ("win_beta", run.beta),
+                    ("yq half", yq_halves(run.yq))):
+        assert n_bad(a) == 0, f"{where}: {n_bad(a)} non-finite {what} values, want none"
+
+
+@functools.lru_cache(maxsize=None)
+def gdnf_w8(combo):
+    """parity_gdnf's ``w8`` (dec_gdn_parity.cpp:277-278): dec_gdn_rec over all MT rows of ``combo``'s inputs, run once
+    per combo before the window widths; a ``Rec``."""
+    layer, x, qkv, z = gdnf_case(combo)
+    w8 = gg.rec(layer, layer.state, qkv, x, z)
+    check_run("the 8-row window", w8)
+    return w8
+
+
 def check_yq(where, y, yq):
     """G6 (dec_gdn_parity.cpp:291) on dec_gdn_rec's yq rows and the per-stage y: the precondition first, so that a draw
     which breaks it fails as a fixture error, not as a kernel mismatch; every d and sum half of yq finite; then yq
@@ -89,7 +123,7 @@ def check_yq(where, y, yq):
     bad = g6_blocks(y)
     assert bad == 0, (f"{where}: fixture error, not a kernel mismatch: G6's precondition fails on {bad} q8_1 blocks of "
                       f"the per-stage y (the native and the rec sequence store different bytes there)")
-    halves = np.ascontiguousarray(np.asarray(yq, np.uint8).reshape(-1, 36)[:, :4]).view(np.float16)
+    halves = yq_halves(yq)
     assert n_bad(halves) == 0, f"{where}: {n_bad(halves)} non-finite yq halves (d, sum), want none"
     d, want = cmp_b(gpu.q8_1(y), yq), '`d += cmp_b("yq", r.yq, n.yq, native_q8_1_bytes(ZV, T));` -> `d == 0`'
     assert d == 0, f"{where}: {d} yq bytes differ; want {want}"
@@ -113,6 +147,51 @@ def test_dec_gdn_rec_matches_the_per_stage_kernels_bitwise(combo, t):
         d, first = cmp_f(what, ref, new)
         assert d == 0, f"T={t}: {d} elements differ or are not finite, first {first}; want `{want}`"
     check_yq(f"T={t}", y, r.yq)
+
+
+@pytest.mark.parametrize("combo,t", GDNF_CASES)
+def test_dec_gdn_rec_columns_do_not_depend_on_the_window_width(combo, t):
+    layer, x, qkv, z = gdnf_case(combo)
+    w8, n = gdnf_w8(combo), gg.rec(layer, layer.state, qkv[:t], x[:t], z[:t])
+    check_run(f"T={t}", n)
+    g8 = '`inv += cmp_f("h@8", w8.h, n.h, (size_t) T * C, ma);` -> `inv == 0`'
+    for what, also in (("h", ""), ("gate", " on gate too"), ("beta", " on beta too"), ("qkv", " on win_qkv too")):
+        d, first = cmp_f(f"{what}@8", getattr(w8, what)[:t], getattr(n, what))
+        assert d == 0, (f"T={t}: {d} elements differ from the 8-row window's rows or are not finite, first {first}; "
+                        f"want {g8}{also}")
+    d = cmp_b(w8.yq[:t], n.yq)
+    assert d == 0, (f"T={t}: {d} yq bytes differ from the 8-row window's rows; want "
+                    '`inv += cmp_b("yq@8", w8.yq, n.yq, native_q8_1_bytes(ZV, T));` -> `inv == 0`')
+
+
+@pytest.mark.parametrize("combo,t", GDNF_CASES)
+def test_dec_gdn_rec_leaves_the_state_untouched(combo, t):
+    layer, x, qkv, z = gdnf_case(combo)
+    n = gg.rec(layer, layer.state, qkv[:t], x[:t], z[:t])
+    check_run(f"T={t}", n)
+    for where, run in (("the 8-row window", gdnf_w8(combo)), (f"the T={t} window", n)):
+        assert np.array_equal(run.state.view(np.uint32), layer.state.view(np.uint32)), (
+            f"{where} changed its state; want "
+            "`const bool st_ok = std::memcmp(st0.data(), st1.data(), st0.size() * 4) == 0;` -> `st_ok`")
+
+
+@pytest.mark.parametrize("combo", range(len(COMBOS)))
+def test_dec_gdn_rec_rows_alone(combo):
+    layer, x, qkv, z = gdnf_case(combo)
+    w8, bits = gdnf_w8(combo), layer.state.view(np.uint32)
+    for t in range(MT):
+        hist = conv_tail(layer.state[REC:], qkv[:t]).view(np.uint32)          # the rows before t, committed
+        one = gg.rec(layer, np.concatenate([bits[:REC], hist]).view(F32), qkv[t:t + 1], x[t:t + 1], z[t:t + 1])
+        check_run(f"row {t} alone", one)
+        for what in ("gate", "beta", "h", "qkv"):
+            d, first = cmp_f(what, getattr(w8, what)[t:t + 1], getattr(one, what))
+            assert d == 0, (f"row {t}: {d} {what} elements of the 8-row window's row differ from the row run alone "
+                            f"(T = 1) or are not finite, first {first}; want them bitwise equal (D15), invariant 1: a "
+                            f"row's output never depends on the window width T or its position in it")
+        if t == 0:
+            d = cmp_b(w8.yq[:1], one.yq)
+            assert d == 0, (f"row 0: {d} yq bytes of the 8-row window differ from the row run alone (T = 1); want "
+                            f"them bitwise equal (D15), invariant 1")
 
 
 @pytest.mark.parametrize("combo", range(len(COMBOS)))
