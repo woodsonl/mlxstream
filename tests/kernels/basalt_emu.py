@@ -892,13 +892,22 @@ def rel_norm(y, ref):
 # ---- the prompt path's hyper-connection kernels (kernels/common/basalt_prompt_hc.metal) -----------------------------
 # src/prefill/kernels.cu:85-204 builds with nvcc's IEEE defaults: each product, quotient and sum is numpy's float32
 # operation (the ieee_* helpers' semantics, subnormals kept) and each FFMA fma32, in the order
-# docs/research/basalt-nvcc/prefill_kernels.md section 1 records. fast::rsqrt has no bit-exact host model: ``rsqrt``
-# evaluates the GPU's on a float32 array (basalt_prompt_gpu.hc_probe). ``flush=True`` flushes every operation's inputs
-# and result (ftz): a flushing kernel's model, which the tests' discrimination checks compare against.
+# docs/research/basalt-nvcc/prefill_kernels.md section 1 records. fast::rsqrt and fast::exp2 have no bit-exact host
+# model: ``rsqrt`` and ``exp_neg`` evaluate the GPU's fast::rsqrt and expf_ieee(sign_flip(x)) on a float32 array
+# (basalt_prompt_gpu.hc_probe). ``flush=True`` flushes every operation's inputs and result (ftz): a flushing kernel's
+# model, which the tests' discrimination checks compare against.
 
 def hc_bits(x):
     """fp32 store bits with a NaN as sm_120's 0x7fffffff (basalt_fp.metal's cuda_nan)."""
     return np.where(np.isnan(x), np.uint32(0x7FFFFFFF), np.asarray(x, F32).view(np.uint32))
+
+
+def hc_ops(flush):
+    """fma, add, mul and div as the twins round them: fma32 and numpy's float32 add, multiply and divide (IEEE,
+    subnormals kept), or with ``flush`` each with its inputs and result flushed (ftz)."""
+    if flush:
+        return fma_ftz, add_ftz, mul_ftz, lambda a, b: ftz(ftz(a) / ftz(b))
+    return fma32, np.add, np.multiply, np.divide
 
 
 def hc_block_sum(v, flush=False):
@@ -918,8 +927,7 @@ def hc_norm(r, w, eps, rsqrt, flush=False):
     xn16 [T, 4n] as BF16 bits. Row (t, c): thread k sums r[d]^2 over d = k + 256 j, j ascending, by fma32 from +0;
     hc_block_sum; rs = rsqrt(fl(fl(S / n) + eps)), the argument computed here in basalt's order; xn16 =
     bf(cuda_nan(fl(fl(r rs) w[c]))). ``flush``: every operation's inputs and result flushed."""
-    fma, add, mul = (fma_ftz, add_ftz, mul_ftz) if flush else (fma32, np.add, np.multiply)
-    div = (lambda a, b: ftz(ftz(a) / ftz(b))) if flush else np.divide
+    fma, add, mul, div = hc_ops(flush)
     r = np.asarray(r, F32)
     T, n = len(r), r.shape[1] // 4
     x = r.reshape(4 * T, n // 256, 256)                         # [row, j, k]: d = k + 256 j
@@ -930,3 +938,43 @@ def hc_norm(r, w, eps, rsqrt, flush=False):
         rs = np.asarray(rsqrt(add(div(hc_block_sum(ss, flush), F32(n)), F32(eps))), F32).reshape(T, 4)
         xn = mul(mul(r.reshape(T, 4, n), rs[..., None]), np.asarray(w, F32).reshape(4, n))
     return hc_bits(rs), bf16_bits(hc_bits(xn).view(F32)).reshape(T, 4 * n)
+
+
+def hc_sigm(g, exp_neg, flush=False):
+    """sigm (kernels.cu:39) as the port computes it: 1 / (1 + exp_neg(g)), ``exp_neg`` the GPU's
+    expf_ieee(sign_flip(g)), the quotient correctly rounded (rcp.rn, ieee_div): subnormal for g below about -87.3, +0
+    below about -88.7."""
+    _, add, _, div = hc_ops(flush)
+    e = ftz(exp_neg(ftz(g))) if flush else exp_neg(g)
+    return div(F32(1), add(F32(1), np.asarray(e, F32)))
+
+
+def hc_mix(r, rs, w, gated, exp_neg, flush=False):
+    """prompt_gr_mix_r's stores for the residual ``r`` [T, 4n], gr_norm_rs's row scales ``rs`` [T, 4], the weights ``w``
+    [4n] and the gate logits ``gated`` [T, 4n]: mixed, mixed_bf and mixed_h [T, n] as fp32, BF16 and FP16 bits. Output
+    (t, d): s = fma32(fl(fl(r rs) w[c]), hc_sigm(gated), s) for c = 0..3 from +0 (hc_norm's product), then fl(s * 0.25),
+    stored as cuda_nan(s), bf(cuda_nan(s)) and hf(s). ``flush``: every operation's inputs and result flushed."""
+    fma, _, mul, _ = hc_ops(flush)
+    r = np.asarray(r, F32)
+    T, n = len(r), r.shape[1] // 4
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN rows
+        x = mul(mul(r.reshape(T, 4, n), np.asarray(rs, F32)[..., None]), np.asarray(w, F32).reshape(4, n))
+        sg = hc_sigm(np.asarray(gated, F32), exp_neg, flush).reshape(T, 4, n)
+        s = np.zeros((T, n), F32)
+        for c in range(4):
+            s = fma(x[:, c], sg[:, c], s)
+        s = mul(s, F32(0.25))
+    return hc_bits(s), bf16_bits(hc_bits(s).view(F32)), cuda_half_bits(s)
+
+
+def hc_silu(lo, exp_neg, flush=False):
+    """prompt_gr_silu's lo16 [T, lr] as BF16 bits for the low-rank rows ``lo`` [T, lr]: x = fl(lo * 0.25), v = fl(x /
+    fl(1 + exp_neg(x))), one correctly rounded division as the source writes it (not x sigm(x)), stored as
+    bf(cuda_nan(v)); ``exp_neg`` the GPU's expf_ieee(sign_flip(x)). ``flush``: every operation's inputs and result
+    flushed."""
+    _, add, mul, div = hc_ops(flush)
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN entries
+        x = mul(np.asarray(lo, F32), F32(0.25))
+        e = ftz(exp_neg(ftz(x))) if flush else exp_neg(x)
+        v = div(x, add(F32(1), np.asarray(e, F32)))
+    return bf16_bits(hc_bits(v).view(F32))
