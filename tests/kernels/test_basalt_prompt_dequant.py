@@ -36,7 +36,6 @@ ROWS, COLS = 10240, 2560                           # dequant_f16_parity.cpp:35's
 F_TYPES = (23, 8, 13, 14, 42, 11, 12, 2, 6, 20)    # its four types in its order (:37-38), then this pack's six
 D_AT = {11: 108, 14: 208}                          # the block's fp16 d (Q3_K's d_all) at this byte (:48), else at 0
 DMIN = 0x211F                                      # __float2half(0.01f): Q4_K's and Q5_K's dmin, at byte 2 (:51)
-DONE_TYPES = (2, 6, 8, 20, 42)                     # the types basalt_dequant16.metal has arms for so far
 
 
 def run_dq(type_id, out, blocks, rows, cols, *, row0=0, out_offset=0, guard=0):
@@ -103,7 +102,7 @@ def f_blocks():
     return blocks
 
 
-@pytest.fixture(scope="module", params=DONE_TYPES, ids=lambda t: GGML_TYPES[t][0])
+@pytest.fixture(scope="module", params=kernels.DEQUANT16_TYPES, ids=lambda t: GGML_TYPES[t][0])
 def f(request, f_blocks):
     """Fixture F for one type, (type id, blocks, host values); one type's instance at a time (pytest frees it before
     the next). C9's coverage assertion: every fp16 scale finite and nonzero; negative, zero and positive values

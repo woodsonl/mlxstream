@@ -22,6 +22,12 @@ static inline float dq_h2f(device const uchar* p) { return h2f(ushort(p[0] | (p[
 
 constant char kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};    // :33
 
+// :35-38: the 6-bit scale d and min m of group j (0..7) of a Q4_K or Q5_K block, from its 12 scale bytes at q
+static inline void scale_min_k4(int j, device const uchar* q, thread int& d, thread int& m) {
+    if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
+    else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+
 // put (:28-31) by DQ_OUT. Every NaN here is a product on a NaN or infinite scale, sm_120's 0x7fffffff: the fp32 store
 // takes cuda_nan, the BF16 store f2bf of it (0x7fff); __float2half_rn's NaN is cuda_nan_f16's 0x7fff.
 #if DQ_OUT == 0
@@ -75,6 +81,82 @@ static inline void dq_group32(device const uchar* row_blocks, int gi_in_row, dev
     for (int j = 0; j < 16; ++j) {
         dq_put(out, j, d * float(kv_iq4nl[b[2 + j] & 0xf]));
         dq_put(out, j + 16, d * float(kv_iq4nl[b[2 + j] >> 4]));
+    }
+#elif DQ_TYPE == 11                                                 // Q3_K: hmask[32] qs[64] scales[12] d (:92-113)
+    device const uchar* b = row_blocks + size_t(gi_in_row / 8) * 110;
+    const int gi = gi_in_row % 8, n = gi / 4, jj = gi % 4;
+    device const uchar* hm = b;
+    device const uchar* q = b + 32 + n * 32;
+    device const uchar* sc = b + 96;
+    const float d_all = dq_h2f(b + 108);
+    uint aux[4];
+    for (int i = 0; i < 3; ++i) {                                   // memcpy(aux, sc, 12): little-endian, any address
+        device const uchar* w = sc + 4 * i;
+        aux[i] = uint(w[0]) | (uint(w[1]) << 8) | (uint(w[2]) << 16) | (uint(w[3]) << 24);
+    }
+    const uint kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu, tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    thread const char* scales = reinterpret_cast<thread const char*>(aux);
+    const int shift = 2 * jj;
+    const uchar m = uchar(1u << (n * 4 + jj));
+    for (int t = 0; t < 32; ++t) {
+        const int is = n * 8 + jj * 2 + (t >= 16 ? 1 : 0);
+        const float dl = d_all * float(scales[is] - 32);
+        dq_put(out, t, dl * float(int((q[t] >> shift) & 3) - ((hm[t] & m) ? 0 : 4)));
+    }
+#elif DQ_TYPE == 12                                                 // Q4_K: d dmin scales[12] qs[128] (:114-122)
+    device const uchar* b = row_blocks + size_t(gi_in_row / 8) * 144;
+    const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
+    const float d = dq_h2f(b), dmin = dq_h2f(b + 2);
+    int sc, m;
+    scale_min_k4(gi, b + 4, sc, m);
+    const float d1 = d * float(sc), m1 = dmin * float(m);
+    device const uchar* q = b + 16 + 32 * j64;
+    for (int l = 0; l < 32; ++l) dq_put(out, l, fma(d1, float(hi ? (q[l] >> 4) : (q[l] & 0xF)), -m1));   // FFMA
+#elif DQ_TYPE == 13                                                 // Q5_K: d dmin scales[12] qh[32] qs[128] (:123-136)
+    device const uchar* b = row_blocks + size_t(gi_in_row / 8) * 176;
+    const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
+    const float d = dq_h2f(b), dmin = dq_h2f(b + 2);
+    int sc, m;
+    scale_min_k4(gi, b + 4, sc, m);
+    const float d1 = d * float(sc), m1 = dmin * float(m);
+    device const uchar* qh = b + 16;
+    device const uchar* ql = b + 48 + 32 * j64;
+    const uchar u = uchar(1u << (2 * j64 + hi));
+    for (int l = 0; l < 32; ++l) {
+        const int nib = hi ? (ql[l] >> 4) : (ql[l] & 0xF);
+        dq_put(out, l, fma(d1, float(nib + ((qh[l] & u) ? 16 : 0)), -m1));                           // FFMA
+    }
+#elif DQ_TYPE == 14                                                 // Q6_K: ql[128] qh[64] scales[16] d (:137-152)
+    device const uchar* b = row_blocks + size_t(gi_in_row / 8) * 210;
+    const int gi = gi_in_row % 8, n = gi / 4, qu = gi % 4;
+    device const uchar* ql = b + 64 * n;
+    device const uchar* qh = b + 128 + 32 * n;
+    device const char* sc = reinterpret_cast<device const char*>(b + 192) + 8 * n;
+    const float d = dq_h2f(b + 208);
+    for (int l = 0; l < 32; ++l) {
+        const int is = l / 16;
+        int q;
+        if (qu == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+        else if (qu == 1) q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+        else if (qu == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+        else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+        dq_put(out, l, d * float(sc[is + 2 * qu]) * float(q - 32));                                   // left to right
+    }
+#elif DQ_TYPE == 23                                                 // IQ4_XS: d scales_h scales_l[4] qs[128] (:153-164)
+    device const uchar* b = row_blocks + size_t(gi_in_row / 8) * 136;
+    const int ib = gi_in_row % 8;
+    const float d = dq_h2f(b);
+    const ushort scales_h = ushort(b[2] | (b[3] << 8));
+    const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((scales_h >> (2 * ib)) & 3) << 4);
+    const float dl = d * float(ls - 32);
+    device const uchar* qs = b + 8 + 16 * ib;
+    for (int j = 0; j < 16; ++j) {
+        dq_put(out, j, dl * float(kv_iq4nl[qs[j] & 0xf]));
+        dq_put(out, j + 16, dl * float(kv_iq4nl[qs[j] >> 4]));
     }
 #else
 // Q5_1 (7, :70-80) and the iq_only types (:251): no tensor of this pack has them; basalt_dequant16_macros refuses them
