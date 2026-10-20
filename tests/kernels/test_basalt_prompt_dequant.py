@@ -337,6 +337,61 @@ def test_bf16_non_finite_scales(e):
     run_e(e, "bf16")
 
 
+def test_bf16_nan_scale_stays_nan():
+    """DQ-1: elementwise_parity's dequant_bf16 check (basalt src/kernels/elementwise_parity.cpp:438-467), its fixture
+    verbatim (:441-447): two Q8_0 blocks, the first with the fp16 NaN scale 0x7e00 and codes j - 16, the second with
+    scale 1.0 and codes 3 j - 50, dequantized as :453's ``dequant_bf16(8, db, 0, 2, 32, dq, nullptr)`` into exactly 64
+    values. Its criteria verbatim, ``if (!((q[(size_t) j] & 0x7FFFu) > 0x7F80u)) ++dq_wrong;`` (:459) and ``if
+    (q[(size_t) (32 + j)] != ggml_bf16(vb)) ++dq_wrong;`` (:463; its ggml_bf16, :418-421, is basalt_emu.bf16_bits on
+    these finite values), gated as ``dq_wrong`` (:467; the gate's other count, ``wrong``, is f32_to_bf16_bulk's,
+    src/kernels/cuda/elementwise.cu:172, not ported here). Added, bitwise: the NaN row is all 0x7fff, f2bf of sm_120's
+    NaN (this GPU's own NaN, 0x7fc00000, would store 0x7fc0, which :459 accepts)."""
+    j = np.arange(32)
+    blk = np.zeros(2 * 34, np.uint8)
+    blk[0:2] = (0x00, 0x7E)                                              # fp16 quiet NaN (:442)
+    blk[34:36] = (0x00, 0x3C)                                            # fp16 1.0 (:443)
+    blk[2:34] = (j - 16).astype(np.int8).view(np.uint8)                  # :445
+    blk[36:68] = (3 * j - 50).astype(np.int8).view(np.uint8)             # :446
+    q = run_dq(8, "bf16", blk, 2, 32)                                    # :453
+    dq_wrong = np.count_nonzero(~((q[:32] & 0x7FFF) > 0x7F80))           # :459, row 0: NaN scale -> NaN
+    dq_wrong += np.count_nonzero(q[32:] != emu.bf16_bits((3 * j - 50).astype(np.float32)))   # :460-463, row 1
+    assert dq_wrong == 0, f"dequant_bf16 {dq_wrong} of 64 wrong"
+    assert (q[:32] == 0x7FFF).all(), f"the NaN row stores {sorted({hex(v) for v in q[:32].tolist()})}, not 0x7fff"
+
+
+@pytest.mark.parametrize("out", kernels.DEQUANT16_OUT)
+def test_rows_do_not_depend_on_the_slice(f, out):
+    """DQ-2 (the plan's section 1 invariants): a row's values are a pure function of its blocks, whatever row0, row
+    count and grid select it, as basalt's slice branch relies on (src/prefill/gemm.cu:171-182: dequant_f16 of rows [r0,
+    r0 + n) from the whole weight's blocks). Fixture F's rows 0-63 dispatched whole, then rows [row0, row0 + rows) of
+    the same 64 rows' blocks for (0, 1), (1, 1), (5, 7) and (63, 1), each bit for bit its rows of the whole. Every
+    other test dispatches from row 0."""
+    t, raw, _ = f
+    whole = run_dq(t, out, raw[:64], 64, COLS)
+    for row0, rows in ((0, 1), (1, 1), (5, 7), (63, 1)):
+        got = run_dq(t, out, raw[:64], rows, COLS, row0=row0)
+        bad = np.count_nonzero(got != whole[row0 * COLS: (row0 + rows) * COLS])
+        assert bad == 0, f"rows {row0}..{row0 + rows - 1}: {bad} of {got.size} values differ from the whole's"
+
+
+@pytest.mark.parametrize("out", kernels.DEQUANT16_OUT)
+def test_stores_stay_inside_the_output(f, out):
+    """DQ-3 (basalt_dequant_g32's bindings): rows 2-4 of a 5-row, 256-column matrix of fixture F's blocks, the blocks
+    buffer exactly 5 rows' bytes, the output bound between two guards of 64 values: 24 groups in one threadgroup of
+    256, whose other 232 threads return at the kernel's bound (dequant_bf16.cu:174). Both guards keep every 0xFF byte
+    and the 768 values between them are bit for bit the twins. Under MTL_SHADER_VALIDATION=1 a read past the blocks or
+    a store past the output buffer is a report; a store into a guard is caught here."""
+    t, raw, _ = f
+    _, be, bb = GGML_TYPES[t]
+    blk = raw.reshape(-1, bb)[: 5 * 256 // be].reshape(5, -1)
+    assert kernels.basalt_dequant16_grid(3, 256) == (1, 256)
+    got = run_dq(t, out, blk, 3, 256, row0=2, guard=64)
+    guards = np.concatenate([got[:64], got[-64:]]).view(np.uint8)
+    assert (guards == 0xFF).all(), f"{np.count_nonzero(guards != 0xFF)} guard bytes written"
+    bad = np.count_nonzero(got[64:-64] != stored(reference(t, blk[2:]), out).ravel())
+    assert bad == 0, f"{bad} of {3 * 256} values differ from the twins"
+
+
 BF16_PROBE = """
 kernel void bf16_helpers(device const uint* bits [[buffer(0)]], device ushort* rne [[buffer(1)]],
                          device ushort* nonan [[buffer(2)]], constant uint& n [[buffer(3)]],
