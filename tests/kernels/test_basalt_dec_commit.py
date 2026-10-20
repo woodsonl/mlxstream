@@ -46,6 +46,13 @@
   n in {1, MT} rows equals ``commit_f32``, commit_pre_run's order in numpy float32 on the probed decays, bit for bit,
   and the same oracle flushing every input and result differs from it in value: group (a) at n = 1 (its state is
   +-0 on either build from the second row on), group (b) at n = MT.
+- DCM.9, NaNs and special words (contract invariant 5's NaN rule; none in basalt, which stores the state's float,
+  verify_kernels.cu:327-330): parity's fixture with a quarter of each layer's conv history and qkv rows replaced at
+  random by ``SPECIALS`` (subnormals, +-0, +-inf and the NaN payloads 0x7FA00001 and 0xFFC00000), committed for n =
+  1..MT rows with and without a NaN (this GPU's 0x7fc00000) in row 0's v at ``NAN_AT``. The update spreads it down that
+  column only, whose 128 state words must be stored as sm_120's 0x7fffffff (cuda_nan); every other word equals the
+  NaN-free run's, whose state is finite; and each layer's history is conv_tail's word copy, every special word in each
+  of its three slots (n = 1 and 2 keep words of the initial history).
 """
 
 from typing import NamedTuple
@@ -84,6 +91,9 @@ CRIT7 = ("decay probe: for gates in `[-100, -88]`, `0 < g < 2^-126` and `|g - ex
          "0.1 to 1 and (b) gates randn 0.3 with `state0` randn scaled by `1e-39` and `k` of order 1; state bitwise "
          "equal to a numpy float32 + `basalt_emu.fma32` transcription with the probed `g`; power: the same oracle with "
          "`basalt_emu.ftz` on every input and result differs from it in each group")
+CRIT9 = ("A NaN in row 0's `v` of one (head, col) makes that column's 128 state words `0x7FFFFFFF`, and every other "
+         "word equals the NaN-free run's. The qkv rows and the initial history hold subnormals, +-0, +-inf and the NaN "
+         "payloads `0x7FA00001` and `0xFFC00000`, and the history must equal the numpy word copy")
 
 
 def commit_record(n_keep, p0, mt=MT):
@@ -344,3 +354,48 @@ def test_gdn_commit_keeps_subnormals_like_the_ieee_build(n, subnormal_layer):
     i, f = (o.reshape(S, HV, S)[:, grp::2] for o in (ieee, ftz))
     assert np.any(i != f), (f"group ({'ab'[grp]}), {n} rows: the flushing oracle's state equals the IEEE one in "
                             f"value, so the fixture cannot tell the builds apart ({CRIT7})")
+
+
+# ---- DCM.9: a NaN the update makes is stored as sm_120's, the history's words as they came --------------------------
+
+SPECIALS = np.array([0x00000001, 0x007FFFFF, 0x80000001, 0x807FFFFF,   # +-(the smallest and the largest subnormal)
+                     0x00000000, 0x80000000, 0x7F800000, 0xFF800000,   # +-0, +-inf
+                     0x7FA00001, 0xFFC00000], U32)                     # a signaling NaN's payload, a negative quiet NaN
+NAN_AT = (1, 37, 77)     # DCM.9's NaN in row 0's v: layer, value head (q/k head 5), column (block 2, lane 13)
+
+
+def test_gdn_commit_stores_cudas_nan_and_copies_specials(gdn):
+    rng = np.random.default_rng(90)
+
+    def special(w):      # a quarter of the uint32 words w, drawn at random, become SPECIALS words, in place
+        m = rng.random(w.shape) < 0.25
+        w[m] = rng.choice(SPECIALS, np.count_nonzero(m))
+
+    st0 = gdn.state0.view(U32).reshape(NL, GDN_FLOATS).copy()   # words throughout: no float operation quiets a NaN
+    special(st0[:, REC:])
+    qkv = gdn.qkv.view(U32).copy()
+    special(qkv)
+    l, hd, j = NAN_AT
+    h = gdn.h.view(U32).copy()
+    h[l * MT * C + 2 * HK * S + hd * S + j] = 0x7FC00000          # this GPU's NaN, not sm_120's
+    col = l * GDN_FLOATS + (np.arange(S) * HV + hd) * S + j       # that column's 128 state words
+    st0, qkv, h = (a.reshape(-1).view(np.float32) for a in (st0, qkv, h))
+    for n in range(1, MT + 1):
+        free, _ = gdn_gpu.gdn_commit(st0, gdn.h, qkv, gdn.gate, gdn.beta, commit_record(n, 0), c=C, h_v=HV, mt=MT,
+                                     n_layers=NL)
+        st, _ = gdn_gpu.gdn_commit(st0, h, qkv, gdn.gate, gdn.beta, commit_record(n, 0), c=C, h_v=HV, mt=MT,
+                                   n_layers=NL)
+        bad = n_bad(free.reshape(NL, GDN_FLOATS)[:, :REC])
+        assert bad == 0, (f"{n} rows without the NaN: {bad} non-finite state values, so the NaN's column proves "
+                          f"nothing ({CRIT9})")
+        want = free.view(U32).copy()
+        want[col] = 0x7FFFFFFF
+        assert_bits(f"{n} rows, a NaN in row 0's v at layer {l}, head {hd}, column {j}: the state and history against "
+                    f"the NaN-free run's with that column 0x7fffffff", st, want, CRIT9)
+        for k in range(NL):
+            hist = conv_tail(layer(st0, k)[REC:], qkv[k * MT * C:(k * MT + n) * C])
+            slots = hist.view(U32).reshape(C, 3)
+            assert all(np.isin(SPECIALS, slots[:, s]).all() for s in range(3)), (
+                f"{n} rows, layer {k}: a slot of the expected history lacks a SPECIALS word, so the copy's check has "
+                f"no power ({CRIT9})")
+            assert_bits(f"{n} rows, layer {k}: the history against its word copy", layer(st, k)[REC:], hist, CRIT9)
