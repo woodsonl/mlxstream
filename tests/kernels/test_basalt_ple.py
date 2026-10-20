@@ -2,8 +2,9 @@
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/ple_parity.cpp, src/kernels/ple_win_parity.cpp and
 # src/kernels/gr_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): ple_parity's history
-# regression (:177-214), key-row check (:617-637), block check with its seven stages and its log line (:740-783),
-# native key projection check with its host norm, metric and pass criterion (:892-912), host reference check's
+# regression with its guards (:177-228), key-row check (:617-637), block check with its seven stages and its log line
+# (:740-783), native key projection check with its host norm, metric and pass criterion (:892-912) and its guards
+# (:930-937), separate-exports and in-place result check with its log line (:949-969), host reference check's
 # per-stage pass criterion and log line (:1114-1122) and conv cancellation metric (:1139-1165), ple_win_parity's
 # projected-form input scales (:47-55), and gr_parity's scalar activation contract's degenerate norm input and the
 # exactness it relies on (:167-236).
@@ -89,7 +90,25 @@ gamma rows and eps = f32(1e-6) (native_ple_postops.cu:352-353, :358), unless sta
   ``if (!le(worst, 0.0) || nf) ++bad;`` (:636), worst the NaN-safe largest |GPU - ggml| and nf the non-finite pairs;
   the decoded row finite with 1e-4 < rms < 10 (weights, not padding: tests/contract/test_basalt_pack.py's
   ``test_real_rows_match_the_reference``); and row 0 of the key the real fixture binds (gguf/blk.1.ple_key.weight, cut
-  from its full range at T§5's offset) equal to the committed slice, byte for byte."""
+  from its full range at T§5's offset) equal to the committed slice, byte for byte.
+- X-INPLACE ``test_compact_build_equals_full_exports`` (ple_parity.cpp:949-969, spec T§8), on C3's fixtures, every row:
+  the chain as the handler binds it (``block``) against two other bindings of the same 12 rows, criterion quoted:
+  ``const bool equal = std::memcmp(compact_norm.data(), dev_norm.data(), hcd * sizeof(float)) == 0 &&
+  std::memcmp(compact_result.data(), dev_res.data(), hcd * sizeof(float)) == 0;`` (:963-964), then
+  ``if (!equal) ++bad;`` (:966), with :965's log line. (1) Query and normalized as one buffer against two buffers
+  (``split_query``): gate, gated, normalized and result equal. (2) Result bound onto hidden, basalt's in-place alias
+  (``inplace``), against out of place: normalized and result equal. The conv store is kept (plan D3), so there is no
+  compact build to compare.
+- X-GUARD ``test_store_bounds_guards`` (H3, ple_parity.cpp:221-228; C10, :930-937; spec T§8): the chain's guard run
+  (``basalt_ple_gpu.chain(..., guard=True)``: every binding of every kernel, the rows, hidden, weights, history,
+  snapshots, outputs and scratch, between 64 B of 0xA5) of a T-row window, T = 1..8, of the synthetic fixture over
+  buffers of T_MAX rows and slots, as the T = 8 program's row I/O and its snapshots, then the commit's restore of
+  n_keep = 1 into the window's history (``basalt_ple_gpu.restore``, its three bindings guarded too). Criteria quoted:
+  ``if (!guard_ok(history_storage, count) || !guard_ok(norm_storage, channels)) ++bad;`` (:228) and
+  ``if (!std::all_of(ends.begin(), ends.end(), [](uint8_t x) { return x == 0xa5; })) ++bad;`` (:936), for every
+  buffer; "rows from T to T_MAX − 1 of every multi-row output still hold their sentinel" (T§8), 0xFF in normalized,
+  result and the snapshots; and rows below T equal the exact-size run's (``block``) byte for byte, so the guards and
+  offsets change nothing else. The exact-size half is every test's validated pass (plan §4.9)."""
 
 import functools
 
@@ -608,3 +627,48 @@ def test_real_key_row0_decodes_like_ggml():
     assert bound == row0.tobytes(), (
         f"spec T§6.4, C1: \"the bound key's row 0 equals the committed slice byte for byte\": {KEY} row 0 differs at "
         f"bytes {np.flatnonzero(np.frombuffer(bound, np.uint8) != row0)[:8].tolist()}")
+
+
+# ---- X-INPLACE and X-GUARD: the chain's aliases and its stores' bounds (spec T§8) ----------------------------------
+def differ(a, b, keys, rows):
+    """The (output, row) pairs of ``keys`` over ``rows`` where the chain runs ``a`` and ``b`` differ, byte for byte."""
+    return [(k, t) for k in keys for t in rows if a[k][t].tobytes() != b[k][t].tobytes()]
+
+
+@pytest.mark.parametrize("name", list(FIXTURES))
+def test_compact_build_equals_full_exports(name):
+    fx, _, shared = block(name)
+    args = fx.emb, fx.hidden, np.ascontiguousarray(fx.hist.T).ravel(), fx
+    split = differ(shared, ple_gpu.chain(*args, split_query=True), ("gate", "gated", "normalized", "result"),
+                   range(ROWS))
+    inplace = differ(shared, ple_gpu.chain(*args, inplace=True), ("normalized", "result"), range(ROWS))
+    equal = not split and not inplace
+    print(f"  PLE separate exports and in-place hidden result: {'byte-identical' if equal else 'FAIL'}")
+    assert equal, (
+        "C12, `const bool equal = std::memcmp(compact_norm.data(), dev_norm.data(), hcd * sizeof(float)) == 0 && "
+        "std::memcmp(compact_result.data(), dev_res.data(), hcd * sizeof(float)) == 0;` (ple_parity.cpp:963-964), "
+        "then `if (!equal) ++bad;` (:966), on every row: (1) query and normalized bound as one buffer (the handler's "
+        f"binding) against two buffers, (output, row) {split} differ; (2) result bound onto hidden (basalt's in-place "
+        f"alias) against out of place, (output, row) {inplace} differ")
+
+
+@pytest.mark.parametrize("t", range(1, T_MAX + 1))
+def test_store_bounds_guards(t):
+    fx, _, clean = block("synthetic")
+    out = ple_gpu.chain(fx.emb[:T_MAX], fx.hidden[:T_MAX], np.ascontiguousarray(fx.hist.T).ravel(), fx, t,
+                        guard=True)
+    broken = [k for k, kept in out["guards"].items() if not kept]
+    touched = [(k, r) for k in ("normalized", "result", "snap") for r in range(t, T_MAX)
+               if (bits(out[k][r]) != 0xFFFFFFFF).any()]
+    wrong = differ(out, clean, (*ple_gpu.SCRATCH, "hist", "normalized", "result", "snap"), range(t))
+    restored, kept = ple_gpu.restore(out["hist"][-1], out["snap"], commit_record(1, t, 0))
+    if not kept:
+        broken.append("restore: hist, snap or commit")
+    if restored.tobytes() != out["snap"][0].tobytes():
+        wrong.append(("restore", 0))
+    assert not broken and not touched and not wrong, (
+        "X-GUARD (spec T§8), H3's `if (!guard_ok(history_storage, count) || !guard_ok(norm_storage, channels)) "
+        "++bad;` (ple_parity.cpp:228) and C10's `if (!std::all_of(ends.begin(), ends.end(), [](uint8_t x) { return x "
+        "== 0xa5; })) ++bad;` (:936) on every binding: guards broken on {broken}; \"rows from T to T_MAX − 1 of every "
+        f"multi-row output still hold their sentinel\": (output, row) {touched} were written; rows below T equal the "
+        f"exact-size run's, and the restore of n_keep = 1 equals slot 0: (output, row) {wrong} differ (T = {t})")

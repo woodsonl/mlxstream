@@ -157,7 +157,7 @@ SCRATCH = {  # the window op's per-row scratch (plan §3), bytes: q8_1, raw key,
 }
 
 
-def chain(rows, hidden, hist, w, n=None):
+def chain(rows, hidden, hist, w, n=None, guard=False, split_query=False, inplace=False):
     """basalt's per-row n-gram block (verify.cpp:1105-1124: ple_block's native branch, ple.cu:298-326, then the
     history's advance and snapshot, :1118, :1123) as the window op's eleven dispatches a row (plan §3), on rows 0 to
     ``n`` - 1 (default: all) of the gathered rows ``rows`` (R, PLE_N) and the hidden rows ``hidden`` (R, PLE_D), from
@@ -170,8 +170,15 @@ def chain(rows, hidden, hist, w, n=None):
     their row bytes, as the program binds them, and every row shares the scratch, as basalt shares its workspace
     (ple.cu:282-292). Every output starts as 0xFF bytes, the scratch again before each row. Returns a dict: per row
     run, the scratch after it (``q8_1`` uint8, ``key`` the raw key, ``key_norm``, ``value``, ``gate``, ``gated``,
-    ``conv``) and ``hist``, the history after it, (n, ...) each; ``normalized`` and ``result``, all R rows (rows from n
-    on as they started); ``snap``, the n snapshot slots. The values are float32."""
+    ``conv``) and ``hist``, the history after it, (n, ...) each; ``normalized``, ``result`` and ``snap`` (R snapshot
+    slots), all R rows (rows from n on as they started). The values are float32.
+
+    ``guard``: every binding (inputs, weights, history, outputs and scratch) lies between GUARD bytes of 0xA5 and binds
+    after its head guard (basalt's guards, ple_parity.cpp:183-190), and ``guards`` maps each buffer's name to whether
+    both its guards still hold 0xA5. ``split_query``: the query norm writes its own buffer (``query``, scratch), which
+    the gate reads, in place of normalized row r (basalt's permitted alias query == normalized undone,
+    native_ple_postops.cu:344-351). ``inplace``: result binds onto hidden (basalt's in-place alias, ple_parity.cpp:957,
+    verify.cpp:1105-1124), and ``result`` is read back from the hidden buffer."""
     N, D, H = kernels.PLE_N, kernels.PLE_D, kernels.PLE_H
     rows, hidden = _words(rows, N), _words(hidden, D)
     n = len(rows) if n is None else n
@@ -190,44 +197,57 @@ def chain(rows, hidden, hist, w, n=None):
     gate_pso = gpu.pipeline(kernels.basalt_ple_source(), "basalt_ple_gate")
     for pso, threads in ((norm, grids[3][1]), (gate_pso, kernels.PLE_GRIDS["gate"][1])):
         assert pso.max_threads_per_threadgroup >= threads, (pso.max_threads_per_threadgroup, threads)
-    dev, r_all = gpu.device(), len(rows)
-    b_rows, b_hidden, b_hist, b_nk, b_nq, b_nc = (nt.Buffer(dev, a.tobytes()) for a in (
-        rows, hidden, _words(hist, HS), *(_words(g, D) for g in (w.w_nk, w.w_nq, w.w_nc))))
-    b_key = nt.Buffer(dev, key.tobytes())
-    b_value = nt.Buffer(dev, np.ascontiguousarray(w.value).view(np.uint16).reshape(N * N).tobytes())
-    b_taps = nt.Buffer(dev, np.ascontiguousarray(w.conv1d).view(np.uint16).reshape(4 * D).tobytes())
-    b_norm, b_result, b_snap = nt.Buffer(dev, 4 * r_all * D), nt.Buffer(dev, 4 * r_all * D), nt.Buffer(dev, 4 * n * HS)
-    for b in (b_norm, b_result, b_snap):
-        b.fill(0xFF)
-    scratch = {k: nt.Buffer(dev, nbytes) for k, nbytes in SCRATCH.items()}
-    s = {k: (b, 0) for k, b in scratch.items()}
+    r_all, pad = len(rows), GUARD if guard else 0
+    scratch = {**SCRATCH, **({"query": 4 * D} if split_query else {})}
+    data = {  # each binding's bytes, or its size for one that starts as 0xFF bytes
+        "rows": rows.tobytes(), "hidden": hidden.tobytes(), "hist": _words(hist, HS).tobytes(),
+        **{k: _words(getattr(w, k), D).tobytes() for k in ("w_nk", "w_nq", "w_nc")}, "w_key": key.tobytes(),
+        "w_value": np.ascontiguousarray(w.value).view(np.uint16).reshape(N * N).tobytes(),
+        "taps": np.ascontiguousarray(w.conv1d).view(np.uint16).reshape(4 * D).tobytes(),
+        "normalized": 4 * r_all * D, "snap": 4 * r_all * HS, **({} if inplace else {"result": 4 * r_all * D}),
+        **scratch}
+    data = {k: b"\xff" * v if isinstance(v, int) else v for k, v in data.items()}
+    b = {k: _guarded(v) if guard else nt.Buffer(gpu.device(), v) for k, v in data.items()}
+    if inplace:
+        b["result"] = b["hidden"]
+
+    def at(k, offset=0):
+        return b[k], pad + offset
+
+    def payload(k):
+        return b[k].read(pad, b[k].nbytes - 2 * pad)
+
+    s = {k: at(k) for k in scratch}
     q81_p, mmvq_p, mmvf_p = (kernels.basalt_q8_1_params(N), kernels.basalt_mmvq_params(N, D),
                              kernels.basalt_mmvf_params(N, N, 1))
     norm_p, gate_p = kernels.basalt_gr_norm_params(N, H, kernels.PLE_RMS_EPS), kernels.basalt_ple_gate_params()
-    q, out = nt.Queue(dev), {k: [] for k in (*SCRATCH, "hist")}
+    q, out = nt.Queue(gpu.device()), {k: [] for k in (*scratch, "hist")}
     for r in range(n):
-        for b in scratch.values():
-            b.fill(0xFF)
-        x, h, nr, res = (b_rows, 4 * N * r), (b_hidden, 4 * D * r), (b_norm, 4 * D * r), (b_result, 4 * D * r)
+        for k in scratch:
+            b[k].write(data[k], pad)
+        x, h = at("rows", 4 * N * r), at("hidden", 4 * D * r)
+        nr, res = at("normalized", 4 * D * r), at("result", 4 * D * r)
+        qr = s["query"] if split_query else nr
         _submit(q,
                 _launch(q81, [x, s["q8_1"]], grids[0], q81_p),                                    # ple.cu:298-299
-                _launch(mmvq, [(b_key, 0), s["q8_1"], s["key"]], grids[1], mmvq_p),               # :300-301
-                _launch(mmvf, [x, (b_value, 0), s["value"]], grids[2], mmvf_p),                   # :312-313
-                _launch(norm, [s["key"], (b_nk, 0), s["key_norm"]], grids[3], norm_p),            # postops.cu:352
-                _launch(norm, [h, (b_nq, 0), nr], grids[3], norm_p),                              # :353
-                _dispatch("gate", [s["key_norm"], nr, s["gate"]], gate_p),                        # :355
+                _launch(mmvq, [at("w_key"), s["q8_1"], s["key"]], grids[1], mmvq_p),              # :300-301
+                _launch(mmvf, [x, at("w_value"), s["value"]], grids[2], mmvf_p),                  # :312-313
+                _launch(norm, [s["key"], at("w_nk"), s["key_norm"]], grids[3], norm_p),           # postops.cu:352
+                _launch(norm, [h, at("w_nq"), qr], grids[3], norm_p),                             # :353
+                _dispatch("gate", [s["key_norm"], qr, s["gate"]], gate_p),                        # :355
                 _dispatch("broadcast", [s["value"], s["gate"], s["gated"]]),                      # :356
-                _launch(norm, [s["gated"], (b_nc, 0), nr], grids[3], norm_p),                     # :358
-                _dispatch("conv", [(b_hist, 0), nr, (b_taps, 0), h, s["gated"], s["conv"], res]),  # :359
-                _dispatch("advance", [(b_hist, 0), nr]),                                          # verify.cpp:1118
-                _dispatch("snapshot", [(b_snap, 4 * HS * r), (b_hist, 0)]))                       # :1123
-        for k, b in scratch.items():
-            out[k].append(b.read(0, b.nbytes))
-        out["hist"].append(b_hist.read(0, b_hist.nbytes))
+                _launch(norm, [s["gated"], at("w_nc"), nr], grids[3], norm_p),                    # :358
+                _dispatch("conv", [at("hist"), nr, at("taps"), h, s["gated"], s["conv"], res]),   # :359
+                _dispatch("advance", [at("hist"), nr]),                                           # verify.cpp:1118
+                _dispatch("snapshot", [at("snap", 4 * HS * r), at("hist")]))                      # :1123
+        for k in out:
+            out[k].append(payload(k))
     got = {k: np.frombuffer(b"".join(v), np.uint8 if k == "q8_1" else np.float32).reshape(n, -1)
            for k, v in out.items()}
-    for k, b, m in (("normalized", b_norm, r_all), ("result", b_result, r_all), ("snap", b_snap, n)):
-        got[k] = np.frombuffer(b.read(0, b.nbytes), np.float32).reshape(m, -1)
+    for k in ("normalized", "result", "snap"):
+        got[k] = np.frombuffer(payload(k), np.float32).reshape(r_all, -1)
+    if guard:
+        got["guards"] = {k: _payload(v)[1] for k, v in b.items()}
     return got
 
 
