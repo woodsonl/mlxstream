@@ -77,9 +77,9 @@ exact integer division of `__cuda_sm20_div_s64` (`I2F.U64.RP`, `MUFU.RCP`, `F2I.
 | `:20-27`, `:28` | `put(uint16_t*)`: `f2bf(v)` | `LOP3.LUT a, u, 0x7fffffff, RZ, 0xc0`; `ISETP.GT.U32.AND P, PT, a, 0x7f800000, PT`; NaN: `PRMT` (u >> 16) and `LOP3.LUT h, h, 0x40, RZ, 0xfc`; else `SHF.R.U32.HI t, RZ, 0x10, u`; `LOP3.LUT t, t, 0x1, RZ, 0xc0`; `IADD3 u, u, 0x7fff, t`; the high half | `f2bf(cuda_nan(v))`, a float argument as in basalt's signature (`:20`), then the same integer steps on its bits u: `(u & 0x7fffffffu) > 0x7f800000u ? ushort((u >> 16) \| 64u) : ushort((u + 0x7fffu + ((u >> 16) & 1u)) >> 16)`. v is a product, so CUDA's NaN is 0x7fffffff and its image 0x7fff; `cuda_nan` gives Metal the same, where this GPU's own NaN 0x7fc00000 would give 0x7fc0 |
 | `:31` | `put(float*)`: `o[i] = v` | a plain store | `cuda_nan(v)` stored |
 
-Unlike `kernels.cu`'s `bf` (`prefill_kernels.md`, Notation), this `f2bf` keeps a NaN a NaN (`:22-24`: "as in
-ggml_compute_fp32_to_bf16 and `bf16_from_f32`"), so the two files' BF16 images of a NaN differ (0x7fff here, 0x8000
-there); the port keeps both as basalt has them.
+Unlike `src/prefill/kernels.cu:31-35`'s `bf` (ported as `bf16_rne_nonan` in `kernels/common/basalt_fp.metal`), this
+`f2bf` keeps a NaN a NaN (`:22-24`: "as in ggml_compute_fp32_to_bf16 and `bf16_from_f32`"), so the two files' BF16
+images of a NaN differ (0x7fff here, 0x8000 there); the port keeps both as basalt has them.
 
 ## 2. Per-type arithmetic
 
