@@ -183,17 +183,20 @@ def test_matrices_through_both_transcriptions(matrices):
 def test_copy_list_on_the_pack_index():
     """HC8-INDEX: ``copy_list`` on the official pack's header and index sections (``real_source``, whose range reader
     raises on any other byte: the list reads no weight byte). The 290 target copies in ``hc8_tensors``' order
-    (``src/core/verify.cpp:566-581``), then the drafter's 8 in its load's order (``src/core/mtp.cpp:488-503``; the final
-    mixer has no injection), each of its shape (down ``320 x 10240``, up ``10240 x 320``, injection ``4 x 10240``), with
-    basalt's byte totals; the down and up matrices are exactly those the source refuses as ``HC8`` (basalt holds them
-    only as their copies), and every injection is a bindable BF16 entry at the copy's offset and shape."""
+    (``src/core/verify.cpp:566-581``), then the drafter's 8 in ``mtp/dense.index``'s line order, as ``hc8_dump`` writes
+    them (``src/core/verify.cpp:640``, ``src/core/mtp.cpp:516-521``; the final mixer has no injection), each of its
+    shape (down ``320 x 10240``, up ``10240 x 320``, injection ``4 x 10240``), with basalt's byte totals; the down and
+    up matrices are exactly those the source refuses as ``HC8`` (basalt holds them only as their copies), and every
+    injection is a bindable BF16 entry at the copy's offset and shape."""
     src, _ = real_source()
     es = copy_list(src.file)
     names = [f"blk.{l}.{p}{m}.weight" for l in range(48) for p in ("hc_attn_", "hc_ffn_") for m in ("down", "up", "inject")]
-    names += ["output_hc_down.weight", "output_hc_up.weight"] + [
-        "mtp." + p + m for p in ("attn_hyper_connection.", "mlp_hyper_connection.", "hyper_connection_mixer.")
-        for m in ("input_mix_weight_down.weight", "input_mix_weight_up.weight", "block_inject_weight.weight")
-        if p + m != "hyper_connection_mixer.block_inject_weight.weight"]
+    # then the drafter's 8: the fixture's mtp/dense.index lines 4, 5, 6, 8, 9, 15, 17 and 18, in that order
+    names += ["output_hc_down.weight", "output_hc_up.weight"] + [f"mtp.{n}.weight" for n in (
+        "hyper_connection_mixer.input_mix_weight_down", "hyper_connection_mixer.input_mix_weight_up",
+        "attn_hyper_connection.block_inject_weight", "attn_hyper_connection.input_mix_weight_down",
+        "attn_hyper_connection.input_mix_weight_up", "mlp_hyper_connection.block_inject_weight",
+        "mlp_hyper_connection.input_mix_weight_down", "mlp_hyper_connection.input_mix_weight_up")]
     got = [e.name for e in es]
     at = next((i for i, (a, b) in enumerate(zip(got, names)) if a != b), min(len(got), len(names)))
     assert got == names and [e.src for e in es] == [f"mtp/{n[4:]}" if n.startswith("mtp.") else f"dense/{n}"
@@ -231,7 +234,8 @@ def _dense(i, name, ne0, ne1, kind=4):
 
 
 # HC8-REFUSE's valid file: its matrices out of hc8_tensors' order (layer 10 before layer 2, an injection before its
-# layer's down matrix, the drafter's final mixer first), beside rows copy_list leaves alone (an F32 norm, a Q8_0 matrix)
+# layer's down matrix) and the drafter's final mixer first, last in the prepare loop (mtp.cpp:488-503) but first in
+# basalt's table, which keeps the index's order; beside rows copy_list leaves alone (an F32 norm, a Q8_0 matrix)
 DENSE = (_dense(0, "blk.10.hc_attn_down.weight", 64, 2), _dense(1, "output_hc_up.weight", 32, 64),
          _dense(2, "blk.2.hc_ffn_up.weight", 32, 64), _dense(3, "blk.2.attn_norm.weight", 64, 0, kind=2),
          _dense(4, "blk.2.hc_attn_inject.weight", 64, 4), _dense(5, "blk.2.hc_attn_down.weight", 64, 2))
@@ -264,7 +268,7 @@ def test_refusals():
     its own message naming its row or cause; then ``quantize``'s own refusals."""
     f = _basalt()
     d, m = f.section("dense").offset, f.section("mtp/dense").offset
-    target, drafter = (5, 4, 2, 0, 1), (2, 3, 1)                        # DENSE's and MTP's rows in basalt's order
+    target, drafter = (5, 4, 2, 0, 1), (1, 2, 3)                        # DENSE's and MTP's rows in basalt's order
     want = tuple(Hc8Entry(r.name, f"dense/{r.name}", d + r.src_off, r.ne1, r.ne0) for r in (DENSE[i] for i in target)) \
         + tuple(Hc8Entry(f"mtp.{t.name}", f"mtp/{t.name}", m + t.offset, t.rows, t.cols) for t in (MTP[i] for i in drafter))
     es = copy_list(f)
@@ -273,8 +277,8 @@ def test_refusals():
     long = "blk." + "1" * 103 + ".hc_attn_down.weight"                  # 127 bytes, the longest hc8_write takes
     assert es == want and held == fill and copy_list(_basalt(mtp=None)) == want[:5] \
         and copy_list(_basalt(DENSE + (_dense(6, long, 64, 2),)))[4].name == long, \
-        f"HC8-REFUSE: the valid file passes, its copies in hc8_tensors' order then the drafter's, each at its row's " \
-        f"bytes, the target's alone without the mtp sections, and a 127-byte name taken: {es}"
+        f"HC8-REFUSE: the valid file passes, its copies in hc8_tensors' order then the drafter's in its index's, each " \
+        f"at its row's bytes, the target's alone without the mtp sections, and a 127-byte name taken: {es}"
 
     edit = lambda rows, i, **kw: rows[:i] + (rows[i]._replace(**kw),) + rows[i + 1:]
     down = r"^copy_list: dense/blk\.2\.hc_attn_down\.weight: "

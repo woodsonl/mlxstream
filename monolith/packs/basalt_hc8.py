@@ -2,8 +2,9 @@
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/cuda/hc_fused.cu:1171-1227 (hc8_quant_kernel, hc8_make),
 # include/basalt/core/model_file.hpp:126-149 and src/core/model_file.cpp:438-485 (the BASALTH8 table),
-# src/core/verify.cpp:566-581 and src/core/mtp.cpp:215-218, :488-503 (the copied matrices) @
-# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+# src/core/verify.cpp:566-581 and src/core/mtp.cpp:215-218, :488-503 (the copied matrices), src/core/verify.cpp:638-640
+# and src/core/mtp.cpp:516-521 (their order in hc8_dump's table) @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT;
+# third_party/NOTICE).
 """Basalt's int8 copies of the hyper-connection matrices, made on the host.
 
 A copy of a BF16 matrix ``w [rows][cols]`` (``cols % 32 == 0``) is one block of bytes, the allocation ``hc8_make``
@@ -91,16 +92,18 @@ def quantize(w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def copy_list(f: BasaltFile) -> Tuple[Hc8Entry, ...]:
-    """The matrices basalt copies on one GPU, in its order, from the file's index sections alone (no weight byte is
-    read). ``name`` is basalt's table name, ``src`` the IR name of the BF16 row (for messages), ``offset`` its byte
-    offset in the file, ``rows`` x ``cols`` the copy's shape. The target's come first, in ``hc8_tensors``' order
-    (``src/core/verify.cpp:566-581``): per layer, ascending, ``blk.L.hc_attn_{down,up,inject}.weight`` then
-    ``blk.L.hc_ffn_{down,up,inject}.weight``, then ``output_hc_{down,up}.weight``, each a ``dense/`` row of
-    ``ne1`` x ``ne0`` (``generate.cpp:2326``, ``:2350``); then the drafter's, named ``"mtp." + name``, in its load's
-    order (``mtp.cpp:488-503``): per hyper-connection (attention, MLP, the final mixer) the ``input_mix_weight_down``,
-    ``input_mix_weight_up`` and ``block_inject_weight`` tensors of ``mtp/dense.index``. A matrix the file lacks is left
-    out, as basalt's ``prepare_hc8`` leaves it (``verify.cpp:604``); a graph that reads its copy is refused by
-    ``emit_program``, where basalt's read ends the process (``hc_fused.cu:1442-1445``).
+    """The matrices basalt copies on one GPU, in the order of the table ``hc8_dump`` writes
+    (``src/core/verify.cpp:619-645``), from the file's index sections alone (no weight byte is read). ``name`` is
+    basalt's table name, ``src`` the IR name of the BF16 row (for messages), ``offset`` its byte offset in the file,
+    ``rows`` x ``cols`` the copy's shape. The target's come first, in ``hc8_tensors``' order (``verify.cpp:566-581``,
+    ``:638-639``): per layer, ascending, ``blk.L.hc_attn_{down,up,inject}.weight`` then
+    ``blk.L.hc_ffn_{down,up,inject}.weight``, then ``output_hc_{down,up}.weight``, each a ``dense/`` row of ``ne1`` x
+    ``ne0`` (``generate.cpp:2326``, ``:2350``). Then the drafter's (``verify.cpp:640``), named ``"mtp." + name``: the
+    ``input_mix_weight_down``, ``input_mix_weight_up`` and ``block_inject_weight`` tensors of its attention's, MLP's and
+    final mixer's hyper-connections (``mtp.cpp:488-503``), in ``mtp/dense.index``'s line order, the order in which
+    ``hc8_keys`` lists them (``mtp.cpp:516-521``) and the load copies the down and up matrices (``:257-267``). A matrix
+    the file lacks is left out, as basalt's ``prepare_hc8`` leaves it (``verify.cpp:604``); a graph that reads its copy
+    is refused by ``emit_program``, where basalt's read ends the process (``hc_fused.cu:1442-1445``).
 
     Raises ``ValueError`` naming the row or cause for a file with an ``hc8`` section, a target row that is in ``gguf``,
     not kind 4 (BF16 as stored) or not ``ne0 * ne1 * 2`` bytes, a drafter row not ``bf16`` of ``rows * cols * 2``
@@ -128,12 +131,11 @@ def copy_list(f: BasaltFile) -> Tuple[Hc8Entry, ...]:
             "its bytes are in gguf" if r.in_gguf else
             f"kind {r.kind}, not 4 (BF16 as stored)" if r.kind != 4 else
             f"{r.src_bytes} bytes, not {r.ne1} x {r.ne0} BF16" if r.src_bytes != r.ne0 * r.ne1 * 2 else None)
-    mtp, base = ({t.name: t for t in f.mtp_dense_index()}, f.section("mtp/dense").offset) \
-        if "mtp/dense.index" in f.sections else ({}, 0)                          # a file with no drafter
-    for n in DRAFTER:
-        if n in mtp:
-            t = mtp[n]
-            add("mtp." + n, f"mtp/{n}", base + t.offset, t.rows, t.cols,
+    mtp, base = (f.mtp_dense_index(), f.section("mtp/dense").offset) \
+        if "mtp/dense.index" in f.sections else ((), 0)                          # a file with no drafter
+    for t in mtp:                                 # the index's line order, hc8_keys' (mtp.cpp:516-521)
+        if t.name in DRAFTER:
+            add("mtp." + t.name, f"mtp/{t.name}", base + t.offset, t.rows, t.cols,
                 f"kind {t.kind!r}, not 'bf16'" if t.kind != "bf16" else
                 f"{t.nbytes} bytes, not {t.rows} x {t.cols} BF16" if t.nbytes != t.rows * t.cols * 2 else None)
     return tuple(out)
