@@ -719,7 +719,8 @@ inline uint prompt_rows(device const StepState* st) {          // invariant 4: t
 
 
 def basalt_prompt_gemm_source() -> str:
-    """basalt's ``Gemm::bf16`` product and ``Gemm::native``'s FP16 product (``basalt_prompt_gemm``)."""
+    """basalt's ``Gemm::bf16`` product and ``Gemm::native``'s FP16 product (``basalt_prompt_gemm``), and the
+    conversion ``to_f16`` (``basalt_prompt_convert``)."""
     return PRELUDE + template("basalt_fp.metal") + PROMPT_ROWS + template("basalt_prompt_gemm.metal")
 
 
@@ -749,6 +750,11 @@ def basalt_prompt_gemm_slices(rows: int, n: int, k: int) -> List[Tuple[int, int,
 def basalt_prompt_gemm_params(n: int, k: int, row0: int, col0: int) -> bytes:
     """``PromptGemmParams``: the product's n and k, the slice's first row and first column."""
     return struct.pack("<4I", n, k, row0, col0)
+
+
+def basalt_prompt_convert_params(n: int) -> bytes:
+    """``PromptConvertParams``: the row width n (the conversion runs the chunk's rows times n elements)."""
+    return struct.pack("<I", n)
 
 
 # ---- the other decode kernels -------------------------------------------------------------------------------

@@ -29,7 +29,14 @@ construction, and these gates keep it bit for bit against one whole-product disp
   (2560, 640), 37 rows: the w rows [r0, r0 + n) alone (n 1, 63, 65 at r0 0 and 37), the w rows permuted, explicit
   column slices of 64 and of 192 give the whole product's columns.
 - GM-REPEAT (determinism), FP16 (6144, 2560) at B 512 in the handler's slices: y prefilled 0x00, then 0xFF, on one
-  pipeline, then on a freshly compiled one, every run the same bits."""
+  pipeline, then on a freshly compiled one, every run the same bits.
+
+The conversion to_f16 (src/prefill/kernels.cu:818-821, hf :40: __float2half_rn), the PLE key's operand
+(prefill.cpp:1534), has no basalt test; the nearest check, dequant_f16_parity.cpp:73's store against __float2half_rn of
+the fp32 value, is bitwise, and so is this one:
+- G9-F16: n 100 a row at 37 rows of a 64-row bound, ``F16_SPECIALS`` (+-0, fp32 subnormals, 65504, the overflow tie
+  65520 and the float below it, +-inf, three NaNs, the fp16-subnormal ties) among fp32 normals from 2^-30 to 2^20,
+  bit for bit against emu.cuda_half_bits; the elements past 37 * n keep the 0xFF fill."""
 
 import itertools
 
@@ -308,3 +315,40 @@ def test_repeats_are_bit_identical():
         assert np.array_equal(y, runs[0]), (
             "port: every run bitwise identical (deterministic: no atomics, no split of K, no dependence on scheduling "
             f"or on y's prior bytes) (run {i} against run 1; fp16 N 6144 K 2560, B 512): {differ(y, runs[0])}")
+
+
+# G9-F16's specials, float32 bits: to_f16's fp16 bits (__float2half_rn). +-0; the fp32 subnormals 0x00000001 and
+# 0x807fffff, below half of fp16's least subnormal (a signed zero whether or not read as zero); 65504, the largest
+# fp16; 0x477fefff, the float below the tie 65520; 65520 (65504's last bit is odd: inf); +-inf; the NaNs 0x7fc00000,
+# 0xffffffff and the signaling 0x7f800001, each sm_120's 0x7fff; the fp16-subnormal ties 2^-25 (to 0, where ties away
+# from zero would give 2^-24) and 3 * 2^-25 (to 2 * 2^-24).
+F16_SPECIALS = {
+    0x00000000: 0x0000, 0x80000000: 0x8000, 0x00000001: 0x0000, 0x807FFFFF: 0x8000, 0x477FE000: 0x7BFF,
+    0x477FEFFF: 0x7BFF, 0x477FF000: 0x7C00, 0x7F800000: 0x7C00, 0xFF800000: 0xFC00, 0x7FC00000: 0x7FFF,
+    0xFFFFFFFF: 0x7FFF, 0x7F800001: 0x7FFF, 0x33000000: 0x0000, 0x33C00000: 0x0002,
+}
+
+
+def test_to_f16_is_the_conversion():
+    """G9-F16: to_f16 of n 100 floats a row at 37 rows of a 64-row bound, into a y prefilled 0xFF. F16_SPECIALS,
+    written as bits, start row 0, end row 36 (the last converted elements) and start row 37; every other element is
+    an fp32 normal of magnitude 2^u, u uniform in [-30, 20] (to 0, to fp16 subnormals and normals, past 65520 to
+    inf)."""
+    B, R, n = 64, 37, 100
+    rng = np.random.default_rng(73)
+    x = (np.exp2(rng.uniform(-30.0, 20.0, (B, n))) * rng.choice([-1.0, 1.0], (B, n))).astype(F32)
+    bits, sp = x.reshape(-1).view(np.uint32), np.array(list(F16_SPECIALS), np.uint32)
+    for at in (0, R * n - len(sp), R * n):
+        bits[at:at + len(sp)] = sp
+    with np.errstate(invalid="ignore"):                      # numpy's cast of a signaling NaN
+        want, twin = emu.cuda_half_bits(x), emu.cuda_half_bits(sp.view(F32))
+    assert np.array_equal(twin, list(F16_SPECIALS.values())) and np.isin(sp, bits[:R * n]).all(), \
+        "a special is not among the converted elements, or the twin misses its fp16 bits"
+    y = gpu.convert(x, bf16=False, B=B, rows=R)
+    miss = np.argwhere(y[:R] != want[:R])
+    assert np.array_equal(y[:R], want[:R]) and (y[R:] == 0xFFFF).all(), (
+        "port: bitwise equal to emu.cuda_half_bits (__float2half_rn: round to nearest even, every NaN to sm_120's "
+        "0x7fff); elements past R*n keep 0xFFFF. The nearest basalt check (dequant_f16_parity.cpp:73, the store "
+        f"against the rounded fp32 value) is bitwise too (R {R} of B {B}, n {n}): {len(miss)} elements differ, as "
+        f"(x, y, want) {[(hex(bits[i * n + j]), hex(y[i, j]), hex(want[i, j])) for i, j in miss[:4]]}; "
+        f"{np.count_nonzero(y[R:] != 0xFFFF)} past R*n written")

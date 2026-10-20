@@ -55,3 +55,17 @@ def prompt_gemm(xb, wb, *, bf16, B, rows=None, slices=None, fill=0xFF, done=0):
         y = run_rows(pso, [xb.tobytes(), wb.tobytes(), y], kernels.basalt_prompt_gemm_params(n, k, row0, col0), 3,
                      (-(-ncols // 64), -(-nrows // 64), 1), (256, 1, 1), B if rows is None else rows, 0, done=done)[2]
     return np.frombuffer(y, np.uint32).reshape(B, n)
+
+
+def convert(x, *, bf16, B, rows, fill=0xFF):
+    """basalt_prompt_convert: ``to_bf16`` (``bf16``) or ``to_f16`` of the floats ``x`` [B, n] (kernels.cu:818-833),
+    compiled at bound ``B`` and run with ``rows`` in StepState, one thread per element, into one y of exactly B * n
+    halves whose bytes start as ``fill``. ``x``'s bits reach the kernel as they are (NaN payloads included). Returns
+    y's bits, uint16 [B, n]."""
+    x = np.ascontiguousarray(x)
+    assert x.dtype == np.float32 and x.ndim == 2 and len(x) == B, f"x {x.dtype} {x.shape} at bound {B}"
+    n = x.shape[1]
+    pso = prompt_pipeline(kernels.basalt_prompt_gemm_source(), "basalt_prompt_convert", B, {"CV_BF16": str(int(bf16))})
+    y = run_rows(pso, [x.tobytes(), 2 * B * n], kernels.basalt_prompt_convert_params(n), 2, (-(-B * n // 256), 1, 1),
+                 (256, 1, 1), rows, 0, fill=fill)[1]
+    return np.frombuffer(y, np.uint16).reshape(B, n)

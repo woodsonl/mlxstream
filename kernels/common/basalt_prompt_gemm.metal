@@ -24,11 +24,23 @@
 // past R returns before its first barrier; loads past R or N stage zeros (never read past x's B rows or w's N rows);
 // stores need t < R and n < N. Grid: (ceil(ncols / 64), nrows / 64) threadgroups of 256 per slice. K % 16 == 0.
 //
-// Macros: GEMM_BF16 (1: BF16 operands, 0: FP16), and PROMPT_ROWS' T_SRC, ROWS_MAX and T_STATIC_ROWS.
+// basalt_prompt_convert: to_f16 (kernels.cu:818-821, hf :40) at CV_BF16 0, x [B][n] floats to y [B][n] fp16 bits.
+// One thread per element of the chunk's rows, i < prompt_rows(st) * n (basalt's launcher, :846-850, runs a grid-stride
+// loop of min(ceil(count / 256), 4096) blocks of 256 over the element count; every element is independent, so the
+// geometry changes no bit).
+// hf is __float2half_rn: round to nearest even, a finite overflow to inf, fp16 subnormals kept, an fp32 subnormal to
+// the zero of its sign, every NaN to sm_120's 0x7fff (f16_bits, then cuda_nan_f16). Grid: ceil(B * n / 256)
+// threadgroups of 256.
+//
+// Macros: GEMM_BF16 (1: BF16 operands, 0: FP16), CV_BF16 (0: to_f16), and PROMPT_ROWS' T_SRC, ROWS_MAX and
+// T_STATIC_ROWS.
 #pragma STDC FP_CONTRACT OFF
 
 #ifndef GEMM_BF16
 #define GEMM_BF16 0
+#endif
+#ifndef CV_BF16
+#define CV_BF16 0
 #endif
 
 // ponytail: one geometry for every shape (a 64 x 64 tile, 4 x 4 outputs per thread, K steps of 16, single-buffered);
@@ -78,4 +90,17 @@ kernel void basalt_prompt_gemm(device const ushort* x [[buffer(0)]], device cons
             if (t < R && n < p.n) y[ulong(t) * p.n + n] = cuda_nan(acc[i][j]);
         }
     }
+}
+
+struct PromptConvertParams { uint n; };
+
+kernel void basalt_prompt_convert(device const float* x [[buffer(0)]], device ushort* y [[buffer(1)]],
+                                  constant PromptConvertParams& p [[buffer(2)]],
+                                  device const StepState* st [[buffer(15)]], uint i [[thread_position_in_grid]]) {
+    if (st->done || i >= prompt_rows(st) * p.n) return;
+#if CV_BF16
+#error "basalt_prompt_convert: only to_f16 (CV_BF16 0) is built"
+#else
+    y[i] = cuda_nan_f16(f16_bits(x[i]));
+#endif
 }
