@@ -123,3 +123,61 @@ static inline float gdn_sq32(float oc) { return warp_sum_ieee(ieee_mul(oc, oc));
 static inline float gdn_out(float oc, float ss, float eps, float gam, float z) {
     return ieee_mul(ieee_mul(ieee_mul(oc, rsqrt_ieee(fma_ieee(ss, 0.0078125f, eps))), gam), gdn_beta(z));
 }
+
+// ---- the per-stage kernels: dec_gdn_parity's reference side (test-only) --------------------------------------------
+
+// gdn_conv_l2_multi (verify_kernels.cu:29-57, the launcher :817-826, t_begin 0): the window's h for every channel c
+// and token t < T, h[t C + c], the conv of the taps [history | qkv rows < t] and qkv row t, SiLU'd; on the q and k
+// heads (threadgroups below 2 h_k) L2-normed over the head's 128 channels. The history is the state's conv tail,
+// [C][3] oldest first after the S x h_v x S recurrent state, read only. Grid (C / 128, T) threadgroups of 128 threads,
+// one head of 128 channels each, SIMD-group sg holding channels 32 sg .. 32 sg + 31 (CUDA's warps).
+kernel void gdn_conv_l2_multi(device const float* state [[buffer(0)]], device const float* qkv [[buffer(1)]],
+                              device const float* w [[buffer(2)]], device float* h [[buffer(3)]],
+                              constant BsGdnParams& p [[buffer(16)]], uint2 tg [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[4];
+    const uint t = tg.y, c = 128u * tg.x + 32u * sg + lane;
+    if (t >= min(p.T, 8u)) return;                                 // the whole threadgroup, before the barrier
+    device const float* hist = state + 128u * p.h_v * 128u;        // the conv tail
+    float win[3];
+    for (uint j = 0; j < 3u; ++j) {
+        const uint src = t + j;                                    // into [history(3) | qkv rows]
+        win[j] = src < 3u ? hist[3u * c + src] : qkv[(src - 3u) * p.C + c];
+    }
+    const float x = qkv[t * p.C + c];
+    device const float* wc = w + 4u * c;
+    float y = gdn_silu(gdn_conv(win[0], win[1], win[2], x, wc[0], wc[1], wc[2], wc[3]));
+    if (tg.x < 2u * p.h_k) {                                       // threadgroup-uniform
+        const float sq = warp_sum_ieee(ieee_mul(y, y));
+        if (lane == 0u) part[sg] = sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        y = ieee_mul(y, rsqrt_ieee(ieee_add(gdn_sum4(part[0], part[1], part[2], part[3]), p.eps)));
+    }
+    h[t * p.C + c] = cuda_nan(y);
+}
+
+// gdn_ab_multi (verify_kernels.cu:113-213, the launcher :873-898): the window's gate and beta for every value head
+// r and token t < T, gate[t h_v + r] from the alpha row r of x row t (softplus(v + dt[r]) ssm_a[r], the decay's
+// logarithm) and beta[t h_v + r] = sigmoid(v) from the beta row r. Grid h_v threadgroups of 64 threads: SIMD-group sg
+// of threadgroup tg takes row 2 tg + sg, rows below h_v alpha, the next h_v beta. One kernel for basalt's five
+// instantiations (gdn_ab_multi_kernel<4/8>, gdn_ab_multi_unrolled_kernel<4/6/8, 10>), whose token sums are one chain
+// in one order whatever MAX_T (verify_gdn.md section 5): here each token's dot runs on its own, then lane 0 stores.
+kernel void gdn_ab_multi(device const float4* x [[buffer(0)]], device const uint4* wa [[buffer(1)]],
+                         device const uint4* wb [[buffer(2)]], device const float* dt [[buffer(3)]],
+                         device const float* ssm_a [[buffer(4)]], device float* gate [[buffer(5)]],
+                         device float* beta [[buffer(6)]], constant BsGdnParams& p [[buffer(16)]],
+                         uint tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]]) {
+    const uint row = 2u * tg + sg;
+    if (row >= 2u * p.h_v) return;                                // a whole SIMD-group
+    const bool is_beta = row >= p.h_v;
+    const uint r = is_beta ? row - p.h_v : row, n8 = p.n_embd / 8u, T = min(p.T, 8u);
+    device const uint4* w = (is_beta ? wb : wa) + r * n8;
+    for (uint t = 0; t < T; ++t) {
+        const float a = gdn_ab_dot(w, x + 2u * n8 * t, lane, n8);    // x row t: n_embd floats, 2 n8 float4
+        if (lane == 0u) {
+            if (is_beta) beta[t * p.h_v + r] = cuda_nan(gdn_beta(a));
+            else gate[t * p.h_v + r] = cuda_nan(gdn_gate(a, dt[r], ssm_a[r]));
+        }
+    }
+}
