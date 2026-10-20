@@ -771,6 +771,59 @@ def basalt_prompt_convert_params(n: int) -> bytes:
     return struct.pack("<I", n)
 
 
+# ---- basalt's prompt path: MMQ for the routed experts (kernels/common/basalt_mmq.metal; docs/research/basalt-nvcc/mmq.md) ----
+# The constants and the products' geometry are adapted from basalt (jesdga95/basalt) src/prefill/prefill.cpp:971-992,
+# :1840-2008, :2241-2264, src/prefill/moe_mmq.cu:168-199 and src/prefill/mmq/{mmq.cuh:13, :30-50, quantize.cuh:11} @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE); the mmq/ files are ggml-org/llama.cpp's
+# ggml/src/ggml-cuda/{mmq.cuh, quantize.cuh} @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+
+MMQ_THREADS = 128           # the quantizers' threadgroup (quantize.cuh:11), mul_mat_q's (one weight row of a 128-row tile
+                            # each) and plan_count's
+MMQ_RANGE = 16              # the plan kernels' tokens per range: B / 16 ranges counted apart, then scanned in order
+MMQ_PLAN_WORDS = 1540       # the plan's int32 words: n, rows_local, order[512], bounds[513], wpre[513]
+MMQ_BLOCK_BYTES = 144       # block_q8_1_mmq (mmq.cuh:30-50): d4[4] fp32 scales, then 128 int8 codes
+BASALT_ERR_EXPERT_ID = 5    # StepState.error for a routed id outside [0, n_expert) (prefill.cpp:1843): the next free code
+
+
+def basalt_mmq_source() -> str:
+    """basalt's prompt-path MMQ: the routed experts on Q2_0 (src/prefill/moe_mmq.cu, src/prefill/mmq/) and the Q8_0
+    instance for draft_kv."""
+    return PRELUDE + PROMPT_ROWS + template("basalt_fp.metal") + template("basalt_mmq.metal")
+
+
+def basalt_mmq_macros(product: str, *, sm_count: int = DENSE_TC_SM_COUNT, rows_per_t: int = 1, n: int = 0,
+                      k: int = 0) -> Dict[str, str]:
+    """The macros of an MMQ product. ``gate_up`` and ``down``: the routed experts' Q2_0 / Q2_0 native blobs at 2560 /
+    640 (basalt_expert_layout; prefill.cpp:2252-2264's products): gate then up, 1280 rows of 2560, at the blob; down,
+    2560 rows of 640, MAT_OFF ushorts into it. ``q8_0``: draft_kv's dense Q8_0 matrix [n, k] (prefill.cpp:971-992),
+    bound directly, on ``rows_per_t`` activation rows a token; n % 128 != 0 takes basalt's fallback configurations
+    (moe_mmq.cu:119-123), which are not ported, and k % 256 != 0 a padded last iteration the dense kernel does not
+    redirect, so both are refused. K is the reduction length, NTY the 128-row weight tiles, LD the output row stride,
+    BPNE a row's weight blocks (64 values for Q2_0, 32 for Q8_0), BPI those of a 256-value k iteration (mmq.cuh:13),
+    NITER the iterations (the down product's last one padded), MMQ_SM_COUNT the multiprocessors whose stream-k pieces
+    the kernels reproduce (basalt's 170 by default, never this GPU's), MMQ_ERR the StepState error code of a routed id
+    out of range."""
+    lay = basalt_expert_layout(2560, 640)
+    shapes = {"gate_up": (42, lay["n_embd"], 2 * lay["n_ff"], 0),
+              "down": (42, lay["n_ff"], lay["n_embd"], lay["down_off"] // 2), "q8_0": (8, k, n, 0)}
+    if product not in shapes:
+        raise ValueError(f"basalt_mmq: unknown product {product!r}")
+    dense = product == "q8_0"
+    if sm_count < 1 or rows_per_t < 1:
+        raise ValueError(f"basalt_mmq: sm_count and rows_per_t must be positive, got {sm_count}, {rows_per_t}")
+    if not dense and (n or k or rows_per_t != 1):
+        raise ValueError(f"basalt_mmq: {product} has the experts' fixed shape, so no n, k or rows_per_t; got {n}, {k}, "
+                         f"{rows_per_t}")
+    if dense and (n <= 0 or n % 128 or k <= 0 or k % 256):
+        raise ValueError(f"basalt_mmq: q8_0 needs n a positive multiple of 128 and k of 256, got n {n}, k {k}")
+    type_id, kk, rows, mat_off = shapes[product]
+    bpne, bpi = (kk // 32, 8) if dense else (kk // 64, 4)
+    return {"MMQ_TYPE": str(type_id), "K": str(kk), "NTY": str(rows // 128), "LD": str(rows), "BPNE": str(bpne),
+            "BPI": str(bpi), "NITER": str(-(-bpne // bpi)), "MMQ_DOWN": str(int(product == "down")),
+            "MMQ_DENSE": str(int(dense)), "ROWS_PER_T": str(rows_per_t), "MMQ_SM_COUNT": str(sm_count),
+            "MAT_OFF": str(mat_off), "MMQ_ERR": str(BASALT_ERR_EXPERT_ID)}
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)

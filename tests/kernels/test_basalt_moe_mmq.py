@@ -3,8 +3,9 @@
 # adapted from basalt (jesdga95/basalt) tests/cuda/prefill_mmq_kq_test.cpp and tests/cuda/prefill_cpu_share_test.cpp @
 # b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): their fixtures (tests/kernels/
 # basalt_moe_fixture.py) and their checks on the routed experts' MMQ.
-"""basalt's MoE MMQ for the routed experts on Q2_0 (src/prefill/moe_mmq.cu, src/prefill/mmq/), the tests that run on
-the host: the emulator's launch walk, the fixture, and the emulator's own gates before any Metal exists.
+"""basalt's MoE MMQ for the routed experts on Q2_0 (src/prefill/moe_mmq.cu, src/prefill/mmq/) and its Q8_0 instance:
+the tests that run on the host (the emulator's launch walk, the fixture, and the emulator's own gates before any Metal
+exists), then the Metal port's (kernels/common/basalt_mmq.metal).
 
 - test_mmq_walk_facts: ``emu.pick_j`` is mul_mat_q_switch_J's tile width (mmq.cuh:867-889) where the first width
   reaching the fewest column tiles is not 128, and ``emu.mmq_walk`` gives tile 0's pieces, in the fixup's order, for
@@ -21,7 +22,10 @@ the host: the emulator's launch walk, the fixture, and the emulator's own gates 
   meets G1-G3 (prefill_mmq_kq_test.cpp:269, :277-278, :375-377) against the float64 reference.
 - test_mmq_q2_batch_independence_emulator: MK-4's bound (:433) measured on the emulator first (L13).
 - test_mmq_reciprocal_division_counts: how often the port's reciprocal-and-multiply form of the quantizer's and
-  SwiGLU's divisions differs from the correctly rounded quotient (contract invariant 5's count)."""
+  SwiGLU's divisions differs from the correctly rounded quotient (contract invariant 5's count).
+- test_mmq_launch_and_pieces (M3, spec-kernels-mmq.md 10): the kernels' launch helpers mmq_launch and mmq_piece_mask,
+  run on the GPU by a probe kernel, equal emu.mmq_launches and the pieces of emu.mmq_walk on every tile of every launch
+  of scripts/mmq_pieces.py's sweep and of the fixtures' plans."""
 
 import functools
 
@@ -31,7 +35,9 @@ import pytest
 from monolith import kernels
 from tests.contract import gguf_reference
 from tests.kernels import basalt_emu as emu
+from tests.kernels import basalt_gpu
 from tests.kernels import basalt_moe_fixture as fx
+from tests.kernels import basalt_prompt_gpu as gpu
 
 F32 = np.float32
 NSM = kernels.DENSE_TC_SM_COUNT       # basalt's reference GPU, which the port pins (never this Mac's)
@@ -238,3 +244,89 @@ def test_mmq_reciprocal_division_counts():
               f"{nc} of {v.size} codes ({nc / v.size:.4%}) change; SwiGLU: {nq} of {g.size} quotients "
               f"({nq / g.size:.3%}) differ from fl(g / (1 + e)), {nh} after * u ({nh / g.size:.3%})")
         assert np.all(np.abs(cp - ce) <= 1), name
+
+
+# M3's probe (spec-kernels-mmq.md 10): item i = (first, n, g, t) runs the helpers as basalt_mmq runs them per
+# threadgroup, mmq_launch on group g of the n launch slots whose n + 1 bounds start at bounds[first], then
+# mmq_piece_mask on tile t of that launch, with the product's macros.
+MMQ_PROBE = """
+kernel void mmq_launch_probe(device const int* bounds [[buffer(0)]], device const int4* item [[buffer(1)]],
+                             device int* out [[buffer(2)]], constant uint& count [[buffer(3)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (i >= count) return;
+    const int4 a = item[i];
+    const MmqLaunch L = mmq_launch(bounds + a.x, a.y, a.z, NTY);
+    device int* o = out + 7 * i;
+    o[0] = L.ngx; o[1] = L.maxr; o[2] = L.J; o[3] = L.ntx; o[4] = L.ntiles; o[5] = L.grid;
+    o[6] = int(mmq_piece_mask(a.w, L.ntiles, BPNE, BPI, L.grid));
+}
+"""
+SWEEP_MAXR = list(range(1, 257)) + [384, 512, 1000, 2048]       # scripts/mmq_pieces.py's launches()
+
+
+def _sweep_plans():
+    """(bounds, g) for every launch shape of the sweep, ngx 1-16 experts with maxr in SWEEP_MAXR, plus maxr 16,384 at
+    ngx 16 and 65,536 at ngx 1. Shape c is group g = c % 3 of a plan of 16 g + ngx launch slots (more after a full
+    group when c % 4 != 0): the other groups' experts hold more rows than maxr, the group's own a uniform count in
+    [1, maxr] with maxr at a random slot, so a helper that reads outside its group or misses its largest expert errs."""
+    rng = np.random.default_rng(3)
+    shapes = [(ngx, m) for ngx in range(1, 17) for m in SWEEP_MAXR] + [(16, 16384), (1, 65536)]
+    for c, (ngx, maxr) in enumerate(shapes):
+        g = c % 3
+        cnt = maxr + 1 + rng.integers(0, 8, 16 * g + ngx + (c % 4 if ngx == 16 else 0))
+        cnt[16 * g: 16 * g + ngx] = rng.integers(1, maxr + 1, ngx)
+        cnt[16 * g + rng.integers(0, ngx)] = maxr
+        yield np.append(0, np.cumsum(cnt)), g
+
+
+def _piece_masks(tiles, bpi):
+    """Per tile of an emu.mmq_walk launch, bit q set where a piece of its K range starts at k iteration q > 0, after
+    asserting that the walk's expression is mmq_fixup's fold of its pieces, each from an iteration boundary (so the
+    starts fix the expression the kernel forms, spec-kernels-mmq.md 9.2)."""
+    out = np.empty(len(tiles), np.int32)
+    for t, expr in tiles.items():
+        p = sorted(emu.mmq_pieces(expr))
+        assert expr == emu.mmq_fixup(*p) and all(lo % bpi == 0 for lo, _ in p), (t, expr)
+        out[t] = sum(1 << (lo // bpi) for lo, _ in p[1:])
+    return out
+
+
+@pytest.mark.parametrize("product,n,nty,bpne,bpi", [("gate_up", 0, 10, 40, 4), ("down", 0, 20, 10, 4),
+                                                     ("q8_0", 2560, 20, 80, 8), ("q8_0", 512, 4, 80, 8)],
+                         ids=["gate_up", "down", "q8_0-2560", "q8_0-512"])
+def test_mmq_launch_and_pieces(product, n, nty, bpne, bpi):
+    """M3 (spec-kernels-mmq.md 10): basalt_mmq.metal's mmq_launch and mmq_piece_mask (9.3), compiled from
+    basalt_mmq_source() with the product's macros and run on the GPU by a probe kernel, equal the host's transcription
+    of basalt's launch rules (emu.mmq_launches: MMQ_GROUP experts a launch, prefill.cpp:2243-2248; mul_mat_q_switch_J's
+    tile width, mmq.cuh:866-889; ntx, the tile count and the stream-k grid at basalt's 170 multiprocessors, :801-833)
+    and the pieces of the literal walk of mul_mat_q and its fixup (emu.mmq_walk, :487-629, :654-698, :765), on every
+    tile of every launch: scripts/mmq_pieces.py's sweep (_sweep_plans: ngx 1-16, maxr 1-256, 384, 512, 1000, 2048),
+    maxr 16,384 at ngx 16 and 65,536 at ngx 1 (x * grid past 2^32: the 64-bit products), and every group of the five
+    fixtures' plans. The Q8_0 instance runs the same helpers with bpne 80 and bpi 8 at draft_kv's widths, 2560 and 512
+    rows."""
+    macros = kernels.basalt_mmq_macros(product, n=n, k=2560 if n else 0)
+    assert (macros["NTY"], macros["BPNE"], macros["BPI"]) == (str(nty), str(bpne), str(bpi))
+    plans = list(_sweep_plans()) + [(fx.config(name).plan.bounds, g) for name in fx.CONFIGS
+                                    for g in range(-(-fx.config(name).plan.n // emu.MMQ_GROUP))]
+    bounds, items, want, masks, first, wide = [], [], [], {}, 0, 0
+    for b, g in plans:
+        la = emu.mmq_launches(b, nty, NSM)[g]
+        if (la.ntiles, la.grid) not in masks:
+            masks[la.ntiles, la.grid] = _piece_masks(emu.mmq_walk(la.ntiles, bpne, la.grid, bpi), bpi)
+        t = np.arange(la.ntiles)
+        items.append(np.stack([np.full_like(t, first), np.full_like(t, len(b) - 1), np.full_like(t, g), t], axis=1))
+        want.append(np.column_stack([np.tile([la.ngx, la.maxr, la.J, la.ntx, la.ntiles, la.grid], (la.ntiles, 1)),
+                                     masks[la.ntiles, la.grid]]))
+        bounds.append(b)
+        first += len(b)
+        wide = max(wide, la.ntiles * bpne * la.grid)
+    items, want = np.concatenate(items).astype(np.int32), np.concatenate(want).astype(np.int32)
+    pso = gpu.prompt_pipeline(kernels.basalt_mmq_source() + MMQ_PROBE, "mmq_launch_probe", 256, macros)
+    out = basalt_gpu.run(pso, [np.concatenate(bounds).astype(np.int32).tobytes(), items.tobytes(), want.nbytes],
+                         np.uint32(len(items)).tobytes(), 3, -(-len(items) // 256), 256, fill=0xFF)[2]
+    got = np.frombuffer(out, np.int32).reshape(want.shape)
+    bad = np.flatnonzero((got != want).any(axis=1))
+    print(f"\n{product} (NTY {nty}): {len(plans)} launches, {len(items)} tiles ({np.count_nonzero(want[:, 6])} split), "
+          f"{len(masks)} (ntiles, grid) pairs; {len(bad)} tiles differ")
+    assert wide >= 2 ** 32, wide
+    assert not len(bad), [(items[i].tolist(), got[i].tolist(), want[i].tolist()) for i in bad[:5]]
