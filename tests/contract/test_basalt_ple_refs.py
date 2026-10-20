@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
-# adapted from basalt (jesdga95/basalt) src/kernels/ple_parity.cpp, src/kernels/ple_win_parity.cpp
+# adapted from basalt (jesdga95/basalt) src/kernels/ple_parity.cpp, src/kernels/ple_win_parity.cpp, src/core/verify.cpp
 # @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): ple_parity's checks on its block oracle (the
-# conv input and the conv tap order, :984-1025) and their pass criteria; the fixture's properties (spec T§6.3); the
-# capture loader's and the preflight's checks (:135-164, :273-283, :563-614) as the real-weight fixture's (spec T§1.1).
+# conv input and the conv tap order, :984-1025) and on its host f32 reference (:1104-1123), and their pass criteria;
+# the fixture's properties (spec T§6.3); the capture loader's and the preflight's checks (:135-164, :273-283,
+# :563-614) as the real-weight fixture's (spec T§1.1); verify.cpp's commit count refusal and record (:2732-2737).
 """Host-only checks of the n-gram block's references (tests/basalt_ple_ref.py) and of its real-weight fixture; no GPU.
 The block-level checks run 12 rows from one initial history through R-struct (spec T§6.1).
 
@@ -24,6 +25,14 @@ The block-level checks run 12 rows from one initial history through R-struct (sp
   of basalt's first reference, :1012-1016), each with ``if (!gt(rel, 0.05)) ++bad;`` (:1024); on the synthetic taps
   ``[synthetic]``, on the pack's committed conv1d over the synthetic fixture's rows and history ``[committed]``, and on
   R-struct of the real fixture ``[full]``.
+- C15 ``test_host_f32_matches_float64_graph`` (ple_parity.cpp:1027-1137): R-f32, basalt's host f32 block transcribed
+  with its own slide, against R-struct on every stage of every row, criterion quoted: ``const bool ok = le(rel, 1e-4)
+  && nf == 0;`` (:1119), rel = rel_l1(R-struct, R-f32); on the synthetic fixture ``[synthetic]`` and the real one
+  ``[full]``. Every stage R-f32 returns is float32, and its slid history after each row is H-ORACLE (spec T§7.1) of
+  its own normalized rows, byte for byte.
+- X-COMMIT's host half ``test_commit_record_refuses`` (spec T§8): the host refuses n_keep < 1 and n_keep > T, as
+  ``if (n_keep < 1 || n_keep > last_t_)`` does (verify.cpp:2732), and the record's words for n_keep = 1..T are the ones
+  verify.cpp:2735-2737 writes.
 
 The ``[full]`` cases read $BASALT_PLE_FIXTURE (make_basalt_ple_fixture.py --full DIR fetches it) and skip when it is
 unset."""
@@ -31,8 +40,9 @@ unset."""
 import numpy as np
 import pytest
 
-from tests.basalt_ple_ref import (D, DIL, KERN, KEY_BLOCK, N, RANGES, ROWS, TENSORS, Fixture, check_fixture, committed,
-                                  conv, full_ranges, gt, r_struct, real, real_tensors, rel_l1, silu, synthetic, taps)
+from tests.basalt_ple_ref import (D, DIL, KERN, KEY_BLOCK, N, RANGES, ROWS, STAGES, T_MAX, TENSORS, Fixture, Ref,
+                                  check_fixture, commit_record, committed, conv, full_ranges, gt, h_oracle, le, r_f32,
+                                  r_struct, real, real_tensors, rel_l1, silu, synthetic, taps)
 from tests.contract.fixtures.make_basalt_fixture import FILE, REPO, REVISION
 
 CONV1D = "blk.1.ple_conv1d.weight"
@@ -154,3 +164,47 @@ def test_tap_order_rivals_are_visible(form, synth, request):
         bad[name] = (sum(not gt(rel, 0.05) for rel in rels), np.round(rels, 4).tolist())
     assert all(n == 0 for n, _ in bad.values()), \
         f"`if (!gt(rel, 0.05)) ++bad;` (ple_parity.cpp:1024), rel = rel_l1(conv_out, rival) per row: {bad}"
+
+
+@pytest.mark.parametrize("form", ["synthetic", "full"])
+def test_host_f32_matches_float64_graph(form, synth, request):
+    fx, want = request.getfixturevalue("full") if form == "full" else synth
+    got = r_f32(fx)
+    wide = [name for name in Ref._fields if getattr(got, name).dtype != np.float32]
+    assert not wide, f"R-f32 is basalt's host f32 block, every stage float32; these are not: {wide}"
+    rels, bad = {}, []
+    for stage in STAGES:
+        for t in range(ROWS):
+            rel, _, nf = rel_l1(getattr(want, stage)[t], getattr(got, stage)[t])
+            rels.setdefault(stage, []).append(rel)
+            if not (le(rel, 1e-4) and nf == 0):
+                bad.append((stage, t, rel, nf))
+    print(f"host f32 reference [{form}], worst rel over {ROWS} rows: "
+          + ", ".join(f"{stage} {max(r):.3e}" for stage, r in rels.items()))
+    assert not bad, ("`const bool ok = le(rel, 1e-4) && nf == 0;` (ple_parity.cpp:1119), rel = rel_l1(R-struct, "
+                     f"R-f32) per stage and row; these (stage, row, rel, nf) fail: {bad}")
+    start = fx.hist.T.ravel()                            # basalt's layout, row r of channel c at c * 9 + r
+    moved = [n for n in range(1, ROWS + 1)
+             if h_oracle(start, got.normalized, n).tobytes() != got.hist[n - 1].T.tobytes()]
+    assert not moved, ("H-ORACLE (spec T§7.1), \"the last nine rows of the host sequence [H rows 0..8 | the GPU's "
+                       "normalized rows 0..`n_keep` − 1], compared byte for byte in basalt's layout (row r, channel c "
+                       "at `c * 9 + r`)\", against R-f32's slide (ple_parity.cpp:1127-1131) over its own normalized "
+                       f"rows: these n_keep differ: {moved}")
+
+
+def test_commit_record_refuses():
+    words = commit_record(3, 5, 100)
+    assert words.dtype == np.int32 and words.tolist() == [3, 2, 100, 101, 102, -1, -1, -1, -1, -1], words
+    for t in range(1, T_MAX + 1):
+        for n_keep in (-1, 0, t + 1):
+            # The host refuses n_keep < 1 and n_keep > T before any write, as `if (n_keep < 1 || n_keep > last_t_)`
+            # does (verify.cpp:2732): `{ err = "verify: commit count out of range"; return false; }`
+            with pytest.raises(ValueError, match="commit count out of range"):
+                commit_record(n_keep, t, 4096)
+        for n_keep in range(1, t + 1):
+            words = commit_record(n_keep, t, 4096)
+            want = [n_keep, n_keep - 1] + [4096 + r for r in range(n_keep)] + [-1] * (T_MAX - n_keep)
+            assert words.dtype == np.int32 and words.tolist() == want, (
+                "`h_commit_[0] = n_keep; h_commit_[1] = n_keep - 1; for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] "
+                f"= t < n_keep ? (int32_t) (last_pos0_ + t) : -1;` (verify.cpp:2735-2737), T = {t}, n_keep = {n_keep}: "
+                f"{words.tolist()} ({words.dtype}), not {want}")

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
-# adapted from basalt (jesdga95/basalt) src/kernels/ple_parity.cpp, src/kernels/ple_win_parity.cpp
+# adapted from basalt (jesdga95/basalt) src/kernels/ple_parity.cpp, src/kernels/ple_win_parity.cpp, src/core/verify.cpp
 # @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): ple_parity's metric helpers (le, gt,
-# nonfinite and rel_l1, :41-77) and the seven stages its block check compares (:751-759); ple_win_parity's fixture
-# scales (:48-56); ple_parity's capture loader rules (:135-164: a file missing or of the wrong size fails).
+# nonfinite and rel_l1, :41-77), the seven stages its block check compares (:751-759), its host grouped norm
+# (:899-904) and its host f32 reference block with the history slide (:1046-1102, :1127-1131); ple_win_parity's
+# fixture scales (:48-56); ple_parity's capture loader rules (:135-164: a file missing or of the wrong size fails);
+# verify.cpp's commit record and its count refusal (:2732-2737).
 """The n-gram (PLE) block's host references, numpy only (no Metal import), imported as ``from tests.basalt_ple_ref
 import ...``.
 
@@ -18,6 +20,25 @@ import ...``.
   the history after the row and the gate's argument s. The window is one pad, P = [history | normalized rows], read
   at rows t, t + 3, t + 6 and t + 9 (ple.hpp's ``padded[hist + t - (kern - 1 - k) * dil]``), so the 12 rows run from
   one initial history. ``r_contract`` (R-contract) is R-struct entered after the projections, fed a raw key and value.
+  ``STAGES`` names the seven slices.
+- R-f32 (``r_f32``): basalt's own host f32 reference block (ple_parity.cpp:1046-1102), transcribed, every row in order
+  from ``fx.hist`` with its own slide between rows (:1127-1131). It shares only the weights with R-struct: it works on
+  basalt's flat buffers (the history row-fastest, row r of channel c at r + 9 c; conv1d at [k + 4 c]; the taps read
+  rows 0, 3 and 6 and the new normalized row), rounds to f32 wherever the C++ does (an x86-64 SSE2 build: no FMA, no
+  flush), adds each float64 sum in the C++ loop's order (a product of two f32 is exact) and takes std::exp's float
+  overload as exp in float64 rounded once to f32. It returns a ``Ref`` of float32 arrays, ``hist`` the slid history
+  after each row in R-struct's (row, channel) order.
+- The host norm (``host_norm``): ple_parity.cpp:899-904, the grouped norm C8 holds the GPU's against, which is R-f32's
+  ``gnorm`` (:1046-1059) operation for operation: per stream, the f32 squares summed in float64 in column order, the
+  mean rounded to f32, scale = 1.0f / sqrtf(mean + 1e-6f), then (x * scale) * w, all in f32.
+- H-ORACLE (``h_oracle``, spec T§7.1): the history a commit of ``n_keep`` rows of a window run from ``hist`` leaves,
+  the last nine rows of [hist rows 0..8 | the window's normalized rows 0..n_keep - 1], in basalt's layout (row r of
+  channel c at c * 9 + r). It only moves words, so it holds bit for bit on the GPU's own rows, NaN payloads included;
+  it refuses an ``n_keep`` outside 1..T (form (a)'s no-op leaves the history advanced by all T rows, not as it was).
+- ``commit_record(n_keep, t, pos0)``: the commit record, the host-written int32 graph input of 2 + T_MAX words, for a
+  window of ``t`` rows at positions pos0, pos0 + 1, ..., as basalt's host writes it (verify.cpp:2735-2737): n_keep,
+  n_keep - 1 (the snapshot the n-gram commit restores), then pos0 + r for each row r < n_keep of the T_MAX and -1 for
+  the rest. It raises ValueError unless 1 <= n_keep <= t, basalt's refusal (verify.cpp:2732).
 - The synthetic fixture (``synthetic``, spec T§6.3), ``Fixture``: the weights in the encodings the GPU reads (the key
   as type-42 rows, the value as BF16 bits, the conv kernel as F16 in ggml's flat [k + 4 i]) and float32 activations;
   the history is logical, row r oldest first (its row-fastest buffer layout, hist[r + 9 c], is the harness's).
@@ -64,6 +85,7 @@ D = H * N                       # NG_HC_DIM: a [D] vector is stream-major, eleme
 KERN, DIL = 4, 3                # PLE_CONV_KERNEL, NGRAM_SIZE
 HIST = (KERN - 1) * DIL         # NG_HIST: 9 history rows, oldest first
 ROWS = 12                       # T§6.1: every block-level comparison runs 12 rows from one initial history
+T_MAX = 8                       # kVerifyMaxT (include/basalt/kernels/verify_kernels.hpp:21): a window's most rows
 EPS = float(F32(1e-6))          # NG_RMS_EPS as float64(float32(1e-6)): the norms' eps and the gate's clamp
 KEY_BLOCK = 18                  # a type-42 (Q2_0) block: the f16 d, then 16 bytes of 2-bit codes, for 64 weights
 SYNTHETIC_SEED = 54             # the first seed from 0 for which property 2 holds: min |s| 0.1251, min row share 0.628
@@ -144,6 +166,9 @@ class Ref(NamedTuple):
     s: np.ndarray           # (T, H): the gate's argument
 
 
+STAGES = Ref._fields[:7]    # the capture's seven slices, in its order (ple_parity.cpp:171-172)
+
+
 @functools.lru_cache(maxsize=2)
 def _key_weights(key):
     """W_key (D, N) in float32 as gguf_reference.q2_0 decodes ``key``, the bytes of the type-42 rows. The decode is a
@@ -210,6 +235,86 @@ def r_struct(fx):
     key_raw = emb @ _key_weights(fx.key.tobytes()).astype(F64).T
     value = emb @ bf16_values(fx.value).astype(F64).T
     return r_contract(fx, key_raw, value)
+
+
+def host_norm(x, w):
+    """ple_parity.cpp:899-904 (C8's host norm) and R-f32's ``gnorm`` (:1046-1059), one arithmetic: per stream of N,
+    the f32 squares widened and summed in float64 in column order, the mean rounded to f32, scale = 1.0f /
+    sqrtf(mean + 1e-6f), then (x * scale) * w, all in f32. ``x`` (..., D); float32, x's shape."""
+    x = np.asarray(x, F32)
+    xs = x.reshape(-1, H, N)
+    total = np.cumsum((xs * xs).astype(F64), axis=2)[..., -1:]       # `sum += double(v * v)`, in order
+    scale = F32(1) / np.sqrt((total / N).astype(F32) + F32(EPS))
+    return (xs * scale * np.asarray(w, F32).reshape(H, N)).reshape(x.shape)
+
+
+def _dot_in_order(w, x):
+    """a[t, o] = the C++ loop's ``a += (double) w[o * n + i] * (double) x[i]`` for i = 0..n-1 in order, float64 (rows
+    of x, rows of w). A product of two f32 is exact in float64, so the order of the adds is all there is to match."""
+    wt = np.ascontiguousarray(np.asarray(w, F32).T)
+    x = np.asarray(x, F64)
+    a = np.zeros((len(x), wt.shape[1]))
+    for i, col in enumerate(wt):
+        a += np.multiply.outer(x[:, i], col)
+    return a
+
+
+def _expf(x):
+    """std::exp's float overload as exp in float64 rounded once to f32, the correctly rounded value. glibc's expf,
+    basalt's on Linux, errs by at most 0.502 ulp (runtime/src/basalt_cpu_expf.cpp:106-107): one ulp apart at most."""
+    return np.exp(np.asarray(x, F64)).astype(F32)
+
+
+def r_f32(fx):
+    """R-f32, basalt's host f32 reference block (ple_parity.cpp:1046-1102), every row of ``fx`` in order with its
+    slide between rows (:1127-1131), on the module docstring's terms."""
+    k_raw = _dot_in_order(_key_weights(fx.key.tobytes()), fx.emb).astype(F32)       # :1066-1070, before the loop:
+    v_raw = _dot_in_order(bf16_values(fx.value).reshape(N, N), fx.emb).astype(F32)  # :1073-1077, no history in them
+    hist = np.asarray(fx.hist, F32).T.flatten()              # hist_ref = cap.hist: row r of channel c at r + 9 c
+    w_conv = np.asarray(fx.conv1d, F32)                      # cap.w_conv[k + 4 c]
+    i = np.arange(D)
+    rows = []
+    for t in range(len(fx.emb)):
+        hid = np.asarray(fx.hidden[t], F32)
+        key = host_norm(k_raw[t], fx.w_nk)                                         # :1071
+        query = host_norm(hid, fx.w_nq)                                            # :1072
+        a = np.cumsum((key.astype(F64) * query.astype(F64)).reshape(H, N), axis=1)[:, -1]
+        s = a.astype(F32) / np.sqrt(F32(N))                                        # :1082
+        mag = np.sqrt(np.fmax(np.abs(s), F32(1e-6)))
+        sgn = np.where(s > 0, F32(1), np.where(s < 0, F32(-1), F32(0)))
+        gate = F32(1) / (F32(1) + _expf(-(sgn * mag)))
+        gated = v_raw[t][i % N] * gate[i // N]                                     # :1087-1088
+        normalized = host_norm(gated, fx.w_nc)                                     # :1089
+        acc = np.zeros(D, F32)
+        for kk in range(KERN):                                                     # :1090-1101
+            row = HIST - (KERN - 1 - kk) * DIL
+            vv = normalized if row == HIST else hist[row::HIST]                    # hist_ref[row + 9 c]
+            acc = acc + w_conv[kk::KERN] * vv                                      # w_conv[kk + 4 c]
+        conv_out = acc / (F32(1) + _expf(-acc))
+        result = hid + gated + conv_out                                            # :1102
+        h = hist.reshape(D, HIST)                                                  # :1127-1131, in place
+        h[:, :-1] = h[:, 1:]
+        h[:, -1] = normalized
+        rows.append((key, v_raw[t], gate, gated, normalized, conv_out, result, h.T.copy(), s))
+    return Ref(*map(np.stack, zip(*rows)))
+
+
+def h_oracle(hist, normalized, n_keep):
+    """H-ORACLE (spec T§7.1) on the module docstring's terms: ``hist`` (D, 9) or flat and the returned history in
+    basalt's layout, ``normalized`` (T, D), both float32 as the GPU stores them."""
+    hist, normalized = np.asarray(hist, F32), np.asarray(normalized, F32)
+    if not 1 <= n_keep <= len(normalized):
+        raise ValueError(f"H-ORACLE keeps 1 to {len(normalized)} rows, not {n_keep}")
+    seq = np.concatenate([hist.reshape(D, HIST), normalized[:n_keep].T], axis=1)
+    return np.ascontiguousarray(seq[:, -HIST:]).reshape(hist.shape)
+
+
+def commit_record(n_keep, t, pos0):
+    """The commit record of a window of ``t`` rows at positions pos0, pos0 + 1, ..., on the module docstring's
+    terms."""
+    if n_keep < 1 or n_keep > t:                                      # verify.cpp:2732
+        raise ValueError(f"verify: commit count out of range: n_keep {n_keep} for a window of {t} rows")
+    return np.array([n_keep, n_keep - 1] + [pos0 + r if r < n_keep else -1 for r in range(T_MAX)], np.int32)
 
 
 def check_fixture(fx, ref):
