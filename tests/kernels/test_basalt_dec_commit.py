@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/dec_commit_parity.cpp and src/kernels/dec_gdn_parity.cpp:370-407,
-# :551 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): dec_commit_parity's geometry, its GDN
-# fixture, set_commit's record, the threadgroup counts and the GDN half's criterion; dec_gdn_parity's cpu_commit and
-# the commit's es < 1e-3 bound, graded by max_err.
+# :504-551 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): dec_commit_parity's geometry, its GDN
+# fixture, set_commit's record, the threadgroup counts and the GDN half's criterion; dec_gdn_parity's cpu_commit,
+# parity_seg's commit inputs and the commit's es < 1e-3 bound, graded by max_err.
 """dec_commit_parity's GDN half (basalt src/kernels/dec_commit_parity.cpp) on the Metal commit
 (kernels/common/basalt_gdn_commit.metal's ``gdn_commit_layers``), through tests/kernels/basalt_gdn_gpu.py's
 ``gdn_commit``, which binds a sentinel tail past the state and checks it and the ``used`` word after every dispatch.
@@ -30,6 +30,9 @@
   n_keep 0..7, each of the 3 layers (GDN_FLOATS words) holds no non-finite value, counted before the maximum, and is
   within ``max_err < 1e-3`` of ``cpu_commit``, dec_gdn_parity's float64 reference (:370-401), taken in one pass over
   the kept rows; its history equals the word copy bit for bit, and at n_keep 0 the layer keeps state0's bits.
+  ``[seg-<trial>-<nseg>]``, S11, the bound on the inputs it grades in basalt (:504-551): ``seg_cases``' commits of
+  parity_seg's 12 configurations, one segment at a time (D12: no _seg kernel), each segment's 2 layers committed with
+  keep[k] of its T[k] rows, its 8 window rows NaN past T[k]; the same checks per layer.
 - DCM.5, the keep count's edges (none in basalt): ``commit[0]`` of -1, 0 and -2^31 stores nothing but ``used`` = 0,
   and 8 and 100 give the bits of 7, the window's rows, with ``used`` = 7 (basalt clamps to kVerifyMaxT = 8 and would
   read row 7 past this window). The 7-row commit must store: every thread's rows of the state change and every
@@ -41,7 +44,7 @@ from typing import NamedTuple
 import numpy as np
 import pytest
 
-from tests.basalt_gdn_ref import conv_tail, max_err, n_bad, randn
+from tests.basalt_gdn_ref import SEG_CASES, SEG_SEED, conv_tail, max_err, n_bad, randn, segments
 from tests.kernels import basalt_gdn_gpu as gdn_gpu
 
 U32 = np.uint32
@@ -52,6 +55,7 @@ GDN_FLOATS = REC + C * 3             # 817152 (:30)
 NL = 3                               # parity's GDN layers (make_gdn(rng, 3), :159)
 P0S = (0, 1, 5, 6, 1001)             # parity's p0 (:164)
 TGS = (1, 7, 24, 32, 170, 816, 1000) # parity's blocks (:171), then one item per threadgroup (3 x 272) and idle ones
+SEG_MT, CNL = 8, 2                   # parity_seg's window rows (kDecMaxT, the contract's MT) and commit layers (:505)
 
 CRIT1 = ("for `n_keep = 0..7` × `p0 in {0, 1, 5, 6, 1001}` (3 layers, fresh `state0` each time), state + history bytes "
          "(`GDN_FLOATS` per layer) at threadgroup counts `{1, 7, 24, 32, 170, 816, 1000}` equal the 1-threadgroup "
@@ -133,6 +137,25 @@ def cpu_commit(st0, h, qkv, gate, beta, n):
     return out
 
 
+def seg_cases(trial, nseg):
+    """The commits of parity_seg's configuration (trial, nseg) (dec_gdn_parity.cpp:504-531), one per segment (D12):
+    tests/basalt_gdn_ref.py's ``segments`` on its default stream gives the T[k], keep[k] and st0[k] that S8 and S9
+    grade; the same stream then draws the recorded inputs in :505-507's order, hL N(0, 0.1), qL N(0, 1), gL and bL
+    N(0, 0.3), CNL layer-major blocks of R = sum(T) rows. Yields per segment k: keep[k], st0[k]'s CNL layers (flat)
+    and its window, h and qkv (CNL, SEG_MT, C), gate and beta (CNL, SEG_MT, HV): each layer's rows row0[k] ..
+    row0[k] + T[k] - 1, then NaN. basalt offsets its pointers by row0[k] with h_stride R * C; the harness binds at
+    offset 0, so the window is repacked to the dense strides at mt 8 (h_stride 8 C, gb_stride 8 HV)."""
+    rng = np.random.default_rng((SEG_SEED, trial, nseg))
+    seg = segments(trial, nseg, rng)
+    R = sum(seg.T)
+    rec = [randn(rng, (CNL, R, w), sd) for w, sd in ((C, 0.1), (C, 1.0), (HV, 0.3), (HV, 0.3))]   # hL, qL, gL, bL
+    for k, (t, r0) in enumerate(zip(seg.T, seg.row0)):
+        win = [np.full((CNL, SEG_MT, a.shape[2]), np.nan, np.float32) for a in rec]
+        for w, a in zip(win, rec):
+            w[:, :t] = a[:, r0:r0 + t]
+        yield seg.keep[k], seg.st0[k].reshape(-1), win
+
+
 # ---- DCM.1: the threadgroup count changes no bit --------------------------------------------------------------------
 
 def test_gdn_commit_is_bitwise_the_same_at_every_threadgroup_count(gdn):
@@ -171,21 +194,28 @@ def test_gdn_commit_of_n_rows_equals_n_one_row_commits(gdn):
 
 # ---- DCM.4: the state against the float64 cpu_commit, the history against its word copy ----------------------------
 
-@pytest.mark.parametrize("case", ["dcp"])
+@pytest.mark.parametrize("case", ["dcp", *SEG_CASES], ids=["dcp", *(f"seg-{t}-{n}" for t, n in SEG_CASES)])
 def test_gdn_commit_state_meets_the_double_reference_and_copies_the_history(case, gdn):
-    win = [a.reshape(NL, MT, -1) for a in (gdn.h, gdn.qkv, gdn.gate, gdn.beta)]     # per layer, MT rows
-    refs = [cpu_commit(layer(gdn.state0, l), *(w[l] for w in win), MT) for l in range(NL)]
-    for n in range(MT + 1):
-        st, _ = gdn_gpu.gdn_commit(gdn.state0, gdn.h, gdn.qkv, gdn.gate, gdn.beta, commit_record(n, 0), c=C, h_v=HV,
-                                   mt=MT, n_layers=NL)
-        for l in range(NL):
-            got, what = layer(st, l), f"{case}, layer {l}, n_keep {n}"
-            assert n_bad(got) == 0, f"{what}: {n_bad(got)} non-finite values in the state and history ({CRIT4})"
-            e = max_err(got, refs[l][n])
-            assert e < 1e-3, f"{what}: max_err {e:.3g} against cpu_commit, want max_err < 1e-3 ({CRIT4})"
-            assert_bits(f"{what}: the history", got[REC:], refs[l][n][REC:], CRIT4)
+    # each commit: (what, n_keep, its layers' state0, its window (layers, rows, width) x 4, mt, each layer's reference)
+    if case == "dcp":
+        win = [a.reshape(NL, MT, -1) for a in (gdn.h, gdn.qkv, gdn.gate, gdn.beta)]     # per layer, MT rows
+        refs = [cpu_commit(layer(gdn.state0, l), *(w[l] for w in win), MT) for l in range(NL)]
+        commits = [(f"dcp, n_keep {n}", n, gdn.state0, win, MT, [r[n] for r in refs]) for n in range(MT + 1)]
+    else:
+        trial, nseg = case
+        commits = ((f"seg-{trial}-{nseg}, segment {k}, keep {n}", n, st0, win, SEG_MT,
+                    [cpu_commit(layer(st0, l), *(w[l] for w in win), n)[n] for l in range(CNL)])
+                   for k, (n, st0, win) in enumerate(seg_cases(trial, nseg)))
+    for what, n, st0, win, mt, refs in commits:
+        st, _ = gdn_gpu.gdn_commit(st0, *win, commit_record(n, 0, mt), c=C, h_v=HV, mt=mt, n_layers=len(refs))
+        for l, ref in enumerate(refs):
+            got, at = layer(st, l), f"{what}, layer {l}"
+            assert n_bad(got) == 0, f"{at}: {n_bad(got)} non-finite values in the state and history ({CRIT4})"
+            e = max_err(got, ref)
+            assert e < 1e-3, f"{at}: max_err {e:.3g} against cpu_commit, want max_err < 1e-3 ({CRIT4})"
+            assert_bits(f"{at}: the history", got[REC:], ref[REC:], CRIT4)
             if n == 0:
-                assert_bits(f"{what}: the state and history", got, layer(gdn.state0, l), CRIT4)
+                assert_bits(f"{at}: the state and history", got, layer(st0, l), CRIT4)
 
 
 # ---- DCM.5: the keep count's edges ----------------------------------------------------------------------------------
