@@ -365,7 +365,7 @@ def test_rows_do_not_depend_on_the_slice(f, out):
     count and grid select it, as basalt's slice branch relies on (src/prefill/gemm.cu:171-182: dequant_f16 of rows [r0,
     r0 + n) from the whole weight's blocks). Fixture F's rows 0-63 dispatched whole, then rows [row0, row0 + rows) of
     the same 64 rows' blocks for (0, 1), (1, 1), (5, 7) and (63, 1), each bit for bit its rows of the whole. Every
-    other test dispatches from row 0."""
+    other test but DQ-3 (row0 2) dispatches from row 0."""
     t, raw, _ = f
     whole = run_dq(t, out, raw[:64], 64, COLS)
     for row0, rows in ((0, 1), (1, 1), (5, 7), (63, 1)):
