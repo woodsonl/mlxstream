@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
-# adapted from basalt (jesdga95/basalt) src/kernels/dec_commit_parity.cpp and src/kernels/dec_gdn_parity.cpp:370-407,
-# :504-551 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): dec_commit_parity's geometry, its GDN
-# fixture, set_commit's record, the threadgroup counts and the GDN half's criterion; dec_gdn_parity's cpu_commit,
-# parity_seg's commit inputs and the commit's es < 1e-3 bound, graded by max_err.
+# adapted from basalt (jesdga95/basalt) src/kernels/dec_commit_parity.cpp, src/kernels/dec_gdn_parity.cpp:370-407,
+# :504-551 and src/kernels/cuda/verify_kernels.cu:296-330 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT;
+# third_party/NOTICE): dec_commit_parity's geometry, its GDN fixture, set_commit's record, the threadgroup counts and
+# the GDN half's criterion; dec_gdn_parity's cpu_commit, parity_seg's commit inputs and the commit's es < 1e-3 bound,
+# graded by max_err; commit_pre_run's operation order, which commit_f32 transcribes.
 """dec_commit_parity's GDN half (basalt src/kernels/dec_commit_parity.cpp) on the Metal commit
 (kernels/common/basalt_gdn_commit.metal's ``gdn_commit_layers``), through tests/kernels/basalt_gdn_gpu.py's
 ``gdn_commit``, which binds a sentinel tail past the state and checks it and the ``used`` word after every dispatch.
@@ -37,6 +38,14 @@
   and 8 and 100 give the bits of 7, the window's rows, with ``used`` = 7 (basalt clamps to kVerifyMaxT = 8 and would
   read row 7 past this window). The 7-row commit must store: every thread's rows of the state change and every
   layer's history is the word copy, so the equalities cannot hold for a commit that stores nothing.
+- DCM.7, subnormals (contract invariant 5; none in basalt, whose fixture keeps the decay in about [0.3, 3]): first the
+  decay probe, ``probe_expf_ieee``, which runs the commit's own ``expf_ieee`` text: for gates in [-100, -88] (the
+  fixture's and a grid) the decay is a nonzero subnormal, and every probed decay is within 1e-4 relative, plus
+  2^-148, of float64's exp. Then one layer, ``subnormal_layer``, with v = 0 and two head groups: (a) a subnormal decay
+  on a state and keys of order 0.1 to 1, (b) ordinary gates on a state of order 1e-39 with keys of order 1. A commit of
+  n in {1, MT} rows equals ``commit_f32``, commit_pre_run's order in numpy float32 on the probed decays, bit for bit,
+  and the same oracle flushing every input and result differs from it in value: group (a) at n = 1 (its state is
+  +-0 on either build from the second row on), group (b) at n = MT.
 """
 
 from typing import NamedTuple
@@ -44,8 +53,11 @@ from typing import NamedTuple
 import numpy as np
 import pytest
 
+from monolith import kernels
 from tests.basalt_gdn_ref import SEG_CASES, SEG_SEED, conv_tail, max_err, n_bad, randn, segments
+from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gdn_gpu as gdn_gpu
+from tests.kernels import basalt_gpu as gpu
 
 U32 = np.uint32
 S, HK, HV, MT = 128, 16, 48, 7       # dec_commit_parity.cpp:29
@@ -67,6 +79,11 @@ CRIT4 = ("state against the numpy float64 `cpu_commit` from `state0`: `max_err <
          "[hist | qkv_0 .. qkv_{n-1}]` bitwise")
 CRIT5 = ("`commit[0] in {-1, 0}` leaves state and history equal to `state0` bitwise; `commit[0] in {8, 100}` gives "
          "the bits of `commit[0] = 7` (the window's static row count) with no shader-validation report")
+CRIT7 = ("decay probe: for gates in `[-100, -88]`, `0 < g < 2^-126` and `|g - exp(gate)| <= 1e-4 * exp(gate) + "
+         "2^-148` (float64); `v = 0` with two head groups, (a) gates in `[-100, -88]` with `state0` and `k` of order "
+         "0.1 to 1 and (b) gates randn 0.3 with `state0` randn scaled by `1e-39` and `k` of order 1; state bitwise "
+         "equal to a numpy float32 + `basalt_emu.fma32` transcription with the probed `g`; power: the same oracle with "
+         "`basalt_emu.ftz` on every input and result differs from it in each group")
 
 
 def commit_record(n_keep, p0, mt=MT):
@@ -156,6 +173,50 @@ def seg_cases(trial, nseg):
         yield seg.keep[k], seg.st0[k].reshape(-1), win
 
 
+PROBE = """
+kernel void probe_expf_ieee(device const float* x [[buffer(0)]], device uint* out [[buffer(1)]],
+                            constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i < n) out[i] = as_type<uint>(expf_ieee(x[i]));
+}
+"""
+
+
+def probe_expf_ieee(x):
+    """The port's decay, basalt_ieee.metal's ``expf_ieee`` (the commit's __expf, verify_kernels.cu:315), on each
+    element of the float32 array ``x``: the inline kernel ``PROBE`` appended to basalt_gdn_commit_source()
+    (test_basalt_platform.py's pattern), so it runs the very text the commit compiles. fast::exp2's bits have no host
+    model, so DCM.7's oracle takes the decay from here. Returns float32 in x's shape."""
+    x = np.ascontiguousarray(x, np.float32)
+    pso = gpu.pipeline(kernels.basalt_gdn_commit_source() + PROBE, "probe_expf_ieee")
+    out = gpu.run(pso, [x.tobytes(), x.nbytes], np.uint32(x.size).tobytes(), 2, -(-x.size // 256), 256, fill=0xFF)
+    return np.frombuffer(out[1], np.float32).reshape(x.shape)
+
+
+def commit_f32(st0, h, gate, beta, n, g, ftz=False):
+    """DCM.7's oracle: one layer's state after its first n rows, commit_pre_run (verify_kernels.cu:296-330) in the
+    order nvcc compiles it (verify_gdn.md section 7), in numpy float32, every operation rounded once with subnormals
+    kept (basalt_emu.fma32 for each FFMA). Per row t: the decay gt = g(gate[t]), ``g`` the port's decay on a float32
+    array (probe_expf_ieee); per row group rg of 32 key rows and column, kv = fma(s_r, k_r, kv) from +0, r ascending;
+    kv_col = ((kv_0 + kv_1) + kv_2) + kv_3; delta = fma(-gt, kv_col, v) b; per row kd = k delta, s = fma(gt, s, kd).
+    ``ftz``: the same with basalt_emu.ftz on every input and every result (fma_ftz, mul_ftz, add_ftz), a flushing
+    build. ``st0``: the layer, of which the state is read; ``h`` its rows (C each), ``gate`` and ``beta`` (HV each).
+    Returns the S x HV x S state, flat float32."""
+    fma, mul, add = (emu.fma_ftz, emu.mul_ftz, emu.add_ftz) if ftz else (emu.fma32, np.multiply, np.add)
+    s = np.asarray(st0, np.float32)[:REC].reshape(4, 32, HV, S)                # [rg][r][hd][j]: key row 32 rg + r
+    hr, br = np.reshape(h, (-1, C)), np.reshape(beta, (-1, HV))
+    gd = np.asarray(g(np.reshape(gate, (-1, HV))[:n]), np.float32)[:, :, None]  # [t][hd][1]
+    qh = np.arange(HV) % HK
+    for t in range(n):
+        k = hr[t, HK * S:2 * HK * S].reshape(HK, 4, 32)[qh].transpose(1, 2, 0)[..., None]   # [rg][r][hd][1]
+        v = hr[t, 2 * HK * S:].reshape(HV, S)
+        kv = np.zeros((4, HV, S), np.float32)
+        for r in range(32):
+            kv = fma(s[:, r], k[:, r], kv)
+        delta = mul(fma(emu.sign_flip(gd[t]), add(add(add(kv[0], kv[1]), kv[2]), kv[3]), v), br[t][:, None])
+        s = fma(gd[t], s, mul(k, delta))
+    return s.reshape(-1)
+
+
 # ---- DCM.1: the threadgroup count changes no bit --------------------------------------------------------------------
 
 def test_gdn_commit_is_bitwise_the_same_at_every_threadgroup_count(gdn):
@@ -242,3 +303,44 @@ def test_gdn_commit_clamps_the_keep_count_to_the_window(gdn):
         st, used = commit(n)
         assert used == MT, f"commit[0] = {n}: used {used}, want {MT} ({CRIT5})"
         assert_bits(f"commit[0] = {n} against {MT}: the state and history", st, full, CRIT5)
+
+
+# ---- DCM.7: subnormals, as the IEEE build keeps them ----------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def subnormal_layer():
+    """DCM.7's layer (C section 6), on its own seed: the even value heads are group (a), gates U(-100, -88) (a
+    subnormal decay) with state0 and keys of magnitude U(0.1, 1), random signs; the odd ones group (b), gates N(0, 0.3)
+    with state0 N(0, 1) times 1e-39 (a subnormal state) and keys N(0, 1). HK is even, so a value head's q/k head
+    hd % HK keeps its parity and each group has keys of its own. v = 0, q (never read) 0, beta N(0, 0.3); the conv
+    history and qkv 0."""
+    rng = np.random.default_rng(70)
+    mag = lambda shape: (rng.uniform(0.1, 1.0, shape) * rng.choice((-1.0, 1.0), shape)).astype(np.float32)
+    a, ka = np.arange(HV) % 2 == 0, np.arange(HK) % 2 == 0
+    state0 = np.zeros(GDN_FLOATS, np.float32)
+    state0[:REC] = np.where(a[:, None], mag((S, HV, S)), randn(rng, (S, HV, S), 1e-39)).reshape(-1)
+    h = np.zeros((MT, C), np.float32)
+    h[:, HK * S:2 * HK * S] = np.where(ka[:, None], mag((MT, HK, S)), randn(rng, (MT, HK, S), 1.0)).reshape(MT, -1)
+    gate = np.where(a, rng.uniform(-100, -88, (MT, HV)), randn(rng, (MT, HV), 0.3)).astype(np.float32)
+    return Gdn(state0, h.reshape(-1), np.zeros(MT * C, np.float32), gate.reshape(-1), randn(rng, MT * HV, 0.3))
+
+
+@pytest.mark.parametrize("n", [1, MT])
+def test_gdn_commit_keeps_subnormals_like_the_ieee_build(n, subnormal_layer):
+    lay = subnormal_layer
+    # the probe, before the oracle takes its bits: the fixture's gates and a grid over [-100, -88]
+    x = np.concatenate([lay.gate, np.linspace(-100, -88, 4097, dtype=np.float32)])
+    g, want = probe_expf_ieee(x).astype(np.float64), np.exp(x.astype(np.float64))
+    bad = np.flatnonzero((x >= -100) & (x <= -88) & ~((g > 0) & (g < 2.0 ** -126)))
+    assert bad.size == 0, f"expf_ieee({x[bad[0]]}) = {g[bad[0]]!r}, want a nonzero subnormal ({CRIT7})"
+    bad = np.flatnonzero(~(np.abs(g - want) <= 1e-4 * want + 2.0 ** -148))
+    assert bad.size == 0, f"expf_ieee({x[bad[0]]}) = {g[bad[0]]!r} against exp's {want[bad[0]]!r} ({CRIT7})"
+    st, _ = gdn_gpu.gdn_commit(*lay, commit_record(n, 0), c=C, h_v=HV, mt=MT)
+    ieee = commit_f32(lay.state0, lay.h, lay.gate, lay.beta, n, probe_expf_ieee)
+    assert_bits(f"{n} rows: the state against commit_f32", st[:REC], ieee, CRIT7)
+    # the power: group (a) at n = 1 (from its second row on, its state is +-0 on either build), group (b) at n = MT
+    grp = 0 if n == 1 else 1
+    ftz = commit_f32(lay.state0, lay.h, lay.gate, lay.beta, n, probe_expf_ieee, ftz=True)
+    i, f = (o.reshape(S, HV, S)[:, grp::2] for o in (ieee, ftz))
+    assert np.any(i != f), (f"group ({'ab'[grp]}), {n} rows: the flushing oracle's state equals the IEEE one in "
+                            f"value, so the fixture cannot tell the builds apart ({CRIT7})")
