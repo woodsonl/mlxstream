@@ -181,3 +181,49 @@ kernel void gdn_ab_multi(device const float4* x [[buffer(0)]], device const uint
         }
     }
 }
+
+// gdn_step_norm_multi (verify_kernels.cu:377-461, the launcher :900-916; its verify form: n = T, t_out_begin 0, no
+// write-back): the window's y for every value head and token t < T, y[t 128 h_v + 128 head + col], the recurrence
+// from the head's state over tokens 0..t (gate, beta and h from gdn_ab_multi and gdn_conv_l2_multi) and the gated RMS
+// norm of its read-out. The state is read only. Grid h_v threadgroups of 512 threads, one value head each: thread tid
+// = 32 sg + lane (CUDA's linear warp order) holds column col = tid % 128 of the head's state, rows 32 rg .. 32 rg + 31
+// (rg = tid / 128), in registers; q/k head head % h_k. basalt's six barriers per token; the SIMD-groups of rg > 0
+// butterfly zeros into wsum[4..15], which nothing reads.
+kernel void gdn_step_norm_multi(device const float* state [[buffer(0)]], device const float* h [[buffer(1)]],
+                                device const float* gate [[buffer(2)]], device const float* beta [[buffer(3)]],
+                                device const float* z [[buffer(4)]], device const float* gamma [[buffer(5)]],
+                                device float* y [[buffer(6)]], constant BsGdnParams& p [[buffer(16)]],
+                                uint head [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sk[128], sq[128], red[4][128], wsum[16];
+    const uint tid = 32u * sg + lane, col = tid % 128u, rg = tid / 128u;
+    const uint qh = head % p.h_k, qk = 128u * p.h_k, vd = 128u * p.h_v, T = min(p.T, 8u);
+    float s[32];
+    for (uint r = 0; r < 32u; ++r) s[r] = state[((32u * rg + r) * p.h_v + head) * 128u + col];
+    for (uint t = 0; t < T; ++t) {
+        device const float* ht = h + t * p.C;
+        threadgroup_barrier(mem_flags::mem_threadgroup);           // the previous token is done with sk, sq, red, wsum
+        if (tid < 128u) {
+            sk[tid] = ht[qk + qh * 128u + tid];
+            sq[tid] = ht[qh * 128u + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float g = expf_ieee(gate[t * p.h_v + head]);
+        red[rg][col] = gdn_kv(s, sk + 32u * rg);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float kv_col = gdn_sum4(red[0][col], red[1][col], red[2][col], red[3][col]);
+        const float delta = gdn_delta(g, kv_col, ht[2u * qk + head * 128u + col], beta[t * p.h_v + head]);
+        const float o = gdn_update(s, sk + 32u * rg, sq + 32u * rg, g, delta);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[rg][col] = o;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float oc = rg == 0u ? gdn_oc(red[0][col], red[1][col], red[2][col], red[3][col]) : 0.0f;
+        const float sq_part = gdn_sq32(oc);                        // every SIMD-group: uniform control flow
+        if (lane == 0u) wsum[sg] = sq_part;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (rg == 0u) {
+            const uint i = t * vd + head * 128u + col;
+            y[i] = cuda_nan(gdn_out(oc, gdn_sum4(wsum[0], wsum[1], wsum[2], wsum[3]), p.eps, gamma[col], z[i]));
+        }
+    }
+}

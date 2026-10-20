@@ -10,13 +10,15 @@ of tests/basalt_gdn_ref.py.
   with every buffer's bytes after the run, the inputs' included (the state's: the window must leave it untouched).
 - ``conv_l2``: ``gdn_conv_l2_multi``, the window's h from a layer's state (its conv history) and qkv's rows.
 - ``ab``: ``gdn_ab_multi``, the window's gate and beta from x's rows.
+- ``step_norm``: ``gdn_step_norm_multi``, the window's y from a layer's state (its recurrent state) and the window's
+  h, gate, beta and z rows.
 """
 
 import numpy as np
 
 from monolith import kernels
 from monolith.runtime import _native as nt
-from tests.basalt_gdn_ref import C, EPS, F32, HK, HV, N, S
+from tests.basalt_gdn_ref import C, EPS, F32, HK, HV, N, S, ZV
 from tests.kernels import basalt_gpu as gpu
 
 PARAMS_SLOT = 16
@@ -71,3 +73,13 @@ def ab(layer, x):
                                                       4: layer.ssm_a}, {5: (t, 4 * HV), 6: (t, 4 * HV)}, (HV,), 64)
     gate, beta = (got[k][: 4 * HV * t].view(F32).reshape(t, HV) for k in (5, 6))
     return gate, beta, ok
+
+
+def step_norm(state, h, gate, beta, z, gamma):
+    """``gdn_step_norm_multi`` over the window of h's rows (T = len(h); h (T, C), gate and beta (T, HV), z (T, ZV), each
+    bound at exactly those rows) from one layer's ``state`` (SF floats, of which the kernel reads the recurrent state)
+    and ``gamma`` (S,): y, (T, ZV) float32, the gated RMS-normed read-out, and sentinel_ok."""
+    t = len(h)
+    ins = dict(enumerate(np.asarray(a, F32) for a in (state, h, gate, beta, z, gamma)))     # slots 0..5
+    _, got, ok = launch(pipeline("gdn_step_norm_multi"), t, ins, {6: (t, 4 * ZV)}, (HV,), 512)
+    return got[6][: 4 * ZV * t].view(F32).reshape(t, ZV), ok
