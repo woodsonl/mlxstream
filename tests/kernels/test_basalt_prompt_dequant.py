@@ -120,6 +120,88 @@ def f(request, f_blocks):
     return t, raw, ref
 
 
+# Fixture E's six blocks, appended to F's row 0: each F's first block of the type with its fp16 d (and Q4_K's and
+# Q5_K's dmin where one is given, else F's 0x211f) set, as (block class, d, dmin). The overflow block's codes are
+# EXTREME's; the last two blocks are class E-tiny (eng-review D25).
+E_BLOCKS = (("nan", 0x7E00, None), ("inf", 0x7C00, None), ("overflow", 0x7BFF, None), ("-0", 0x8000, 0x0000),
+            ("2^-24", 0x0001, 0x0001), ("0x03ff", 0x03FF, 0x03FF))
+
+# The overflow block's codes: (first byte, end, the bytes repeated over them) per type, every value 65504 times an
+# integer of magnitude 2 or more, of both signs where the type has them, so every fp16 value overflows to +-inf and
+# every fp32 and BF16 one stays finite (at most 65504 * 4096, dequant_bf16.md section 2).
+EXTREME = {
+    2: ((2, 18, (0x0F,)),),                              # Q4_0: nibbles 15 and 0: +7, -8
+    6: ((2, 6, (0xFF, 0xFF, 0, 0)), (6, 22, (0x0F,))),   # Q5_0: qh bits 0-15, so codes 31 and 0: +15, -16
+    8: ((2, 34, (0x7F, 0x80)),),                         # Q8_0: +127, -128
+    11: ((0, 96, (0xFF, 0)), (96, 108, (0,))),           # Q3_K: scales 0 (-32); q 3 with hmask, 0 without: -96, +128
+    12: ((4, 144, (0xFF,)),),                            # Q4_K: sc = m = 63, nibbles 15 (never negative: >= -m1)
+    13: ((4, 176, (0xFF,)),),                            # Q5_K: sc = m = 63, codes 31
+    14: ((0, 192, (0xFF, 0)), (192, 208, (0x80,))),      # Q6_K: scales -128, codes 63 and 0 (31, -32): -3968, +4096
+    20: ((2, 18, (0x0F,)),),                             # IQ4_NL: entries 113 and -127
+    23: ((2, 8, (0,)), (8, 136, (0x0F,))),               # IQ4_XS: ls 0 (-32), entries 113 and -127: -3616, +4064
+    42: ((2, 18, (0xFF,)),),                             # Q2_0: codes 3: +2 (code 0's -1 stays finite: -65504)
+}
+
+
+@pytest.fixture(params=kernels.DEQUANT16_TYPES, ids=lambda t: GGML_TYPES[t][0])
+def e(request, f_blocks):
+    """Fixture E for one type (TG 3.4, 4.4; eng-review D25): one row, F's row 0 and then E_BLOCKS' six blocks, every
+    edge beside ordinary blocks. A NaN scale (every value NaN) and +inf (each value the infinity of its code's sign, a
+    zero code NaN) on F's codes; 65504 on EXTREME's codes (every fp16 value +-inf, every fp32 and BF16 one finite); -0
+    on F's codes with Q4_K's and Q5_K's dmin +0 (fma(-0, n, -(+0)) is -0, where dmin -0 would give +0); class E-tiny, d
+    (and dmin) 2^-24 and 0x03ff, the largest fp16 subnormal: every fp32 value n * 2^-24 with |n| < 2^24, exact and
+    normal, the fp16 ones under 2^-14 fp16 subnormals. (type id, blocks [1, row bytes], each value's block class, host
+    values [1, n])."""
+    t = request.param
+    _, be, bb = GGML_TYPES[t]
+    row = f_blocks[t][0]
+    at = D_AT.get(t, 0)
+    blocks = [row]
+    for name, d, dmin in E_BLOCKS:
+        b = row[:bb].copy()
+        b[at: at + 2] = np.array([d], "<u2").view(np.uint8)
+        if dmin is not None and t in (12, 13):
+            b[2:4] = np.array([dmin], "<u2").view(np.uint8)
+        for lo, hi, fill in EXTREME[t] if name == "overflow" else ():
+            b[lo:hi] = np.resize(np.array(fill, np.uint8), hi - lo)
+        blocks.append(b)
+    raw = np.concatenate(blocks)[None]
+    cls = np.repeat(["F"] + [name for name, _, _ in E_BLOCKS], [COLS] + [be] * len(E_BLOCKS))
+    return t, raw, cls, reference(t, raw)
+
+
+def run_e(e, out):
+    """Fixture E through the ``out`` store, with the checks every E test makes: each block class bit for bit the twins
+    (``stored``); the NaN block all sm_120's NaN (0x7fffffff, 0x7fff), the inf block signed infinities or that NaN, the
+    -0 block at least one -0; no non-finite value outside the nan and inf blocks and (fp16 only) the overflow block,
+    counted per class. Returns the outputs (uint32 or uint16 words) and their classes."""
+    t, raw, cls, ref = e
+    got = run_dq(t, out, raw, 1, cls.size)
+    want = stored(ref, out).ravel()
+    names = ["F"] + [name for name, _, _ in E_BLOCKS]
+    bad = {c: int(np.count_nonzero(got[cls == c] != want[cls == c])) for c in names}
+    assert not any(bad.values()), f"{out}: values unlike the twins, per block class: {bad}"
+    sign, inf, nan = {"f32": (0x80000000, 0x7F800000, 0x7FFFFFFF), "f16": (0x8000, 0x7C00, 0x7FFF),
+                      "bf16": (0x8000, 0x7F80, 0x7FFF)}[out]
+    nonfinite = {c: int(np.count_nonzero((got[cls == c] & inf) == inf)) for c in names}
+    may = {"nan", "inf"} | ({"overflow"} if out == "f16" else set())
+    assert not any(nonfinite[c] for c in names if c not in may), f"{out}: non-finite values per class: {nonfinite}"
+    assert (got[cls == "nan"] == nan).all(), f"{out}: a NaN scale's value is not sm_120's NaN"
+    assert np.isin(got[cls == "inf"], [inf, sign | inf, nan]).all(), f"{out}: an infinite scale's value is finite"
+    assert (got[cls == "-0"] == sign).any(), f"{out}: no -0 from the -0 scale"
+    return got, cls
+
+
+def test_f16_is_the_f32_rounded(f):
+    """F16-1 (dequant_f16_parity.cpp:73), over all 10240 x 2560 values of fixture F: the fp16 output (dequant_f16) bit
+    for bit the fp32 output (dequant_f32) rounded to half (basalt_emu.cuda_half_bits, __float2half_rn),
+    ``if (__half_as_ushort(__float2half_rn(f[(size_t) i])) != h[(size_t) i]) ++bad_f32;``."""
+    t, raw, _ = f
+    f32 = run_dq(t, "f32", raw, ROWS, COLS).view(np.float32)
+    bad_f32 = np.count_nonzero(emu.cuda_half_bits(f32) != run_dq(t, "f16", raw, ROWS, COLS))
+    assert bad_f32 == 0, f"bad_f32 {bad_f32} of {f32.size}"
+
+
 def test_outputs_equal_the_host_dequantizer(f):
     """F16-1, added (TG 3.4): over all 10240 x 2560 values of fixture F, the fp32 output bit for bit the host
     dequantizer's value and the fp16 output its round to nearest even (basalt_emu.cuda_half_bits). F16-1 itself (:73)
@@ -128,6 +210,46 @@ def test_outputs_equal_the_host_dequantizer(f):
     for out in ("f32", "f16"):
         bad = np.count_nonzero(run_dq(t, out, raw, ROWS, COLS) != stored(ref, out).ravel())
         assert bad == 0, f"{out}: {bad} of {ref.size} values differ"
+
+
+def test_unaligned_output_same_bits(f):
+    """F16-2 (:64, :74), over all n: the fp16 output bound 2 bytes into its buffer, as basalt's d_h2 + 1 (which takes
+    its scalar-store instance, dequant_bf16.cu:219), bit for bit the output bound at 0,
+    ``if (h[(size_t) i] != h2[(size_t) i]) ++bad_scalar;``. The port has one store form, so this pins that the output
+    is addressed by value from its binding's start: the buffers are exactly n * 2 and n * 2 + 2 bytes (basalt's carry
+    16 spare), and the 2 bytes ahead of the offset binding keep their fill."""
+    t, raw, _ = f
+    h = run_dq(t, "f16", raw, ROWS, COLS)
+    h2 = run_dq(t, "f16", raw, ROWS, COLS, out_offset=1)
+    bad_scalar = np.count_nonzero(h != h2[1:])
+    assert bad_scalar == 0 and h2[0] == 0xFFFF, f"bad_scalar {bad_scalar}, the word ahead {h2[0]:#06x}"
+
+
+def test_first_rows_against_the_cpu(f):
+    """F16-3 (:76-84): the fp16 output's first min(rows, 64) rows against the CPU dequantizer (gguf_reference, bit for
+    bit basalt's dequant.hpp, TG 2.1) in double, ``const double e = std::fabs((double) __half2float(hv) - v);``
+    ``if (e > 1e-3 * std::fabs((double) v) + 1e-6) ++bad_cpu;``, and no non-finite output (a NaN's e compares false).
+    On Q4_0, Q5_0, Q3_K, Q4_K, IQ4_NL and Q2_0, which dequant_f16_parity does not draw: basalt's bound, extended beyond
+    its fixture (D5)."""
+    t, raw, ref = f
+    rows = min(ROWS, 64)
+    hv = run_dq(t, "f16", raw, ROWS, COLS)[: rows * COLS].view(np.float16).astype(np.float64)
+    v = ref[:rows].ravel().astype(np.float64)
+    bad_cpu = np.count_nonzero(np.abs(hv - v) > 1e-3 * np.abs(v) + 1e-6)
+    nonfinite = np.count_nonzero(~np.isfinite(hv))
+    assert bad_cpu == 0 and nonfinite == 0, f"bad_cpu {bad_cpu}, non-finite {nonfinite}"
+
+
+def test_f16_non_finite_scales(e):
+    """F16-E, added (TG 3.4; eng-review D25): fixture E through the fp16 store (dequant_f16) and the fp32 one, bit for
+    bit the twins (run_e): a NaN scale's values 0x7fff (0x7fffffff), an infinite one's +-0x7c00 or 0x7fff, the -0
+    scale's 0x8000 (0x80000000); 65504 on extreme codes overflows every fp16 value to +-inf; class E-tiny holds a
+    nonzero fp16 subnormal, which the conversion keeps (plan R2). basalt's fixture avoids these scales (:45)."""
+    h, cls = run_e(e, "f16")
+    assert np.isin(h[cls == "overflow"], [0x7C00, 0xFC00]).all(), "a finite fp16 value from 65504 on extreme codes"
+    tiny = h[np.isin(cls, ["2^-24", "0x03ff"])] & 0x7FFF
+    assert ((tiny > 0) & (tiny < 0x400)).any(), "no nonzero fp16 subnormal in class E-tiny"
+    run_e(e, "f32")
 
 
 BF16_PROBE = """
