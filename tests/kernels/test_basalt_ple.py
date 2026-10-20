@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
 # adapted from basalt (jesdga95/basalt) src/kernels/ple_parity.cpp, src/kernels/ple_win_parity.cpp and
-# src/kernels/gr_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): ple_parity's native
-# key-norm check's metric and pass criterion (:899-910), ple_win_parity's projected-form input scales (:47-55), and
-# gr_parity's scalar activation contract's degenerate norm input and the exactness it relies on (:167-236).
+# src/kernels/gr_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): ple_parity's history
+# regression (:177-214) and native key-norm check's metric and pass criterion (:899-910), ple_win_parity's
+# projected-form input scales (:47-55), and gr_parity's scalar activation contract's degenerate norm input and the
+# exactness it relies on (:167-236).
 """The n-gram (PLE) block's Metal port on the GPU, kernel by kernel (kernels/common/basalt_gr_norm.metal and
 basalt_ple.metal). Each norm call runs at its call sites' shape, 4 rows of 2560 with 4 gamma rows and eps = f32(1e-6)
 (native_ple_postops.cu:352-353, :358), unless stated.
@@ -34,7 +35,24 @@ basalt_ple.metal). Each norm call runs at its call sites' shape, 4 rows of 2560 
   clamp: the same gate as |s| = 1e-6f), |s| = 1e-6f, and |s| = 2e4 (the sigmoid saturates at 1, and at 0 where
   fast::exp2 overflows). The others are the projected form's first row with inputs planted (``EDGE_ROWS``): a SiLU
   whose fast::exp2 overflows (act = acc * rcp(inf) = -0), subnormal key, value, hidden and history inputs (read as
-  zero under the flush) beside fp16-subnormal taps (widened exactly), and gated products below 2^-126 (flushed)."""
+  zero under the flush) beside fp16-subnormal taps (widened exactly), and gated products below 2^-126 (flushed).
+- H1, T-HIST ``test_history_advance_12_steps`` (spec T§7.4): ple_parity's history regression (ple_parity.cpp:177-214)
+  as written, on basalt_ple_advance: the initial history ``expected[c * rows + r] = -float(c * 16 + r + 1)``
+  (row-fastest) and 12 tokens of ``normalized[c] = float((token + 1) * 1000000 + c)``, one dispatch built once and run
+  once per token (basalt captures its advance once and replays it, :195-207), each run followed by the host shift
+  (:203-204) and the criterion, quoted: ``if (std::memcmp(actual.data(), expected.data(), count * sizeof(float)) != 0)
+  {`` (:210), then ``++bad;`` (:212). Its refusals (H2) are the emitter's, its guards (H3) X-GUARD's.
+- X-H ``test_history_moves_bits`` (spec T§8): H1's run with fp32 subnormals (0x00000001, 0x807fffff), -0.0, +-inf, a
+  quiet NaN with a payload (0x7fc00001) and a signalling NaN (0x7f800001) planted in every token's normalized row, as
+  words, so that they pass through every history row: "every pattern survives the history's moves bit for bit
+  (memcmp, as H1)", the advance, then basalt_ple_snapshot of the GPU's histories, then basalt_ple_restore from the
+  GPU's snapshots into a history that differs from each of them at every word.
+- T-COPY ``test_snapshot_copy_exact`` and ``test_commit_restore_exact`` (spec T§7.5), byte for byte (the precedent
+  ``if (ra != rb) {``, dec_commit_parity.cpp:177), every guard byte intact: the snapshot into each slot equals its
+  source and leaves the other slots' 0xA5; the restore by the commit record's word 1 (``commit_record``: every
+  (T, n_keep) with n_keep - 1 = word 1 has the same record, so words 0 to 7 cover T = 1..8 and n_keep = 1..T) equals
+  that slot, a negative word leaves the history unchanged, and a word above 7 restores slot 7 (the port's bound, plan
+  D5). The words are slot-tagged random words (``copy_words``), so that a missed, stray or misplaced store shows."""
 
 import functools
 
@@ -42,8 +60,8 @@ import numpy as np
 import pytest
 
 from monolith import kernels
-from tests.basalt_ple_ref import (D, EPS, H, HIST, KERN, N, ROWS, Fixture, gnorm, h_oracle, le, nonfinite, r_contract,
-                                  rel_l1)
+from tests.basalt_ple_ref import (D, EPS, H, HIST, KERN, N, ROWS, T_MAX, Fixture, commit_record, gnorm, h_oracle, le,
+                                  nonfinite, r_contract, rel_l1)
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
 from tests.kernels import basalt_ple_gpu as ple_gpu
@@ -275,3 +293,123 @@ def test_postops_bitwise_emu(case):
         flushed = int(np.count_nonzero(rows[0]["gated"][0] == 0))
         assert 0 < flushed < D, (
             f"T§7.3, gated products below 2^-126 are flushed and the others kept: {flushed} of {D} are 0")
+
+
+# ---- T-HIST, X-H and T-COPY: the history's moves (spec T§7.4-7.5, T§8) ---------------------------------------------
+HS = HIST * D           # a history's words
+TOKENS = 12             # ple_parity.cpp:200
+PATTERNS = np.array([0x00000001, 0x807FFFFF, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC00001, 0x7F800001], np.uint32)
+PLANT = 37              # X-H plants PATTERNS, in turn, at every PLANT-th channel from the token's index
+COPY_SEED = 177         # default_rng(COPY_SEED) draws T-COPY's random words
+
+
+def h1_fixture():
+    """H1's fixture as words (ple_parity.cpp:181-182, :200-202): the initial history
+    ``expected[c * rows + r] = -float(c * 16 + r + 1)`` and the 12 tokens' normalized rows,
+    ``normalized[c] = float((token + 1) * 1000000 + c); // distinct exactly represented integers``."""
+    c, r = np.meshgrid(np.arange(D), np.arange(HIST), indexing="ij")
+    hist = bits((-(c * 16 + r + 1)).astype(F32)).ravel()
+    normalized = bits(((np.arange(TOKENS)[:, None] + 1) * 1000000 + np.arange(D)).astype(F32))
+    return hist, normalized
+
+
+def host_shift(expected, normalized):
+    """ple_parity.cpp:203-204 for every channel, on words: rows 1 to 8 move to rows 0 to 7, and ``normalized`` enters
+    row 8."""
+    e = expected.reshape(D, HIST).copy()
+    e[:, :-1] = expected.reshape(D, HIST)[:, 1:]
+    e[:, -1] = normalized
+    return e.ravel()
+
+
+def test_history_advance_12_steps():
+    hist, normalized = h1_fixture()
+    actual = ple_gpu.advance(hist, normalized)[0]
+    expected, bad = hist, []
+    for token in range(TOKENS):
+        expected = host_shift(expected, normalized[token])
+        if actual[token].tobytes() != expected.tobytes():
+            bad.append(token)
+    assert not bad, (
+        "H1, `if (std::memcmp(actual.data(), expected.data(), count * sizeof(float)) != 0) {` (ple_parity.cpp:210), "
+        f"then `++bad;` (:212): history advance mismatch after token {bad}")
+
+
+def test_history_moves_bits():
+    hist, normalized = h1_fixture()
+    for token in range(TOKENS):
+        planted = np.arange(token, D, PLANT)
+        normalized[token, planted] = PATTERNS[np.arange(planted.size) % PATTERNS.size]
+    expected = [hist]
+    for token in range(TOKENS):
+        expected.append(host_shift(expected[-1], normalized[token]))
+    expected = expected[1:]                       # expected[t]: the history after token t
+    first = TOKENS - T_MAX                        # slot s takes the history after token first + s
+    last = expected[-1].reshape(D, HIST)
+    assert all(np.isin(PATTERNS, last[:, r]).all() for r in range(HIST)), "X-H: every pattern in every history row"
+    assert all((hist != expected[first + s]).all() for s in range(T_MAX)), (
+        "X-H: the restore's target history differs from every slot at every word")
+    advanced = ple_gpu.advance(hist, normalized)[0]
+    bad = [f"advance after token {t}" for t in range(TOKENS) if advanced[t].tobytes() != expected[t].tobytes()]
+    slots = np.empty((T_MAX, HS), np.uint32)
+    for s in range(T_MAX):
+        slots[s] = ple_gpu.snapshot(advanced[first + s], s)[0][s]
+        if slots[s].tobytes() != expected[first + s].tobytes():
+            bad.append(f"snapshot into slot {s}")
+    for s in range(T_MAX):
+        if ple_gpu.restore(hist, slots, commit_record(s + 1, T_MAX, 0))[0].tobytes() != expected[first + s].tobytes():
+            bad.append(f"restore of slot {s}")
+    assert not bad, (
+        "X-H, \"every pattern survives the history's moves bit for bit (memcmp, as H1). Under forms (a)/(b) the moves "
+        f"are the advance, the snapshot and the commit restore\" (spec T§8): mismatches at {bad}")
+
+
+@functools.lru_cache(maxsize=1)
+def copy_words():
+    """T-COPY's words, (T_MAX + 1, HS) uint32: row s is ``w ^ (s << 24)`` for one draw ``w`` of HS random words
+    (default_rng(COPY_SEED)), rows 0 to 7 the snapshots and row 8 the history. Each row differs from every other at
+    every word, and no word is a fill of the harness (0xFFFFFFFF, 0xA5A5A5A5; asserted), so that a missed, stray or
+    misplaced store shows."""
+    w = np.random.default_rng(COPY_SEED).integers(0, 2 ** 32, HS, dtype=np.uint32)
+    words = w[None] ^ (np.arange(T_MAX + 1, dtype=np.uint32)[:, None] << np.uint32(24))
+    assert not np.isin(words, np.array([0xFFFFFFFF, 0xA5A5A5A5], np.uint32)).any(), "T-COPY: a fill word in the data"
+    return words
+
+
+@pytest.mark.parametrize("slot", range(T_MAX))
+def test_snapshot_copy_exact(slot):
+    src = copy_words()[T_MAX]
+    snaps, guards = ple_gpu.snapshot(src, slot)
+    equal = snaps[slot].tobytes() == src.tobytes()
+    changed = [s for s in range(T_MAX) if s != slot and (snaps[s] != 0xA5A5A5A5).any()]
+    assert equal and not changed and guards, (
+        "T-COPY, \"for every row t of a T-row window, snapshot t equals the history after row t, byte for byte; the "
+        "snapshot rows from T to T_MAX − 1 still hold their sentinel; the guard bytes around the buffer are "
+        "untouched\" (spec T§7.5; `if (ra != rb) {`, dec_commit_parity.cpp:177): "
+        f"slot {slot} equals its source: {equal}; other slots changed: {changed}; guards intact: {guards}")
+
+
+RESTORES = {  # case: (the record's word 1, the slot the history must then equal, None: unchanged)
+    **{f"word 1 = {i}": (i, i) for i in range(T_MAX)},
+    **{f"word 1 = {i}": (i, None) for i in (-1, -5)},
+    **{f"word 1 = {i}": (i, T_MAX - 1) for i in (T_MAX, 100)},
+}
+
+
+@pytest.mark.parametrize("case", list(RESTORES))
+def test_commit_restore_exact(case):
+    word1, slot = RESTORES[case]
+    words = copy_words()
+    if 0 <= word1 < T_MAX:
+        commit = commit_record(word1 + 1, T_MAX, 0)       # the window's record (verify.cpp:2735-2737)
+    else:                                                 # a record the host refuses (verify.cpp:2732); word 0 names
+        commit = commit_record(3, T_MAX, 0)               # slot 3, so that a read of word 0 shows
+        commit[1] = word1
+    got, guards = ple_gpu.restore(words[T_MAX], words[:T_MAX], commit)
+    want = words[T_MAX] if slot is None else words[slot]
+    equal = got.tobytes() == want.tobytes()
+    assert equal and guards, (
+        "T-COPY, \"the history after the restore equals snapshot n_keep − 1 byte for byte; with index −1 the history "
+        "is unchanged; ... guard bytes are untouched\" (spec T§7.5), and word 1 above 7 restores slot 7 (plan D5): "
+        f"record {commit.tolist()}, the history equals {'itself' if slot is None else f'slot {slot}'}: {equal}; "
+        f"guards intact: {guards}")

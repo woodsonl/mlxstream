@@ -762,8 +762,10 @@ PLE_GRIDS = {           # entry (basalt_ple_<name>) -> (threadgroups, threads), 
 
 
 def basalt_ple_source() -> str:
-    """basalt's ``gate_kernel`` (``basalt_ple_gate``), ``broadcast_kernel`` (``basalt_ple_broadcast``) and
-    ``conv_residual_kernel`` (``basalt_ple_conv``)."""
+    """basalt's ``gate_kernel`` (``basalt_ple_gate``), ``broadcast_kernel`` (``basalt_ple_broadcast``),
+    ``conv_residual_kernel`` (``basalt_ple_conv``), ``history_advance_kernel`` (``basalt_ple_advance``),
+    ``copy_from_mapped_kernel`` as the history's snapshot (``basalt_ple_snapshot``) and ``copy_indexed_kernel`` as the
+    commit's restore (``basalt_ple_restore``)."""
     return PRELUDE + template("basalt_fp.metal") + template("basalt_ple.metal")
 
 
