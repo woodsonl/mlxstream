@@ -3,7 +3,7 @@
 # adapted from basalt (jesdga95/basalt) src/kernels/ple_parity.cpp, src/kernels/ple_win_parity.cpp
 # @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): ple_parity's metric helpers (le, gt,
 # nonfinite and rel_l1, :41-77) and the seven stages its block check compares (:751-759); ple_win_parity's fixture
-# scales (:48-56).
+# scales (:48-56); ple_parity's capture loader rules (:135-164: a file missing or of the wrong size fails).
 """The n-gram (PLE) block's host references, numpy only (no Metal import), imported as ``from tests.basalt_ple_ref
 import ...``.
 
@@ -29,6 +29,17 @@ import ...``.
   f32(sigma_h * z), with sigma_h by T§6.3's rule 3: R-struct with the unit-scale hidden f32(z), then sigma_h = mean
   |gated + conv_out| / mean |f32(z)|. ``SYNTHETIC_SEED`` = 54 is the first seed from 0 for which property 2 holds
   (seeds 0-53 put some |s[c]| below 0.1).
+- The real weights (spec T§5): ``TENSORS`` places blk.1's six PLE tensors in the pack (make_basalt_fixture.py's pinned
+  file; absolute offsets) and ``RANGES`` the two byte ranges that hold them, one per name space. ``committed()`` reads
+  ``FIXTURE``, the committed slices (key row 0, the first 1024 B of the five dense rows and of their GGUF twins, all of
+  the dense conv1d) with the writer's record of where each lies; ``full_ranges()`` reads the two full ranges from
+  $BASALT_PLE_FIXTURE (tests/contract/fixtures/make_basalt_ple_fixture.py --full DIR fetches them): unset, the caller
+  skips with a reason naming the variable; set, a file missing or of the wrong size fails (ple_parity's L1-L4, spec
+  T§1.1). ``real_tensors()`` cuts the full ranges at TENSORS' offsets. ``real`` is T§6.3's real fixture: the key as
+  the session binds it (gguf, type 42), the value, the three norms and conv1d from their dense rows, and
+  ``_with_activations(default_rng(REAL_SEED), 0.0158, ...)``: emb = f32(0.0158 * N(0,1)), the history f32(N(0,1)) and
+  hidden by rule 3. ``REAL_SEED`` = 279 is the first seed from 0 for which property 2 holds (seeds 0-278 put some
+  |s[c]| below 0.1).
 - ``check_fixture``: the four properties every generator asserts on R-struct before it returns (T§6.3):
   1. hidden is nonzero (every row's every stream: with hidden = 0, s = 0 and gate = 0.5, the key is never observed);
   2. min over rows and streams of |s[c]| >= 0.1;
@@ -36,10 +47,14 @@ import ...``.
   4. T = 12 rows from one initial history: each row's normalized row enters the history the next rows read."""
 
 import functools
+import json
+import os
+from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
 
+from monolith.formats.safetensors_reader import read_header
 from tests.contract.gguf_reference import q2_0
 from tests.kernels.basalt_emu import bf16_bits
 
@@ -53,6 +68,31 @@ EPS = float(F32(1e-6))          # NG_RMS_EPS as float64(float32(1e-6)): the norm
 KEY_BLOCK = 18                  # a type-42 (Q2_0) block: the f16 d, then 16 bytes of 2-bit codes, for 64 weights
 SYNTHETIC_SEED = 54             # the first seed from 0 for which property 2 holds: min |s| 0.1251, min row share 0.628
 VALUE_SEED = 790                # test_ple_value_float64's
+REAL_SEED = 279                 # the first seed from 0 for which property 2 holds: min |s| 0.1219, min row share 0.562
+
+
+class PackTensor(NamedTuple):
+    type_id: int          # ggml type
+    ne: tuple             # ggml order, fastest first
+    nbytes: int
+    gguf: int             # the GGUF tensor's absolute offset in the pack
+    kind: int             # its dense.index row's kind: 5 F16, 2 F32, 4 BF16 as stored, 0 shape-only
+    dense: int | None     # that row's absolute offset (dense base + src_off); None: shape-only, the bytes are in gguf
+
+
+TENSORS = {  # spec T§5's table in file order; the shapes are ngram.hpp:30-41's
+    "blk.1.ple_conv1d.weight": PackTensor(1, (KERN, D), 81920, 36325965824, 5, 90852224),
+    "blk.1.ple_key.weight": PackTensor(42, (N, D), 7372800, 36326047744, 0, None),
+    "blk.1.ple_norm_conv.weight": PackTensor(0, (D,), 40960, 36333420544, 2, 90934144),
+    "blk.1.ple_norm_key.weight": PackTensor(0, (D,), 40960, 36333461504, 2, 90975104),
+    "blk.1.ple_norm_query.weight": PackTensor(0, (D,), 40960, 36333502464, 2, 91016064),
+    "blk.1.ple_value.weight": PackTensor(30, (N, N), 13107200, 36333543424, 4, 91057024),
+}
+RANGES = {  # T§5: each name space's tensors lie in one range, (file under $BASALT_PLE_FIXTURE, absolute offset, bytes)
+    "gguf": ("gguf_blk1_ple.bin", 36325965824, 20684800),
+    "dense": ("dense_blk1_ple.bin", 90852224, 13312000),
+}
+FIXTURE = Path(__file__).parent / "contract" / "fixtures" / "basalt_ple.safetensors"
 
 
 def le(x, t):
@@ -216,3 +256,57 @@ def synthetic(seed=SYNTHETIC_SEED):
     w_nk, w_nq, w_nc = ((1 + 0.1 * rng.standard_normal(D)).astype(F32) for _ in range(3))
     conv1d = (0.3 * rng.standard_normal(KERN * D)).astype(np.float16)
     return _with_activations(rng, 0.2, key=key, value=value, w_nk=w_nk, w_nq=w_nq, w_nc=w_nc, conv1d=conv1d)
+
+
+def committed():
+    """``FIXTURE``'s committed slices, ``{key: bytes}``, and the writer's metadata (``entries``: each slice's tensor and
+    name space, where the pack's tables put it and how many of its bytes are kept)."""
+    infos, meta = read_header(FIXTURE)
+    data = FIXTURE.read_bytes()
+    return {k: data[i.start:i.end] for k, i in infos.items()}, json.loads(meta["fixture"])
+
+
+def full_ranges():
+    """The two full ranges from $BASALT_PLE_FIXTURE, ``{name space: bytes}``. Unset, the caller skips with a reason that
+    names the variable; set, a file missing or of the wrong size fails."""
+    import pytest           # imported here: make_basalt_ple_fixture.py imports this module and needs no pytest
+
+    root = os.environ.get("BASALT_PLE_FIXTURE")
+    if not root:
+        pytest.skip("set BASALT_PLE_FIXTURE to the directory `make_basalt_ple_fixture.py --full DIR` filled with the "
+                    "n-gram block's two real-weight ranges")
+    out = {}
+    for space, (name, _, size) in RANGES.items():
+        path = Path(root) / name
+        got = path.stat().st_size if path.is_file() else None
+        if got != size:
+            pytest.fail(f"$BASALT_PLE_FIXTURE/{name} is {'missing' if got is None else f'{got} bytes'}, not {size} "
+                        "bytes: fetch it again with make_basalt_ple_fixture.py --full DIR")
+        out[space] = path.read_bytes()
+    return out
+
+
+def real_tensors():
+    """``TENSORS`` cut from the full ranges: ``{"gguf/<name>": bytes}`` for all six, ``{"dense/<name>": bytes}`` for
+    the five with a dense row."""
+    ranges, out = full_ranges(), {}
+    for name, t in TENSORS.items():
+        for space, at in (("gguf", t.gguf), ("dense", t.dense)):
+            if at is not None:
+                at -= RANGES[space][1]
+                out[f"{space}/{name}"] = ranges[space][at:at + t.nbytes]
+    return out
+
+
+def real(seed=REAL_SEED):
+    """T§6.3's real fixture, as the module docstring says."""
+    w = real_tensors()
+
+    def dense(name, dtype):
+        return np.frombuffer(w[f"dense/blk.1.ple_{name}.weight"], dtype)
+
+    key = np.frombuffer(w["gguf/blk.1.ple_key.weight"], np.uint8).reshape(D, -1)
+    return _with_activations(np.random.default_rng(seed), 0.0158, key=key,
+                             value=dense("value", np.uint16).reshape(N, N), w_nk=dense("norm_key", F32),
+                             w_nq=dense("norm_query", F32), w_nc=dense("norm_conv", F32),
+                             conv1d=dense("conv1d", np.float16))
