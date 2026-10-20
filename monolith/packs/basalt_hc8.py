@@ -16,9 +16,14 @@ in IEEE binary32: subnormals kept, both divisions correctly rounded, both roundi
 that arithmetic in numpy, operation for operation; ``docs/research/basalt-nvcc/hc_fused.md`` section 1 records what
 nvcc compiles it to.
 
-Basalt quantizes every hyper-connection down, up and injection matrix of the target and of the drafter at load, from
-the BF16 bytes its model file stores, and its reads then take only the copies (``src/program/generate.cpp:2233-2365``,
-``src/core/mtp.cpp:254-282``, ``:488-503``). The port makes the copies on the host, once per ``.basalt`` file:
+On one GPU basalt quantizes every hyper-connection down, up and injection matrix of the target and of the drafter at
+load, from the BF16 bytes its model file stores (``src/program/generate.cpp:2233-2365``, ``src/core/mtp.cpp:254-282``,
+``:488-503``). It holds the down and up matrices only as their copies, while the injections stay BF16 beside theirs
+(``generate.cpp:2360``, ``mtp.cpp:215-218``). Every hyper-connection read then takes the copies (decode's fused read,
+``src/kernels/cuda/hc_fused.cu:1430-1431``, and ``hc8_gr_read_multi``, ``src/kernels/cuda/hc8_gr.cu:250``, ``:279``)
+except the target prompt path's injection product, which multiplies the BF16 matrix (``src/prefill/prefill.cpp:1572``;
+``src/prefill/gemm.cu:136`` takes a copy only when it is ``owned``, the matrix's only form, as the down and up copies
+are: ``hc_fused.cu:1274``, ``:1302``). The port makes the copies on the host, once per ``.basalt`` file:
 
 * Exact without a flush argument: the host CPU computes binary32 with subnormals kept, the kernel's own arithmetic,
   where a Metal pass would flush them.
