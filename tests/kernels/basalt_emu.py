@@ -958,3 +958,54 @@ def gdn_gate(v, dt, sa, exp2):
         u = np.asarray(dt, F32) + np.asarray(v, F32)
         sp = np.where(u > F32(20.0), u, log1pf_nv(expf_ieee(u, exp2)))
         return (np.asarray(sa, F32) * sp).astype(F32)
+
+
+RSQRT128 = np.uint32(0x3DB504F3).view(F32)      # rsqrtf((float) S) as nvcc folds it: RN(2^-3.5)
+
+
+def gdn_kv(s, k):
+    """kv (dec_gdn_rec.cu:251, verify_kernels.cu:410) of each row of 32 state values ``s`` against ``k`` (the rows on
+    the last axis): FFMA kv, s_0, k_0, RZ, then 31 FFMA, r ascending."""
+    s, k = np.asarray(s, F32), np.asarray(k, F32)
+    kv = np.zeros(np.broadcast_shapes(s.shape, k.shape)[:-1], F32)
+    for r in range(s.shape[-1]):
+        kv = fma32(s[..., r], k[..., r], kv)
+    return kv
+
+
+def gdn_delta(g, kv_col, v, b):
+    """delta (dec_gdn_rec.cu:255, verify_kernels.cu:414): FFMA d, -g, kv_col, v (contracted); FMUL delta, d, b."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return (fma32(sign_flip(g), kv_col, v) * np.asarray(b, F32)).astype(F32)
+
+
+def gdn_update(s, k, q, g, delta):
+    """The state update and o (dec_gdn_rec.cu:259-260, verify_kernels.cu:423-424) of each row of 32 state values (the
+    last axis; ``g`` and ``delta`` per row): FMUL p, delta, k_r; FFMA s_r, g, s_r, p; then o's chain, FFMA o, s_r,
+    q_r, o on the updated s_r, the first on RZ. Returns the updated rows and o."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        kd = np.asarray(k, F32) * np.asarray(delta, F32)[..., None]
+    s = fma32(np.asarray(g, F32)[..., None], s, kd)
+    return s, gdn_kv(s, q)
+
+
+def gdn_oc(o0, o1, o2, o3):
+    """oc (dec_gdn_rec.cu:265-266, verify_kernels.cu:431): gdn_sum4's three FADDs, FMUL by 0x3DB504F3."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return (gdn_sum4(o0, o1, o2, o3) * RSQRT128).astype(F32)
+
+
+def gdn_sq32(oc):
+    """sq32 (dec_gdn_rec.cu:136-137, verify_kernels.cu:432-434) of each row of 32 columns: FMUL q, oc, oc, then the
+    butterfly's FADDs (every lane's sum)."""
+    oc = np.asarray(oc, F32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        return butterfly(oc * oc, np.add)
+
+
+def gdn_out(oc, ss, eps, gam, z, exp2, rsqrt):
+    """The gated RMS norm (dec_gdn_rec.cu:119-120, verify_kernels.cu:439-441): FFMA x, ss, 0.0078125, eps; rsqn(x);
+    FMUL by oc, then by gam; the sigmoid of z as gdn_beta's; FMUL."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        scale = rsqrt_ieee(fma32(ss, F32(0.0078125), eps), rsqrt)
+        return (((np.asarray(oc, F32) * scale) * np.asarray(gam, F32)) * gdn_beta(z, exp2)).astype(F32)

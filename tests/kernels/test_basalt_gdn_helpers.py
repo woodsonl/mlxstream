@@ -55,6 +55,19 @@ comparison is bitwise; a NaN result compares by class (the kernels' stores canon
   stores the step in this GPU's plain operations, which must differ from IEEE's on many rows of each class built for
   a subnormal path; the other order of the conv's taps 0 and 1 must differ on many random rows, and the random rows
   must be near float64.
+- H.6: the recurrence and output steps (basalt_gdn.metal: the decay ``expf_ieee(gate)``, ``gdn_kv``, kv_col by
+  ``gdn_sum4``, ``gdn_delta``, ``gdn_update`` (the state update and o), ``gdn_oc``, ``gdn_sq32``, ss by ``gdn_sum4``,
+  ``gdn_out``) against ``basalt_emu``'s twins, which follow the SASS rows (dec_gdn.md sections 1-2, verify_gdn.md
+  section 6), the GPU's ``fast::exp2`` and ``fast::rsqrt`` injected: one head per threadgroup of 512 in
+  gdn_step_norm_multi's layout, k and q in threadgroup memory, one token, every intermediate compared in the window's
+  order. Classes: random model-like heads (L2-normed k and q, gates of a few units, beta in (0, 1), eps 1e-6); whole
+  columns of state and v scaled by 2^-140 to 1 (a decaying state: tiny partial sums and deltas, subnormal updated
+  states, subnormal oc whose y the norm's scale of about 2^10 makes normal); gates in (-103.2, -87.4), a subnormal
+  decay, beside zero key rows, zero v and a +0 or subnormal beta, so that g s reaches the state; z in (-88.72, -87.34),
+  a subnormal sigmoid; a state and v near 2^-61 with eps 0 (subnormal squares, ss * 2^-7 subnormal: the norm's rsqrt
+  takes its scaled branch); infinities, NaNs and signed zeros. Each step's plain form on the same operands must differ
+  from IEEE's on many elements of each class built for it, and the random heads' decay, updated state, oc and y must
+  be within 1e-5 of float64's, relative to the sum of the absolute terms.
 """
 
 import numpy as np
@@ -793,3 +806,205 @@ def test_gdn_ab_dot_matches_the_emulation():
     t = ((w[sl].astype(U32) << U32(16)).view(F32).astype(F64)) * x[sl].astype(F64)
     s = got[sl, 0].view(F32).astype(F64)
     assert np.all(np.abs(s - t.sum(1)) <= 1e-5 * np.abs(t).sum(1))
+
+
+# ---- H.6: the decay, gdn_kv, gdn_delta, gdn_update, gdn_oc, gdn_sq32, gdn_out --------------------------------------
+
+H6 = """
+// one head per threadgroup of 512 threads in gdn_step_norm_multi's layout (col = tid % 128, rg = tid / 128; k and q in
+// threadgroup memory), one token: each step as the kernels call it, its plain form (this GPU's own operations) beside
+// it on the same operands. Every thread stores a record of H6_W words: the (step, plain) pairs of the decay, kv,
+// kv_col, delta, o, oc, its SIMD-group's sum of squares, ss and y, then its 32 updated state rows and their plain forms
+kernel void h6_step(device const uint* st [[buffer(0)]], device const uint* vec [[buffer(1)]],
+                    device const uint* sc [[buffer(2)]], device uint* out [[buffer(3)]],
+                    uint head [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float sk[128], sq[128], red[4][128], wsum[4];
+  const uint col = tid % 128, rg = tid / 128;
+  device const uint* hv = vec + 640 * head;                 // k, q, v, z, gamma: 128 each
+  if (tid < 128) {
+    sk[tid] = as_type<float>(hv[tid]);
+    sq[tid] = as_type<float>(hv[128 + tid]);
+  }
+  const float v = as_type<float>(hv[256 + col]), z = as_type<float>(hv[384 + col]), gam = as_type<float>(hv[512 + col]);
+  const float gate = as_type<float>(sc[4 * head]), b = as_type<float>(sc[4 * head + 1]);
+  const float eps = as_type<float>(sc[4 * head + 2]);
+  float s[32], s0[32];
+  for (uint r = 0; r < 32; ++r) s[r] = s0[r] = as_type<float>(st[16384 * head + (32 * rg + r) * 128 + col]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float g = expf_ieee(gate), g_p = expf_ftz(gate);
+  const float kv = gdn_kv(s, sk + 32 * rg);
+  float kv_p = 0.0f;
+  for (uint r = 0; r < 32; ++r) kv_p = fma(s0[r], sk[32 * rg + r], kv_p);
+  red[rg][col] = kv;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float kv_col = gdn_sum4(red[0][col], red[1][col], red[2][col], red[3][col]);
+  const float kvc_p = ((red[0][col] + red[1][col]) + red[2][col]) + red[3][col];
+  const float delta = gdn_delta(g, kv_col, v, b), delta_p = fma(sign_flip(g), kv_col, v) * b;
+  const float o = gdn_update(s, sk + 32 * rg, sq + 32 * rg, g, delta);
+  device uint* w = out + H6_W * (512 * head + tid);
+  float o_p = 0.0f;
+  for (uint r = 0; r < 32; ++r) {
+    w[18 + r] = as_type<uint>(s[r]);
+    w[50 + r] = as_type<uint>(fma(g, s0[r], sk[32 * rg + r] * delta));
+    o_p = fma(s[r], sq[32 * rg + r], o_p);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);         // every thread has read red's kv partials
+  red[rg][col] = o;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float oc = gdn_oc(red[0][col], red[1][col], red[2][col], red[3][col]);
+  const float oc_p = (((red[0][col] + red[1][col]) + red[2][col]) + red[3][col]) * as_type<float>(0x3DB504F3u);
+  const float sq2 = gdn_sq32(oc), sq2_p = warp_sum(oc * oc);
+  if (tid < 128 && tid % 32 == 0) wsum[tid / 32] = sq2;    // the four column groups of rg 0, in order
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float ss = gdn_sum4(wsum[0], wsum[1], wsum[2], wsum[3]);
+  const float ss_p = ((wsum[0] + wsum[1]) + wsum[2]) + wsum[3];
+  const float y = gdn_out(oc, ss, eps, gam, z);
+  const float y_p = ((oc * fast::rsqrt(fma(ss, 0.0078125f, eps))) * gam) * (1.0f / (1.0f + expf_neg(z)));
+  const float f[18] = {g, g_p, kv, kv_p, kv_col, kvc_p, delta, delta_p, o, o_p, oc, oc_p, sq2, sq2_p, ss, ss_p, y, y_p};
+  for (uint i = 0; i < 18; ++i) w[i] = as_type<uint>(f[i]);
+}
+"""
+H6_W = 82                  # a thread's record: 9 (step, plain) pairs, its 32 updated state rows, their plain forms
+
+
+def h6_run(st, vec, sc):
+    """h6_step over the heads (float32 state (heads, 128, 128) rows by columns, vec (heads, 5, 128): k, q, v, z, gamma,
+    sc (heads, 4): gate, beta, eps, 0): one threadgroup of 512 per head. The records as (heads, 4, 128, H6_W) uint32,
+    [head, rg, col] for thread 128 rg + col."""
+    n = len(st)
+    pso = gpu.pipeline(kernels.basalt_gdn_source() + f"constant constexpr uint H6_W = {H6_W};\n" + H6, "h6_step")
+    assert pso.max_threads_per_threadgroup >= 512, pso.max_threads_per_threadgroup
+    out = gpu.run(pso, [np.ascontiguousarray(a, F32).tobytes() for a in (st, vec, sc)] + [4 * H6_W * 512 * n], None, 0,
+                  n, 512, fill=0xFF)
+    return np.frombuffer(out[3], U32).reshape(n, 4, 128, H6_W)
+
+
+def h6_heads(rng, n=16):
+    """H.6's heads by class: float64 (state (n, 128, 128) rows by columns, vec (n, 5, 128): k, q, v, z, gamma, sc
+    (n, 4): gate, beta, eps, 0)."""
+    def base():
+        kq = rng.standard_normal((2, n, 128))
+        kq /= np.linalg.norm(kq, axis=2, keepdims=True)              # L2-normed, as the window's q and k
+        vec = np.stack([kq[0], kq[1], rng.standard_normal((n, 128)), rng.standard_normal((n, 128)) * 2,
+                        1 + 0.2 * rng.standard_normal((n, 128))], axis=1)
+        sc = np.c_[-np.exp(rng.uniform(-4, 2.5, n)), 1 / (1 + np.exp(-rng.standard_normal(n))), np.full(n, 1e-6),
+                   np.zeros(n)]
+        return rng.standard_normal((n, 128, 128)) * 0.3, vec, sc
+
+    heads = {"random": base()}
+    # whole columns, their state and v, scaled by 2^-e (e up to 140) and a quarter of the v zero: a state decayed to
+    # 2^-140, tiny partial sums and deltas, subnormal oc whose y the norm's scale makes normal
+    st, vec, sc = base()
+    scale = np.exp2(-rng.uniform(0, 140, (n, 1, 128)))
+    st *= scale
+    vec[:, 2] *= scale[:, 0] * (rng.random((n, 128)) < 0.75)
+    heads["decaying"] = (st, vec, sc)
+    # gates in (-103.2, -87.4): a subnormal decay g; then g s reaches the state where kd is about 0: a third of the
+    # key rows zero, half the v zero, a beta of +0 or a subnormal one on two heads in three
+    st, vec, sc = base()
+    vec[:, 0] *= rng.random((n, 128)) < 2 / 3
+    vec[:, 2] *= rng.random((n, 128)) < 0.5
+    sc[:, 0] = rng.uniform(-103.2, -87.4, n)
+    third = np.arange(n) % 3
+    sc[:, 1] = np.select([third == 1, third == 2], [0.0, np.exp2(-rng.uniform(127, 149, n))], sc[:, 1])
+    heads["subnormal_decay"] = (st, vec, sc)
+    # z in (-88.72, -87.34): a subnormal sigmoid (1 + e passes 2^126) on three columns in four
+    st, vec, sc = base()
+    vec[:, 3] = np.where(rng.random((n, 128)) < 0.75, rng.uniform(-88.72, -87.34, (n, 128)), vec[:, 3])
+    heads["small_out"] = (st, vec, sc)
+    # the state and v scaled by 2^-58 to 2^-64 and eps 0: |oc| near 2^-66, subnormal squares, ss * 2^-7 subnormal (the
+    # norm's rsqrt takes its scaled branch)
+    st, vec, sc = base()
+    scale = np.exp2(-rng.uniform(58, 64, (n, 1, 1)))
+    st *= scale
+    vec[:, 2] *= scale[:, 0]
+    sc[:, 2] = 0
+    heads["small_ss"] = (st, vec, sc)
+    # infinities, NaNs and zeros planted one kind per head
+    st, vec, sc = base()
+    st[0, 5, 7], st[1, 40, 3], vec[2, 0, 17], vec[3, 1, 100], vec[4, 2, 9] = np.nan, np.inf, np.inf, np.nan, -np.inf
+    sc[5:10, 0] = [np.nan, -np.inf, np.inf, -200.0, 0.0]           # g NaN, +0, inf, +0 (halved: 2^-144.3 squared), 1
+    sc[10:12, 1] = [np.nan, np.inf]
+    vec[12, 3, :8] = [np.nan, np.inf, -np.inf, 0.0, -0.0, 88.8, -88.8, 1e30]
+    vec[13, 4, :4] = [np.inf, np.nan, 0.0, -0.0]
+    st[14], vec[14, 2] = 0.0, 0.0                                   # a zero head: the chains' +0 from RZ
+    st[14, ::2], vec[14, 2, ::2] = -0.0, -0.0
+    st[15], vec[15, 2], sc[15, 2] = 0.0, 0.0, 0.0                   # and with eps 0: rsqrt_ieee(+0) = inf, y NaN
+    heads["special"] = (st, vec, sc)
+    return heads
+
+
+def test_gdn_recurrence_and_output_steps_match_the_emulation():
+    classes = h6_heads(np.random.default_rng(41))
+    st, at = stack({c: r[0].astype(F32) for c, r in classes.items()})
+    vec = np.concatenate([r[1] for r in classes.values()]).astype(F32)
+    sc = np.concatenate([r[2] for r in classes.values()]).astype(F32)
+    names = np.repeat(list(classes), [len(r[0]) for r in classes.values()])
+    got = h6_run(st, vec, sc)
+    n = len(st)
+    k, q, v, z, gam = vec.transpose(1, 0, 2)
+    gate, b, eps = sc[:, 0], sc[:, 1], sc[:, 2]
+    s4 = st.reshape(n, 4, 32, 128).transpose(0, 1, 3, 2)          # [head, rg, col, r]: thread (rg, col)'s rows
+    k4, q4 = k.reshape(n, 4, 1, 32), q.reshape(n, 4, 1, 32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        g = emu.expf_ieee(gate, fast_exp2)
+        kv = emu.gdn_kv(s4, k4)
+        kv_col = emu.gdn_sum4(*kv.transpose(1, 0, 2))
+        delta = emu.gdn_delta(g[:, None], kv_col, v, b[:, None])
+        s1, o = emu.gdn_update(s4, k4, q4, g[:, None, None], delta[:, None, :])
+        oc = emu.gdn_oc(*o.transpose(1, 0, 2))
+        sq2 = emu.gdn_sq32(oc.reshape(-1, 32)).reshape(n, 4)       # lane = col % 32 of column group col // 32
+        ss = emu.gdn_sum4(*sq2.T)
+        y = emu.gdn_out(oc.ravel(), np.repeat(ss, 128), np.repeat(eps, 128), gam.ravel(), z.ravel(), fast_exp2,
+                        fast_rsqrt).reshape(n, 128)
+    # (step, its field pair, the threads that hold it: every thread, rg 0's columns, rg 0's SIMD-groups, one per head)
+    every, cols, groups, one = np.s_[:, :, :], np.s_[:, 0, :], np.s_[:, 0, ::32], np.s_[:, 0, 0]
+    steps = [("decay", 0, one, g), ("kv", 1, every, kv), ("kv_col", 2, cols, kv_col), ("delta", 3, cols, delta),
+             ("update", None, every, s1), ("o", 4, every, o), ("oc", 5, cols, oc), ("sq32", 6, groups, sq2),
+             ("ss", 7, one, ss), ("y", 8, cols, y)]
+    plain = {}
+    for name, f, sel, want in steps:                             # in the window's order: the first failure names it
+        ieee, plain_bits = (got[..., 18:50], got[..., 50:82]) if f is None else (got[sel + (2 * f,)],
+                                                                                 got[sel + (2 * f + 1,)])
+        want = np.asarray(want, F32).view(U32)
+        bad = np.argwhere(differ(ieee, want))
+        assert len(bad) == 0, (f"{name}: {len(bad)} of {want.size} differ; first at {tuple(bad[0])} "
+                               f"({names[bad[0][0]]}): got {ieee[tuple(bad[0])]:#010x}, want "
+                               f"{want[tuple(bad[0])]:#010x}")
+        plain[name] = differ(plain_bits, want)
+    # the classes exercise what they claim: the plain step differs on many of their elements, and the subnormal values
+    # the IEEE path keeps are there (subnormal updated states; subnormal oc whose y is normal; ss * 2^-7 subnormal)
+    least = {"decay": {"subnormal_decay": 15}, "kv": {"decaying": 600}, "kv_col": {"decaying": 120},
+             "delta": {"decaying": 120, "subnormal_decay": 350},
+             "update": {"decaying": 15000, "subnormal_decay": 100000},
+             "o": {"decaying": 600, "subnormal_decay": 3000}, "oc": {"decaying": 120, "subnormal_decay": 700},
+             "sq32": {"small_ss": 60}, "ss": {"small_ss": 8},
+             "y": {"decaying": 120, "subnormal_decay": 700, "small_out": 700, "small_ss": 1000}}
+    for name, m in plain.items():
+        if name in least:
+            exercised(m, at, least[name])
+    sub_s = subnormal32(got[..., 18:50])
+    assert np.count_nonzero(sub_s[at["decaying"]]) > 15000 and np.count_nonzero(sub_s[at["subnormal_decay"]]) > 100000
+    normal_y = subnormal32(got[:, 0, :, 10]) & ((got[:, 0, :, 16] & U32(0x7F800000)) != 0)
+    assert np.count_nonzero(normal_y[at["decaying"]]) > 50, "too few subnormal oc with a normal y"
+    assert np.all(got[at["small_ss"], 0, 0, 14].view(F32) < F32(2.0 ** -119)), "small_ss: an ss * 2^-7 not subnormal"
+    # near float64 on the random heads: an error both sides share (a constant, an operand order, a scale) cannot hide;
+    # each tolerance is relative to the sum of the absolute terms
+    sl = at["random"]
+    s64, k64, q64, v64, z64, gam64 = (a[sl].astype(F64) for a in (st, k, q, v, z, gam))
+    g64, b64, eps64 = np.exp(gate[sl].astype(F64))[:, None], b[sl].astype(F64)[:, None], eps[sl].astype(F64)[:, None]
+    kv64, kva = np.einsum("hrc,hr->hc", s64, k64), np.einsum("hrc,hr->hc", np.abs(s64), np.abs(k64))
+    d64, da = (v64 - g64 * kv64) * b64, (np.abs(v64) + g64 * kva) * b64
+    s164 = g64[:, :, None] * s64 + k64[:, :, None] * d64[:, None, :]
+    s1a = g64[:, :, None] * np.abs(s64) + np.abs(k64)[:, :, None] * da[:, None, :]
+    oc64 = np.einsum("hrc,hr->hc", s164, q64) / np.sqrt(128)
+    oca = np.einsum("hrc,hr->hc", s1a, np.abs(q64)) / np.sqrt(128)
+    scale = 1 / np.sqrt((oc64 ** 2).sum(1, keepdims=True) / 128 + eps64)
+    sig = 1 / (1 + np.exp(-z64))
+    r = got[sl].view(F32).astype(F64)
+    gs = r[..., 18:50].transpose(0, 1, 3, 2).reshape(-1, 128, 128)          # [head, row, col]
+    assert np.all(np.abs(r[:, 0, 0, 0] - g64[:, 0]) <= 1e-5 * g64[:, 0]), "the decay is not near float64's"
+    assert np.all(np.abs(gs - s164) <= 1e-5 * s1a), "the updated state is not near float64's"
+    assert np.all(np.abs(r[:, 0, :, 10] - oc64) <= 1e-5 * oca), "oc is not near float64's"
+    ya = oca * scale * np.abs(gam64) * sig
+    assert np.all(np.abs(r[:, 0, :, 16] - oc64 * scale * gam64 * sig) <= 1e-5 * ya), "y is not near float64's"

@@ -70,3 +70,56 @@ static inline float gdn_gate(float v, float dt, float sa) {
     const float sp = u > 20.0f ? u : log1pf_nv(expf_ieee(u));
     return ieee_mul(sp, sa);
 }
+
+// ---- the recurrence and the output -------------------------------------------------------------------------------
+//
+// dec_gdn_rec.cu:245-297 with norm_q8 and sq32 (:115-139), verify_kernels.cu:405-441 (dec_gdn.md section 2,
+// verify_gdn.md section 6). A thread holds rows 32 rg .. 32 rg + 31 of one column of the head's state, s[r] in
+// registers; k and q point at the same rows of the token's L2-normed key and query in threadgroup memory. The decay is
+// g = expf_ieee(gate) (dec_gdn_rec.cu:248, verify_kernels.cu:407); kv_col and the head's sum of squares are gdn_sum4 of
+// the four row groups' and column groups' partials, in that order.
+
+// kv, the thread's part of the column's k-weighted state sum (dec_gdn_rec.cu:251, verify_kernels.cu:410): one FFMA
+// chain from +0, r ascending.
+static inline float gdn_kv(thread const float* s, threadgroup const float* k) {
+    float kv = 0.0f;
+    for (uint r = 0; r < 32u; ++r) kv = fma_ieee(s[r], k[r], kv);
+    return kv;
+}
+
+// delta = (v - g kv_col) b (dec_gdn_rec.cu:255, verify_kernels.cu:414): ptxas contracts the product into the
+// difference, FFMA d, -g, kv_col, v (-g by its bits), then FMUL by b.
+static inline float gdn_delta(float g, float kv_col, float v, float b) {
+    return ieee_mul(fma_ieee(sign_flip(g), kv_col, v), b);
+}
+
+// The state update and o (dec_gdn_rec.cu:259-260, verify_kernels.cu:423-424), per row r ascending: kd = k_r delta
+// rounded alone (FMUL), s[r] = g s[r] + kd (FFMA), then o's FFMA chain, from +0, on the updated s[r] and q_r. s holds
+// the updated rows; returns the thread's o.
+static inline float gdn_update(thread float* s, threadgroup const float* k, threadgroup const float* q, float g,
+                               float delta) {
+    float o = 0.0f;
+    for (uint r = 0; r < 32u; ++r) {
+        const float kd = ieee_mul(k[r], delta);
+        s[r] = fma_ieee(g, s[r], kd);
+        o = fma_ieee(s[r], q[r], o);
+    }
+    return o;
+}
+
+// oc, the column's output (dec_gdn_rec.cu:265-266, verify_kernels.cu:431): the four row groups' o in order, times
+// rsqrtf((float) S), which nvcc folds to RN(2^-3.5) = 0x3DB504F3 (never fast::rsqrt(128.0f)).
+static inline float gdn_oc(float o0, float o1, float o2, float o3) {
+    return ieee_mul(gdn_sum4(o0, o1, o2, o3), as_type<float>(0x3DB504F3u));
+}
+
+// The sum of squares of a SIMD-group's 32 columns (sq32, dec_gdn_rec.cu:136-137; verify_kernels.cu:432-434): FMUL,
+// then the butterfly's FADDs; every lane returns the sum.
+static inline float gdn_sq32(float oc) { return warp_sum_ieee(ieee_mul(oc, oc)); }
+
+// The gated RMS norm of one column (norm_q8, dec_gdn_rec.cu:119-120; verify_kernels.cu:439-441): rsqrtf(ss / 128 +
+// eps), the division made the exact multiply by 2^-7 and fused into the add (FFMA); then ((oc scale) gam) times the
+// sigmoid of z, gdn_beta's sequence, left to right.
+static inline float gdn_out(float oc, float ss, float eps, float gam, float z) {
+    return ieee_mul(ieee_mul(ieee_mul(oc, rsqrt_ieee(fma_ieee(ss, 0.0078125f, eps))), gam), gdn_beta(z));
+}
