@@ -331,8 +331,9 @@ def test_bf16_non_finite_scales(e):
     (dequant_bf16), bit for bit the twins (run_e): a NaN scale's values 0x7fffffff and 0x7fff (f2bf of sm_120's NaN;
     of this GPU's own NaN, 0x7fc00000, it would be 0x7fc0), an infinite one's signed infinities (0x7f800000, 0xff800000;
     0x7f80, 0xff80) or that NaN, the -0 scale's 0x80000000 and 0x8000; 65504 on extreme codes stays finite in both, and
-    class E-tiny's nonzero values, n * 2^-24, are normal in both. basalt's fixtures have none of these scales:
-    dequant_bf16_test reads real tensors, and dequant_f16_parity.cpp:45 gives every block a normal one."""
+    class E-tiny's nonzero values, n * 2^-24, are normal in both. Of basalt's fixtures only elementwise_parity's
+    NaN-scale Q8_0 block (DQ-1) has one of these scales: dequant_bf16_test reads real tensors, and
+    dequant_f16_parity.cpp:45 gives every block a normal one."""
     run_e(e, "f32")
     run_e(e, "bf16")
 

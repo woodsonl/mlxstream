@@ -128,7 +128,13 @@ too, by the check above. Its Metal form is unaffected: Metal's multiply is corre
 
 ## 3. Test coverage
 
-Two basalt tests check this file; neither is registered with `ctest`, and both are run by hand.
+Four basalt tests call this file's entries directly. `dequant_f16_parity` and `dequant_bf16_test`, below, are not
+registered with `ctest` and are run by hand. `elementwise_parity`, registered (`CMakeLists.txt:489-492`), checks
+`dequant_bf16` on two Q8_0 blocks (`src/kernels/elementwise_parity.cpp:438-467`): with a NaN scale every BF16 value
+must be a NaN, with scale 1 each must be ggml's BF16 of its integer. `q5_projection_parity`
+(`src/kernels/q5_projection_parity.cpp`, built at `CMakeLists.txt:791-793`, run by hand on a real shard) checks
+`dequant_f32` and `dequant_bf16` on Q5_1 only, which this pack does not use and the port refuses. The port runs the
+first three in `tests/kernels/test_basalt_prompt_dequant.py`, `elementwise_parity`'s check verbatim.
 
 **`dequant_f16_parity`** (`src/kernels/dequant_f16_parity.cpp`, built at `CMakeLists.txt:515-517`). For IQ4_XS,
 Q8_0, Q5_K and Q6_K (`:37-38`) on random blocks of 10240 × 2560 values (`:35`, `std::mt19937 rng(7)`, `:40`), with
@@ -148,10 +154,10 @@ dmin by 0.01 (`:51`), so that no NaN or infinite scale occurs. It counts three k
 same output through the scalar store (`out` misaligned by one element, `:64`), bitwise; and the first 64 rows (`:76`) against
 the artifact's CPU dequantizers, within 10^-3 relative plus 10^-6. On Metal the first two hold by construction
 (sections 1 and 2: the fp32 values are exact, and the store form changes none), and the port keeps both checks as
-bit checks; the third needs a host reference of the four types, here a binary64 transcription of the same formulas,
-at basalt's bound. The prompt path converts this pack's other six types too (Q2_0, Q3_K, Q4_K, IQ4_NL, Q4_0, Q5_0;
-`flash-next.md:218-219`); the type list is the test's data, so the port runs the same three checks for all ten
-(recommended; the cost is a longer list).
+bit checks; the third needs a host reference of the four types, here `tests/contract/gguf_reference.py`'s float32
+values, bit for bit basalt's CPU dequantizers (`include/basalt/artifact/dequant.hpp`), compared in binary64 at
+basalt's bound. The prompt path converts this pack's other six types too (Q2_0, Q3_K, Q4_K, IQ4_NL, Q4_0, Q5_0;
+`flash-next.md:218-219`); the type list is the test's data, so the port runs the same three checks for all ten.
 
 **`dequant_bf16_test`** (`src/kernels/dequant_bf16_test.cpp`, `CMakeLists.txt:804-807`: "not a ctest: needs the full
 model"). For each type `dequant_bf16_supported` accepts, the first four rows of the first two-dimensional tensor of
@@ -170,4 +176,6 @@ that type in the model's GGUF shards, against the artifact's CPU dequantizers:
 reordered at most") and the BF16 path within 2^-8 of the reference's magnitude. With every product exact (section 2)
 the fp32 path equals any reference that forms the same products, whatever its order or contraction; only Q4_K's
 and Q5_K's one rounding of d1 · q − m1 must be the reference's too, and it is the same rounding in either form. The
-port runs this test on this pack's own shards, for every type they hold.
+port runs these criteria on the committed pack fixture (`tests/contract/fixtures/basalt_pack.safetensors`), not on
+the shards: the fixture's tensor of each of the ten types, rows 0 and n − 1, at most their first 1,024 bytes in whole
+blocks (where basalt reads four whole rows); and on `dequant_f16_parity`'s blocks above.
