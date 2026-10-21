@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Jesús Gulfo (MIT)
 // SPDX-License-Identifier: MIT
-// adapted from basalt (jesdga95/basalt) src/kernels/cuda/hc_fused.cu:1229-1246 and :1328-1333
+// adapted from basalt (jesdga95/basalt) src/kernels/cuda/hc_fused.cu:1229-1244 and :1328-1333
 // @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE)
 //
 // basalt's hc8_dequant_bf16_kernel and its launch hc8_dequant_bf16, as basalt_hc8_dequant_bf16: the BF16 image of rows
@@ -40,7 +40,8 @@ kernel void basalt_hc8_dequant_bf16(device const char* q [[buffer(0)]], device c
     const float sc = h2f(s[r * p.srow + k / 32u]);
     // ponytail: eight char loads and eight ushort stores where basalt loads one uint2 and stores one uint4 (:1236,
     // :1243), so no alignment of a pack window or a scratch offset is assumed; the values are the same. Vector loads
-    // if the image's time (~25 us a copy [H]) ever matters.
+    // if the image's time ever matters: 14.4-14.9 us [M] for a whole 320 x 10240 or 10240 x 320 copy on an M3 Max,
+    // warm (min of 5 back-to-back runs); a cold copy's 10 MB take 25-36 us at the bus's 278-400 GB/s [H].
     for (uint j = 0; j < 8u; ++j) {
         const int v = int(q[r * p.cols + k + j]);           // MSL's char is signed: (int) (int8_t), I2F.S8
         out[i + j] = f2bf(cuda_nan(float(v) * sc));

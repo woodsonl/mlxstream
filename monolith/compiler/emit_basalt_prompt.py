@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
-# adapted from basalt (jesdga95/basalt) src/prefill/prefill.cpp:1188-1199 @ b4c63b55754637f4c72ad53a0f791d425f71eb36
-# (MIT; third_party/NOTICE).
+# adapted from basalt (jesdga95/basalt) src/prefill/prefill.cpp:1188-1199 and src/prefill/gemm.cu:134-156 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 """The emitter's handlers for basalt's prompt path (``monolith/ops/basalt_prompt.py``), merged into ``emit.HANDLERS``.
 Every dispatch binds StepState at slot 15 and reads the chunk's rows only through ``prompt_rows(st)``
 (``kernels.PROMPT_ROWS``; ``Gemm::native``'s dequantization and ``Gemm::bf16_w``'s copy image read none), in the

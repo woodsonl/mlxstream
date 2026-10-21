@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jesús Gulfo
+# adapted from basalt (jesdga95/basalt) src/kernels/hc8_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
+# (MIT; third_party/NOTICE): the GEMM gate's bound and its use of Err (:253-262, :269), and part 2's shapes, fixture
+# and checks of Gemm::bf16_w on the copies (:209-275).
 """basalt's prompt-path products on Metal (kernels/common/basalt_prompt_gemm.metal). Gemm::bf16's product and
 Gemm::native's (Gemm::f16 on the dequantized FP16 image) are cuBLAS calls (src/prefill/gemm.cu:122-132, :158-185) that
 fix no summation order; the port computes each output as one fp32 fma chain from +0 in increasing k, and
@@ -661,7 +666,9 @@ def test_hc8_product_against_the_copy_in_double(i):
     then the product in the handler's slices) against the copy's exact values in double, x64 @ dequant_copy(q, s).T
     (q * f16(s), not the BF16 image the product multiplies), emu.rel_norm (:57-61's Err) on part 2's 256 sampled
     outputs, as basalt gates it, and (the port's addition) on every output, each below 5e-3; no output non-finite.
-    Prints the measured values."""
+    Prints the measured values. On the M3 Max [M], in PART2's order, samples / every output: 1.553e-3 / 1.496e-3,
+    1.905e-3 / 1.552e-3, 2.139e-3 / 1.544e-3, 1.400e-3 / 1.443e-3, 1.286e-3 / 1.587e-3; at most 0.43 of the bound on
+    the samples and 0.32 on every output."""
     (t, name), (x, ts, ns) = PART2[i], part2_draws()[i]
     _, q, s = hc8_copies()[name]
     n, k = q.shape
@@ -681,7 +688,8 @@ def test_hc8_product_against_bf16(i):
     """HC8-8, GM-B (src/kernels/hc8_parity.cpp:244-245, :250-252, :270): y1, the copy entry's y
     (gpu.prompt_gemm_copy), against y0, the BF16 entry's on the BF16 matrix the copy was made from (gpu.prompt_gemm),
     y0 the reference (eb.add(y1[...], y0[...])), emu.rel_norm over every output below 5e-2: the copy's quantization
-    error; no output of either non-finite. Prints the measured value."""
+    error; no output of either non-finite. Prints the measured value. On the M3 Max [M], in PART2's order: 5.852e-3,
+    5.147e-3, 5.033e-3, 5.736e-3, 8.464e-3; at most 0.17 of the bound."""
     (t, name), (x, _, _) = PART2[i], part2_draws()[i]
     w, q, s = hc8_copies()[name]
     n, k = q.shape

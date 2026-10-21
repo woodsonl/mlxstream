@@ -79,7 +79,10 @@ CUDA math library functions that are not correctly rounded (`log1pf`, and the li
 
 The prompt path's own kernels, `src/prefill/kernels.cu`, build the same way (`CMakeLists.txt:285`) and write `__expf`,
 `rsqrtf` and `log1pf` too (for example `src/prefill/kernels.cu:39`, `:74`, `:214`); the prompt path's port lists the
-ones this pack runs.
+ones this pack runs. `Gemm::bf16_w`'s BF16 image of an int8 hyper-connection copy
+(`src/kernels/cuda/hc_fused.cu:1229-1244`) needs no IEEE emulation: each product of a code and a finite fp16 scale is
+exact and never subnormal, and a group whose scale overflowed to infinity has only zero codes, whose NaN products are
+stored through `cuda_nan` (`docs/research/basalt-nvcc/hc_fused.md`).
 
 ### Exactness invariants
 
