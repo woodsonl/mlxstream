@@ -4,6 +4,8 @@ is basalt_gpu.run with a StepState record bound there. A source compiles as the 
 struct spliced in after the prelude) with the dynamic-T program's row macros: STEP_STATE 1, T_SRC 0 and ROWS_MAX the
 compiled bound B; the static form (T_SRC 2) is the contract and program tiers' concern."""
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from monolith import kernels
@@ -80,6 +82,50 @@ def plan_words(plan):
     for at, a in ((2, plan.order), (514, plan.bounds), (1027, plan.wpre)):
         w[at: at + len(a)] = a
     return w
+
+
+def mmq_plan(ids, *, B, n_expert=512, cpu_mask=None, hist=None, done=0):
+    """The plan kernels basalt_mmq_plan_count, _scan and _fill (basalt's host expert walk, prefill.cpp:1840-1932,
+    :1993-1996) in one command buffer, sharing one StepState, on the routed ids ``ids`` [R, 10] (R = len(ids) rows in
+    StepState), compiled at bound ``B`` with N_EXPERT ``n_expert``: ids' rows from R on hold 512 and -1, ids no kernel
+    may read; ``cpu_mask`` U32 [n_expert] (nonzero: basalt's on_cpu; default all zero); ``hist`` the mmq_hist scratch's
+    first bytes (default 0xFF: every range a kernel must not read counts absent pairs); ``done`` StepState's. slot,
+    src and plan start as 0xFF bytes. Returns slot int32 [B, 10], src int32 [10 B], plan int32 [MMQ_PLAN_WORDS],
+    hist's bytes and StepState's fields (``state``)."""
+    ids = np.asarray(ids, np.int32)
+    R, k = ids.shape
+    assert k == 10 and R <= B, f"ids {ids.shape} at bound {B}"
+    mask = np.zeros(n_expert, np.uint32) if cpu_mask is None else np.asarray(cpu_mask, np.uint32)
+    assert mask.shape == (n_expert,), mask.shape
+    macros = kernels.basalt_mmq_macros("gate_up", n_expert=n_expert)
+    pc, ps, pf = (prompt_pipeline(kernels.basalt_mmq_source(), f"basalt_mmq_plan_{s}", B, macros)
+                  for s in ("count", "scan", "fill"))
+    nr = -(-B // kernels.MMQ_RANGE)
+    rows = np.tile(np.array([512, -1], np.int32), 5 * B).reshape(B, 10)
+    rows[:R] = ids
+    dev = device()
+    b_ids, b_mask = nt.Buffer(dev, rows.tobytes()), nt.Buffer(dev, mask.tobytes())
+    b_hist = nt.Buffer(dev, 4 * nr * (512 + 1) if hist is None else hist)
+    b_plan, b_slot, b_src = (nt.Buffer(dev, n) for n in (4 * kernels.MMQ_PLAN_WORDS, 40 * B, 40 * B))
+    for b in (b_plan, b_slot, b_src) + ((b_hist,) if hist is None else ()):
+        b.fill(0xFF)
+    layout = StepStateLayout()
+    b_st = nt.Buffer(dev, layout.pack({"t_this_step": R, "done": done}))
+
+    def dispatch(pso, binds, grid, threads):
+        d = nt.Dispatch().pipeline(pso)
+        for slot, b in binds:
+            d = d.buffer(slot, b)
+        return d.buffer(15, b_st).grid(grid).threadgroup(threads)
+
+    r = nt.Queue(dev).run([dispatch(pc, [(0, b_ids), (1, b_hist)], nr, kernels.MMQ_THREADS),
+                           dispatch(ps, [(1, b_hist), (2, b_plan), (5, b_mask)], 1, 512),
+                           dispatch(pf, [(0, b_ids), (1, b_hist), (3, b_slot), (4, b_src)], nr,
+                                    10 * kernels.MMQ_RANGE)])
+    assert not r.error, r.error
+    i32 = lambda b: np.frombuffer(b.read(0, b.nbytes), np.int32)
+    return SimpleNamespace(slot=i32(b_slot).reshape(B, 10), src=i32(b_src), plan=i32(b_plan),
+                           hist=b_hist.read(0, b_hist.nbytes), state=layout.unpack(b_st.read(0, b_st.nbytes)))
 
 
 def mmq_quantize(x, plan, *, B):

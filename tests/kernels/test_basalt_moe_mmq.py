@@ -36,7 +36,15 @@ exists), then the Metal port's (kernels/common/basalt_mmq.metal).
   at or past bounds[n] keep the 0xFF fill, with and without experts held on the CPU.
 - test_mmq_swiglu_edges (SG-1, spec-tests-moe.md 7.2): kernel 3 on the edge pairs where flushing decides h, each alone
   in its group: Hq's bytes equal the emulator's, and the emulator without the flushes (a port that keeps subnormals)
-  differs in exactly the first two edge groups."""
+  differs in exactly the first two edge groups.
+- test_mmq_plan_matches_host_walk: the plan kernels basalt_mmq_plan_count, _scan and _fill (basalt's host expert walk,
+  prefill.cpp:1840-1932, :1993-1996; integers, so bitwise) equal emu.moe_plan word for word, slot, src, n,
+  rows_local, order, bounds and wpre, at four chunk sizes on route-like ids and on ids repeating an expert inside a
+  token, on a stale mmq_hist, with experts held on the CPU through cpu_mask, and on every fixture; every word past
+  them keeps the 0xFF fill.
+- test_mmq_plan_routed_id_out_of_range: a routed id outside [0, n_expert) in the chunk's partial last range sets
+  StepState's error to BASALT_ERR_EXPERT_ID with done, and slot, src and plan keep their 0xFF fill (basalt refuses at
+  prefill.cpp:1843, before its first write); a step that arrives with done set stores nothing at all."""
 
 import functools
 
@@ -44,6 +52,7 @@ import numpy as np
 import pytest
 
 from monolith import kernels
+from monolith.core.step_state import StepStateLayout
 from tests.contract import gguf_reference
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu
@@ -489,3 +498,96 @@ def test_mmq_swiglu_edges():
     (da, ca), (db, cb) = _groups(want), _groups(emu.mmq_quantize(emu.cuda_nan(keep)))
     differ = set(zip(*(a.tolist() for a in np.nonzero((da != db) | (ca != cb).any(axis=-1)))))
     assert differ == {(3, 0), (3, 1)}, sorted(differ)
+
+
+def _plan_ids(rng, R):
+    """R tokens of ten distinct routed ids, as route_kernel gives them: slot 0 is expert 7 in three tokens of four (so
+    mostly more than 8 of a full range's 16 tokens route to it), the other slots uniform on [0, 448) without 7 or a
+    repeat, and token R // 2's slot 9 is expert 500, its only row: experts 448-511 but 500 hold none."""
+    ids = np.argsort(rng.random((R, 447)), axis=1)[:, :10]
+    ids += ids >= 7
+    ids[rng.random(R) < 0.75, 0] = 7
+    ids[R // 2, 9] = 500
+    return ids
+
+
+def _check_plan(got, ids, B, cpu=(), n_expert=512, what=""):
+    """gpu.mmq_plan's ``got`` against emu.moe_plan(ids, n_expert, cpu), basalt's host walk, word for word: slot's R
+    rows, src's 10 R rows, the plan's n, rows_local, order[n], bounds[n + 1] and wpre[n + 1] (gpu.plan_words), every
+    other word still the 0xFF fill (-1); StepState's error and done 0. Returns the walk's plan."""
+    want = emu.moe_plan(ids, n_expert, cpu)
+    R = len(ids)
+    slot, src = np.full((B, 10), -1, np.int32), np.full(10 * B, -1, np.int32)
+    slot[:R], src[:10 * R] = want.slot, want.src
+    assert (got.state["error"], got.state["done"]) == (0, 0), (what, got.state["error"], got.state["done"])
+    for name, a, b in (("plan", got.plan, gpu.plan_words(want)), ("slot", got.slot.ravel(), slot.ravel()),
+                       ("src", got.src, src)):
+        bad = np.flatnonzero(a != b)
+        assert not len(bad), f"{what}: {len(bad)} {name} words differ, first {bad[0]}: {a[bad[0]]} for {b[bad[0]]}"
+    return want
+
+
+@pytest.mark.parametrize("R", [1, 17, 256, 4096], ids=lambda r: f"R={r}")
+def test_mmq_plan_matches_host_walk(R):
+    """No basalt test (basalt's walk is host code; integers, so bitwise): the plan kernels basalt_mmq_plan_count,
+    _scan and _fill, in one command buffer at bound B = 4096, equal emu.moe_plan, the transcription of basalt's host
+    walk (prefill.cpp:1840-1932, :1993-1996), word for word: slot, src, n, rows_local, order, bounds and wpre, and every
+    word past them keeps the 0xFF fill; id rows past R hold 512 and -1 and the scratch starts as 0xFF, so a kernel that
+    reads past the chunk's pairs or ranges raises a false error 5. Ids on R tokens: route-like (_plan_ids: an expert
+    on more than 8 of the first range's 16 tokens, one with a single row, at least 63 with none) and repeating experts
+    inside a token (a token of ten 3s on ten consecutive rows; every src row below 10 R written). At R = 17 also the
+    stale scratch: after an R = 256 plan on the same un-cleared mmq_hist, the 17 tokens' plan is still theirs. At R =
+    256 also residency (L10): cpu_mask nonzero (1, 2^31, 2^32 - 1, 2, 3) for four experts with rows and one without,
+    the walk's plan with those experts' rows the last block in id order (prefill.cpp:1907-1908): the mechanics of the
+    input, not the CPU-share rule; and every fixture configuration at its own token count, N_EXPERT 64 (cpu_mask 64
+    words)."""
+    B = 4096
+    rng = np.random.default_rng(9 + R)
+    ids = _plan_ids(rng, R)
+    cnt = np.bincount(ids.ravel(), minlength=512)
+    assert cnt[500] == 1 and np.count_nonzero(cnt == 0) >= 63 and (R < 16 or np.count_nonzero(ids[:16] == 7) > 8)
+    want = _check_plan(gpu.mmq_plan(ids, B=B), ids, B, what="route-like")
+    assert want.rows_local == 10 * R
+    rep = rng.integers(0, 40, (R, 10))
+    rep[0] = 3
+    got = gpu.mmq_plan(rep, B=B)
+    _check_plan(got, rep, B, what="repeats")
+    assert np.all(got.src[:10 * R] >= 0) and np.array_equal(np.diff(got.slot[0]), np.ones(9)), got.slot[0]
+    if R == 17:
+        ids256 = _plan_ids(rng, 256)
+        first = gpu.mmq_plan(ids256, B=B)
+        _check_plan(first, ids256, B, what="stale scratch's first plan")
+        _check_plan(gpu.mmq_plan(ids, B=B, hist=first.hist), ids, B, what="stale scratch")
+    if R == 256:
+        routed = np.setdiff1d(ids, [7, 500])
+        cpu = [7, 500, *rng.choice(routed, 2, replace=False), 470]
+        mask = np.zeros(512, np.uint32)
+        mask[cpu] = [1, 1 << 31, 2 ** 32 - 1, 2, 3]
+        want = _check_plan(gpu.mmq_plan(ids, B=B, cpu_mask=mask), ids, B, cpu, what="cpu_mask")
+        assert want.rows_local < 10 * R and 470 not in ids
+        for name in fx.CONFIGS:
+            cfg = fx.config(name)
+            _check_plan(gpu.mmq_plan(cfg.ids, B=B, n_expert=fx.E), cfg.ids, B, n_expert=fx.E, what=name)
+
+
+@pytest.mark.parametrize("n_expert,bad", [(512, (512, -1)), (512, (512,)), (512, (-1,)), (64, (64,))],
+                         ids=["512,-1", "512", "-1", "64-of-64"])
+def test_mmq_plan_routed_id_out_of_range(n_expert, bad):
+    """R 7.5, eng-review D23: the plan kernels alone at R = 17 (bound B = 256), token 16, alone in the chunk's partial
+    last range, holding ``bad`` among valid ids: 512 and -1 together and each alone at basalt's 512 experts, and 64 at
+    N_EXPERT 64 (the fixtures' count; cpu_mask 64 words). basalt refuses ``if (e < 0 || e >= m.g->n_expert) { err =
+    "prefill: routed id out of range"; return false; }`` (prefill.cpp:1843) inside its counting loop, before its first
+    off, slot or src write (:1897-1916): StepState takes error BASALT_ERR_EXPERT_ID and done, its other words unchanged,
+    and slot, src and plan keep their 0xFF fill (mmq_hist, which plan_count writes first, is scratch and not compared).
+    A step that arrives with done set (any later layer of the refused step) stores nothing at all, mmq_hist included."""
+    ids = _plan_ids(np.random.default_rng(8), 17) % n_expert
+    ids[16, 3: 3 + len(bad)] = bad
+    layout = StepStateLayout()
+    for done in (0, 1):
+        got = gpu.mmq_plan(ids, B=256, n_expert=n_expert, done=done)
+        want = layout.unpack(layout.pack({"t_this_step": 17, "done": done}))
+        if not done:
+            want.update(error=kernels.BASALT_ERR_EXPERT_ID, done=1)
+        assert got.state == want, (done, got.state["error"], got.state["done"])
+        assert all(np.all(a == -1) for a in (got.slot, got.src, got.plan)), done
+        assert not done or got.hist == b"\xff" * len(got.hist)

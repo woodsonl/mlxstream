@@ -30,13 +30,17 @@
 //
 // The kernels (spec-kernels-mmq.md 9.1). Each returns at StepState.done before its first load, so once the plan
 // refuses a routed id nothing more of the step is stored.
+// - basalt_mmq_plan_count, basalt_mmq_plan_scan, basalt_mmq_plan_fill: basalt's host walk over the chunk's routed ids
+//   (prefill.cpp:1840-1932, :1993-1996) as integer passes: per-range counts, one threadgroup's scans in expert-id
+//   order, a stable fill; the plan, slot and src every later kernel reads.
 // - basalt_mmq_quantize (kernel 1): the layer's activations to Xq through the plan's src (quantize.cu:10-84, launched
 //   :94-96 from prefill.cpp:1990).
 // - basalt_mmq_swiglu_quantize (kernel 3): GU's split halves to Hq, mmq::swiglu (moe_mmq.cu:85-93) fused with the
 //   quantizer on H (prefill.cpp:2257-2258's group calls), compiled with the down product's macros (K = n_ff).
 //
 // Macros (monolith/kernels.py basalt_mmq_macros): MMQ_TYPE (42 Q2_0, 8 Q8_0), K, NTY, LD, BPNE, BPI, NITER, MMQ_DOWN,
-// MMQ_DENSE, ROWS_PER_T, MMQ_SM_COUNT, MAT_OFF, MMQ_ERR; and PROMPT_ROWS' T_SRC, ROWS_MAX and T_STATIC_ROWS.
+// MMQ_DENSE, ROWS_PER_T, MMQ_SM_COUNT, MAT_OFF, MMQ_ERR, N_EXPERT, MMQ_RANGE; and PROMPT_ROWS' T_SRC, ROWS_MAX and
+// T_STATIC_ROWS.
 #pragma STDC FP_CONTRACT OFF
 
 // quantize.cu:53-56 (q.x = roundf(xi.x*d_inv)): FADD.FTZ.RZ of copysign(0.5, v), F2I.TRUNC.NTZ (s32, saturating, NaN
@@ -89,8 +93,123 @@ static inline uint mmq_piece_mask(int t, int ntiles, int bpne, int bpi, int grid
 }
 
 // The plan's int32 words (monolith/kernels.py MMQ_PLAN_WORDS): n, rows_local, order[512], then bounds[513] from word
-// MMQ_BOUNDS, then wpre[513].
+// MMQ_BOUNDS, then wpre[513] from word MMQ_WPRE.
 constant int MMQ_BOUNDS = 514;
+constant int MMQ_WPRE = 1027;
+constant uint MMQ_EXPERTS = 512;   // the plan's expert slots; the model's N_EXPERT <= 512
+constant uint MMQ_TOPK = 10;       // routed experts per token: ids rows of 10 pairs (t, k), pair i = 10 t + k
+
+// The plan kernels (spec-kernels-mmq.md 9.4): basalt's host walk over one chunk's routed ids, integer only, so every
+// output equals the sequential walk's whatever the ranges, the threadgroups or the order in which atomic adds land.
+// ids [B][MMQ_TOPK] (rows t >= R never read); hist, the mmq_hist scratch [ceil(B / MMQ_RANGE)][MMQ_EXPERTS + 1],
+// shared by every layer and chunk and never cleared: only the NR = ceil(R / MMQ_RANGE) ranges of this chunk's R rows
+// are touched, range r holding tokens MMQ_RANGE r .. + MMQ_RANGE - 1. No peer block: the GPU's experts in id order,
+// then cpu_mask's (basalt's on_cpu) as the last block.
+
+// Count (prefill.cpp:1840-1845): range r's pairs per expert id, an id outside [0, N_EXPERT) at column MMQ_EXPERTS,
+// basalt's ``if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }`` (:1843),
+// which basalt_mmq_plan_scan raises. Integer adds, so their order changes no count. Grid ceil(B / MMQ_RANGE) x
+// MMQ_THREADS; ranges at or past R return.
+kernel void basalt_mmq_plan_count(device const int* ids [[buffer(0)]], device int* hist [[buffer(1)]],
+                                  device const StepState* st [[buffer(15)]],
+                                  uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                                  uint nt [[threads_per_threadgroup]]) {
+    if (st->done) return;                                                    // uniform: before any load
+    const uint R = prompt_rows(st);
+    if (r * MMQ_RANGE >= R) return;                                          // uniform per threadgroup
+    threadgroup atomic_int h[MMQ_EXPERTS + 1];
+    for (uint e = tid; e <= MMQ_EXPERTS; e += nt) atomic_store_explicit(&h[e], 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const int* rid = ids + ulong(r) * (MMQ_RANGE * MMQ_TOPK);
+    const uint np = min(R - r * MMQ_RANGE, uint(MMQ_RANGE)) * MMQ_TOPK;     // the range's pairs with t < R
+    for (uint i = tid; i < np; i += nt) {                                    // :1841-1844
+        const int e = rid[i];
+        atomic_fetch_add_explicit(&h[e < 0 || e >= N_EXPERT ? MMQ_EXPERTS : uint(e)], 1, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e <= MMQ_EXPERTS; e += nt)
+        hist[ulong(r) * (MMQ_EXPERTS + 1) + e] = atomic_load_explicit(&h[e], memory_order_relaxed);
+}
+
+// Scan (prefill.cpp:1843, :1896-1909, :1926-1932, :1995-1996), one threadgroup of MMQ_EXPERTS threads, thread e
+// expert id e. First the refusal: if any of the NR ranges counted an absent pair, StepState takes error MMQ_ERR and
+// done and nothing else is stored, as basalt returns inside its counting loop before its first off, slot or src write
+// (:1897-1916). Else cnt[e] = column e over the NR ranges; off[e] the exclusive scan in id order of the GPU's experts'
+// counts from 0 (:1897-1902), then of cpu_mask's experts' from rows_local, the first scan's total (:1907-1908, :1893);
+// n and order the GPU's experts with rows in id order (:1927-1930); bounds[j] = off[order[j]], bounds[n] = rows_local
+// (:1995-1996); wpre the exclusive prefix of ceil(cnt / 8) in that order (kernels 2 and 4's work items of 8 rows).
+// Column e of each range becomes fill[e] at the range's first pair (:1911): off[e] plus the earlier ranges' counts.
+kernel void basalt_mmq_plan_scan(device int* hist [[buffer(1)]], device int* plan [[buffer(2)]],
+                                 device const uint* cpu_mask [[buffer(5)]], device StepState* st [[buffer(15)]],
+                                 uint e [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    if (st->done) return;                                                    // uniform: before any load
+    const uint nr = (prompt_rows(st) + MMQ_RANGE - 1) / MMQ_RANGE;
+    threadgroup bool absent[MMQ_EXPERTS / 32];
+    threadgroup int4 part[MMQ_EXPERTS / 32];
+    bool bad = false;
+    for (uint r = e; r < nr; r += MMQ_EXPERTS) bad = bad || hist[ulong(r) * (MMQ_EXPERTS + 1) + MMQ_EXPERTS] != 0;
+    bad = simd_any(bad);
+    if (lane == 0) absent[sg] = bad;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 0; s < MMQ_EXPERTS / 32; ++s) bad = bad || absent[s];
+    if (bad) {                                                               // uniform: the threadgroup's OR
+        if (e == 0) { st->error = uint(MMQ_ERR); st->done = 1u; }            // advance.metal:22's form
+        return;
+    }
+    device int* col = hist + e;
+    int cnt = 0;
+    for (uint r = 0; r < nr; ++r) cnt += col[ulong(r) * (MMQ_EXPERTS + 1)];
+    const bool cpu = int(e) < N_EXPERT && cpu_mask[e] != 0u, run = !cpu && cnt > 0;   // cpu_mask is U32 [N_EXPERT]
+    const int4 v = int4(cpu ? 0 : cnt, cpu ? cnt : 0, run ? 1 : 0, run ? (cnt + 7) / 8 : 0);
+    int4 x = simd_prefix_exclusive_sum(v);                                   // integer: exact in any order
+    if (lane == 31) part[sg] = x + v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int4 all = int4(0);
+    for (uint s = 0; s < MMQ_EXPERTS / 32; ++s) {
+        if (s < sg) x += part[s];
+        all += part[s];
+    }
+    const int off = cpu ? all.x + x.y : x.x;                                 // all.x = rows_local
+    int f = off;
+    for (uint r = 0; r < nr; ++r) {
+        device int* w = col + ulong(r) * (MMQ_EXPERTS + 1);
+        const int c = *w;
+        *w = f;
+        f += c;
+    }
+    if (run) {
+        plan[2 + x.z] = int(e);
+        plan[MMQ_BOUNDS + x.z] = off;
+        plan[MMQ_WPRE + x.z] = x.w;
+    }
+    if (e == 0) {
+        plan[0] = all.z;                                                     // n
+        plan[1] = all.x;                                                     // rows_local
+        plan[MMQ_BOUNDS + all.z] = all.x;
+        plan[MMQ_WPRE + all.z] = all.w;
+    }
+}
+
+// Fill (prefill.cpp:1911-1917): pair i = MMQ_TOPK t + k of range r, one thread each, takes p = fill[e]++ as basalt's
+// walk in pair order gives it, fill[e] at the range's first pair (basalt_mmq_plan_scan's column) plus the range's
+// earlier pairs routed to e. An expert's rows are its pairs in pair order, a token's repeated id included (consecutive
+// rows), so no two pairs share a row and every row below 10 R is written once. Grid ceil(B / MMQ_RANGE) x
+// MMQ_RANGE * MMQ_TOPK; pairs with t >= R return. It never meets an absent id: basalt_mmq_plan_scan set done for one.
+kernel void basalt_mmq_plan_fill(device const int* ids [[buffer(0)]], device const int* hist [[buffer(1)]],
+                                 device int* slot [[buffer(3)]], device int* src [[buffer(4)]],
+                                 device const StepState* st [[buffer(15)]],
+                                 uint r [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]]) {
+    if (st->done) return;                                                    // uniform: before any load
+    const uint t = r * MMQ_RANGE + i / MMQ_TOPK;
+    if (t >= prompt_rows(st)) return;                                        // ranges at or past R too
+    device const int* rid = ids + ulong(r) * (MMQ_RANGE * MMQ_TOPK);
+    const int e = rid[i];
+    int p = hist[ulong(r) * (MMQ_EXPERTS + 1) + uint(e)];
+    for (uint j = 0; j < i; ++j) p += int(rid[j] == e);                      // at most 159 earlier pairs
+    slot[ulong(r) * (MMQ_RANGE * MMQ_TOPK) + i] = p;                         // :1914-1915
+    src[p] = int(t);                                                         // :1916
+}
 
 // quantize.cu:39-81 in the D4 layout (spec-kernels-mmq.md 3.2 steps 1-6, 9.7): the thread's four values xi are values
 // iqs .. iqs + 3 of the block_q8_1_mmq at blk (36 words: d4[4], then the 128 int8 codes), and the 8 lanes of each

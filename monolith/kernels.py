@@ -792,7 +792,7 @@ def basalt_mmq_source() -> str:
 
 
 def basalt_mmq_macros(product: str, *, sm_count: int = DENSE_TC_SM_COUNT, rows_per_t: int = 1, n: int = 0,
-                      k: int = 0) -> Dict[str, str]:
+                      k: int = 0, n_expert: int = 512) -> Dict[str, str]:
     """The macros of an MMQ product. ``gate_up`` and ``down``: the routed experts' Q2_0 / Q2_0 native blobs at 2560 /
     640 (basalt_expert_layout; prefill.cpp:2252-2264's products): gate then up, 1280 rows of 2560, at the blob; down,
     2560 rows of 640, MAT_OFF ushorts into it. ``q8_0``: draft_kv's dense Q8_0 matrix [n, k] (prefill.cpp:971-992),
@@ -802,7 +802,9 @@ def basalt_mmq_macros(product: str, *, sm_count: int = DENSE_TC_SM_COUNT, rows_p
     BPNE a row's weight blocks (64 values for Q2_0, 32 for Q8_0), BPI those of a 256-value k iteration (mmq.cuh:13),
     NITER the iterations (the down product's last one padded), MMQ_SM_COUNT the multiprocessors whose stream-k pieces
     the kernels reproduce (basalt's 170 by default, never this GPU's), MMQ_ERR the StepState error code of a routed id
-    out of range."""
+    out of range. Every product also carries the plan kernels' macros, as one library holds them all: N_EXPERT, the
+    model's experts (an id outside [0, n_expert) is out of range, prefill.cpp:1843; at most the plan's 512 slots), and
+    MMQ_RANGE."""
     lay = basalt_expert_layout(2560, 640)
     shapes = {"gate_up": (42, lay["n_embd"], 2 * lay["n_ff"], 0),
               "down": (42, lay["n_ff"], lay["n_embd"], lay["down_off"] // 2), "q8_0": (8, k, n, 0)}
@@ -811,6 +813,8 @@ def basalt_mmq_macros(product: str, *, sm_count: int = DENSE_TC_SM_COUNT, rows_p
     dense = product == "q8_0"
     if sm_count < 1 or rows_per_t < 1:
         raise ValueError(f"basalt_mmq: sm_count and rows_per_t must be positive, got {sm_count}, {rows_per_t}")
+    if not 0 < n_expert <= 512:
+        raise ValueError(f"basalt_mmq: n_expert must be in 1..512 (the plan's expert slots), got {n_expert}")
     if not dense and (n or k or rows_per_t != 1):
         raise ValueError(f"basalt_mmq: {product} has the experts' fixed shape, so no n, k or rows_per_t; got {n}, {k}, "
                          f"{rows_per_t}")
@@ -821,7 +825,8 @@ def basalt_mmq_macros(product: str, *, sm_count: int = DENSE_TC_SM_COUNT, rows_p
     return {"MMQ_TYPE": str(type_id), "K": str(kk), "NTY": str(rows // 128), "LD": str(rows), "BPNE": str(bpne),
             "BPI": str(bpi), "NITER": str(-(-bpne // bpi)), "MMQ_DOWN": str(int(product == "down")),
             "MMQ_DENSE": str(int(dense)), "ROWS_PER_T": str(rows_per_t), "MMQ_SM_COUNT": str(sm_count),
-            "MAT_OFF": str(mat_off), "MMQ_ERR": str(BASALT_ERR_EXPERT_ID)}
+            "MAT_OFF": str(mat_off), "MMQ_ERR": str(BASALT_ERR_EXPERT_ID), "N_EXPERT": str(n_expert),
+            "MMQ_RANGE": str(MMQ_RANGE)}
 
 
 # ---- the other decode kernels -------------------------------------------------------------------------------
