@@ -781,6 +781,22 @@ def basalt_gr_post_grid(n_embd: int, hc: int, t: int) -> Tuple[int, int]:
     return -(-t * hc * n_embd // 256), 256
 
 
+# ---- basalt's router top-10 (kernels/common/basalt_router.metal; docs/research/basalt-nvcc/hc_fused.md section 8)
+# The grid below is adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_router.cu:121-128 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+def basalt_router_source() -> str:
+    """basalt's ``route`` (``native_router_top10``, ``native_router_top10_multi``) and the fused read's ``hc_top10``
+    (``basalt_router_top10``): the softmax of 512 router logits per token and its ten largest probabilities."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_router.metal")
+
+
+def basalt_router_grid(n_tok: int) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup): one SIMD-group per token, threadgroup k token k (basalt's multi
+    launcher's ``dim3(n_tok)`` blocks, native_router.cu:121-128, without the 224 threads ``route`` returns at once)."""
+    return n_tok, 32
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)

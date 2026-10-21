@@ -4,7 +4,8 @@
 # adapted from basalt (jesdga95/basalt) src/kernels/cuda/hc_fused.cu:1171-1197 (hc8_quant_kernel),
 # src/core/model_file.cpp:487-513 (hc8_read), src/kernels/hc8_parity.cpp:69-99 (hc8_parity's matrices),
 # src/kernels/gr_parity.cpp:136-156 (gr_parity's metrics), :433-454, :621-623, :675 (its write fixture), :679-688
-# (its double write) and src/kernels/cuda/native_gr_postops.cu:65-74 (native_gr_post's arithmetic) @
+# (its double write), src/kernels/router_top10_parity.cpp:33-60 (its router reference), :87-88 (its weight metric),
+# :119-146 (its fixtures) and src/kernels/cuda/native_gr_postops.cu:65-74 (native_gr_post's arithmetic) @
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, the last of which adapts ggml-org/llama.cpp
 # ggml/src/ggml-cuda/{dsv4-hc.cu,scale.cu,unary.cu,unary.cuh} @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT;
 # third_party/NOTICE).
@@ -24,6 +25,9 @@ two cannot share a mistake.
 * ``gr_post_emulation``: ``native_gr_post`` as nvcc compiles it (docs/research/basalt-nvcc/native_gr_postops.md
   section 1), every operation ``.FTZ`` through ``tests/kernels/basalt_emu.py``'s helpers, with the approximate
   exponential the caller's; ``cuda_nan``: a stored NaN as sm_120's.
+* ``router_reference``, ``near_tie_guard``, ``rel_w``, ``router_cases``: router_top10_parity's double reference of the
+  router's softmax and top 10 (``RENORM_CLAMP`` its floor), the guard that keeps near-ties out of its fixtures, its
+  weight metric, and its four fixtures, drawn with numpy.
 """
 
 import struct
@@ -167,3 +171,66 @@ def cuda_nan(x):                                    # kernels/common/basalt_fp.m
     bits."""
     u = np.ascontiguousarray(x, np.float32).view(np.uint32)
     return np.where((u & 0x7FFFFFFF) > 0x7F800000, np.uint32(0x7FFFFFFF), u).view(np.float32)
+
+
+RENORM_CLAMP = 6.103515625e-05                           # router_top10_parity.cpp:33 (2**-14)
+
+
+def router_reference(logits, k=10):                      # router_top10_parity.cpp:35-60, per row
+    """router_top10_parity's host reference of the router on ``logits [n, ne]`` (float32), every step float64: the
+    softmax with its sum sequential in index order, a stable descending order (equal ``p`` keep index order: the lower
+    expert id wins a tie), the top ``k`` gathered, their unrounded sum floored at ``RENORM_CLAMP`` and each weight
+    ``float32(float64(float32(p)) / sum)``. Returns ``(ids [n, k] int32, weights [n, k] float32, ids [n, k + 1],
+    p [n, k + 1])``, the last two ranks 0..k of the order and their double ``p``, for ``near_tie_guard``."""
+    logits = np.asarray(logits, np.float32)
+    n, ne = logits.shape
+    ids, w, p11 = np.empty((n, k + 1), np.int32), np.empty((n, k), np.float32), np.empty((n, k + 1))
+    for t in range(n):
+        x = logits[t].astype(np.float64)
+        mx = x[0]
+        for e in range(1, ne):
+            mx = max(mx, x[e])                           # std::max(mx, x): mx unless mx < x (:38)
+        p = np.exp(x - mx)                               # :42
+        s = 0.0
+        for e in range(ne):
+            s += p[e]                                    # sequential, index order (:43)
+        p = p / s                                        # :45
+        idx = np.argsort(-p, kind="stable")              # stable descending: equal p keep index order (:47-51)
+        ss = 0.0
+        for i in range(k):
+            ss += p[idx[i]]                              # the unrounded p, in rank order (:56)
+        ss = max(ss, RENORM_CLAMP)                       # :58
+        w[t] = (p[idx[:k]].astype(np.float32).astype(np.float64) / ss).astype(np.float32)   # :55, :59
+        ids[t], p11[t] = idx[:k + 1], p[idx[:k + 1]]
+    return ids[:, :k], w, ids, p11                       # ids, weights; ranks 0..10 (ids and p) for the guard
+
+
+def near_tie_guard(p11, rel=1e-5):                       # ranks 0..10 exactly equal or apart > rel
+    """True when, for every token, the reference's double ``p`` at ranks 0..10 (``router_reference``'s last output)
+    are pairwise either exactly equal (an exact tie, which the tie rule decides on both sides) or apart by more than
+    ``rel`` relative: then no near-tie, which the kernel's float32 ``p`` could order differently, decides an id, and
+    router_top10_parity's exact ids are a property of a correct port. A fixture that fails it is redrawn in the test's
+    source, never skipped."""
+    a, b = p11[:, :, None], p11[:, None, :]
+    return bool(np.all((a == b) | (np.abs(a - b) > rel * np.maximum(np.abs(a), np.abs(b)))))
+
+
+def rel_w(got, ref):                                     # router_top10_parity.cpp:87-88, elementwise
+    """router_top10_parity's weight metric ``|got - ref| / |ref|``, the denominator floored at 1e-30, in float64."""
+    g, r = got.astype(np.float64), ref.astype(np.float64)
+    return np.abs(g - r) / np.where(np.abs(r) > 1e-30, np.abs(r), 1e-30)
+
+
+def router_cases(seed=2024, nt=64, ne=512):     # router_top10_parity.cpp:119-146; 2024 = std::mt19937 rng(2024), :122
+    """router_top10_parity's four fixtures in its order, ``{name: logits [nt, ne] float32}``, numpy's normals in place
+    of its ``std::normal_distribution`` ones: "random normal" N(0, 1); "all equal (ties)" every logit 0.5; "12-way
+    exact tie" experts 0..11 at 2.0, the rest N(0, 1); "dominant expert" 20.0 at expert ``t % ne`` of token t, every
+    other logit 0."""
+    rng = np.random.default_rng(seed)
+    rand = rng.standard_normal((nt, ne), dtype=np.float32)                  # "random normal" (:126-129)
+    equal = np.full((nt, ne), 0.5, np.float32)                              # "all equal (ties)" (:131-134)
+    tie12 = rng.standard_normal((nt, ne), dtype=np.float32)
+    tie12[:, :12] = 2.0                                                     # "12-way exact tie" (:136-141)
+    dom = np.zeros((nt, ne), np.float32)
+    dom[np.arange(nt), np.arange(nt) % ne] = 20.0                           # "dominant expert" (:143-146)
+    return {"random normal": rand, "all equal (ties)": equal, "12-way exact tie": tie12, "dominant expert": dom}

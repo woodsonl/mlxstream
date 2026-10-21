@@ -475,3 +475,18 @@ def gr_post(R, bo, inj, T, n_embd, hc, *, in_place=True, fill=0xFF):
     assert not r.error, r.error
     f32 = lambda b: np.frombuffer(b.read(0, b.nbytes), np.float32)
     return f32(b_out).reshape(8, hc, n_embd), f32(b_bo).reshape(8, n_embd), f32(b_inj).reshape(8, hc)
+
+
+def top10(logits, n_tok, fill=0xFF):
+    """``basalt_router_top10`` (basalt's ``route``) over the ``n_tok`` rows of 512 float32 ``logits`` in one dispatch,
+    into ids and weights buffers of ``n_tok + 1`` rows whose bytes start as ``fill``; asserts that row ``n_tok`` of
+    both kept them (a store past the window, which shader validation cannot see). Returns rows ``< n_tok``: the ids as
+    int32 and the weights as float32, [n_tok, 10] each."""
+    grid, threads = kernels.basalt_router_grid(n_tok)
+    x = np.ascontiguousarray(logits, np.float32).reshape(n_tok, 512)
+    out = run(pipeline(kernels.basalt_router_source(), "basalt_router_top10"),
+              [x.tobytes(), 40 * (n_tok + 1), 40 * (n_tok + 1)], None, 0, grid, threads, fill)
+    for name, b in (("ids", out[1]), ("weights", out[2])):
+        assert bytes(b[40 * n_tok:]) == bytes([fill]) * 40, f"{name}: a store into the row past the window"
+    return (np.frombuffer(out[1], np.int32)[: 10 * n_tok].reshape(n_tok, 10),
+            np.frombuffer(out[2], np.float32)[: 10 * n_tok].reshape(n_tok, 10))
