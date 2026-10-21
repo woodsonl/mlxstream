@@ -28,7 +28,15 @@ exists), then the Metal port's (kernels/common/basalt_mmq.metal).
   of scripts/mmq_pieces.py's sweep and of the fixtures' plans.
 - test_mmq_quantize_edges (M1): kernel 1, basalt_mmq_quantize, alone: Xq's bytes equal emu.mmq_quantize's on every
   slot through the plan's src, the edge groups (NaN, subnormal, d_inv = +inf, +-inf, roundf's ties) hold their literal
-  codes and scales, and slots at or past bounds[n] keep the 0xFF fill, with and without experts held on the CPU."""
+  codes and scales, and slots at or past bounds[n] keep the 0xFF fill, with and without experts held on the CPU.
+- test_mmq_swiglu_quantize_fused (M2): kernel 3, basalt_mmq_swiglu_quantize (mmq::swiglu fused with the quantizer on
+  H), alone: Hq's bytes equal the separate path's (emu.mmq_swiglu's stored H, then emu.mmq_quantize, with the GPU's
+  expf_ftz) on g and u's edge values, each pair as a whole group and as one value among plain ones, and on plain rows;
+  the uniform groups' NaN, infinite, zero and finite h give their literal bytes, the padding blocks are zero, and slots
+  at or past bounds[n] keep the 0xFF fill, with and without experts held on the CPU.
+- test_mmq_swiglu_edges (SG-1, spec-tests-moe.md 7.2): kernel 3 on the edge pairs where flushing decides h, each alone
+  in its group: Hq's bytes equal the emulator's, and the emulator without the flushes (a port that keeps subnormals)
+  differs in exactly the first two edge groups."""
 
 import functools
 
@@ -387,3 +395,97 @@ def test_mmq_quantize_edges():
                     c = blk[16 + 32 * g: 48 + 32 * g].view(np.int8)
                     assert d4 is None or blk[:16].view(np.uint32)[g] == d4, (p, gi, hex(blk[:16].view(np.uint32)[g]))
                     assert all(c[i] == code for i, code in codes.items()), (p, gi, c.tolist())
+
+
+def _groups(hq):
+    """Hq's bytes [rows, blocks, 144] per 32-value group of a row, four a block: the d4 words, uint32 [rows, groups],
+    and the codes, int8 [rows, groups, 32] (block_q8_1_mmq: d4[4], then its 128 codes; group 4 b + g holds values
+    128 b + 32 g .. +31)."""
+    hq = np.asarray(hq, np.uint8)
+    return (np.ascontiguousarray(hq[..., :16]).view(np.uint32).reshape(len(hq), -1),
+            np.ascontiguousarray(hq[..., 16:]).view(np.int8).reshape(len(hq), -1, 32))
+
+
+def test_mmq_swiglu_quantize_fused():
+    """M2 (spec-kernels-mmq.md 10): kernel 3, basalt_mmq_swiglu_quantize, alone at bound B = 4 on two tokens' 20 slots.
+    The fused kernel (mmq::swiglu, moe_mmq.cu:85-93, with quantize_mmq_q8_1<D4> on its H; H never stored) gives the
+    Hq bytes of the separate path, basalt_emu.mmq_swiglu's stored H (``h[i] = g / (1.0f + __expf(-g)) * u;``, :92, in
+    fast math, through cuda_nan) then basalt_emu.mmq_quantize, with the GPU's expf_ftz. GU's rows: g in {+-0,
+    +-subnormal, +-1e-30, +-20, +-100, +-inf, NaN} against u in {+-0, +-1, +-subnormal, +-inf, NaN}, the 117 pairs
+    each as a whole 32-value group (rows 0-5: its own |h| the group's amax) and as one value among plain ones (rows
+    6-11), then plain rows (g, u ~ N(0, 3)); groups 16-19 of a row are columns 512-639, the second threadgroup's
+    values below K. The uniform groups' bytes are also checked literally: 43 pairs give a NaN h (g NaN or -inf, u NaN,
+    0 x inf), so an all-NaN group whose d4 is cuda_nan(1 / NaN) = 0x7fffffff; 14 an infinite one (d4 +inf); 50 a zero
+    one (+-0 or flushed: d4 +0); 10 a finite one (codes +-127); all with codes 0 but the finite ones. Padding blocks
+    5-7 (pad512(640), quantize.cu:39's zeros) are zero bytes (d4 +0, codes 0); slots at or past bounds[n] keep the
+    0xFF fill, with and without experts held on the CPU (bounds[n] 18 < 10 R)."""
+    rng = np.random.default_rng(5)
+    B, T = 4, 2
+    bits = lambda b: np.asarray(b, np.uint32).view(F32)
+    g_edge = np.concatenate([bits([0, 0x80000000, 0x007FFFFF, 0x80000001]),
+                             np.array([1e-30, -1e-30, 20, -20, 100, -100, np.inf, -np.inf], F32), bits([0x7FC00001])])
+    u_edge = np.concatenate([bits([0, 0x80000000]), np.array([1, -1], F32), bits([0x00400000, 0x80000001]),
+                             np.array([np.inf, -np.inf], F32), bits([0xFFA00000])])
+    gp, up = (a.ravel() for a in np.meshgrid(g_edge, u_edge, indexing="ij"))
+    gu = rng.normal(0.0, 3.0, (10 * B, 2 * fx.FF)).astype(F32)
+    i = np.arange(len(gp))
+    r, j = np.divmod(i, 20)
+    cols = 32 * j[:, None] + np.arange(32)
+    gu[r[:, None], cols], gu[r[:, None], fx.FF + cols] = gp[:, None], up[:, None]      # rows 0-5: whole groups
+    at = 32 * j + 7 * i % 32
+    gu[6 + r, at], gu[6 + r, fx.FF + at] = gp, up                                      # rows 6-11: one value each
+    want = emu.mmq_quantize(emu.mmq_swiglu(gu, basalt_gpu.expf_ftz))
+    ids = np.array([[e for e in range(20) if e % 4 in (1, 2)], [e for e in range(20) if e % 4 in (0, 3)]])
+    for cpu, local in (((), 10 * T), ((5, 12), 18)):
+        plan = emu.moe_plan(ids, 512, cpu)
+        assert plan.bounds[-1] == plan.rows_local == local
+        got = gpu.mmq_swiglu_quantize(gu, plan, B=B)
+        bad = np.argwhere(got[:local] != want[:local])
+        assert not len(bad), (f"cpu {cpu}: {len(bad)} bytes differ from the separate path, first (slot, block, "
+                              f"byte) {bad[0]}")
+        assert np.all(got[local:] == 0xFF), f"cpu {cpu}: a slot at or past bounds[n] = {local} was written"
+        assert not got[:local, 5:].any(), f"cpu {cpu}: a padding block is not zero"
+    d4, codes = _groups(got)
+    d4, codes = d4[:6, :20].reshape(-1)[:len(gp)], codes[:6, :20].reshape(-1, 32)[:len(gp)]
+    nan, inf, zero = d4 == 0x7FFFFFFF, d4 == 0x7F800000, d4 == 0
+    fin = ~(nan | inf | zero)
+    assert (nan.sum(), inf.sum(), zero.sum(), fin.sum()) == (43, 14, 50, 10)
+    assert not codes[~fin].any() and np.all(np.abs(codes[fin].astype(int)) == 127)
+    assert np.all(np.isfinite(d4[fin].view(F32)) & (d4[fin].view(F32) > 0))
+
+
+def test_mmq_swiglu_edges():
+    """SG-1 (spec-tests-moe.md 7.2): kernel 3 alone on the GU rows whose exponent edges the chain's GU never reaches,
+    4 rows x 1280 (g = GU[r][f], u = GU[r][640 + f]): rows 0-2 N(0, 3) (seed 23), row 3 an edge pair at column 32 j of
+    groups j = 0..7, every other g and u 0 (h +0, so each edge group's amax is the edge's own |h|). One token's ten
+    slots, six of them experts held on the CPU, so bounds[n] = 4: the kernel forms those four rows, at bound B = 1, and
+    the other six slots keep the 0xFF fill. Every Hq byte, padding blocks included, equals the separate path's
+    (basalt_emu.mmq_swiglu then mmq_quantize, with the GPU's expf_ftz), whose H holds the table's flushing column: -88
+    (1e30) -0, as t = 1 + e > 2^126 makes rcp_ftz +0 (div.approx.ftz's 0 for such a divisor); 2^-126 (2^100) +0, the
+    quotient 2^-127 flushed; -87 (1) a negative normal near -1.4e-36; -inf (1) NaN; +inf (2) +inf; NaN (1) NaN; 0
+    (+inf) NaN; 40 (1e38) +inf. And the same emulator with rcp_ftz and mul_ftz replaced by IEEE float32 (a port that
+    keeps subnormals: -5.3e-7 and 2^-27 there) differs from it in exactly the first two edge groups."""
+    rng = np.random.default_rng(23)
+    gu = np.zeros((10, 2 * fx.FF), F32)
+    gu[:3] = rng.normal(0.0, 3.0, (3, 2 * fx.FF))
+    gu[3, 32 * np.arange(8)] = [-88.0, 2.0 ** -126, -87.0, -np.inf, np.inf, np.nan, 0.0, 40.0]
+    gu[3, fx.FF + 32 * np.arange(8)] = [1e30, 2.0 ** 100, 1.0, 1.0, 2.0, 1.0, np.inf, 1e38]
+    plan = emu.moe_plan(np.arange(10)[None], 512, range(4, 10))
+    assert plan.bounds[-1] == plan.rows_local == 4
+    got = gpu.mmq_swiglu_quantize(gu, plan, B=1)
+    h = emu.mmq_swiglu(gu[:4], basalt_gpu.expf_ftz)
+    want = emu.mmq_quantize(h)
+    bad = np.argwhere(got[:4] != want)
+    assert not len(bad), f"{len(bad)} bytes differ from the emulator, first (row, block, byte) {bad[0]}"
+    assert np.all(got[4:] == 0xFF), "a slot at or past bounds[n] = 4 was written"
+    edge = h[3, 32 * np.arange(8)]
+    assert edge.view(np.uint32)[[0, 1, 3, 4, 5, 6, 7]].tolist() == [0x80000000, 0, 0x7FFFFFFF, 0x7F800000, 0x7FFFFFFF,
+                                                                     0x7FFFFFFF, 0x7F800000], edge
+    assert -1.5e-36 < edge[2] < -1.3e-36, edge[2]
+    g, u = gu[:4, :fx.FF], gu[:4, fx.FF:]
+    with np.errstate(all="ignore"):
+        keep = (F32(1.0) / emu.add_ftz(basalt_gpu.expf_ftz(-g), F32(1.0))) * g * u
+    assert abs(keep[3, 0] / F32(-5.3e-7) - 1) < 0.01 and keep[3, 32] == F32(2.0 ** -27), keep[3, :64:32]
+    (da, ca), (db, cb) = _groups(want), _groups(emu.mmq_quantize(emu.cuda_nan(keep)))
+    differ = set(zip(*(a.tolist() for a in np.nonzero((da != db) | (ca != cb).any(axis=-1)))))
+    assert differ == {(3, 0), (3, 1)}, sorted(differ)

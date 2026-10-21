@@ -32,6 +32,8 @@
 // refuses a routed id nothing more of the step is stored.
 // - basalt_mmq_quantize (kernel 1): the layer's activations to Xq through the plan's src (quantize.cu:10-84, launched
 //   :94-96 from prefill.cpp:1990).
+// - basalt_mmq_swiglu_quantize (kernel 3): GU's split halves to Hq, mmq::swiglu (moe_mmq.cu:85-93) fused with the
+//   quantizer on H (prefill.cpp:2257-2258's group calls), compiled with the down product's macros (K = n_ff).
 //
 // Macros (monolith/kernels.py basalt_mmq_macros): MMQ_TYPE (42 Q2_0, 8 Q8_0), K, NTY, LD, BPNE, BPI, NITER, MMQ_DOWN,
 // MMQ_DENSE, ROWS_PER_T, MMQ_SM_COUNT, MAT_OFF, MMQ_ERR; and PROMPT_ROWS' T_SRC, ROWS_MAX and T_STATIC_ROWS.
@@ -121,4 +123,31 @@ kernel void basalt_mmq_quantize(device const float* x [[buffer(0)]], device cons
     const uint i0 = 512u * tg.y + 4u * tid;
     const float4 xi = *(device const float4*) (x + ulong(src[tg.x]) * K + i0);                     // :29-39
     mmq_quantize_block(xi, xq + (ulong(tg.x) * (K / 128) + i0 / 128u) * 36u, i0 % 128u);          // :70-71
+}
+
+// Kernel 3 (spec-kernels-mmq.md 2, 9.7): swiglu_kernel (moe_mmq.cu:85-93, interleaved false) then quantize.cu:10-84
+// on its H, as prefill.cpp:2257-2258 run mmq::swiglu and mmq::quantize on a group's rows (pad512(n_ff) values a row,
+// moe_mmq.cu:154-159), fused: H never exists, which is exact because the quantizer reads each stored h once and an
+// h's NaN payload never reaches a store (an all-NaN group stores cuda_nan(1 / NaN)). Compiled with the down
+// product's macros: K = n_ff = 640. gu [10 B][2 K] floats, slot p's gate outputs then its up outputs, its binding
+// 16-byte aligned; Hq [10 B][pad512(K) / 128] blocks of 144 bytes, a slot's row contiguous; plan its words.
+// Threadgroup (p, by) of MMQ_THREADS forms values 512 by .. 512 by + 511 of H's row p, four a thread (h below K, the
+// float4 zero of quantize.cu:39 above), and quantizes them into blocks 4 by .. 4 by + 3 of Hq's row p. Slots p >=
+// bounds[n] return. Grid (10 B, pad512(K) / 512).
+kernel void basalt_mmq_swiglu_quantize(device const float* gu [[buffer(0)]], device const int* plan [[buffer(2)]],
+                                       device uint* hq [[buffer(3)]], device const StepState* st [[buffer(15)]],
+                                       uint2 tg [[threadgroup_position_in_grid]],
+                                       uint tid [[thread_index_in_threadgroup]]) {
+    if (st->done) return;                                                    // uniform: before any load
+    if (int(tg.x) >= plan[MMQ_BOUNDS + plan[0]]) return;                     // uniform per threadgroup
+    const uint i0 = 512u * tg.y + 4u * tid;
+    float4 h = float4(0.0f);                                                 // quantize.cu:39 past ne00 = K
+    if (i0 < uint(K)) {
+        device const float* row = gu + ulong(tg.x) * (2 * K);                                         // moe_mmq.cu:90
+        const float4 g = *(device const float4*) (row + i0), u = *(device const float4*) (row + K + i0);     // :91
+        // :92 h[i] = g / (1.0f + __expf(-g)) * u: FMUL.FTZ by -log2 e and MUFU.EX2 (expf_ftz), FADD.FTZ, MUFU.RCP
+        // then FMUL.FTZ by g (div.approx.ftz), FMUL.FTZ by u (docs/research/basalt-nvcc/mmq.md section 7)
+        for (int c = 0; c < 4; ++c) h[c] = mul_ftz(mul_ftz(rcp_ftz(add_ftz(expf_ftz(-g[c]), 1.0f)), g[c]), u[c]);
+    }
+    mmq_quantize_block(h, hq + (ulong(tg.x) * ((K + 511) / 512 * 4) + i0 / 128u) * 36u, i0 % 128u);     // :70-71
 }

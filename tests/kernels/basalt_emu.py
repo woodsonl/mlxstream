@@ -1015,12 +1015,14 @@ def mmq_code(v):
 
 def mmq_quantize(x):
     """quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4> (quantize.cu:10-84; spec-kernels-mmq.md 3.2, 9.7) of float32 rows
-    [R, n], n a multiple of 128, as basalt_mmq.metal stores them: per row n / 128 block_q8_1_mmq of 144 bytes, its
-    d4[4] (each 32-value group's d, through cuda_nan) then its 128 int8 codes. Per group, in fast math: amax the max of
-    abs_ftz over the values (FMNMX.FTZ: max is exact and order-free, fmax drops a NaN), d_inv = mul_ftz(127,
+    [R, n], n a multiple of 4, as mmq::quantize launches it (moe_mmq.cu:154-159: pad512(n) values a row, those past n
+    quantize.cu:39's float4 zero) and basalt_mmq.metal stores them: per row pad512(n) / 128 block_q8_1_mmq of 144
+    bytes, its d4[4] (each 32-value group's d, through cuda_nan) then its 128 int8 codes. Per group, in fast math: amax
+    the max of abs_ftz over the values (FMNMX.FTZ: max is exact and order-free, fmax drops a NaN), d_inv = mul_ftz(127,
     rcp_ftz(amax)) (MUFU.RCP, FMUL.FTZ), the codes mmq_code(mul_ftz(x, d_inv)), d = rcp_ftz(d_inv) (MUFU.RCP); rcp_ftz
     is the contract's correctly rounded reciprocal for MUFU.RCP."""
     x = np.asarray(x, F32)
+    x = np.pad(x, ((0, 0), (0, -x.shape[1] % 512)))           # pad512 (moe_mmq.cu:21)
     v = x.reshape(-1, 32)
     amax = np.fmax.reduce(ftz(np.abs(v)), axis=1)
     d_inv = mul_ftz(F32(127.0), rcp_ftz(amax))
@@ -1098,6 +1100,18 @@ def mmq_product(xq, plan, buf, offsets, product, nsm):
     return out
 
 
+def mmq_swiglu(gu, expf):
+    """swiglu_kernel (moe_mmq.cu:85-93, interleaved false: g and u the split halves of each GU row [R, 1280]) as basalt
+    stores H [R, 640]: ``h[i] = g / (1.0f + __expf(-g)) * u;`` in fast math (FMUL.FTZ by -log2 e and MUFU.EX2, FADD.FTZ,
+    MUFU.RCP then FMUL.FTZ by g, FMUL.FTZ by u; docs/research/basalt-nvcc/mmq.md section 7), cuda_nan(mul_ftz(mul_ftz(
+    rcp_ftz(add_ftz(e, 1)), g), u)) with e = expf(-g) (spec-tests-moe.md 5.4 step 3). ``expf`` evaluates the kernel's
+    expf_ftz on an array."""
+    ff = MMQ_PRODUCTS["down"][2]
+    gu = np.asarray(gu, F32)
+    g, u = gu[:, :ff], gu[:, ff:]
+    return cuda_nan(mul_ftz(mul_ftz(rcp_ftz(add_ftz(expf(-g), F32(1.0))), g), u))
+
+
 def mmq_moe(x, plan, buf, offsets, *, expf, nsm):
     """The routed experts' MMQ chain of one MoE half on Q2_0/Q2_0 blobs at 2560 / 640, as basalt_mmq.metal's four
     kernels compute it (spec-tests-moe.md 5.4 steps 1-7): the tier-1 gates' emulator. ``x`` [T, 2560] float32,
@@ -1106,13 +1120,9 @@ def mmq_moe(x, plan, buf, offsets, *, expf, nsm):
     (MUFU.EX2 and fast::exp2 have no bit-exact host model; GPU tests pass basalt_gpu.expf_ftz). Returns, rows the
     plan's rows_local in sorted order: ``xq`` [rows, 20, 144], kernel 1 (each slot's token through mmq_quantize; the
     K copies of a token are byte-identical, so each token is quantized once); ``gu`` [rows, 1280], kernel 2; ``hq``
-    [rows, 8, 144], kernel 3: h = mul_ftz(mul_ftz(rcp_ftz(add_ftz(e, 1)), g), u) with e = expf(-g), g and u the split
-    halves of GU's stored row (moe_mmq.cu:85-93, interleaved false), then mmq_quantize of h and 384 zeros (pad512(640));
-    ``d`` [rows, 2560], kernel 4."""
+    [rows, 8, 144], kernel 3: mmq_quantize of mmq_swiglu's H, its 640 values and 384 zeros (pad512(640)); ``d``
+    [rows, 2560], kernel 4."""
     xq = mmq_quantize(x)[plan.src[:plan.rows_local]]
     gu = mmq_product(xq, plan, buf, offsets, "gate_up", nsm)
-    ff = MMQ_PRODUCTS["down"][2]
-    g, u = gu[:, :ff], gu[:, ff:]
-    h = mul_ftz(mul_ftz(rcp_ftz(add_ftz(expf(-g), F32(1.0))), g), u)
-    hq = mmq_quantize(np.pad(h, ((0, 0), (0, -ff % 512))))
+    hq = mmq_quantize(mmq_swiglu(gu, expf))
     return SimpleNamespace(xq=xq, gu=gu, hq=hq, d=mmq_product(hq, plan, buf, offsets, "down", nsm))

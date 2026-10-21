@@ -98,3 +98,21 @@ def mmq_quantize(x, plan, *, B):
     xq = run_rows(pso, [x.tobytes(), src.tobytes(), nbytes, plan_words(plan).tobytes()], None, 0, (slots, k // 512, 1),
                   (kernels.MMQ_THREADS, 1, 1), len(plan.slot), 0, fill=0xFF)[2]
     return np.frombuffer(xq, np.uint8).reshape(slots, k // 128, kernels.MMQ_BLOCK_BYTES)
+
+
+def mmq_swiglu_quantize(gu, plan, *, B):
+    """basalt_mmq_swiglu_quantize (kernel 3, mmq::swiglu fused with quantize_mmq_q8_1<D4> on H) of the float32 GU rows
+    ``gu`` [10 B, 1280] (slot p's gate outputs, then its up outputs) through ``plan`` (basalt_emu.moe_plan's for its R
+    tokens: slots p < bounds[n]), compiled at bound ``B`` with the down product's macros (K = n_ff = 640) and run with R
+    rows in StepState, into an Hq of the 10 B slots' pad512(640) / 128 = 8 blocks whose bytes start as 0xFF. Slot 1,
+    which kernel 3 does not bind, holds a 4-byte placeholder. Returns Hq's bytes, uint8 [10 B, 8, 144]."""
+    macros = kernels.basalt_mmq_macros("down")
+    k, slots = int(macros["K"]), B * plan.slot.shape[1]
+    kp = -(-k // 512) * 512
+    gu = np.ascontiguousarray(gu, np.float32)
+    assert gu.shape == (slots, 2 * k), f"gu {gu.shape} at bound {B}"
+    pso = prompt_pipeline(kernels.basalt_mmq_source(), "basalt_mmq_swiglu_quantize", B, macros)
+    nbytes = slots * kp // 128 * kernels.MMQ_BLOCK_BYTES
+    hq = run_rows(pso, [gu.tobytes(), 4, plan_words(plan).tobytes(), nbytes], None, 0, (slots, kp // 512, 1),
+                  (kernels.MMQ_THREADS, 1, 1), len(plan.slot), 0, fill=0xFF)[3]
+    return np.frombuffer(hq, np.uint8).reshape(slots, kp // 128, kernels.MMQ_BLOCK_BYTES)
