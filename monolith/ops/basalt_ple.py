@@ -68,15 +68,18 @@ Refused with a reason, before anything is encoded:
 
 * ``basalt_ple_block``: a dynamic-T program; T above 8 (basalt's window limit, ``verify.cpp:685-688``, and the
   snapshot slots); a key that is not an unpacked type-42 ``[10240, 2560]`` weight, a BF16 or dense-section key among
-  them (basalt's other native key types, ``ple.cu:231-235``, wait for a pack that needs them); a value that is not
-  BF16 ``[2560, 2560]``; ``rows``, ``hidden``, ``result`` or ``normalized`` not of its shape above; a norm that is not
-  F32 ``[10240]``, or taps that are not F16 ``[10240, 4]``; ``hist`` or ``snap`` not a state of its shape or missing
-  from ``updates``, or ``snap`` the same value as ``hist``; a misaligned binding; two of ``rows``, ``hidden``,
-  ``result``, ``normalized``, ``hist`` and ``snap`` in one buffer (basalt's two permitted aliases do not arise here:
-  ``result`` is a value of its own, and query == normalized is the emitter's own binding).
+  them (basalt's other native key types, ``ple.cu:231-235``, wait for a pack that needs them); a key whose ``.basalt``
+  file has no ``dense.index`` (basalt cannot tell which arm serves it and refuses to load) or a ``dense.index`` row for
+  it that is unquantized (code_bits 0, which basalt serves from that row instead, an arm the port does not build;
+  ``src/core/native_dense.cpp:95-102``), where no row, or a shape-only one, keeps the gguf tensor; a value that is
+  not BF16 ``[2560, 2560]``; ``rows``, ``hidden``, ``result`` or ``normalized`` not of its shape above; a norm that
+  is not F32 ``[10240]``, or taps that are not F16 ``[10240, 4]``; ``hist`` or ``snap`` not a state of its shape or
+  missing from ``updates``, or ``snap`` the same value as ``hist``; a misaligned binding; two of ``rows``,
+  ``hidden``, ``result``, ``normalized``, ``hist`` and ``snap`` in one buffer (basalt's two permitted aliases do not
+  arise here: ``result`` is a value of its own, and query == normalized is the emitter's own binding).
 * ``basalt_ple_commit``: a dynamic-T program; ``hist`` not a state F32 ``[10240, 9]`` in ``updates``; ``snap`` not a
   state F32 ``[8, 10240, 9]``, or in ``updates``, or the same value as ``hist``; ``commit`` not an I32 graph input of
-  at least 2 words; a misaligned binding.
+  at least 2 words, or one named after a StepState field (which binds StepState); a misaligned binding.
 
 Alignment, checked at every binding: 8 bytes for ``rows`` (the BF16 GEMV reads it as float2), 2 for ``conv1d``, 16
 for ``hist`` and ``snap`` (the snapshot's float4 copy), 4 for every other binding (basalt's spans,

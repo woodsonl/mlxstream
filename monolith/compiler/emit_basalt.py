@@ -12,16 +12,19 @@ window width).
 # their order and its refusals from src/kernels/cuda/ple.cu:204-212 and :228-356,
 # src/kernels/cuda/native_ple_postops.cu:317-361, src/kernels/cuda/native_gr_norm.cu:78-100,
 # src/kernels/cuda/elementwise.cu:277-287, src/kernels/cuda/verify_kernels.cu:1086-1090 and
-# src/core/verify.cpp:1105-1124 and :2137 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+# src/core/verify.cpp:1105-1124 and :2137, and the key's arm from src/core/native_dense.cpp:95-102 and
+# src/core/weights.cpp:129-148 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Dict, Sequence, Tuple
 
 from .. import kernels
 from ..core.dtypes import DType
 from ..core.ir import Op, Value
 from ..formats.gguf import GGML_TYPES, ggml_row_bytes
+from ..packs.basalt import BasaltSource
 
 if TYPE_CHECKING:
     from .emit import _Ctx
@@ -195,6 +198,20 @@ def _ple_block(ctx: _Ctx, op: Op) -> None:
         _, n_out, n_in = _weight(ctx, op, w, (GGML_IDS[ty],))
         if (n_out, n_in) != shape:
             raise ValueError(f"{op.kind}: {what} {w.name!r} is {ty} {[n_out, n_in]}, not {list(shape)}")
+    # the key's arm as basalt picks it from the dense.index of the file that holds it (keep_unquantized_ple_key,
+    # native_dense.cpp:95-102): no index fails the load (index_code_bits cannot open it, weights.cpp:129-132); a row
+    # of code_bits 0 serves the key from that unquantized row, an arm the port does not build; no row (-1) or a
+    # shape-only row keeps the gguf tensor
+    key = w_key.name.split("/", 1)[-1]
+    for pk in ctx.packs:
+        if not isinstance(pk, BasaltSource) or w_key.name not in pk.entries:
+            continue
+        if "dense.index" not in pk.file.sections:
+            raise ValueError(f"{op.kind}: {pk.path} holds {w_key.name!r} but no dense.index, so basalt cannot tell "
+                             "which arm serves the key and refuses to load (index_code_bits cannot open the index)")
+        if any(r.name == key and r.code_bits == 0 for r in pk.file.dense_index().rows):
+            raise ValueError(f"{op.kind}: the dense.index holds {key!r} unquantized (code_bits 0), so basalt serves "
+                             f"the key from that row, an arm this port does not build, not from {w_key.name!r}")
     for v, shape, why in ((rows, (t, n), "the window's gathered rows"), (hidden, (t, d), "the window's hidden rows"),
                           (result, (t, d), "the block's output rows"), (normalized, (t, d), "the conv norm's rows")):
         _expect(ctx, op, v, shape, DType.F32, why)
@@ -268,6 +285,36 @@ def _ple_block(ctx: _Ctx, op: Op) -> None:
             ctx.add(k[kind], bindings, (groups, 1, 1), (threads, 1, 1), f"{op.kind}:{r}:{stage}", writes=writes)
 
 
+def _ple_commit(ctx: _Ctx, op: Op) -> None:
+    """The commit's restore (verify.cpp:2137): basalt's ``copy_indexed`` of snapshot ``commit[1]`` (n_keep - 1) into
+    the history, one dispatch. The kernel reads the record's word at run time and nothing of the program's width, so
+    a commit program compiled at any width restores after every window."""
+    d, hist_rows, slots = kernels.PLE_D, kernels.PLE_HIST, kernels.PLE_SNAP_SLOTS
+    _columns(ctx, op)
+    hist, snap, record = op.inputs
+    if snap is hist:
+        raise ValueError(f"{op.kind}: {hist.name!r} is both the history and its snapshots")
+    updates = op.attrs.get("updates", ())
+    for v, shape, what, written in ((hist, (d, hist_rows), "the history", True),
+                                    (snap, (slots, d, hist_rows), "the snapshots", False)):
+        if not v.is_state:
+            raise ValueError(f"{op.kind}: {v.name!r} ({what}) is not a state")
+        if (v.name in updates) != written:
+            why = "not in updates; the commit restores it in place" if written else "in updates; it only reads them"
+            raise ValueError(f"{op.kind}: {v.name!r} ({what}) is {why}")
+        _expect(ctx, op, v, shape, DType.F32, what)
+    if not record.is_input or record.dtype != DType.I32 or math.prod(ctx.shape(record)) < 2:
+        raise ValueError(f"{op.kind}: {record.name!r} ({record.dtype} {list(ctx.shape(record))}) is not the commit "
+                         "record, an i32 graph input of at least 2 words (word 1 is n_keep - 1)")
+    bindings = [_bind(ctx, op, 0, hist, 16), _bind(ctx, op, 1, snap, 16), _bind(ctx, op, 2, record, 4)]
+    if bindings[2][1] == ctx.program.step_state:
+        raise ValueError(f"{op.kind}: {record.name!r} names a StepState field; the commit record is a host-written "
+                         "input buffer of its own, never StepState")
+    k = ctx.kernel("basalt_ple", kernels.basalt_ple_source(), "basalt_ple_restore", {})
+    groups, threads = kernels.PLE_GRIDS["restore"]
+    ctx.add(k, bindings, (groups, 1, 1), (threads, 1, 1), f"{op.kind}:restore", writes=[0])
+
+
 BASALT_HANDLERS: Dict[str, object] = {"basalt_q8_1": _q8_1, "basalt_mmvq": _mmvq, "basalt_dense_tc": _dense_tc,
                                       "basalt_dense_tc_pair": _dense_tc_pair, "basalt_mmvf": _mmvf,
-                                      "basalt_ple_block": _ple_block}
+                                      "basalt_ple_block": _ple_block, "basalt_ple_commit": _ple_commit}
