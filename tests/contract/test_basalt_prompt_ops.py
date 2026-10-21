@@ -40,10 +40,12 @@ PRODUCTS = ((320, 10240), (10240, 320), (4, 10240), (10240, 2560), (6144, 2560),
 
 
 def prompt_graph(g, src, rows=T):
-    """Both kinds at ``rows`` rows: to_f16 of x [rows, 2560] F32, and Gemm::bf16 of xb [rows, 2560] BF16 by the file's
-    two BF16 matrices (128 outputs: two column tiles; 1 output: one partial tile)."""
+    """Both kinds at ``rows`` rows: to_f16 and to_bf16 of x [rows, 2560] F32 (the PLE's key and value operands of one
+    row, prefill.cpp:1534, :1536), and Gemm::bf16 of xb [rows, 2560] BF16 by the file's two BF16 matrices (128 outputs:
+    two column tiles; 1 output: one partial tile)."""
     x = g.input("x", (rows, 2560), F32)
     op(g, "basalt_prompt_convert", [x], [g.value("x16", (rows, 2560), F16)])
+    op(g, "basalt_prompt_convert", [x], [g.value("xbf16", (rows, 2560), BF16)])
     xb = g.input("xb", (rows, 2560), BF16)
     for name in ("mmvf.q", "mmvf.gate"):
         w = weight(g, f"dense/{name}", src)
@@ -85,7 +87,8 @@ def test_dispatches_bind_step_state(src, monkeypatch, dynamic, rows, t):
     """Every dispatch of both kinds is the builders' and binds (15, step_state, 0) once, with STEP_STATE 1, ROWS_MAX
     the compiled rows B and T_SRC 0 (dynamic-T, T rows) or T_SRC 2 with T_STATIC_ROWS B. Under a budget of one tile
     the products split into static slices, one dispatch each in basalt_prompt_gemm_slices' order, each with its own
-    record (row0, col0) and the grid of its block; the conversion is one dispatch over the bound's elements."""
+    record (row0, col0) and the grid of its block; each conversion is one dispatch over the bound's elements, its
+    output's dtype choosing CV_BF16."""
     monkeypatch.setattr(kernels, "PROMPT_GEMM_MACS", TILE_K2560)
     g = Graph("step")
     prompt_graph(g, src, rows)
@@ -95,8 +98,9 @@ def test_dispatches_bind_step_state(src, monkeypatch, dynamic, rows, t):
     macros = row_macros(b, not dynamic or rows is not T)
     source = kernels.basalt_prompt_gemm_source().replace(kernels.PRELUDE, kernels.PRELUDE + LAYOUT.to_msl() + "\n", 1)
     # per dispatch: (function, its macro, the value slots, params, grid, label, written slots)
-    want = [("basalt_prompt_convert", {"CV_BF16": "0"}, [(0, "x", 0), (1, "x16", 0)],
-             kernels.basalt_prompt_convert_params(2560), (-(-b * 2560 // 256), 1, 1), "basalt_prompt_convert:to_f16:x", [1])]
+    want = [("basalt_prompt_convert", {"CV_BF16": cv}, [(0, "x", 0), (1, y, 0)],
+             kernels.basalt_prompt_convert_params(2560), (-(-b * 2560 // 256), 1, 1), f"basalt_prompt_convert:{name}:x", [1])
+            for cv, y, name in (("0", "x16", "to_f16"), ("1", "xbf16", "to_bf16"))]
     for name in ("mmvf.q", "mmvf.gate"):
         n = src.entries[f"dense/{name}"].shape[0]
         values = [(0, "xb", 0), (1, *bound[f"dense/{name}"]), (2, f"y.{name}", 0)]
@@ -308,8 +312,6 @@ REFUSALS = [
     ("K not a multiple of 16", _k16, "k must be a positive multiple of 16, got 40"),
     ("rows from n_inject", _gemm(rows=N_INJ), r"'y' has the rows n_inject \(T_SRC 1\)"),
     ("convert to F32", _convert(y_dtype=F32), r"'y' is f32; the output is F16 \(to_f16\) or BF16 \(to_bf16\)"),
-    # the valid to_bf16 op until dequant's bf16_rne_nonan merges into this branch
-    ("convert to BF16 before dequant", _convert(y_dtype=BF16), "bf16_rne_nonan, which this branch does not have yet"),
     ("convert of F16 rows", _convert(x_dtype=F16), r"'x' is f16 \[2, 64\], not f32 \[2, 64\]"),
     ("convert output of another width", _convert(y_extra=1), r"'y' is f16 \[2, 65\], not f16 \[2, 64\]"),
 ]

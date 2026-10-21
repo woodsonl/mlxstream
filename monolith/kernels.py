@@ -721,7 +721,7 @@ inline uint prompt_rows(device const StepState* st) {          // invariant 4: t
 
 def basalt_prompt_gemm_source() -> str:
     """basalt's ``Gemm::bf16`` product and ``Gemm::native``'s FP16 product (``basalt_prompt_gemm``), and the
-    conversion ``to_f16`` (``basalt_prompt_convert``)."""
+    conversions ``to_f16`` and ``to_bf16`` (``basalt_prompt_convert``)."""
     return PRELUDE + template("basalt_fp.metal") + PROMPT_ROWS + template("basalt_prompt_gemm.metal")
 
 

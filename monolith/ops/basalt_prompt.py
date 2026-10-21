@@ -26,8 +26,7 @@ through it) and static programs (the tests') are both accepted; every dispatch b
   that computes it (basalt's cuBLAS call promises none of these).
 * ``basalt_prompt_convert`` (``to_f16`` / ``to_bf16``, ``src/prefill/kernels.cu:818-833``): ``(x [T, n] F32)`` →
   ``y [T, n]`` F16 (``to_f16``) or BF16 (``to_bf16``); the output dtype picks the kernel. Element-local, so a row's
-  bits never depend on the chunk. Until dequant's ``bf16_rne_nonan`` merges into this branch, a BF16 output is
-  refused.
+  bits never depend on the chunk.
 
 Alignment, checked at every binding: 2 bytes for 16-bit values, 4 for F32 ones.
 """

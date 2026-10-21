@@ -95,22 +95,22 @@ def _product(ctx: _Ctx, op: Op, w: Tuple[int, str, int], bf16: bool, rows: int, 
 
 
 def _convert(ctx: _Ctx, op: Op) -> None:
-    """``to_f16`` (``kernels.cu:818-821``): one thread per element of the bound's rows."""
+    """``to_f16`` (``kernels.cu:818-821``) or ``to_bf16`` without ``ylo`` (``:826-833``), as the output's dtype
+    says: one thread per element of the bound's rows."""
     (x,), (y,) = op.inputs, op.outputs
     rows, macros = prompt_rows(ctx, op)
     n = ctx.shape(x)[-1]
     _expect(ctx, op, x, (rows, n), DType.F32, "the converted rows")
-    if y.dtype == DType.BF16:
-        raise ValueError(f"basalt_prompt_convert: {y.name!r} is BF16 (to_bf16), which rounds with dequant's "
-                         "bf16_rne_nonan, which this branch does not have yet")
-    if y.dtype != DType.F16:
+    if y.dtype not in (DType.F16, DType.BF16):
         raise ValueError(f"basalt_prompt_convert: {y.name!r} is {y.dtype}; the output is F16 (to_f16) or BF16 (to_bf16)")
-    _expect(ctx, op, y, (rows, n), DType.F16, "the input's rows, converted")
+    bf16 = y.dtype == DType.BF16
+    _expect(ctx, op, y, (rows, n), y.dtype, "the input's rows, converted")
     kern = ctx.kernel("basalt_prompt_gemm", kernels.basalt_prompt_gemm_source(), "basalt_prompt_convert",
-                      {**macros, "CV_BF16": "0"})
+                      {**macros, "CV_BF16": str(int(bf16))})
     prm = ctx.params("basalt_prompt_convert", kernels.basalt_prompt_convert_params(n))
     ctx.add(kern, [_bind(ctx, op, 0, x, 4), _bind(ctx, op, 1, y, 2), (2, prm, 0), (15, ctx.program.step_state, 0)],
-            (-(-rows * n // 256), 1, 1), (256, 1, 1), f"{op.kind}:to_f16:{x.name}", writes=[1])
+            (-(-rows * n // 256), 1, 1), (256, 1, 1), f"{op.kind}:{'to_bf16' if bf16 else 'to_f16'}:{x.name}",
+            writes=[1])
 
 
 BASALT_PROMPT_HANDLERS: Dict[str, object] = {"basalt_prompt_gemm": _gemm, "basalt_prompt_convert": _convert}
