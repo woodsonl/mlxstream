@@ -3,8 +3,8 @@ the dynamic-T prompt program once, at its chunk bound B, and replays it for ever
 to the chunk's rows (monolith/generate.py:604); this tier runs the handlers' dispatches (compiler/emit_basalt_prompt.py)
 that way, through Engine, over a synthetic .basalt file (tests/contract/test_basalt_ops.py ``write_file``), and checks
 what the single-kernel tier (tests/kernels/test_basalt_prompt_gemm.py) cannot see: that the handlers bind what the
-kernels read, and that a program's rows are StepState data (dynamic-T) or its compiled count (static). Each prompt
-kind joins ``graph``.
+kernels read, and that a program's rows are StepState data (dynamic-T) or its compiled count (static). The GEMM's
+kinds join ``graph``; the hyper-connection kinds run as the contract tier's ``hc_graph`` (HC-5).
 
 - GM-PROG: Gemm::bf16 (src/prefill/gemm.cu:122-132) of BF16 rows by dense/a, 48 BF16 rows over 2560 inputs
   (ssm_alpha's shape, src/prefill/prefill.cpp:1587), in dynamic-T programs at B 64 and B 128 on one StepState layout
@@ -69,3 +69,57 @@ def test_prompt_gemm_in_a_program(tmp_path):
                 f"{np.count_nonzero(y[:m] != ref[:m])} outputs below row {m} differ from the helper's, "
                 f"{np.count_nonzero(y[m:] != FILL)} at or past it written, {np.count_nonzero(again != y)} differ in "
                 "the second run")
+
+
+def test_prompt_hc_program(tmp_path):
+    """HC-5: the hyper-connection kinds (src/prefill/kernels.cu:85-204) as one half of a layer's hyper-connection, every
+    kind once and the mix in both forms (tests/contract/test_basalt_prompt_ops.py ``hc_graph``: broadcast of e into r,
+    norm of r by w, silu of lo, mix of r, rs, w and gated with and without its BF16 image, write_norm of r, bo and inj
+    by w_next into r2, write of r2, bo and inj into r3), its inputs e, lo, gated, bo, inj, w and w_next written by
+    name, in a dynamic-T program at B 64 replayed at t_this_step 1, 17 and 64 and in a static program at T 17 replayed
+    at t_this_step 1. Each replay runs twice, into outputs prefilled 0xFF before each run: every output's rows below
+    the chunk's are the single-kernel runs' (tests/kernels/test_basalt_prompt_hc.py ``run``, chained as the graph is,
+    on its fixture without edge tokens) at B 256 with every row live (asserted: every word written, one nonzero), so
+    neither the program's bound nor its form changes a row; the rest keep the fill; and the second run gives the
+    first's bits."""
+    from tests.contract.test_basalt_prompt_ops import hc_graph
+    from tests.kernels import test_basalt_prompt_hc as hc
+
+    d = hc.fixture(edges=False)                  # 256 rows; the chain's r and rs replace the fixture's
+    ref = {}
+    ref["r"], = hc.run("broadcast", d, hc.B)
+    d.update(r=ref["r"])
+    ref["rs"], ref["xn"] = hc.run("norm", d, hc.B)
+    d.update(rs=ref["rs"])
+    ref["lo16"], = hc.run("silu", d, hc.B)
+    ref["mixed"], ref["mixed_bf"], ref["mixed_h"] = hc.run("mix", d, hc.B)
+    ref["mixed2"], _, ref["mixed_h2"] = hc.run("mix", d, hc.B, mix_bf=0)
+    ref["r2"], ref["rs2"], ref["xn2"] = hc.run("write_norm", d, hc.B)
+    ref["r3"], = hc.run("write", {**d, "r": ref["r2"]}, hc.B)
+    for name, want in ref.items():
+        assert (want != np.iinfo(want.dtype).max).all() and np.count_nonzero(want), f"a vacuous reference ({name})"
+    src = BasaltSource(write_file(tmp_path / "hc.basalt", {}, {"a": (1, 64, bytes(128))}))   # hc_graph reads none
+    for t, dynamic, replays in [(64, True, [(r, r) for r in (1, 17, 64)]), (17, False, [(1, 17)])]:
+        g = Graph("step")
+        hc_graph(g)
+        eng = Engine(emit(g, src, t, dynamic_t=dynamic, layout=LAYOUT), gpu.device())
+        for name in ("e", "lo", "gated", "bo", "inj", "w", "w_next"):       # the first t rows; the weights whole
+            eng.buffers[name].write((d[name][:t] if d[name].ndim == 2 else d[name]).tobytes(), 0)
+        for r, m in replays:
+            eng.buffers[eng.program.step_state].write(LAYOUT.pack({"t_this_step": r}), 0)
+            runs = []
+            for _ in range(2):
+                for name in ref:
+                    eng.buffers[name].fill(0xFF)
+                assert eng.run(1, steps_per_cb=1, in_flight=1).steps == 1
+                runs.append({name: np.frombuffer(eng.read(name), want.dtype).reshape(t, -1)
+                             for name, want in ref.items()})
+            for name, want in ref.items():
+                y, again, fill = runs[0][name], runs[1][name], np.iinfo(want.dtype).max
+                assert np.array_equal(y[:m], want[:m]) and (y[m:] == fill).all() and np.array_equal(again, y), (
+                    "port: rows < r bitwise equal to the single-kernel chain's rows at B 256, rows >= r keep 0xFF, a "
+                    "second replay identical, the bound and the static program (at r 17) giving the same rows "
+                    f"({'dynamic-T at B' if dynamic else 'static at T'} {t}, t_this_step {r}, {name}): "
+                    f"{np.count_nonzero(y[:m] != want[:m])} words below row {m} differ from the chain's, "
+                    f"{np.count_nonzero(y[m:] != fill)} at or past it written, {np.count_nonzero(again != y)} differ "
+                    "in the second run")

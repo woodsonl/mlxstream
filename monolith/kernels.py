@@ -941,7 +941,11 @@ def basalt_dequant16_grid(rows: int, cols: int) -> Tuple[int, int]:
 
 # ---- basalt's prompt path: the hyper-connection kernels (kernels/common/basalt_prompt_hc.metal; docs/research/basalt-nvcc/prefill_kernels.md) ----
 
-PROMPT_HC_ROWS = 1 << 30   # a placeholder until measured on this Mac: the rows one hyper-connection dispatch covers
+# The rows one hyper-connection dispatch covers, measured on 2026-10-20 on an Apple M3 Max (40 GPU cores, macOS
+# 27.0.1): one-slice dispatches at B = R = 16384 (n 2560, lr 320) took 0.066-5.79 ms, 308-476 GB/s (three runs, each
+# the least of 5 at a warm clock; one run alone gave 1472); the slowest kind, write_norm (1.85 GB), finished 1415-1528
+# rows per 0.5 ms, and the least of those, rounded down to a multiple of 64, is the value.
+PROMPT_HC_ROWS = 1408
 
 
 def basalt_prompt_hc_source() -> str:
