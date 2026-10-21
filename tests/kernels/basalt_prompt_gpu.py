@@ -108,15 +108,16 @@ def mmq_quantize(x, plan, *, B):
     return np.frombuffer(xq, np.uint8).reshape(slots, k // 128, kernels.MMQ_BLOCK_BYTES)
 
 
-def mmq(xq, plan, buf, offsets, *, B, product="gate_up"):
+def mmq(xq, plan, buf, offsets, *, B, product="gate_up", sm_count=kernels.DENSE_TC_SM_COUNT):
     """basalt_mmq (kernel 2, mul_mat_q<Q2_0> with its stream-k fixup folded per output element, every launch of the
     plan in one dispatch) with ``product``'s macros, on the activation blocks ``xq`` [10 B, pad512(K) / 128, 144]
     (kernel 1's slots) through ``plan`` (basalt_emu.moe_plan's for its R tokens: n, order, bounds, wpre). Expert e's
     blob is at byte ``offsets[e]`` of ``buf``, one buffer made resident with Dispatch.use, and the kernel reads it
     through an I64 [512] table of GPU addresses (basalt_gpu.experts' grp_ptr; ids without a blob 0). Compiled at bound
-    ``B``, run with R rows in StepState on kernels.basalt_mmq_grids' grid, into an output of the 10 B slots' LD floats
-    whose bytes start as 0xFF. Returns its bits, uint32 [10 B, LD]."""
-    macros = kernels.basalt_mmq_macros(product)
+    ``B`` with MMQ_SM_COUNT ``sm_count`` (basalt's 170 unless a test asks), run with R rows in StepState on
+    kernels.basalt_mmq_grids' grid, into an output of the 10 B slots' LD floats whose bytes start as 0xFF. Returns its
+    bits, uint32 [10 B, LD]."""
+    macros = kernels.basalt_mmq_macros(product, sm_count=sm_count)
     k, ld, slots = int(macros["K"]), int(macros["LD"]), 10 * B
     xq = np.ascontiguousarray(xq, np.uint8)
     assert xq.shape == (slots, -(-k // 512) * 4, kernels.MMQ_BLOCK_BYTES), f"xq {xq.shape} at bound {B}"
@@ -170,26 +171,33 @@ def moe_mmq(x, ids, buf=None, offsets=None, *, B, n_expert=512, cpu_mask=None, h
     bytes start as 0xFF, as Xq's, GU's, Hq's and D's do. Returns slot int32 [B, 10], src int32 [10 B], plan int32
     [MMQ_PLAN_WORDS], hist's bytes, StepState's fields (``state``) and, with ``x``, Xq uint8 [10 B, 20, 144], GU uint32
     [10 B, 1280], Hq uint8 [10 B, 8, 144] and D uint32 [10 B, 2560]."""
-    ids = np.asarray(ids, np.int32)
-    R, k = ids.shape
-    assert k == 10 and R <= B, f"ids {ids.shape} at bound {B}"
+    return moe_mmq_program(buf, offsets, B=B, n_expert=n_expert, cpu_mask=cpu_mask, hist=hist, prior=prior,
+                           experts=x is not None)(x, ids, done=done)
+
+
+def moe_mmq_program(buf=None, offsets=None, *, B, n_expert=512, cpu_mask=None, hist=None, prior=None, experts=True):
+    """moe_mmq's buffers and dispatches made once (its arguments; without ``experts`` the plan kernels alone), for one
+    program over several chunks (spec-tests-moe.md 5.6's addition 3). Returns ``run(x, ids, done=0)``, which writes
+    the routed ids ``ids`` [R, 10] (rows from R on 512 and -1), ``x`` and StepState (R rows, ``done``) into their
+    buffers, fills Xq, GU, Hq and D with 0xFF, runs the same dispatches in one command buffer and returns moe_mmq's
+    namespace: the row count and the ids reach the kernels through buffers, nothing of a chunk through the encode.
+    slot, src, plan and mmq_hist keep what the previous run left, as a program's scratch does."""
     mask = np.zeros(n_expert, np.uint32) if cpu_mask is None else np.asarray(cpu_mask, np.uint32)
     assert mask.shape == (n_expert,), mask.shape
     mg, md = (kernels.basalt_mmq_macros(p, n_expert=n_expert) for p in ("gate_up", "down"))
     gg, gd = (kernels.basalt_mmq_grids(B, p) for p in ("gate_up", "down"))
-    rows = np.tile(np.array([512, -1], np.int32), 5 * B).reshape(B, 10)
-    rows[:R] = ids
     slot, src = np.full((B, 10), -1, np.int32), np.full(10 * B, -1, np.int32)
     plan = np.full(kernels.MMQ_PLAN_WORDS, -1, np.int32)
     if prior is not None:
         slot[:len(prior.slot)], src[:len(prior.src)], plan = prior.slot, prior.src, plan_words(prior)
     dev = device()
-    b_ids, b_mask, b_slot, b_src, b_plan = (nt.Buffer(dev, a.tobytes()) for a in (rows, mask, slot, src, plan))
+    b_ids = nt.Buffer(dev, slot.nbytes)
+    b_mask, b_slot, b_src, b_plan = (nt.Buffer(dev, a.tobytes()) for a in (mask, slot, src, plan))
     b_hist = nt.Buffer(dev, 4 * gg["basalt_mmq_plan_count"][0] * (512 + 1) if hist is None else hist)
     if hist is None:
         b_hist.fill(0xFF)
     layout = StepStateLayout()
-    b_st = nt.Buffer(dev, layout.pack({"t_this_step": R, "done": done}))
+    b_st = nt.Buffer(dev, layout.size)
 
     def dispatch(name, macros, grid, binds, threads=kernels.MMQ_THREADS, use=None):
         d = nt.Dispatch().pipeline(prompt_pipeline(kernels.basalt_mmq_source(), name, B, macros))
@@ -203,22 +211,18 @@ def moe_mmq(x, ids, buf=None, offsets=None, *, B, n_expert=512, cpu_mask=None, h
                    512),
           dispatch("basalt_mmq_plan_fill", mg, gg["basalt_mmq_plan_fill"],
                    [(0, b_ids), (1, b_hist), (3, b_slot), (4, b_src)], 10 * kernels.MMQ_RANGE)]
-    outs = {}
-    if x is not None:
+    outs, b = {}, {}
+    if experts:
         slots, kd = 10 * B, int(md["K"])
-        x = np.ascontiguousarray(x, np.float32)
-        assert x.shape == (B, int(mg["K"])), f"x {x.shape} at bound {B}"
         b_blobs = nt.Buffer(dev, np.ascontiguousarray(buf, np.uint8).tobytes())
         tab = np.zeros(512, np.uint64)
         tab[: len(offsets)] = b_blobs.gpu_address + np.asarray(offsets, np.uint64)
-        b_x, b_tab = nt.Buffer(dev, x.tobytes()), nt.Buffer(dev, tab.tobytes())
+        b_x, b_tab = nt.Buffer(dev, 4 * B * int(mg["K"])), nt.Buffer(dev, tab.tobytes())
         outs = {"xq": (np.uint8, (slots, int(mg["K"]) // 128, kernels.MMQ_BLOCK_BYTES)),
                 "gu": (np.uint32, (slots, int(mg["LD"]))),
                 "hq": (np.uint8, (slots, -(-kd // 512) * 4, kernels.MMQ_BLOCK_BYTES)),
                 "d": (np.uint32, (slots, int(md["LD"])))}
         b = {n: nt.Buffer(dev, int(np.prod(s)) * np.dtype(t).itemsize) for n, (t, s) in outs.items()}
-        for o in b.values():
-            o.fill(0xFF)
         ds += [dispatch("basalt_mmq_quantize", mg, gg["basalt_mmq_quantize"],
                         [(0, b_x), (1, b_src), (2, b["xq"]), (3, b_plan)]),
                dispatch("basalt_mmq", mg, gg["basalt_mmq"], [(0, b["xq"]), (1, b_tab), (2, b_plan), (3, b["gu"])],
@@ -227,9 +231,28 @@ def moe_mmq(x, ids, buf=None, offsets=None, *, B, n_expert=512, cpu_mask=None, h
                         [(0, b["gu"]), (2, b_plan), (3, b["hq"])]),
                dispatch("basalt_mmq", md, gd["basalt_mmq"], [(0, b["hq"]), (1, b_tab), (2, b_plan), (3, b["d"])],
                         use=b_blobs)]
-    r = nt.Queue(dev).run(ds)
-    assert not r.error, r.error
     i32 = lambda b: np.frombuffer(b.read(0, b.nbytes), np.int32)
-    return SimpleNamespace(slot=i32(b_slot).reshape(B, 10), src=i32(b_src), plan=i32(b_plan),
-                           hist=b_hist.read(0, b_hist.nbytes), state=layout.unpack(b_st.read(0, b_st.nbytes)),
-                           **{n: np.frombuffer(b[n].read(0, b[n].nbytes), t).reshape(s) for n, (t, s) in outs.items()})
+
+    def run(x, ids, done=0):
+        ids = np.asarray(ids, np.int32)
+        R, k = ids.shape
+        assert k == 10 and R <= B, f"ids {ids.shape} at bound {B}"
+        assert (x is not None) == experts, "x is the experts' input, and only theirs"
+        rows = np.tile(np.array([512, -1], np.int32), 5 * B).reshape(B, 10)
+        rows[:R] = ids
+        b_ids.write(rows.tobytes())
+        b_st.write(layout.pack({"t_this_step": R, "done": done}))
+        if experts:
+            x = np.ascontiguousarray(x, np.float32)
+            assert x.shape == (B, int(mg["K"])), f"x {x.shape} at bound {B}"
+            b_x.write(x.tobytes())
+            for o in b.values():
+                o.fill(0xFF)
+        r = nt.Queue(dev).run(ds)
+        assert not r.error, r.error
+        return SimpleNamespace(slot=i32(b_slot).reshape(B, 10), src=i32(b_src), plan=i32(b_plan),
+                               hist=b_hist.read(0, b_hist.nbytes), state=layout.unpack(b_st.read(0, b_st.nbytes)),
+                               **{n: np.frombuffer(b[n].read(0, b[n].nbytes), t).reshape(s)
+                                  for n, (t, s) in outs.items()})
+
+    return run

@@ -55,7 +55,15 @@ exists), then the Metal port's (kernels/common/basalt_mmq.metal).
   before the down product's padded sub-blocks: the scales mmq_dA finds past each row (the next row's, the next launch
   slot's row 0, the zeroed tail past a group's last slot) decide the zero's sign as basalt's group buffer does.
 - test_mmq_chain_routed_id_out_of_range: a routed id out of range through the whole chain stores nothing, not even
-  over an earlier chunk's plan, which kernels 1-4 would otherwise run on."""
+  over an earlier chunk's plan, which kernels 1-4 would otherwise run on.
+- test_mmq_q2_float64_reference: the Metal chain meets G1-G3 (prefill_mmq_kq_test.cpp:269, :277-278, :375-377) against
+  the float64 reference.
+- test_mmq_q2_batch_independence: MK-4 (:433) on the Metal chain, every run through one program, with I1: rows whose
+  tile chains are their 256-token run's are bitwise equal to it.
+- test_mmq_order_is_basalts_not_this_gpus (M4): MMQ_SM_COUNT is basalt's 170 unless asked, and it reaches the
+  arithmetic: built at this Mac's 40 cores, kernel 2 gives other bits, the emulator's at 40.
+- test_mmq_nan_reaches_d: a NaN group, a +inf and a -inf activation make their slots' GU and D NaN, each stored as
+  sm_120's 0x7fffffff, and the chain's bytes equal the emulator's."""
 
 import functools
 
@@ -742,3 +750,143 @@ def test_mmq_chain_routed_id_out_of_range():
         for e, a in (("Xq", got.xq), ("GU", got.gu), ("Hq", got.hq), ("D", got.d)):
             assert np.all(a == np.iinfo(a.dtype).max), f"{what}: {e} written"
         assert not done or got.hist == b"\xff" * len(got.hist), f"{what}: mmq_hist written"
+
+
+@pytest.mark.parametrize("name", ["share-plain", "share-outliers", "kq-plain", "kq-outliers"])
+def test_mmq_q2_float64_reference(name):
+    """nearest bound; no basalt test launches this kernel: G3 is prefill_mmq_kq_test.cpp:375's
+    ``const double lim_rms = outliers ? 3e-2 : 2e-2, lim_worst = outliers ? 0.15 : 0.1;``, which basalt gates on its
+    K-quant MMQ and never on Q2_0 (the contract's MMQ-on-Q2_0 row, docs/design/flash-next.md:451). The Metal chain,
+    gpu.moe_mmq at bound B = 256 on the configuration (x's rows past its tokens NaN), meets G1-G3 (_float64_gates)
+    against the fixture's float64 reference (spec-tests-moe.md 5.3); G1 and G2 are basalt's own checks
+    (prefill_mmq_kq_test.cpp:269, :277-278; prefill_cpu_share_test.cpp:224, :231-232). G1 counts over the chain's
+    rows_local x 2560 outputs, whose bytes start as 0xFF (NaN), so an output the chain never writes counts."""
+    cfg = fx.config(name)
+    x = np.full((256, fx.N), np.nan, F32)
+    x[:cfg.T] = cfg.x
+    got = gpu.moe_mmq(x, cfg.ids, cfg.buf, cfg.offsets, B=256, n_expert=fx.E)
+    _float64_gates(cfg, got.d[:cfg.plan.rows_local].view(F32))
+
+
+def _chains(plan, row):
+    """I1's chains (spec-tests-moe.md 5.6) of sorted row ``row`` of ``plan`` at basalt's 170 multiprocessors: its
+    expert's 10 gate/up tiles it = 0..9 and the 20 down tiles of its column tile jt, each emu.mmq_walk's expression (its
+    pieces and the fixup's order), and the expert's group, its place zt in the group and the tile width J."""
+    z = int(np.searchsorted(plan.bounds, row, side="right")) - 1          # the row's launch slot
+    out = []
+    for nty, bpne in fx.PRODUCTS.values():
+        la = emu.mmq_launches(plan.bounds, nty, NSM)[z // emu.MMQ_GROUP]
+        tiles = emu.mmq_walk(la.ntiles, bpne, la.grid)
+        zt, jt = z % emu.MMQ_GROUP, (row - plan.bounds[z]) // la.J
+        out += [tiles[(it * la.ngx + zt) * la.ntx + jt] for it in range(nty)]
+    return out, (z // emu.MMQ_GROUP, z % emu.MMQ_GROUP, la.J)
+
+
+@pytest.mark.parametrize("kind", ["plain", "outliers"])
+def test_mmq_q2_batch_independence(kind):
+    """nearest bound; no basalt test launches this kernel: MK-4's ``if (worst_alone > 0.1 * em.worst)``
+    (prefill_mmq_kq_test.cpp:433), which basalt runs only on its K-quant pairs (:525-527), measured on Q2_0 with the
+    host emulator first (test_mmq_q2_batch_independence_emulator; L13, eng-review D24) and run here on the Metal chain
+    through the same fx.mk4: the kq configuration's 256 tokens, then tokens 0..7 each alone and last of three
+    (:383-411), worst_alone as :416-423. Every run goes through one program, gpu.moe_mmq_program at bound B = 256: the
+    same buffers and dispatches, the row count and the ids written into their buffers (x's rows past R NaN), so the
+    plan, the groups, J and the stream-k pieces come from the ids on the GPU, never from the encode (spec-tests-moe.md
+    5.6's addition 3). Its additions 1 and 2: I1, every row whose 30 tile chains (_chains) are its 256-token run's has
+    GU, Hq and D rows bitwise equal to that run's, and such rows exist, among them rows whose expert changed its group,
+    its place zt in the group and its tile width J (128 to 8); the small runs' non-finite values, which MK-4 lets
+    through, are 0. The factor 0.1 is basalt's and is never loosened here; a failure goes to the owner with the
+    measured ratio."""
+    cfg = fx.config(f"kq-{kind}")
+    B, runs = 256, []
+    chain = gpu.moe_mmq_program(cfg.buf, cfg.offsets, B=B, n_expert=fx.E)
+
+    def run(x, ids):
+        xb = np.full((B, fx.N), np.nan, F32)
+        xb[:len(x)] = x
+        got, rows = chain(xb, ids), fx.K * len(ids)
+        runs.append((np.asarray(ids), {e: getattr(got, e)[:rows].copy() for e in ("gu", "hq", "d")}))
+        return runs[-1][1]["d"].view(F32)
+
+    m = fx.mk4(cfg, run)
+    print(f"\n{cfg.name}: worst_alone {m.worst_alone:.3e}  em.worst {m.em.worst:.3e}  worst_alone / em.worst "
+          f"{m.worst_alone / m.em.worst:.3e} (fails above 0.1); {m.differ} of 160 rows differ; {m.nonfinite} non-finite")
+    assert m.nonfinite == 0, (cfg.name, m.nonfinite)
+    assert len(runs) == 17, len(runs)
+    big, matched, changed = runs[0][1], 0, set()
+    for i, (ids1, got) in enumerate(runs[1:]):
+        t = i // 2                                         # mk4's order: t = 0..7, alone, then last of three
+        assert len(ids1) == (1, 3)[i % 2] and np.array_equal(ids1[-1], cfg.ids[t]), i
+        p1 = emu.moe_plan(ids1, fx.E)
+        for k in range(fx.K):
+            r1, r0 = p1.slot[-1, k], cfg.plan.slot[t, k]
+            (c1, w1), (c0, w0) = _chains(p1, r1), _chains(cfg.plan, r0)
+            if c1 != c0:                                   # MK-4's bound only
+                continue
+            matched += 1
+            changed |= {what for what, on in (("group", w0[0] != w1[0]), ("zt", w0[1] != w1[1]),
+                                              ("J 128 to 8", (w0[2], w1[2]) == (128, 8))) if on}
+            for e in ("gu", "hq", "d"):
+                assert np.array_equal(got[e][r1], big[e][r0]), f"I1: token {t} of {len(ids1)}, slot {k}: {e} differs"
+    print(f"I1: {matched} of 160 rows have their 256-token run's 30 chains and equal GU, Hq and D rows; among them "
+          f"rows whose expert changed: {sorted(changed)}")
+    assert matched and changed == {"group", "zt", "J 128 to 8"}, (matched, changed)
+    assert not m.worst_alone > 0.1 * m.em.worst, (cfg.name, m.worst_alone, m.em.worst)
+
+
+def test_mmq_order_is_basalts_not_this_gpus():
+    """M4 (spec-kernels-mmq.md 10): MMQ_SM_COUNT, the multiprocessors whose stream-k pieces the kernels reproduce
+    (mmq.cuh:830-833), is basalt's 170 (kernels.DENSE_TC_SM_COUNT) in every product's macros unless a caller asks
+    otherwise, never this Mac's 40 (tests/contract/test_basalt_ops.py's test_dense_tc_order_is_basalts_not_this_gpus),
+    and it reaches the arithmetic: on share-plain, whose last gate/up launch (4 experts, 40 tiles) splits at 170 and
+    runs unsplit at 40 (test_mmq_q2_streamk_pin), kernel 2 built at 170 equals the emulator at 170 bit for bit and built
+    at 40 differs from it in some element, where it equals the emulator at 40 (so the difference is basalt's rule at 40
+    cores, not a broken build)."""
+    for product, kw in (("gate_up", {}), ("down", {}), ("q8_0", {"n": 2560, "k": 2560})):
+        assert kernels.basalt_mmq_macros(product, **kw)["MMQ_SM_COUNT"] == str(NSM) == "170", product
+        assert kernels.basalt_mmq_macros(product, sm_count=THIS_MAC, **kw)["MMQ_SM_COUNT"] == "40", product
+    cfg = fx.config("share-plain")
+    p, want = cfg.plan, _emulated("share-plain")
+    assert fx.launches(cfg, "gate_up")[-1].tiles != fx.launches(cfg, "gate_up", THIS_MAC)[-1].tiles
+    B = 256
+    xq = np.full((10 * B, fx.N // 128, kernels.MMQ_BLOCK_BYTES), 0xFF, np.uint8)
+    xq[:p.rows_local] = want.xq
+    got = {n: gpu.mmq(xq, p, cfg.buf, cfg.offsets, B=B, sm_count=n)[:p.rows_local] for n in (NSM, THIS_MAC)}
+    bad = np.argwhere(got[NSM] != want.gu.view(np.uint32))
+    assert not len(bad), f"the 170 build: {len(bad)} GU elements differ from the emulator at 170, first {tuple(bad[0])}"
+    differ = np.count_nonzero(got[THIS_MAC] != want.gu.view(np.uint32))
+    print(f"\nthe 40 build: {differ} of {got[THIS_MAC].size} GU elements differ from the emulator at 170")
+    assert differ, "MMQ_SM_COUNT 40 gives the 170 build's bits: the macro does not reach the stream-k pieces"
+    here = emu.mmq_product(want.xq, p, cfg.buf, cfg.offsets, "gate_up", THIS_MAC).view(np.uint32)
+    assert np.array_equal(got[THIS_MAC], here), "the 40 build differs from the emulator at 40"
+
+
+@pytest.mark.parametrize("path", ["moe"])
+def test_mmq_nan_reaches_d(path):
+    """eng-review D25's stored-NaN row (no basalt test: basalt's tests feed no non-finite activation): every NaN the
+    chain stores in GU and D goes through cuda_nan (mmq.cuh:216's write-back; sm_120 stores 0x7fffffff, this GPU's
+    arithmetic NaN is 0x7fc00000). The share-plain configuration's x with three tokens poisoned, each alone: token 0 an
+    all-NaN 32-value group, whose d4 is cuda_nan(1 / NaN), so every step fma_ftz(NaN, .., sum) of each output; token 1
+    a +inf and token 2 a -inf element, whose group's amax +inf gives d_inv = 0, codes 0 and d4 = rcp_ftz(0) = +inf, so
+    fma_ftz(+inf, +-0, sum) (mmq_vec_dot.cuh:87) makes each output NaN. Through gpu.moe_mmq (the plan kernels and
+    kernels 1-4 at bound B = 256): Xq, GU, Hq and D equal emu.mmq_moe's bytes (with the GPU's expf_ftz), the poisoned
+    tokens' 30 slots hold 0x7fffffff in every GU and D element, and every other slot's elements are finite."""
+    cfg = fx.config("share-plain")
+    x = cfg.x.copy()
+    x[0, 224:256] = np.nan                                 # group 7, block 1
+    x[1, 1000], x[2, 2047] = np.inf, -np.inf               # groups 31 and 63, the second and fourth 512-value blocks
+    with np.errstate(invalid="ignore"):
+        want = emu.mmq_moe(x, cfg.plan, cfg.buf, cfg.offsets, expf=basalt_gpu.expf_ftz, nsm=NSM)
+    xb = np.full((256, fx.N), np.nan, F32)
+    xb[:cfg.T] = x
+    got = gpu.moe_mmq(xb, cfg.ids, cfg.buf, cfg.offsets, B=256, n_expert=fx.E)
+    local = cfg.plan.rows_local
+    for e in ("xq", "gu", "hq", "d"):
+        a = getattr(got, e)[:local]
+        bad = np.argwhere(a != getattr(want, e).view(a.dtype))
+        assert not len(bad), f"{e}: {len(bad)} words differ from the emulator, first {tuple(bad[0])}"
+    poisoned = np.isin(cfg.plan.src[:local], [0, 1, 2])
+    assert np.count_nonzero(poisoned) == 3 * fx.K
+    for e in ("gu", "d"):
+        a = getattr(got, e)[:local]
+        assert np.all(a[poisoned] == 0x7FFFFFFF), f"{e}: a poisoned slot's element is not 0x7fffffff"
+        assert np.all(np.isfinite(a[~poisoned].view(F32))), f"{e}: a non-finite element outside the poisoned slots"
