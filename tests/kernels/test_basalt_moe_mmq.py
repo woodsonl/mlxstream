@@ -44,7 +44,11 @@ exists), then the Metal port's (kernels/common/basalt_mmq.metal).
   them keeps the 0xFF fill.
 - test_mmq_plan_routed_id_out_of_range: a routed id outside [0, n_expert) in the chunk's partial last range sets
   StepState's error to BASALT_ERR_EXPERT_ID with done, and slot, src and plan keep their 0xFF fill (basalt refuses at
-  prefill.cpp:1843, before its first write); a step that arrives with done set stores nothing at all."""
+  prefill.cpp:1843, before its first write); a step that arrives with done set stores nothing at all.
+- test_mmq_q2_emulation_bit_for_bit (E1-E2, spec-tests-moe.md 5.4): kernel 1, then kernel 2 (basalt_mmq: every
+  launch's mul_mat_q<Q2_0> with its stream-k fixup folded per output element, in one dispatch) on each fixture
+  configuration: Xq's bytes and GU's bits equal the host emulator's (emu.mmq_moe at basalt's 170 multiprocessors), and
+  slots past rows_local keep the 0xFF fill."""
 
 import functools
 
@@ -591,3 +595,35 @@ def test_mmq_plan_routed_id_out_of_range(n_expert, bad):
         assert got.state == want, (done, got.state["error"], got.state["done"])
         assert all(np.all(a == -1) for a in (got.slot, got.src, got.plan)), done
         assert not done or got.hist == b"\xff" * len(got.hist)
+
+
+@pytest.mark.parametrize("name", list(fx.CONFIGS))
+def test_mmq_q2_emulation_bit_for_bit(name):
+    """E1-E2 (spec-tests-moe.md 5.4; no basalt test: the tier-1 gates against the host emulator at basalt's 170
+    multiprocessors): kernel 1, then kernel 2 (basalt_mmq: mul_mat_q<Q2_0> and its stream-k fixup per output element,
+    every launch of the plan in one dispatch), on the configuration's x through its plan (emu.moe_plan's), compiled at
+    the multiple of 256 rows that holds its tokens: share's 12 at 256 (so 2440 slots must stay unwritten), kq's 256 and
+    wide's 512 at R = B; x's rows past R are NaN. E1: Xq's 32-value groups, d4 and codes (so every byte), equal the
+    emulator's slot for slot; E2: GU's bits equal the emulator's over all rows_local x 1280, kernel 2 reading kernel 1's
+    Xq. Each reports its first mismatch, and slots at or past rows_local keep the 0xFF fill in both. Xq and GU do not
+    depend on expf, so the cached host-expf emulation (_emulated) serves here; Hq and Dm do, and need the GPU's
+    expf_ftz. The configurations hold tile widths 8 to 128, split and unsplit gate/up launches and wide's launch of two
+    column tiles with an empty one (basalt_moe_fixture._coverage)."""
+    cfg = fx.config(name)
+    p, want = cfg.plan, _emulated(name)
+    B, local = 256 * -(-cfg.T // 256), p.rows_local
+    x = np.full((B, fx.N), np.nan, F32)
+    x[:cfg.T] = cfg.x
+    xq = gpu.mmq_quantize(x, p, B=B)
+    (d4, codes), (wd4, wcodes) = _groups(xq[:local]), _groups(want.xq)
+    bad = np.argwhere((d4 != wd4) | (codes != wcodes).any(axis=-1))
+    assert not len(bad), (f"E1: {len(bad)} Xq groups differ from the emulator, first (slot, group) {tuple(bad[0])}: "
+                          f"d4 {d4[tuple(bad[0])]:#010x} for {wd4[tuple(bad[0])]:#010x}")
+    assert np.all(xq[local:] == 0xFF), f"E1: a slot at or past rows_local = {local} was written"
+    gu, want_gu = gpu.mmq(xq, p, cfg.buf, cfg.offsets, B=B), want.gu.view(np.uint32)
+    bad = np.argwhere(gu[:local] != want_gu)
+    assert not len(bad), (f"E2: {len(bad)} GU elements differ from the emulator, first (slot, column) "
+                          f"{tuple(bad[0])}: {gu[tuple(bad[0])]:#010x} for {want_gu[tuple(bad[0])]:#010x}")
+    assert np.all(gu[local:] == 0xFFFFFFFF), f"E2: a slot at or past rows_local = {local} was written"
+    print(f"\n{name}: B {B}, {local} slots, gate/up launches (ngx, J, ntx, grid) "
+          f"{[(la.ngx, la.J, la.ntx, la.grid) for la in emu.mmq_launches(p.bounds, 10, NSM)]}")

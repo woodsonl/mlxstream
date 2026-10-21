@@ -146,6 +146,35 @@ def mmq_quantize(x, plan, *, B):
     return np.frombuffer(xq, np.uint8).reshape(slots, k // 128, kernels.MMQ_BLOCK_BYTES)
 
 
+def mmq(xq, plan, buf, offsets, *, B, product="gate_up"):
+    """basalt_mmq (kernel 2, mul_mat_q<Q2_0> with its stream-k fixup folded per output element, every launch of the
+    plan in one dispatch) with ``product``'s macros, on the activation blocks ``xq`` [10 B, pad512(K) / 128, 144]
+    (kernel 1's slots) through ``plan`` (basalt_emu.moe_plan's for its R tokens: n, order, bounds, wpre). Expert e's
+    blob is at byte ``offsets[e]`` of ``buf``, one buffer made resident with Dispatch.use, and the kernel reads it
+    through an I64 [512] table of GPU addresses (basalt_gpu.experts' grp_ptr; ids without a blob 0). Compiled at bound
+    ``B``, run with R rows in StepState on kernels.basalt_mmq_grids' grid, into an output of the 10 B slots' LD floats
+    whose bytes start as 0xFF. Returns its bits, uint32 [10 B, LD]."""
+    macros = kernels.basalt_mmq_macros(product)
+    k, ld, slots = int(macros["K"]), int(macros["LD"]), 10 * B
+    xq = np.ascontiguousarray(xq, np.uint8)
+    assert xq.shape == (slots, -(-k // 512) * 4, kernels.MMQ_BLOCK_BYTES), f"xq {xq.shape} at bound {B}"
+    pso = prompt_pipeline(kernels.basalt_mmq_source(), "basalt_mmq", B, macros)
+    dev = device()
+    b_blobs = nt.Buffer(dev, np.ascontiguousarray(buf, np.uint8).tobytes())
+    tab = np.zeros(512, np.uint64)
+    tab[: len(offsets)] = b_blobs.gpu_address + np.asarray(offsets, np.uint64)
+    bufs = [nt.Buffer(dev, b) for b in (xq.tobytes(), tab.tobytes(), plan_words(plan).tobytes(), 4 * slots * ld)]
+    bufs[3].fill(0xFF)
+    b_st = nt.Buffer(dev, StepStateLayout().pack({"t_this_step": len(plan.slot)}))
+    d = nt.Dispatch().pipeline(pso)
+    for slot, b in enumerate(bufs):
+        d = d.buffer(slot, b)
+    d = d.buffer(15, b_st).use(b_blobs).grid(*kernels.basalt_mmq_grids(B, product)["basalt_mmq"], 1)
+    r = nt.Queue(dev).run([d.threadgroup(kernels.MMQ_THREADS, 1, 1)])
+    assert not r.error, r.error
+    return np.frombuffer(bufs[3].read(0, bufs[3].nbytes), np.uint32).reshape(slots, ld)
+
+
 def mmq_swiglu_quantize(gu, plan, *, B):
     """basalt_mmq_swiglu_quantize (kernel 3, mmq::swiglu fused with quantize_mmq_q8_1<D4> on H) of the float32 GU rows
     ``gu`` [10 B, 1280] (slot p's gate outputs, then its up outputs) through ``plan`` (basalt_emu.moe_plan's for its R

@@ -35,6 +35,9 @@
 //   order, a stable fill; the plan, slot and src every later kernel reads.
 // - basalt_mmq_quantize (kernel 1): the layer's activations to Xq through the plan's src (quantize.cu:10-84, launched
 //   :94-96 from prefill.cpp:1990).
+// - basalt_mmq (kernel 2, compiled with the gate/up product's macros): every group's mul_mat_q<Q2_0> on Xq and the
+//   experts' gate and up rows with its stream-k fixup folded per output element (mmq.cuh:390-864; prefill.cpp:2243-2256
+//   launches it per group of 16 experts), one dispatch for all of them, into GU.
 // - basalt_mmq_swiglu_quantize (kernel 3): GU's split halves to Hq, mmq::swiglu (moe_mmq.cu:85-93) fused with the
 //   quantizer on H (prefill.cpp:2257-2258's group calls), compiled with the down product's macros (K = n_ff).
 //
@@ -242,6 +245,73 @@ kernel void basalt_mmq_quantize(device const float* x [[buffer(0)]], device cons
     const uint i0 = 512u * tg.y + 4u * tid;
     const float4 xi = *(device const float4*) (x + ulong(src[tg.x]) * K + i0);                     // :29-39
     mmq_quantize_block(xi, xq + (ulong(tg.x) * (K / 128) + i0 / 128u) * 36u, i0 % 128u);          // :70-71
+}
+
+// Kernel 2 (spec-kernels-mmq.md 9.2-9.5): mul_mat_q<Q2_0> (mmq.cuh:390-864) of every launch of the plan, the gate/up
+// product's groups of prefill.cpp:2243-2256, in one dispatch, with the stream-k fixup (:632-767) folded per output
+// element. xq [10 B][pad512(K) / 128] blocks of 144 bytes, kernel 1's slots; tab [512] one GrpPtr per expert id, its
+// blob (what basalt gathers into its group buffers, prefill.cpp:2222-2240, read in place: weight row i at MAT_OFF + 9
+// BPNE i ushorts); plan its words; y [10 B][LD] floats, slot p's outputs at row p (basalt's ids_identity). Grid (NTY,
+// W_cap) x MMQ_THREADS, W_cap >= wpre[n] (monolith/kernels.py basalt_mmq_grids): threadgroup (it, w) computes weight
+// rows 128 it .. 128 it + 127, one a thread, against the 8-row window u = w - wpre[j] of launch slot j, the j with
+// wpre[j] <= w < wpre[j + 1]: slots bounds[j] + 8 u + c, c < ncol = min(8, bounds[j + 1] - bounds[j] - 8 u). Every J
+// is a multiple of 8 and basalt's column tiles start at multiples of J from the expert's first row, so the window lies
+// in one tile t = (it ngx + zt) ntx + jt (:497-506), jt = 8 u / J, whose elements share its pieces; an empty column
+// tile (:523-531) has no window, and columns past the expert's rows (:206-208) are not computed. Work items w >=
+// wpre[n] return. Each element is the tile's pieces P_0 .. P_m (mmq_piece_mask), each a chain from +0 (:340) over its
+// k iterations in K order, kb0 then the two 128-value halves then k01 (:344-377, mmq_vec_dot.cuh:63): per 32-value
+// sub-block s the exact int32 dot c of the weight codes (mmq_load_tiles.cuh:42-58: half s % 2 of block s / 2) with the
+// activation codes, then sum = fma_ftz(dB, mul_ftz(dA, float(c)), sum) (mmq_vec_dot.cuh:87: I2FP, FMUL.FTZ dA * c,
+// FFMA.FTZ), dA the block's fp16 d (mmq_load_tiles.cuh:73), dB the activation group's d4 (mmq_vec_dot.cuh:74). One
+// piece is stored as it is (:216); else P_{m-1} .. P_0 are added from +0, nearest first (the fixup, :646, :689), and
+// that sum onto P_m (:765), add_ftz each. Stores through cuda_nan (sm_120's NaN).
+kernel void basalt_mmq(device const uint* xq [[buffer(0)]], device const GrpPtr* tab [[buffer(1)]],
+                       device const int* plan [[buffer(2)]], device float* y [[buffer(3)]],
+                       device const StepState* st [[buffer(15)]],
+                       uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    if (st->done) return;                                                    // uniform: before any load
+    const int n = plan[0], w = int(tg.y);
+    device const int* bounds = plan + MMQ_BOUNDS;
+    device const int* wpre = plan + MMQ_WPRE;
+    if (w >= wpre[n]) return;                                                // uniform per threadgroup
+    int j = 0;                                                               // the last slot with wpre[j] <= w: wpre
+    for (int h = 256; h > 0; h >>= 1)                                        // rises (cnt >= 1), n <= 512
+        if (j + h < n && wpre[j + h] <= w) j += h;
+    const int u = w - wpre[j];
+    const MmqLaunch L = mmq_launch(bounds, n, j / 16, NTY);
+    const uint mask = mmq_piece_mask((int(tg.x) * L.ngx + j % 16) * L.ntx + 8 * u / L.J, L.ntiles, BPNE, BPI, L.grid);
+    int b[NITER + 1], m = 0;                                                 // the pieces' first k iterations
+    b[0] = 0;
+    for (int q = 1; q < NITER; ++q)
+        if ((mask >> q) & 1u) b[++m] = q;
+    b[m + 1] = NITER;
+    const int p0 = bounds[j] + 8 * u, ncol = min(8, bounds[j + 1] - p0);
+    const int i = 128 * int(tg.x) + int(tid);
+    device const ushort* wr = tab[plan[2 + j]].p + MAT_OFF + ulong(i) * (9 * BPNE);
+    float S[8];
+    for (int c = 0; c < 8; ++c) S[c] = 0.0f;
+    for (int pp = m - 1; pp >= -1; --pp) {                                   // P_{m-1} .. P_0 into S, then P_m
+        const int pc = pp < 0 ? m : pp;
+        float sum[8];
+        for (int c = 0; c < 8; ++c) sum[c] = 0.0f;
+        for (int q = b[pc]; q < b[pc + 1]; ++q)
+            for (int s = 8 * q; s < 8 * q + 8; ++s) {
+                const Q20W wq = q2_0_load(wr + 9 * (s / 2), s % 2);
+                for (int c = 0; c < 8 && c < ncol; ++c) {
+                    device const uint* yb = xq + (ulong(p0 + c) * ((K + 511) / 512 * 4) + ulong(s / 4)) * 36u;
+                    int ci = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        ci = dp4a(int(yb[4 + 8 * (s % 4) + 2 * k]), wq.qx[k], ci);
+                        ci = dp4a(int(yb[4 + 8 * (s % 4) + 2 * k + 1]), wq.qy[k], ci);
+                    }
+                    sum[c] = fma_ftz(as_type<float>(yb[s % 4]), mul_ftz(wq.d2, float(ci)), sum[c]);
+                }
+            }
+        for (int c = 0; c < 8 && c < ncol; ++c) {
+            if (pp >= 0) S[c] = add_ftz(S[c], sum[c]);
+            else y[ulong(p0 + c) * LD + ulong(i)] = cuda_nan(m == 0 ? sum[c] : add_ftz(sum[c], S[c]));
+        }
+    }
 }
 
 // Kernel 3 (spec-kernels-mmq.md 2, 9.7): swiglu_kernel (moe_mmq.cu:85-93, interleaved false) then quantize.cu:10-84

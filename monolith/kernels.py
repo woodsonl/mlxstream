@@ -829,6 +829,25 @@ def basalt_mmq_macros(product: str, *, sm_count: int = DENSE_TC_SM_COUNT, rows_p
             "MMQ_RANGE": str(MMQ_RANGE)}
 
 
+def basalt_mmq_grids(rows_cap: int, product: str) -> Dict[str, Tuple[int, int]]:
+    """The threadgroup grids (x, y) of the kernels that run on an expert product's macros at the program's row bound
+    ``rows_cap`` (B, so 10 B slots), keyed by kernel name. ``gate_up``: the plan kernels, ceil(B / MMQ_RANGE) ranges
+    (count: MMQ_THREADS threads, fill: 10 MMQ_RANGE) and one scan threadgroup of 512; kernel 1, a slot by a 512-value
+    column block; kernel 2. ``down``: kernel 3 (a slot by a 512-value block of pad512(K)) and kernel 4. Kernels 1 to 4
+    hold MMQ_THREADS threads; 2 and 4 run NTY weight tiles by W_cap = ceil((10 B + 7 min(512, 10 B)) / 8) work items
+    (spec-kernels-mmq.md 9.4): at least the plan's wpre[n], the sum of ceil(cnt / 8) over at most min(512, 10 B)
+    experts whose counts total at most 10 B."""
+    if rows_cap < 1:
+        raise ValueError(f"basalt_mmq: rows_cap must be positive, got {rows_cap}")
+    m = basalt_mmq_macros(product)
+    slots, nr, blocks = 10 * rows_cap, -(-rows_cap // MMQ_RANGE), -(-int(m["K"]) // 512)
+    mmq = (int(m["NTY"]), -(-(slots + 7 * min(512, slots)) // 8))
+    if product == "down":
+        return {"basalt_mmq_swiglu_quantize": (slots, blocks), "basalt_mmq": mmq}
+    return {"basalt_mmq_plan_count": (nr, 1), "basalt_mmq_plan_scan": (1, 1), "basalt_mmq_plan_fill": (nr, 1),
+            "basalt_mmq_quantize": (slots, blocks), "basalt_mmq": mmq}
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
