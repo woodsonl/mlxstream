@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Jesús Gulfo (MIT)
-// Adapted from basalt (jesdga95/basalt) src/prefill/kernels.cu:39, :45-58, :85-170 and :192-204
+// Adapted from basalt (jesdga95/basalt) src/prefill/kernels.cu:39, :85-170 and :192-204
 // @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 //
 // basalt's prompt-path hyper-connection kernels (kernels.cu:85-204, launched by :862-900) in the rounding sequence

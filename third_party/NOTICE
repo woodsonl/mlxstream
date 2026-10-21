@@ -340,10 +340,11 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
 - `tests/kernels/test_basalt_prompt_gemm.py` — adapted from `src/kernels/hc8_parity.cpp:253-262` and `:269` (MIT): the
   GEMM gate's bound, `expect(ex.rel() < 5e-3, "the product against the copy in double");`, and its use of `Err`
   over the product against double. License: `third_party/BASALT-LICENSE`.
-- `kernels/common/basalt_prompt_hc.metal` — adapted from `src/prefill/kernels.cu:39`, `:45-58`, `:85-170` and
-  `:192-204` (MIT): `gr_norm_rs_kernel`, `gr_mix_r_kernel`, `gr_write_norm_rs_kernel`, `gr_silu_kernel`,
-  `gr_write_kernel` and `gr_broadcast_kernel` with `sigm` and `block_sum`, written in the rounding sequence nvcc
-  compiles for them (`docs/research/basalt-nvcc/prefill_kernels.md`). License: `third_party/BASALT-LICENSE`.
+- `kernels/common/basalt_prompt_hc.metal` — adapted from `src/prefill/kernels.cu:39`, `:85-170` and `:192-204` (MIT):
+  `gr_norm_rs_kernel`, `gr_mix_r_kernel`, `gr_write_norm_rs_kernel`, `gr_silu_kernel`, `gr_write_kernel` and
+  `gr_broadcast_kernel` with `sigm`, written in the rounding sequence nvcc compiles for them
+  (`docs/research/basalt-nvcc/prefill_kernels.md`); the two row kernels call `block_sum` in
+  `kernels/common/basalt_q8_1.metal` (above). License: `third_party/BASALT-LICENSE`.
 - `tests/kernels/test_basalt_prompt_hc.py` — adapted from `src/kernels/gr_parity.cpp` (MIT): its data distributions
   (`:675`), the float64 references' forms with their activation rounding (`to_bf16`, `:46-53`) and the bounds
   (`:566`, `:645`, `:689`), which `gr_parity` gates on decode's `gr.cu` kernels and the port applies as the nearest
