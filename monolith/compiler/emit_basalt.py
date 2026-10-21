@@ -1,7 +1,8 @@
-"""The emitter's handlers for basalt's ops (``monolith/ops/basalt.py``), merged into ``emit.HANDLERS``. Each handler
-emits one dispatch with the macros, grid, threadgroup and params of ``monolith/kernels.py``'s builders, after the
-checks basalt's launchers make (shapes, column counts, pointer alignment) and the ones its call sites satisfy (the IEEE
-q8_1 rows feed only the routed experts; outputs are contiguous columns); a static program only (one per window width).
+"""The emitter's handlers for basalt's ops (``monolith/ops/basalt.py``, ``monolith/ops/basalt_gdn.py``), merged into
+``emit.HANDLERS``. Each handler emits one dispatch with the macros, grid, threadgroup and params of
+``monolith/kernels.py``'s builders, after the checks basalt's launchers make (shapes, column counts, pointer alignment)
+and the ones its call sites satisfy (the IEEE q8_1 rows feed only the routed experts; outputs are contiguous columns); a
+static program only (one per window width).
 """
 
 # The launcher checks are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu:1465-1475, :1490-1494,
@@ -172,5 +173,77 @@ def _mmvf(ctx: _Ctx, op: Op) -> None:
             (grid, 1, 1), (threads, 1, 1), f"{op.kind}:{w.name}", writes=[2])
 
 
+def _vector(ctx: _Ctx, op: Op, v: Value, n: int) -> None:
+    """A vector as shipped, ``_weight``'s rules for ``(n,)`` F32 values: a weight whose format, or a constant whose
+    dtype, is the ggml type, not a pack's block-lane-major slab, and a pack's aux entry of exactly those values (the
+    kernels read every one)."""
+    name = v.format if v.is_weight else v.dtype.short if v.is_const else None
+    if name != "f32" or ctx.shape(v) != (n,):
+        raise ValueError(f"{op.kind}: the vector {v.name!r} ({name} {list(ctx.shape(v))}) is not a weight or constant "
+                         f"[{n}] of ggml type f32")
+    if any(v.name in pk.slabs for pk in ctx.packs):
+        raise ValueError(f"{op.kind}: the vector {v.name!r} is a block-lane-major pack slab, not values as stored")
+    aux = next((pk.aux[v.name] for pk in ctx.packs if v.name in pk.aux), None)
+    if aux is not None and int(aux["nbytes"]) != 4 * n:
+        raise ValueError(f"{op.kind}: the vector {v.name!r} is {4 * n} bytes of f32 [{n}], but its pack entry holds "
+                         f"{aux['nbytes']}")
+
+
+# The GDN window's checks and bindings are adapted from basalt (jesdga95/basalt) src/kernels/cuda/dec_gdn_rec.cu:30-33
+# and :355-367 and include/basalt/kernels/dec_gdn.hpp:16-39 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT;
+# third_party/NOTICE).
+def _gdn_window(ctx: _Ctx, op: Op) -> None:
+    """``dec_gdn_rec`` (ops/basalt_gdn.py): HV from ``dt``, C from ``conv_w``, h_k = (C - 128 HV) / 256 and n_embd from
+    ``w_alpha``, refused where host ``dec_gdn_rec`` exits (``kernels.basalt_gdn_params``); input i at buffer i, yq at
+    14, the record at 16, and 15 (StepState's) unbound: T is the program's width. One 512-thread threadgroup per value
+    head."""
+    if (len(op.inputs), len(op.outputs)) != (14, 1):
+        raise ValueError(f"{op.kind}: {len(op.inputs)} inputs and {len(op.outputs)} outputs; the window reads 14 (the "
+                         "state, qkv, conv_w, x, the gate rows, dt, ssm_a, z, gamma, its four stores) and writes yq")
+    state, qkv, conv_w, x, wa, wb, dt, ssm_a, z, gamma, *stores = op.inputs
+    (yq,) = op.outputs
+    t = _columns(ctx, op)
+    hv = ctx.shape(dt)[0]
+    _vector(ctx, op, dt, hv)
+    _, c, taps = _weight(ctx, op, conv_w, (GGML_IDS["f32"],))
+    if taps != 4:
+        raise ValueError(f"{op.kind}: the conv weight {conv_w.name!r} holds {taps} taps a channel; basalt's conv has 4")
+    n = ctx.shape(wa)[-1]
+    for w in (wa, wb):
+        if _weight(ctx, op, w, (GGML_IDS["bf16"],))[1:] != (hv, n):
+            raise ValueError(f"{op.kind}: the gate rows {w.name!r} are {list(ctx.shape(w))}, not [{hv}, {n}]: one row "
+                             "of n_embd per value head")
+    _vector(ctx, op, ssm_a, hv)
+    _vector(ctx, op, gamma, kernels.GDN_S)
+    zv = kernels.GDN_S * hv
+    _expect(ctx, op, qkv, (t, c), DType.F32, "the window's q, k and v projections")
+    _expect(ctx, op, x, (t, n), DType.F32, "the gates' input rows")
+    _expect(ctx, op, z, (t, zv), DType.F32, "the output gate's rows")
+    _expect(ctx, op, yq, (t, zv // 32 * kernels.Q8_1_BLOCK_BYTES), DType.U8, "q8_1 rows of the window's output")
+    shapes = [(kernels.GDN_S * zv + 3 * c,), (kernels.GDN_MT, c), (kernels.GDN_MT, c), (kernels.GDN_MT, hv),
+              (kernels.GDN_MT, hv)]
+    for s, shape in zip([state, *stores], shapes):
+        if not s.is_state:
+            raise ValueError(f"{op.kind}: {s.name!r} is not a graph state; the state and the window stores are a "
+                             "session's buffers, shared by name across its programs")
+        _expect(ctx, op, s, shape, DType.F32, "the recurrent state, then the conv history" if s is state else
+                f"the window's {kernels.GDN_MT} rows, a commit's replay")
+    ups, names = set(op.attrs.get("updates", ())), [s.name for s in stores]
+    if state.name in ups:
+        raise ValueError(f"{op.kind}: updates names {state.name!r}; the window reads the state and never writes it "
+                         "(invariant 3: the commit does)")
+    if ups != set(names):
+        raise ValueError(f"{op.kind}: updates names {sorted(ups)}; the window writes exactly its stores {names}")
+    eps = op.attrs.get("eps")
+    if eps is None:
+        raise ValueError(f"{op.kind}: needs attr eps, the norms' epsilon")
+    prm = ctx.params("basalt_gdn_window", kernels.basalt_gdn_params(t, c, n, (c - zv) // 256, hv, eps))
+    k = ctx.kernel("basalt_gdn", kernels.basalt_gdn_source(), "dec_gdn_rec", {})
+    bindings = [_bind(ctx, op, i, v, 16 if i in (3, 4, 5) else 4) for i, v in enumerate(op.inputs)]
+    ctx.add(k, bindings + [_bind(ctx, op, 14, yq, 4), (16, prm, 0)], (hv, 1, 1), (kernels.GDN_THREADS, 1, 1),
+            f"{op.kind}:{state.name}", writes=[10, 11, 12, 13, 14])
+
+
 BASALT_HANDLERS: Dict[str, object] = {"basalt_q8_1": _q8_1, "basalt_mmvq": _mmvq, "basalt_dense_tc": _dense_tc,
-                                      "basalt_dense_tc_pair": _dense_tc_pair, "basalt_mmvf": _mmvf}
+                                      "basalt_dense_tc_pair": _dense_tc_pair, "basalt_mmvf": _mmvf,
+                                      "basalt_gdn_window": _gdn_window}
