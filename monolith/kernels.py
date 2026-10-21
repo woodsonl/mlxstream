@@ -758,6 +758,8 @@ def basalt_dequant16_grid(rows: int, cols: int) -> Tuple[int, int]:
 
 # ---- basalt's hyper-connection write (kernels/common/basalt_gr_post.metal;
 # docs/research/basalt-nvcc/native_gr_postops.md)
+# The shape check and grid below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_gr_postops.cu:35
+# and :79-83 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 
 def basalt_gr_post_source() -> str:
     """basalt's ``native_gr_post`` (``basalt_gr_post``): the hyper-connection write of T tokens' residual stacks."""
