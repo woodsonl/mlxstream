@@ -220,14 +220,15 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `sampler_split_part_kernel`, `sampler_split_merge_kernel` and the four `coupled_*_kernel`s, on `SamplerParams`' memory
   image and with `coupled_draft_counter`, `coupled_hist_len` and `coupled_hist_start`, written in the rounding sequence
   nvcc compiles for them (`docs/research/basalt-nvcc/sampler.md`). License: `third_party/BASALT-LICENSE`.
-- `kernels/common/basalt_gdn.metal` — adapted from `src/kernels/cuda/dec_gdn_rec.cu:30-307`,
-  `src/kernels/cuda/verify_kernels.cu:29-57`, `:113-213` and `:377-461` and `include/basalt/kernels/dec_gdn.hpp:16-39`
-  (MIT): the GDN decode window's steps (`conv_silu`, `ab_one`, `norm_q8`'s gated RMS norm and `sq32`, and
-  `rec_block`'s delta-rule recurrence), `rec_kernel` as `dec_gdn_rec` (its cluster of four blocks as one threadgroup)
-  on `DecRecArgs`' buffers, and `dec_gdn_parity`'s reference side, `gdn_conv_l2_multi_kernel`, `gdn_ab_multi_kernel`
-  with `gdn_ab_multi_unrolled_kernel` (one kernel) and `gdn_step_norm_multi_kernel` with `gdn_step_norm_body`, written
-  in the rounding sequence nvcc compiles for them (`docs/research/basalt-nvcc/dec_gdn.md`,
-  `docs/research/basalt-nvcc/verify_gdn.md`). License: `third_party/BASALT-LICENSE`.
+- `kernels/common/basalt_gdn.metal` and `kernels/common/basalt_gdn_steps.metal` — adapted from
+  `src/kernels/cuda/dec_gdn_rec.cu:30-307`, `src/kernels/cuda/verify_kernels.cu:29-57`, `:113-213` and `:377-461` and
+  `include/basalt/kernels/dec_gdn.hpp:16-39` (MIT): the GDN decode window's steps (`conv_silu`, `ab_one`, `norm_q8`'s
+  gated RMS norm and `sq32`, and `rec_block`'s delta-rule recurrence), `rec_kernel` as `dec_gdn_rec` (its cluster of
+  four blocks as one threadgroup) on `DecRecArgs`' buffers, and `dec_gdn_parity`'s reference side,
+  `gdn_conv_l2_multi_kernel`, `gdn_ab_multi_kernel` with `gdn_ab_multi_unrolled_kernel` (one kernel) and
+  `gdn_step_norm_multi_kernel` with `gdn_step_norm_body`, written in the rounding sequence nvcc compiles for them
+  (`docs/research/basalt-nvcc/dec_gdn.md`, `docs/research/basalt-nvcc/verify_gdn.md`). License:
+  `third_party/BASALT-LICENSE`.
 - `monolith/compiler/emit.py` — `_basalt_sample` adapted from `src/kernels/cuda/sampler.cu:887-922` and `:991-1019`
   (MIT): `sample_greedy_cluster`'s and `sample_tokens_probe`'s launches in their order, with their grids (8 threadgroups
   of 1,024 threads a row for the cluster argmax, 1,024 threads for the one-block kernels, 128 for the split part and 32

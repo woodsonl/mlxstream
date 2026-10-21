@@ -803,11 +803,11 @@ GDN_N_EMBD = 2560             # the gate rows' width, 32 lanes x 8 bf16 x NJ = 1
 
 def basalt_gdn_source() -> str:
     """basalt's GDN decode window: the shared helpers, the IEEE binary32 operations, the software binary64 and the
-    IEEE operations built on it (``basalt_ieee_f64.metal``), the q8_1 quantizers, libdevice's transcriptions and the
-    GDN steps and kernels (``basalt_gdn.metal``), in that order."""
+    IEEE operations built on it (``basalt_ieee_f64.metal``), the q8_1 quantizers, libdevice's transcriptions, the GDN
+    steps (``basalt_gdn_steps.metal``) and the GDN kernels (``basalt_gdn.metal``), in that order."""
     return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
             + template("basalt_ieee_f64.metal") + template("basalt_q8_1.metal") + template("basalt_libdevice.metal")
-            + template("basalt_gdn.metal"))
+            + template("basalt_gdn_steps.metal") + template("basalt_gdn.metal"))
 
 
 def basalt_gdn_params(t: int, c: int, n_embd: int, h_k: int, h_v: int, eps: float) -> bytes:
