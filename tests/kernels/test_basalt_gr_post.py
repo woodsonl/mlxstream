@@ -10,9 +10,10 @@ none of its values; these are the contract's tests (docs/design/flash-next.md, t
   docs/research/basalt-nvcc/native_gr_postops.md section 1), its exponential the GPU's own ``expf_ftz``, at the real
   shape (n_embd 2560, hc 4) at T = 1 and 8 and at a ragged one (n_embd 100, T = 3: the last threadgroup passes the
   last row), with injections planted in every flush and saturation of the weight (one column of every token reads
-  the weight out) and residual/block-output pairs whose sum is subnormal or cancels; each planted weight's exact
-  value (1, +0 or 2) checked apart from the exponential; in basalt's in-place call and in the program's separate
-  output, which give the same bytes.
+  the weight out) and residual/block-output pairs whose sum is subnormal or cancels; at T = 8 a product the write's
+  FFMA.FTZ rounds up to the smallest normal, which this GPU's fma flushes (fma_ftz's corner); each planted weight's
+  exact value (1, +0 or 2) checked apart from the exponential; in basalt's in-place call and in the program's
+  separate output, which give the same bytes.
 - HG-PLAIN, HG-DELTA, HG-STREAM: gr_parity's three write checks (gr_parity.cpp:620-692) on its fixture (n_embd 256, T =
   1) and at the real shape (T = 8), into a separate output as gr_parity writes: a zero injection is the plain residual
   add, the rival reading ``1 * sigmoid`` is visible on the delta ``out - R``, and injections of sd 3 (gr_parity's) and
@@ -64,13 +65,18 @@ PAIRS = ((1.5 * 2.0 ** -126, -(2.0 ** -126), 0x00000000),     # sum 2^-127, subn
          (2.0, None, 0x7FFFFFFF))                             # a NaN residual (0xffc00001): sm_120's NaN
 NAN_R = 0xFFC00001
 W_COL = len(PAIRS)                 # block output 1 and residual +0 in every stream: the output is the weight itself
+CORNER = [W_COL + 1, W_COL + 2]    # block outputs +-bo, residual +0, bo * w in [2^-126 - 2^-150, 2^-126): +-2^-126
 
 
 def planted(n_embd, T):
     """gr_fixture's residuals (stream scales 1, 4, 16, 64) and block outputs with uniform injections in [-100, 100],
     then PLANTS in the injections' first slots (at T = 1 its first four: +0, -350, 70, NaN), PAIRS in token 0's stream
     0, and column W_COL of every token reading out each stream's weight (``fma(1, w, +0) = w``: a weight of +0 and an
-    unflushed reciprocal's 2^-125 store the same bits against a residual of order 1). Also the planted slot count."""
+    unflushed reciprocal's 2^-125 store the same bits against a residual of order 1). Then the smallest normal's
+    corner in the first stream of uniform injections whose weight w (below 1) has one: a bo with bo * w, exact in
+    float64, in [2^-126 - 2^-150, 2^-126), which the write's FFMA.FTZ rounds up to 2^-126 where this GPU's fma
+    flushes it to 0, as +-bo against a residual of +0 at columns CORNER. Also the planted slot count and the corner's
+    stream (t, c), None when every slot holds a plant (T = 1, the ragged case)."""
     R, bo, _ = ref.gr_fixture(n_embd, HC, T)
     inj = np.random.default_rng(5).uniform(-100.0, 100.0, (T, HC)).astype(F32)
     k = min(len(PLANTS), T * HC)
@@ -80,7 +86,18 @@ def planted(n_embd, T):
         R[0, 0, d] = np.nan if r is None else r
     R.view(U32)[0, 0, len(PAIRS) - 1] = NAN_R
     bo[:, W_COL], R[:, :, W_COL] = 1.0, 0.0
-    return R, bo, inj, k
+    w = ref.gr_post_emulation(R, bo, inj, HC, gpu.expf_ftz)[:, :, W_COL].astype(np.float64)   # each stream's weight
+    for t, c in (divmod(j, HC) for j in range(k, T * HC)):
+        if not 0 < w[t, c] < 1:
+            continue
+        near = int(F32(2.0 ** -126 / w[t, c]).view(U32))
+        for b in range(near - 2, near + 3):                       # the float32 patterns around 2^-126 / w
+            if 2.0 ** -126 - 2.0 ** -150 <= float(U32(b).view(F32)) * w[t, c] < 2.0 ** -126:   # exact in float64
+                bo.view(U32)[t, CORNER] = b, b | 0x80000000
+                R[t, c, CORNER] = 0.0
+                return R, bo, inj, k, (t, c)
+    assert k == T * HC, "no stream of uniform injections reaches the smallest normal's corner"
+    return R, bo, inj, k, None
 
 
 @pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "separate_output"])
@@ -88,9 +105,10 @@ def planted(n_embd, T):
 def test_matches_emulation_bit_for_bit(n_embd, T, in_place):
     """HG-EMU. Every element of rows < T has the emulation's bits; each planted injection's stream has the bits of
     its exact weight (``fma(w, bo, R)``, ``.FTZ``, with no exponential; at column W_COL the weight's own bits); token
-    0's stream 0 the PAIRS' bits; the non-finite outputs are exactly the planted NaN stream and residual. The separate
-    output equals basalt's in-place call byte for byte, all 8 rows."""
-    R, bo, inj, k = planted(n_embd, T)
+    0's stream 0 the PAIRS' bits; the corner's stream +-2^-126 at columns CORNER; the non-finite outputs are exactly
+    the planted NaN stream and residual. The separate output equals basalt's in-place call byte for byte, all 8
+    rows."""
+    R, bo, inj, k, corner = planted(n_embd, T)
     out = write(R, bo, inj, T, n_embd, in_place)
     got = out[:T]
     want = ref.gr_post_emulation(R, bo, inj, HC, gpu.expf_ftz)
@@ -111,6 +129,9 @@ def test_matches_emulation_bit_for_bit(n_embd, T, in_place):
             ref.cuda_nan(emu.fma_ftz(F32(w), bo[t], R[t, c])).view(U32)
         assert np.array_equal(got[t, c].view(U32), exact), f"inject {PLANTS[j][0]} does not give w = {w}"
     assert [int(v) for v in got[0, 0, : len(PAIRS)].view(U32)] == [p[2] for p in PAIRS]
+    if corner:
+        assert [int(v) for v in got[corner][CORNER].view(U32)] == [0x00800000, 0x80800000], \
+            "FFMA.FTZ rounds bo * w + 0 in [2^-126 - 2^-150, 2^-126) up to the smallest normal"
     assert nonfinite == planted_nan, "a non-finite output nothing planted"
     if not in_place:
         assert np.array_equal(out.view(U32), write(R, bo, inj, T, n_embd, True).view(U32)), \
