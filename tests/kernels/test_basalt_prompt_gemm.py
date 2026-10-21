@@ -378,7 +378,7 @@ def test_columns_do_not_depend_on_the_matrix_rows(bf16):
     row slices ``HC8_SLICES`` (derived from basalt's rule and asserted equal), each slice's image (gpu.hc8_image at
     row0, n) multiplied at N = n (gpu.prompt_gemm), against columns [row0, row0 + n) of ``whole``'s copy entry over the
     whole copy (basalt's one-slice y1): bitwise, where basalt allows es.rel() < 1e-5 for cuBLAS's change of kernel
-    (docs/design/flash-next.md:183-186: invariances stay bitwise)."""
+    (docs/design/flash-next.md, "How basalt's test tiers carry over to Metal": invariances stay bitwise)."""
     if bf16 == "copy":
         for (t, name), (x, _, _) in zip(PART2, part2_draws()):
             _, q, s = hc8_copies()[name]
