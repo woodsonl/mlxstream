@@ -90,9 +90,10 @@ library `logf` and binary64 `exp`):
   `sigm` (`:39`) at `:114`, `:139` and `:197`, and directly at `:166`; each maps to `expf_ieee(sign_flip(x))`, the one
   helper at every IEEE-built `__expf` site, and each result is followed by `1 + e`. They compute `rsqrtf` at `:94` and
   `:150`, mapped to `metal::fast::rsqrt`; its argument is at least `eps`, so it is never subnormal. Every other
-  operation rounds correctly. Wherever it can see a subnormal it runs through `ieee_mul`, `ieee_div`, `ieee_add` or
-  `fma_ieee`. `fma_ieee` sits at every `FFMA`: the source's `fmaf` (`:114`, `:145`, `:197`) and the two sums ptxas
-  contracts (`:93`, `:148`).
+  operation rounds correctly. Wherever a subnormal can change a bit it runs through `ieee_mul`, `ieee_div`, `ieee_add`
+  or `fma_ieee`; the row norm's `/ N + eps` (for eps of at least 2^-102), `1 + e` and `inj / 4` (which feeds only
+  `__expf`) are plain, since a subnormal there cannot change the result. `fma_ieee` sits at every `FFMA`: the source's
+  `fmaf` (`:114`, `:145`, `:197`) and the two sums ptxas contracts (`:93`, `:148`).
 
 - `src/prefill/gemm.cu`, the prompt path's fp16 and BF16 products, has no device code: each product is one
   `cublasGemmEx` (`gemm.cu:122-132`, `:158-167`), so cuBLAS picks the kernel, the summation order and the subnormal

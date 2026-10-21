@@ -4,7 +4,7 @@
 //
 // basalt's prompt-path hyper-connection kernels (kernels.cu:85-204, launched by :862-900) in the rounding sequence
 // nvcc compiles for them (docs/research/basalt-nvcc/prefill_kernels.md section 1). kernels.cu is IEEE-built: every
-// product, sum and fused product that can see or make a subnormal goes through ieee_mul, ieee_add, ieee_div or
+// product, sum and fused product where a subnormal can change a bit goes through ieee_mul, ieee_add, ieee_div or
 // fma_ieee (this GPU flushes subnormals), with fma_ieee exactly where the SASS has an FFMA; __expf is
 // expf_ieee(sign_flip(x)) and rsqrtf fast::rsqrt. The residual R holds B tokens of four streams of HC_N floats,
 // stream-major: R[t][c * HC_N + d], row (t, c) = 4 t + c. Needs basalt_fp.metal, basalt_ieee.metal, basalt_f64.metal,
