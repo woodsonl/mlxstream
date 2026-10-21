@@ -38,6 +38,10 @@ static inline float gdn_sum4(float p0, float p1, float p2, float p3) {
     return ieee_add(ieee_add(ieee_add(p0, p1), p2), p3);
 }
 
+// The q and k L2 scale of y by its head's sum of squares ss (dec_gdn_rec.cu:228-229, verify_kernels.cu:53):
+// y * rsqrtf(ss + eps), FADD, the rsqrt, then FMUL.
+static inline float gdn_l2(float y, float ss, float eps) { return ieee_mul(y, rsqrt_ieee(ieee_add(ss, eps))); }
+
 // The alpha or beta logit of one row and token (dec_gdn_rec.cu:89-108; verify_kernels.cu:183-203, the unrolled
 // kernel the launcher takes at n_embd = 2560, where the loop form's order is the same): lane `lane`'s chain over the
 // row's words j = lane, lane + 32, ... below n8, each 8 bf16 weights against the token's activations 8j .. 8j + 7 in
@@ -151,7 +155,7 @@ kernel void gdn_conv_l2_multi(device const float* state [[buffer(0)]], device co
         const float sq = warp_sum_ieee(ieee_mul(y, y));
         if (lane == 0u) part[sg] = sq;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        y = ieee_mul(y, rsqrt_ieee(ieee_add(gdn_sum4(part[0], part[1], part[2], part[3]), p.eps)));
+        y = gdn_l2(y, gdn_sum4(part[0], part[1], part[2], part[3]), p.eps);
     }
     h[t * p.C + c] = cuda_nan(y);
 }
@@ -350,10 +354,8 @@ kernel void dec_gdn_rec(device const float* state [[buffer(0)]], device const fl
         const bool write_qk = head < p.h_k;
         for (uint t = 0; t < GDN_MAXT; ++t) {
             if (t >= T) break;
-            q[t] = ieee_mul(q[t], rsqrt_ieee(ieee_add(gdn_sum4(part[0][t][0], part[0][t][1], part[0][t][2],
-                                                               part[0][t][3]), p.eps)));
-            k[t] = ieee_mul(k[t], rsqrt_ieee(ieee_add(gdn_sum4(part[1][t][0], part[1][t][1], part[1][t][2],
-                                                               part[1][t][3]), p.eps)));
+            q[t] = gdn_l2(q[t], gdn_sum4(part[0][t][0], part[0][t][1], part[0][t][2], part[0][t][3]), p.eps);
+            k[t] = gdn_l2(k[t], gdn_sum4(part[1][t][0], part[1][t][1], part[1][t][2], part[1][t][3]), p.eps);
             qn[t][tid] = q[t];
             kn[t][tid] = k[t];
             if (write_qk) {

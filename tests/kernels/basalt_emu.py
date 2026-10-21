@@ -919,8 +919,8 @@ def gdn_sum4(p0, p1, p2, p3):
 
 
 def gdn_l2_scale(y, ss, eps, rsqrt):
-    """The q/k L2 scale (dec_gdn_rec.cu:228-229, verify_kernels.cu:53), which the kernels write at the call site: FADD
-    x, ss, eps; rsqn(x); FMUL y, y, r."""
+    """The q/k L2 scale, basalt_gdn.metal's gdn_l2 (dec_gdn_rec.cu:228-229, verify_kernels.cu:53): FADD x, ss, eps;
+    rsqn(x); FMUL y, y, r."""
     with np.errstate(over="ignore", invalid="ignore"):
         return (np.asarray(y, F32) * rsqrt_ieee(np.asarray(ss, F32) + np.asarray(eps, F32), rsqrt)).astype(F32)
 

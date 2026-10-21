@@ -47,7 +47,7 @@ comparison is bitwise; a NaN result compares by class (the kernels' stores canon
   (G6's precondition), and its d and codes on every block (a flushed max changes no bit); the two ds.y must differ on
   many blocks, and only in the sign of a zero, and the tie blocks' codes must depend on the quotient's rounding.
 - H.5: the GDN window's first steps (basalt_gdn.metal: ``gdn_conv``, ``gdn_silu``, ``gdn_sum4``, ``gdn_ab_dot``,
-  ``gdn_beta``, ``gdn_gate``; the L2 scale as the kernels write it at the call site) against ``basalt_emu``'s twins,
+  ``gdn_beta``, ``gdn_gate`` and the L2 scale ``gdn_l2``) against ``basalt_emu``'s twins,
   which follow the SASS rows (dec_gdn.md section 1, verify_gdn.md sections 2-5), the GPU's ``fast::exp2`` and
   ``fast::rsqrt`` injected; ``gdn_ab_dot`` one SIMD-group per row of 2560 (the window's n_embd). Classes: random
   model-like rows; conv products below 2^-126 of operands near 2^-63, subnormal taps or weights beside large ones, and
@@ -527,7 +527,7 @@ def test_q8_1_store_rec_matches_the_emulation():
     assert np.count_nonzero(emu.roundf(v / d) != emu.roundf(emu.mul_ftz(v, emu.rcp_ftz(d)))) > 100
 
 
-# ---- H.5: gdn_conv, gdn_silu, gdn_sum4, the L2 scale, gdn_ab_dot, gdn_beta, gdn_gate --------------------------------
+# ---- H.5: gdn_conv, gdn_silu, gdn_sum4, gdn_l2, gdn_ab_dot, gdn_beta, gdn_gate --------------------------------------
 
 H5 = """
 // each step, then its plain form: this GPU's own operations, which read and write subnormals as zero
@@ -559,12 +559,11 @@ kernel void h5_sum4(device const uint4* a [[buffer(0)]], device uint* out [[buff
   out[2 * i + 1] = as_type<uint>(((p.x + p.y) + p.z) + p.w);
 }
 
-// the L2 scale, which the kernels write at its call sites (dec_gdn_rec.cu:228-229, verify_kernels.cu:53)
 kernel void h5_l2(device const uint* a [[buffer(0)]], device uint* out [[buffer(1)]],
                   constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
   if (i >= n) return;
   const float y = as_type<float>(a[3 * i]), ss = as_type<float>(a[3 * i + 1]), eps = as_type<float>(a[3 * i + 2]);
-  out[2 * i] = as_type<uint>(ieee_mul(y, rsqrt_ieee(ieee_add(ss, eps))));
+  out[2 * i] = as_type<uint>(gdn_l2(y, ss, eps));
   out[2 * i + 1] = as_type<uint>(y * fast::rsqrt(ss + eps));
 }
 
