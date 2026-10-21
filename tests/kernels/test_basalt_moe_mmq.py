@@ -25,7 +25,10 @@ exists), then the Metal port's (kernels/common/basalt_mmq.metal).
   SwiGLU's divisions differs from the correctly rounded quotient (contract invariant 5's count).
 - test_mmq_launch_and_pieces (M3, spec-kernels-mmq.md 10): the kernels' launch helpers mmq_launch and mmq_piece_mask,
   run on the GPU by a probe kernel, equal emu.mmq_launches and the pieces of emu.mmq_walk on every tile of every launch
-  of scripts/mmq_pieces.py's sweep and of the fixtures' plans."""
+  of scripts/mmq_pieces.py's sweep and of the fixtures' plans.
+- test_mmq_quantize_edges (M1): kernel 1, basalt_mmq_quantize, alone: Xq's bytes equal emu.mmq_quantize's on every
+  slot through the plan's src, the edge groups (NaN, subnormal, d_inv = +inf, +-inf, roundf's ties) hold their literal
+  codes and scales, and slots at or past bounds[n] keep the 0xFF fill, with and without experts held on the CPU."""
 
 import functools
 
@@ -330,3 +333,57 @@ def test_mmq_launch_and_pieces(product, n, nty, bpne, bpi):
           f"{len(masks)} (ntiles, grid) pairs; {len(bad)} tiles differ")
     assert wide >= 2 ** 32, wide
     assert not len(bad), [(items[i].tolist(), got[i].tolist(), want[i].tolist()) for i in bad[:5]]
+
+
+def test_mmq_quantize_edges():
+    """M1 (spec-kernels-mmq.md 10): kernel 1, basalt_mmq_quantize (quantize_mmq_q8_1<D4>, quantize.cu:10-84), alone at
+    bound B = 4 on two tokens whose 20 slots read them through the plan's src = [1, 0, 0, 1, ...]. Xq's bytes equal
+    basalt_emu.mmq_quantize's (spec-tests-moe.md 5.4 step 1) on every slot, slots p >= bounds[n] keep the 0xFF fill, and
+    the edge groups, each token's at other lanes, SIMD-groups and threadgroups, hold their literal bytes: all NaN (d4
+    0x7fffffff, codes 0); one NaN among normals (its code 0); all subnormal (flushed: d4 +0, codes 0); tiny normals,
+    amax < 127 / FLT_MAX, so d_inv = +inf (codes 0xFF for positive values and 0x00 for negative ones, F2I's saturation,
+    0 for the zeros and for a flushed positive subnormal; d4 +0); a +inf, a -inf (d_inv 0: d4 +inf, codes 0); amax 127,
+    where d_inv = fl(127 fl(1 / 127)) is 1 exactly, holding +-0.5, +-2.5, +-126.5 and 0.49999997 (roundf's ties away
+    from zero and its add rounded toward zero: codes +-1, +-3, +-127, 0). A second plan holds two experts on the CPU
+    (rows_local 18 < 10 R): their last block of slots keeps the fill too, as no GPU kernel reads it."""
+    rng = np.random.default_rng(4)
+    B, T = 4, 2
+    bits = lambda b: np.asarray(b, np.uint32).view(F32)
+    sign = lambda: rng.integers(0, 2, 32, dtype=np.uint32) << np.uint32(31)
+    nan = bits(sign() | 0x7F800000 | rng.integers(1, 1 << 23, 32, dtype=np.uint32))     # quiet and signalling
+    one_nan = rng.standard_normal(32, dtype=F32)
+    one_nan[13] = bits(0xFFC00001)                                                        # a quiet NaN
+    sub = bits(sign() | rng.integers(1, 1 << 23, 32, dtype=np.uint32))
+    tiny = (rng.uniform(1, 8, 32) * 2.0 ** -126 * rng.choice([-1, 1], 32)).astype(F32)
+    tiny[[3, 11, 17, 20]] = F32(2.0 ** -122), F32(0.0), F32(-0.0), bits(5)              # amax; zeros; a subnormal
+    pinf, ninf = rng.standard_normal((2, 32), dtype=F32)
+    pinf[7], ninf[30] = np.inf, -np.inf
+    ties = rng.uniform(-126, 126, 32).astype(F32)
+    at = [29, 0, 4, 9, 14, 19, 24, 31]                   # 127 in the group's last thread: amax crosses the butterfly
+    ties[at] = 127, 0.5, -0.5, 2.5, -2.5, 126.5, -126.5, bits(0x3EFFFFFF)
+    zeros = dict.fromkeys(range(32), 0)
+    groups = [(nan, 0x7FFFFFFF, zeros), (one_nan, None, {13: 0}), (sub, 0, zeros),
+              (tiny, 0, dict(enumerate(np.where(tiny >= 2.0 ** -126, -1, 0)))), (pinf, 0x7F800000, zeros),
+              (ninf, 0x7F800000, zeros), (ties, 0x3F800000, dict(zip(at, (127, 1, -1, 3, -3, 127, -127, 0))))]
+    where = [[0, 5, 10, 15, 22, 47, 79], [41, 46, 51, 56, 63, 8, 40]]   # 32-value group gi of each token's row: lanes
+    x = rng.standard_normal((B, fx.N), dtype=F32)                      # 8 (gi % 4) .., block gi // 4, threadgroup gi // 16
+    for t in range(T):
+        for gi, (v, _, _) in zip(where[t], groups):
+            x[t, 32 * gi: 32 * gi + 32] = v
+    ids = np.array([[e for e in range(20) if e % 4 in (1, 2)], [e for e in range(20) if e % 4 in (0, 3)]])
+    want = emu.mmq_quantize(x[:T])
+    for cpu, local in (((), 10 * T), ((5, 12), 18)):
+        plan = emu.moe_plan(ids, 512, cpu)
+        assert plan.bounds[-1] == plan.rows_local == local
+        got = gpu.mmq_quantize(x, plan, B=B)
+        bad = np.argwhere(got[:local] != want[plan.src[:local]])
+        assert not len(bad), f"cpu {cpu}: {len(bad)} bytes differ from the emulator, first (slot, block, byte) {bad[0]}"
+        assert np.all(got[local:] == 0xFF), f"cpu {cpu}: a slot at or past bounds[n] = {local} was written"
+        if not cpu:
+            assert plan.src.tolist() == [1, 0, 0, 1] * 5
+            for p in range(local):
+                for gi, (_, d4, codes) in zip(where[plan.src[p]], groups):
+                    blk, g = got[p, gi // 4], gi % 4
+                    c = blk[16 + 32 * g: 48 + 32 * g].view(np.int8)
+                    assert d4 is None or blk[:16].view(np.uint32)[g] == d4, (p, gi, hex(blk[:16].view(np.uint32)[g]))
+                    assert all(c[i] == code for i, code in codes.items()), (p, gi, c.tolist())

@@ -26,6 +26,12 @@
 //   (bpi weight blocks of bpne a row), the closed form of mul_mat_q's walk over its CTAs (mmq.cuh:487-629) and its
 //   fixup (:632-767). The tile's outputs are its pieces' chains, each from +0, folded in the fixup's order.
 // - mmq_code(v): the quantizer's roundf stored to a char as sm_120 converts it (spec-kernels-mmq.md 3.2).
+// - mmq_quantize_block(xi, blk, iqs): quantize_mmq_q8_1<D4>'s body (quantize.cu:39-81), which kernels 1 and 3 share.
+//
+// The kernels (spec-kernels-mmq.md 9.1). Each returns at StepState.done before its first load, so once the plan
+// refuses a routed id nothing more of the step is stored.
+// - basalt_mmq_quantize (kernel 1): the layer's activations to Xq through the plan's src (quantize.cu:10-84, launched
+//   :94-96 from prefill.cpp:1990).
 //
 // Macros (monolith/kernels.py basalt_mmq_macros): MMQ_TYPE (42 Q2_0, 8 Q8_0), K, NTY, LD, BPNE, BPI, NITER, MMQ_DOWN,
 // MMQ_DENSE, ROWS_PER_T, MMQ_SM_COUNT, MAT_OFF, MMQ_ERR; and PROMPT_ROWS' T_SRC, ROWS_MAX and T_STATIC_ROWS.
@@ -78,4 +84,41 @@ static inline uint mmq_piece_mask(int t, int ntiles, int bpne, int bpi, int grid
         if (k * W / G < t0 + ulong(min(bpi * q + bpi, bpne))) mask |= 1u << q;
     }
     return mask;
+}
+
+// The plan's int32 words (monolith/kernels.py MMQ_PLAN_WORDS): n, rows_local, order[512], then bounds[513] from word
+// MMQ_BOUNDS, then wpre[513].
+constant int MMQ_BOUNDS = 514;
+
+// quantize.cu:39-81 in the D4 layout (spec-kernels-mmq.md 3.2 steps 1-6, 9.7): the thread's four values xi are values
+// iqs .. iqs + 3 of the block_q8_1_mmq at blk (36 words: d4[4], then the 128 int8 codes), and the 8 lanes of each
+// 32-value group (lanes 8g .. 8g + 7 of the SIMD-group) share its amax through the butterfly. The max of flushed
+// magnitudes is order-free (fmax drops a NaN, so amax is NaN only for an all-NaN group); d_inv = 127 / amax is
+// MUFU.RCP then FMUL.FTZ, d = 1 / d_inv MUFU.RCP: rcp_ftz, contract invariant 5.
+static inline void mmq_quantize_block(float4 xi, device uint* blk, uint iqs) {
+    float amax = max_ftz(max_ftz(max_ftz(abs_ftz(xi.x), abs_ftz(xi.y)), abs_ftz(xi.z)), abs_ftz(xi.w));   // :40-43
+    for (ushort o = 4; o > 0; o >>= 1) amax = max_ftz(amax, shfl_xor(amax, o));                              // :46-49
+    const float d_inv = mul_ftz(127.0f, rcp_ftz(amax));                                                      // :51
+    blk[4u + iqs / 4u] = as_type<uint>(char4(mmq_code(mul_ftz(xi.x, d_inv)), mmq_code(mul_ftz(xi.y, d_inv)),  // :53-56,
+                                             mmq_code(mul_ftz(xi.z, d_inv)), mmq_code(mul_ftz(xi.w, d_inv))));  // :74-75
+    if (iqs % 32u == 0u) blk[iqs / 32u] = as_type<uint>(cuda_nan(rcp_ftz(d_inv)));                            // :57, :77-81
+}
+
+// Kernel 1 (quantize.cu:10-84 as quantize.cu:94-96 launches it from prefill.cpp:1990: the layer's activations through
+// src_dev; spec-kernels-mmq.md 9.7). x [B][K] floats, its binding 16-byte aligned (basalt's float4 loads,
+// quantize.cu:32, :39); src [10 B] the plan's slot-to-token rows; Xq [10 B][K / 128] blocks of 144 bytes, a slot's
+// row contiguous (basalt's are k-block-major with the row count as stride: an address change, 9.1); plan its words.
+// Threadgroup (p, by) of MMQ_THREADS quantizes values 512 by .. 512 by + 511 of x's row src[p] into blocks 4 by ..
+// 4 by + 3 of Xq's row p, four values a thread (quantize.cu:18, :35-36). Slots p >= bounds[n] return (bounds[n] is
+// the plan's rows_local, prefill.cpp:1996: below 10 R only when the CPU holds experts, whose last block of rows basalt
+// quantizes too and no GPU kernel reads). Grid (10 B, K / 512).
+kernel void basalt_mmq_quantize(device const float* x [[buffer(0)]], device const int* src [[buffer(1)]],
+                                device uint* xq [[buffer(2)]], device const int* plan [[buffer(3)]],
+                                device const StepState* st [[buffer(15)]],
+                                uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    if (st->done) return;                                                    // uniform: before any load
+    if (int(tg.x) >= plan[MMQ_BOUNDS + plan[0]]) return;                     // uniform per threadgroup
+    const uint i0 = 512u * tg.y + 4u * tid;
+    const float4 xi = *(device const float4*) (x + ulong(src[tg.x]) * K + i0);                     // :29-39
+    mmq_quantize_block(xi, xq + (ulong(tg.x) * (K / 128) + i0 / 128u) * 36u, i0 % 128u);          // :70-71
 }

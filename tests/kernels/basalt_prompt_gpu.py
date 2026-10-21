@@ -1,6 +1,6 @@
-"""Single-kernel runs of basalt's prompt path (kernels/common/basalt_prompt_*.metal) for the GPU tests. Every prompt
-kernel reads its rows from StepState at slot 15 (monolith/kernels.py's PROMPT_ROWS), so ``run_rows`` is
-basalt_gpu.run with a StepState record bound there. A source compiles as the emitter registers it (the StepState
+"""Single-kernel runs of basalt's prompt path (kernels/common/basalt_prompt_*.metal, basalt_mmq.metal) for the GPU
+tests. Every prompt kernel reads its rows from StepState at slot 15 (monolith/kernels.py's PROMPT_ROWS), so ``run_rows``
+is basalt_gpu.run with a StepState record bound there. A source compiles as the emitter registers it (the StepState
 struct spliced in after the prelude) with the dynamic-T program's row macros: STEP_STATE 1, T_SRC 0 and ROWS_MAX the
 compiled bound B; the static form (T_SRC 2) is the contract and program tiers' concern."""
 
@@ -69,3 +69,32 @@ def convert(x, *, bf16, B, rows, fill=0xFF):
     y = run_rows(pso, [x.tobytes(), 2 * B * n], kernels.basalt_prompt_convert_params(n), 2, (-(-B * n // 256), 1, 1),
                  (256, 1, 1), rows, 0, fill=fill)[1]
     return np.frombuffer(y, np.uint16).reshape(B, n)
+
+
+def plan_words(plan):
+    """basalt_emu.moe_plan's ``plan`` as the MMQ kernels' plan buffer: kernels.MMQ_PLAN_WORDS int32 words, n,
+    rows_local, order[512], bounds[513], wpre[513] (kernels/common/basalt_mmq.metal), each array's words past its
+    entries -1."""
+    w = np.full(kernels.MMQ_PLAN_WORDS, -1, np.int32)
+    w[:2] = plan.n, plan.rows_local
+    for at, a in ((2, plan.order), (514, plan.bounds), (1027, plan.wpre)):
+        w[at: at + len(a)] = a
+    return w
+
+
+def mmq_quantize(x, plan, *, B):
+    """basalt_mmq_quantize (kernel 1, quantize_mmq_q8_1<D4>) of the float32 rows ``x`` [B, 2560] through ``plan``
+    (basalt_emu.moe_plan's for its R tokens: slot p reads row src[p], slots p < bounds[n]), compiled at bound ``B`` with
+    the gate/up product's macros and run with R rows in StepState, into an Xq of the 10 B slots' blocks whose bytes
+    start as 0xFF. Returns Xq's bytes, uint8 [10 B, 20, 144]."""
+    macros = kernels.basalt_mmq_macros("gate_up")
+    k, slots = int(macros["K"]), B * plan.slot.shape[1]
+    x = np.ascontiguousarray(x, np.float32)
+    assert x.shape == (B, k), f"x {x.shape} at bound {B}"
+    src = np.full(slots, -1, np.int32)
+    src[: len(plan.src)] = plan.src
+    pso = prompt_pipeline(kernels.basalt_mmq_source(), "basalt_mmq_quantize", B, macros)
+    nbytes = slots * k // 128 * kernels.MMQ_BLOCK_BYTES
+    xq = run_rows(pso, [x.tobytes(), src.tobytes(), nbytes, plan_words(plan).tobytes()], None, 0, (slots, k // 512, 1),
+                  (kernels.MMQ_THREADS, 1, 1), len(plan.slot), 0, fill=0xFF)[2]
+    return np.frombuffer(xq, np.uint8).reshape(slots, k // 128, kernels.MMQ_BLOCK_BYTES)
