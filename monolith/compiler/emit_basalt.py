@@ -244,6 +244,45 @@ def _gdn_window(ctx: _Ctx, op: Op) -> None:
             f"{op.kind}:{state.name}", writes=[10, 11, 12, 13, 14])
 
 
+def _gdn_commit(ctx: _Ctx, op: Op) -> None:
+    """``gdn_commit_layers`` for one layer (ops/basalt_gdn.py): MT and C from ``win_h``, HV from ``win_gate``, refused
+    where ``kernels.basalt_gdn_commit_params`` refuses; input i at buffer i, ``used`` at 6, the record at 7, and no
+    StepState: the host-written record ``commit`` carries the count. One 128-thread threadgroup per item."""
+    if ctx.dynamic_t:
+        raise ValueError(f"{op.kind}: the commit's count is word 0 of its host-written record, not StepState's; a "
+                         "dynamic-T program cannot run it")
+    if (len(op.inputs), len(op.outputs)) != (6, 1):
+        raise ValueError(f"{op.kind}: {len(op.inputs)} inputs and {len(op.outputs)} outputs; the commit reads 6 (the "
+                         "state, win_h, win_qkv, win_gate, win_beta, the record) and writes used")
+    state, win_h, win_qkv, win_gate, win_beta, commit = op.inputs
+    (used,) = op.outputs
+    for s in (state, win_h, win_qkv, win_gate, win_beta):
+        if not s.is_state:
+            raise ValueError(f"{op.kind}: {s.name!r} is not a graph state; the state and the window stores are a "
+                             "session's buffers, shared by name with its window programs")
+    if not commit.is_input:
+        raise ValueError(f"{op.kind}: {commit.name!r} is not a graph input; the record is the host's, written once it "
+                         "has chosen n_keep")
+    ups = set(op.attrs.get("updates", ()))
+    if ups != {state.name}:
+        raise ValueError(f"{op.kind}: updates names {sorted(ups)}; the commit writes exactly the state {state.name!r}")
+    mt, c, hv = ctx.shape(win_h)[0], ctx.shape(win_h)[-1], ctx.shape(win_gate)[-1]
+    _expect(ctx, op, win_h, (mt, c), DType.F32, "the window's rows after the conv, the SiLU and the q/k L2 norm")
+    _expect(ctx, op, win_qkv, (mt, c), DType.F32, f"the window's qkv rows; MT and C from {win_h.name!r}")
+    _expect(ctx, op, win_gate, (mt, hv), DType.F32, f"each value head's decay gate per row; MT from {win_h.name!r}")
+    _expect(ctx, op, win_beta, (mt, hv), DType.F32,
+            f"each value head's beta per row; MT from {win_h.name!r}, HV from {win_gate.name!r}")
+    _expect(ctx, op, state, (kernels.GDN_S * kernels.GDN_S * hv + 3 * c,), DType.F32,
+            f"the recurrent state, then the conv history; HV from {win_gate.name!r}, C from {win_h.name!r}")
+    _expect(ctx, op, commit, (2 + mt,), DType.I32, "the record: n_keep, n_keep - 1, then a position per window row")
+    _expect(ctx, op, used, (1,), DType.U32, "the n the commit used")
+    prm = ctx.params("basalt_gdn_commit", kernels.basalt_gdn_commit_params(c, hv, mt))
+    k = ctx.kernel("basalt_gdn_commit", kernels.basalt_gdn_commit_source(), "gdn_commit_layers", {})
+    bindings = [_bind(ctx, op, i, v, 4) for i, v in enumerate([*op.inputs, used])]
+    ctx.add(k, bindings + [(7, prm, 0)], (kernels.basalt_gdn_commit_grid(c, hv), 1, 1), (128, 1, 1), op.kind,
+            writes=[0, 6])
+
+
 BASALT_HANDLERS: Dict[str, object] = {"basalt_q8_1": _q8_1, "basalt_mmvq": _mmvq, "basalt_dense_tc": _dense_tc,
                                       "basalt_dense_tc_pair": _dense_tc_pair, "basalt_mmvf": _mmvf,
-                                      "basalt_gdn_window": _gdn_window}
+                                      "basalt_gdn_window": _gdn_window, "basalt_gdn_commit": _gdn_commit}

@@ -1,6 +1,19 @@
-"""The packer of basalt's GDN commit (monolith/kernels.py ``basalt_gdn_commit_params`` and ``basalt_gdn_commit_grid``):
-the record's 48 bytes at the contract's shapes and at basalt's multi-layer strides, the threadgroup count, and the
-refusals, each a valid input with exactly one defect refused by that defect's own check (its message). No GPU."""
+"""Host-only checks of basalt's GDN commit; no GPU.
+
+The op (monolith/ops/basalt_gdn.py) as compiler/emit_basalt.py's ``_gdn_commit`` emits it, in a program of no weights;
+the GPU side is tests/kernels/test_basalt_dec_commit.py.
+
+- CT.1: ``basalt_gdn_commit`` registered (MAP over heads, its binding the kind on both families), its handler, and the
+  coverage guard.
+- CT.2: at Flash-Next's layer (C = 10240, HV = 48, MT = 8), one dispatch of ``gdn_commit_layers`` with the builder's
+  source and no macros, grid (272, 1, 1) of 128 threads; input i at slot i and ``used`` at 6, each at byte 0 of its own
+  buffer, the program's own params record at 7 (``kernels.basalt_gdn_commit_params``) and no StepState at 15;
+  ``writes`` [0, 6]; the state and the stores states of their sizes, the record ``commit`` a host-written 40-byte arena
+  input bound as itself, never as StepState.
+- The packer (monolith/kernels.py ``basalt_gdn_commit_params`` and ``basalt_gdn_commit_grid``): the record's 48 bytes at
+  the contract's shapes and at basalt's multi-layer strides, the threadgroup count, and the refusals, each a valid
+  input with exactly one defect refused by that defect's own check (its message).
+"""
 
 import re
 import struct
@@ -8,10 +21,66 @@ import struct
 import pytest
 
 from monolith import kernels
+from monolith.compiler import check_coverage, emit_program
+from monolith.compiler.emit import HANDLERS
+from monolith.core import BlockDomain, DType, Graph, OpClass
+from monolith.ops import OPS
+from tests.contract.test_basalt_ops import spliced
+from tests.contract.test_basalt_windows import PROFILE
 
 C, HV, MT = 10240, 48, 8          # Flash-Next's GDN layer (h_k = 16) and the contract's window rows (D18)
 STATE = 817152                    # a layer's 128 x 48 x 128 state then its 10240 x 3 history (D17; dcp's GDN_FLOATS)
 RECORD = "<12I"                   # GdnCommitParams (basalt_gdn_commit.metal)
+STORES = ("win_h", "win_qkv", "win_gate", "win_beta")      # the window's stores in the commit's slot order (1 to 4)
+
+
+def commit_op(g):
+    """``basalt_gdn_commit`` of layer 0 at the contract's shapes: ``gdn.0.state`` and its four stores (graph states),
+    the record ``commit`` (a graph input), in slot order, then ``gdn.0.commit``, the n used."""
+    ins = [g.state("gdn.0.state", (STATE,), DType.F32),
+           *[g.state(f"gdn.0.{s}", (MT, w), DType.F32) for s, w in zip(STORES, (C, C, HV, HV))],
+           g.input("commit", (2 + MT,), DType.I32)]
+    used = g.value("gdn.0.commit", (1,), DType.U32)
+    g.op("basalt_gdn_commit", ins, [used], domain=BlockDomain("heads", 1), klass=OpClass.MAP, updates=[ins[0].name])
+    return [*ins, used]
+
+
+# ---- CT.1 and CT.2: registration, and the dispatch against the builders --------------------------------------------
+
+def test_registered_and_covered():
+    od = OPS.get("basalt_gdn_commit")
+    assert od.klass is OpClass.MAP and od.domain_kind == "heads"
+    assert od.binding_for("apple9").kernel == od.binding_for("apple10").kernel == "basalt_gdn_commit"
+    assert HANDLERS["basalt_gdn_commit"].__name__ == "_gdn_commit"
+    g = Graph("commit")
+    commit_op(g)
+    check_coverage(g, PROFILE)
+
+
+def test_commit_dispatch_is_the_builders():
+    """One dispatch of ``gdn_commit_layers``: the builder's source, no macros, grid (272, 1, 1) of 128 threads (one
+    threadgroup per item); the state, win_h, win_qkv, win_gate, win_beta, the record and used at slots 0 to 6, each at
+    byte 0 of its own buffer, the record ``basalt_gdn_commit_params`` of the shapes at 7, nothing at 15 (the record
+    carries the count, no StepState); the commit writes slots 0 and 6. The state and the stores are states of their
+    sizes; the record ``commit`` is a 40-byte arena buffer of its own name, as no StepState field is named commit."""
+    g = Graph("commit")
+    vals = commit_op(g)
+    prog = emit_program(g, pack=[], profile=PROFILE, t=1, tail=None)
+    (o,) = prog.ops
+    k = prog.kernels[o.kernel]
+    assert (k.function, k.macros, k.source) == ("gdn_commit_layers", {}, spliced(kernels.basalt_gdn_commit_source()))
+    assert (o.name, o.grid, o.threadgroup, o.threadgroup_memory) == ("basalt_gdn_commit", (272, 1, 1), (128, 1, 1), [])
+    assert [b[0] for b in o.bindings] == list(range(8)) and o.meta["writes"] == [0, 6]
+    assert [(name, off) for _, name, off in o.bindings[:7]] == [(v.name, 0) for v in vals]
+    _, prm, off = o.bindings[7]
+    rec = prog.buffers[prm]
+    assert (prm, off, rec.role, len(rec.init)) == ("params.S1.basalt_gdn_commit.0", 0, "params", 48)
+    assert struct.unpack_from(RECORD, rec.init) == struct.unpack(RECORD, kernels.basalt_gdn_commit_params(C, HV, MT))
+    sizes = {"gdn.0.state": ("state", 4 * STATE), "gdn.0.win_h": ("state", 4 * MT * C),
+             "gdn.0.win_qkv": ("state", 4 * MT * C), "gdn.0.win_gate": ("state", 4 * MT * HV),
+             "gdn.0.win_beta": ("state", 4 * MT * HV), "commit": ("arena", 40), "gdn.0.commit": ("arena", 16)}
+    assert {n: (prog.buffers[n].role, prog.buffers[n].nbytes) for n in sizes} == sizes
+    assert "commit" not in prog.layout.offsets and prog.step_state not in {name for _, name, _ in o.bindings}
 
 
 def test_basalt_gdn_commit_params_record_and_grid():
