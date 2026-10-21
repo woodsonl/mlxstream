@@ -594,10 +594,11 @@ def test_hc8_image_bits():
     src/kernels/hc8_parity.cpp:103-105 and Gemm::bf16_w at src/prefill/gemm.cu:150): basalt_hc8_dequant_bf16 bit for
     bit against ``host_image``, into an output of exactly the image's bytes, on the copies of hc8_parity's three
     matrices (tests/basalt_hc_ref.py, quantized by the hc lane's ``quantize``) whole, on the down copy's rows
-    [102, 204) and [306, 320) (two of the 102-row slices hc8_parity's 1 Mi-element Gemm takes, :214-215), and on
-    ``special_copy`` whole; then on ``special_copy`` with a guard of 2048 values past the image (the reach of the
-    threadgroup's 220 idle threads), whose 0xFF bytes must survive. No image value is non-finite but the 0x7c00 group's
-    32 NaNs, 0x7fff each. The fixtures' coverage is asserted first, so no special case passes vacuously."""
+    [102, 204) and [306, 320) (a 102-row slice and the 14-row tail of the row slices hc8_parity's 1 Mi-element Gemm
+    takes, :214-215), and on ``special_copy`` whole; then on ``special_copy`` with a guard of 2048 values past the
+    image (the reach of the threadgroup's 220 idle threads), whose 0xFF bytes must survive. No image value is
+    non-finite but the 0x7c00 group's 32 NaNs, 0x7fff each. The fixtures' coverage is asserted first, so no special
+    case passes vacuously."""
     copies = {name: (q, s) for name, (_, q, s) in hc8_copies().items()}
     copies["special"] = special_copy()
     (qd, sd), (qx, sx) = copies["down"], copies["special"]
