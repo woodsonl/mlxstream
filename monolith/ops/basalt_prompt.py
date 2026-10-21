@@ -23,12 +23,10 @@ through it) and static programs (the tests') are both accepted; every dispatch b
   ``native``, as ``native_proj`` and ``bf16_proj`` require, ``src/prefill/prefill.cpp:1188-1199``); a mismatch is
   refused. K is a multiple of 16. Each output is one fp32 ``fma`` chain from +0 in increasing k, so its bits depend
   only on its x row, its w row and K: never on the chunk's rows, the row's place in the chunk or the static slice
-  that computes it (basalt's cuBLAS call promises none of these). Until dequant's kernels merge into this branch,
-  ``native`` is refused.
+  that computes it (basalt's cuBLAS call promises none of these).
 * ``basalt_prompt_convert`` (``to_f16`` / ``to_bf16``, ``src/prefill/kernels.cu:818-833``): ``(x [T, n] F32)`` →
   ``y [T, n]`` F16 (``to_f16``) or BF16 (``to_bf16``); the output dtype picks the kernel. Element-local, so a row's
-  bits never depend on the chunk. Until dequant's ``bf16_rne_nonan`` merges into this branch, a BF16 output is
-  refused.
+  bits never depend on the chunk.
 * ``basalt_prompt_hc_broadcast`` (``gr_broadcast``, ``src/prefill/kernels.cu:199-204``): ``(e [T, n] F32)`` →
   ``r [T, 4n] F32``, each of the four streams a 32-bit copy of ``e`` (NaN payloads included).
 * ``basalt_prompt_hc_norm`` (``gr_norm_rs``, ``:85-102``), attr ``eps``: ``(r [T, 4n] F32, w [4n] F32)`` →

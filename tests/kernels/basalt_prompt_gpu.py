@@ -8,6 +8,7 @@ import numpy as np
 
 from monolith import kernels
 from monolith.core.step_state import StepStateLayout
+from monolith.formats.gguf import ggml_row_bytes
 from monolith.runtime import _native as nt
 from tests.contract.test_basalt_ops import spliced
 from tests.kernels.basalt_gpu import device, pipeline, run
@@ -55,6 +56,23 @@ def prompt_gemm(xb, wb, *, bf16, B, rows=None, slices=None, fill=0xFF, done=0):
         y = run_rows(pso, [xb.tobytes(), wb.tobytes(), y], kernels.basalt_prompt_gemm_params(n, k, row0, col0), 3,
                      (-(-ncols // 64), -(-nrows // 64), 1), (256, 1, 1), B if rows is None else rows, 0, done=done)[2]
     return np.frombuffer(y, np.uint32).reshape(B, n)
+
+
+def native(type_id, blocks, xb, *, B, rows=None, fill=0xFF):
+    """``Gemm::native`` (gemm.cu:169-185) of the fp16 bits ``xb`` [B, K] by the GGUF rows ``blocks`` [N, row bytes] of
+    type ``type_id``: basalt_dequant_g32 at DQ_OUT 1 (dequant_f16, through the dequantizer's builders) over all N rows
+    into an fp16 image of exactly N * K halves, then prompt_gemm's FP16 product on that image (rows and y as there).
+    The image's and y's bytes start as ``fill``. Two runs here; the program's two dispatches in one command buffer are
+    the program tier's. Returns (y's bits uint32 [B, N], the image's bits uint16 [N, K])."""
+    blocks = np.ascontiguousarray(blocks, np.uint8)
+    n, k = len(blocks), np.shape(xb)[1]
+    assert blocks.shape[1] == ggml_row_bytes(type_id, k), f"blocks {blocks.shape} of type {type_id} at K {k}"
+    pso = pipeline(kernels.basalt_dequant16_source(), "basalt_dequant_g32",
+                   tuple(kernels.basalt_dequant16_macros(type_id, "f16").items()))
+    image = run(pso, [blocks.tobytes(), 2 * n * k], kernels.basalt_dequant16_params(type_id, 0, n, k), 2,
+                *kernels.basalt_dequant16_grid(n, k), fill)[1]
+    image = np.frombuffer(image, np.uint16).reshape(n, k)
+    return prompt_gemm(xb, image, bf16=False, B=B, rows=rows, fill=fill), image
 
 
 def convert(x, *, bf16, B, rows, fill=0xFF):
