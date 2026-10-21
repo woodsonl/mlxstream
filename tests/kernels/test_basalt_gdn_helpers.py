@@ -31,7 +31,8 @@ comparison is bitwise; a NaN result compares by class (the kernels' stores canon
   0.75 * 2^n - 1 for n = -2..29, which holds every float32 x whose round-to-nearest x + 1 steps k where FADD.RZ's does
   not; [-1, e^20] by bits and by value, [-1, 1] by value; zeros, -1, x < -1, the largest finite values, infinities and
   NaNs. Fixed rows with their bits: 0x3EFFFFFF, the one float32 whose result FADD.RZ changes (a round-to-nearest sum
-  gives 0x3ECF9920), the smallest subnormals (which this GPU's m + s would flush to +0), +-0, -1 and +inf. The results
+  gives 0x3ECF9920), the smallest subnormals (which this GPU's m + s would flush to +0), +-0, -1, +inf, and one x per
+  Horner step of the first five whose result changes when that step's FFMA is split into FMUL + FADD. The results
   must also be within 1 ulp of float64's log1p rounded to float32 wherever x >= -1, which catches an error both
   transcriptions share.
 - H.4: ``q8_1_store_rec`` (dec_gdn_rec's q8_1 rows: native's d and codes, the block sum by unflushed adds) against
@@ -345,7 +346,13 @@ H3_FIXED = [(0x3EFFFFFF, 0x3ECF991F),      # 0.5 - 2^-25: RN(x + 1) = 1.5 steps 
             (0x7F800000, 0x7F800000),      # +inf: fma(x, inf, inf)
             (0xFF800000, 0x7FFFFFFF),      # -inf, x < -1 and NaN: fma(x, inf, inf), NaN
             (0xC0000000, 0x7FFFFFFF),
-            (0x7FC00000, 0x7FFFFFFF)]
+            (0x7FC00000, 0x7FFFFFFF),
+            # one per Horner step from the first: that step's FFMA split into FMUL + FADD gives
+            (0x3E5D5456, 0x3E486147),      # 0x3E486146
+            (0x3E5BA6F5, 0x3E46FFF8),      # 0x3E46FFF9
+            (0x3E3A2BA5, 0x3E2B0DC6),      # 0x3E2B0DC5
+            (0x3E0187DD, 0x3DF3F06B),      # 0x3DF3F06A
+            (0x3D9BC76F, 0x3D962384)]      # 0x3D962383
 
 
 def h3_args(rng, n=1 << 12):
