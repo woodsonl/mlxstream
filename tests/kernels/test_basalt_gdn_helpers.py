@@ -70,9 +70,10 @@ comparison is bitwise; a NaN result compares by class (the kernels' stores canon
   states, subnormal oc whose y the norm's scale of about 2^10 makes normal); gates in (-103.2, -87.4), a subnormal
   decay, beside zero key rows, zero v and a +0 or subnormal beta, so that g s reaches the state; z in (-88.72, -87.34),
   a subnormal sigmoid; a state and v near 2^-61 with eps 0 (subnormal squares, ss * 2^-7 subnormal: the norm's rsqrt
-  takes its scaled branch); infinities, NaNs and signed zeros. Each step's plain form on the same operands must differ
-  from IEEE's on many elements of each class built for it, and the random heads' decay, updated state, oc and y must
-  be within 1e-5 of float64's, relative to the sum of the absolute terms.
+  takes its scaled branch); infinities, NaNs and signed zeros, among them a zero head whose every product in the kv and
+  o chains is -0, where kv, kv_col, o, oc and y must be +0 (the chains start from +0). Each step's plain form on the
+  same operands must differ from IEEE's on many elements of each class built for it, and the random heads' decay,
+  updated state, oc and y must be within 1e-5 of float64's, relative to the sum of the absolute terms.
 """
 
 import numpy as np
@@ -963,8 +964,8 @@ def h6_heads(rng, n=16):
     sc[10:12, 1] = [np.nan, np.inf]
     vec[12, 3, :8] = [np.nan, np.inf, -np.inf, 0.0, -0.0, 88.8, -88.8, 1e30]
     vec[13, 4, :4] = [np.inf, np.nan, 0.0, -0.0]
-    st[14], vec[14, 2] = 0.0, 0.0                                   # a zero head: the chains' +0 from RZ
-    st[14, ::2], vec[14, 2, ::2] = -0.0, -0.0
+    st[14], vec[14, 2] = -0.0, -0.0                                 # a zero head, k, q and gamma positive: every
+    vec[14, [0, 1, 4]] = np.abs(vec[14, [0, 1, 4]])                 # chain product -0, the chains' +0 from RZ
     st[15], vec[15, 2], sc[15, 2] = 0.0, 0.0, 0.0                   # and with eps 0: rsqrt_ieee(+0) = inf, y NaN
     heads["special"] = (st, vec, sc)
     return heads
@@ -1008,6 +1009,10 @@ def test_gdn_recurrence_and_output_steps_match_the_emulation():
                                f"({names[bad[0][0]]}): got {ieee[tuple(bad[0])]:#010x}, want "
                                f"{want[tuple(bad[0])]:#010x}")
         plain[name] = differ(plain_bits, want)
+    # the zero head: every product of the kv and o chains is -0, so only their +0 start (the first FFMA's RZ) makes
+    # kv, kv_col, o, oc and y +0, on every thread
+    z0 = got[at["special"].start + 14][..., [2, 4, 8, 10, 16]]
+    assert np.all(z0 == 0), f"the zero head: kv, kv_col, o, oc or y not +0: {[hex(g) for g in np.unique(z0)]}"
     # the classes exercise what they claim: the plain step differs on many of their elements, and the subnormal values
     # the IEEE path keeps are there (subnormal updated states; subnormal oc whose y is normal; ss * 2^-7 subnormal)
     least = {"decay": {"subnormal_decay": 15}, "kv": {"decaying": 600}, "kv_col": {"decaying": 120},
