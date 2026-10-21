@@ -90,15 +90,16 @@ def words(eng, name, n):
 
 def run_window(engines, t, rows, hidden, hist=None):
     """One replay of the T = ``t`` window over ``rows`` (T_MAX, N) and ``hidden`` (T_MAX, D), all T_MAX rows of each
-    written, from the history ``hist`` (HS float32 values in basalt's layout; None: the history the last run left), the
-    snapshots first 0xa5 bytes, result and normalized 0xFF bytes. Returns its ``result`` and ``normalized`` (T_MAX rows
-    of D words), its snapshots ``snap`` (T_MAX slots of HS words) and ``hist`` after it (HS words), uint32."""
+    written, from the history ``hist`` (HS words in basalt's layout, float32 or the uint32 words a run returns, written
+    as its bytes; None: the history the last run left), the snapshots first 0xa5 bytes, result and normalized 0xFF
+    bytes. Returns its ``result`` and ``normalized`` (T_MAX rows of D words), its snapshots ``snap`` (T_MAX slots of HS
+    words) and ``hist`` after it (HS words), uint32."""
     eng = engines[t]
     b = eng.buffers
     b["ngram.rows"].write(np.ascontiguousarray(rows, F32).tobytes(), 0)
     b["ngram.hidden"].write(np.ascontiguousarray(hidden, F32).tobytes(), 0)
     if hist is not None:
-        b["ngram.hist"].write(np.ascontiguousarray(hist, F32).tobytes(), 0)
+        b["ngram.hist"].write(np.ascontiguousarray(hist).tobytes(), 0)
     b["ngram.snap"].fill(0xA5)
     b["ngram.result"].fill(0xFF)
     b["ngram.normalized"].fill(0xFF)
