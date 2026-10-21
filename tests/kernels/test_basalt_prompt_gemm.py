@@ -15,7 +15,9 @@ fix no summation order; the port computes each output as one fp32 fma chain from
   (hc8_parity.cpp:57-61's Err) over every output under hc8_parity.cpp:269's 5e-3, and no output non-finite, at the
   pack's BF16 shapes (Gemm::bf16's own gate, which hc8_parity applies at hc8's shapes) and FP16 ones (Gemm::native's
   second stage: the nearest bound, as no basalt test launches it), 1, 17 and 512 rows (attn_q's 12288 outputs at 1
-  and 17), activations N(0, 1) and weights 0.02 N(0, 1).
+  and 17), activations N(0, 1) and weights 0.02 N(0, 1); and Gemm::native end to end (``gpu.native``: the fp16
+  image, then its product) at 37 rows, Q2_0 (512, 2560), Q4_K (640, 2560) and the ten GGUF types at (64, 2560),
+  against float64 on the exact dequantized weights (gguf_reference.dequantize), so the image's rounding counts.
 
 basalt promises no invariance (cuBLAS picks the kernel per product, hc8_parity.cpp:263); the chain gives each by
 construction, and these gates keep it bit for bit against one whole-product dispatch (``whole``):
@@ -29,7 +31,12 @@ construction, and these gates keep it bit for bit against one whole-product disp
   (2560, 640), 37 rows: the w rows [r0, r0 + n) alone (n 1, 63, 65 at r0 0 and 37), the w rows permuted, explicit
   column slices of 64 and of 192 give the whole product's columns.
 - GM-REPEAT (determinism), FP16 (6144, 2560) at B 512 in the handler's slices: y prefilled 0x00, then 0xFF, on one
-  pipeline, then on a freshly compiled one, every run the same bits.
+  pipeline, then on a freshly compiled one, every run the same bits; native Q4_K (640, 2560) at B 37, the fp16 image
+  and y prefilled 0x00, then 0xFF, the same image and y.
+
+Gemm::native composes two stages (gemm.cu:169-185: dequant_f16 into the scratch, then Gemm::f16's product on it):
+- GM-COMP: ``gpu.native`` for each of the ten GGUF types at (64, 2560), 37 rows, bitwise equal to the FP16 product on
+  the host's fp16 image of the same blocks, emu.cuda_half_bits(gguf_reference.dequantize(t, blocks)).
 
 The conversion to_f16 (src/prefill/kernels.cu:818-821, hf :40: __float2half_rn), the PLE key's operand
 (prefill.cpp:1534), has no basalt test; the nearest check, dequant_f16_parity.cpp:73's store against __float2half_rn of
@@ -45,9 +52,12 @@ import pytest
 
 from monolith import kernels
 from monolith.formats.fp import bf16_to_f32
+from monolith.formats.gguf import GGML_TYPES
+from tests.contract import gguf_reference
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu
 from tests.kernels import basalt_prompt_gpu as gpu
+from tests.kernels.test_basalt_mmvq import weights
 
 F32 = np.float32
 FILL = 0xFFFFFFFF              # a y word no dispatch wrote (prompt_gemm's 0xFF bytes)
@@ -167,8 +177,13 @@ def test_product_emulates_the_order(bf16):
 # (:1586), attn_q (:1607; at B 1 and 17 only).
 REF_BF16 = ((1, 2560), (48, 2560), (128, 2560), (512, 2560), (2560, 2560), (4, 10240))
 REF_FP16 = ((640, 2560), (2560, 640), (2560, 6144), (6144, 2560), (12288, 2560))
-REF_ROWS = [(bf16, n, k, b) for bf16, shapes in ((True, REF_BF16), (False, REF_FP16)) for n, k in shapes
+# Gemm::native end to end (the dequantization into the fp16 image, then the FP16 product), as (GGUF type, N, K) at
+# B 37: Q2_0 (the pack's routed and dense type) at attn_k's shape (:1605), Q4_K at the shared expert's gate (:1702),
+# and every type the dequantizer takes at one shape. The GGUF type is None on the rows above.
+REF_NATIVE = ((42, 512, 2560), (12, 640, 2560)) + tuple((t, 64, 2560) for t in kernels.DEQUANT16_TYPES)
+REF_ROWS = [(bf16, None, n, k, b) for bf16, shapes in ((True, REF_BF16), (False, REF_FP16)) for n, k in shapes
             for b in ((1, 17) if (n, k) == (12288, 2560) else (1, 17, 512))]
+REF_ROWS += [(False, t, n, k, 37) for t, n, k in REF_NATIVE]
 REF_GATE = {   # the bound's standing per entry (ER-D5's label) with hc8_parity.cpp:269's criterion
     True: "hc8_parity.cpp:269, Gemm::bf16's gate at this pack's plain-BF16 shapes: "
           'expect(ex.rel() < 5e-3, "the product against the copy in double");',
@@ -177,27 +192,37 @@ REF_GATE = {   # the bound's standing per entry (ER-D5's label) with hc8_parity.
 }
 
 
-@pytest.mark.parametrize("bf16, n, k, B", REF_ROWS,
-                         ids=[f"{'bf16' if b else 'fp16'}-{n}x{k}-B{B}" for b, n, k, B in REF_ROWS])
-def test_product_against_double(bf16, n, k, B):
+@pytest.mark.parametrize("bf16, t, n, k, B", REF_ROWS,
+                         ids=[f"{'bf16' if b else 'fp16' if t is None else GGML_TYPES[t][0]}-{n}x{k}-B{B}"
+                              for b, t, n, k, B in REF_ROWS])
+def test_product_against_double(bf16, t, n, k, B):
     """GM-REF: y against x64 @ w64.T on the operands' exact values, emu.rel_norm over all B x N outputs (basalt
-    samples 256, hc8_parity.cpp:253-262). The fixture keeps every operand at most 2^10 and every nonzero BF16 one at
+    samples 256, hc8_parity.cpp:253-262). A native row (GGUF type ``t``) runs gpu.native on test_basalt_mmvq's
+    ``weights`` blocks, and its w64 is their exact dequantized values (gguf_reference.dequantize), so the fp16 image's
+    rounding counts against the bound. The fixture keeps every operand at most 2^10 and every nonzero BF16 one at
     least 2^-40 (TG 7.1: nothing overflows, no partial sum is subnormal). Prints the measured value."""
-    rng = np.random.default_rng((n, k, B))
+    rng = np.random.default_rng((n, k, B) if t is None else (t, n, k, B))
     to16, widen = (emu.bf16_bits, bf16_to_f32) if bf16 else (emu.half_bits, emu.h2f)
     xb = to16(rng.standard_normal((B, k)).astype(F32))
-    wb = to16(F32(0.02) * rng.standard_normal((n, k)).astype(F32))
-    x64, w64 = widen(xb).astype(np.float64), widen(wb).astype(np.float64)
+    if t is None:
+        wb = to16(F32(0.02) * rng.standard_normal((n, k)).astype(F32))
+        w64 = widen(wb).astype(np.float64)
+    else:
+        blocks = weights(t, k, n, rng)
+        w64 = gguf_reference.dequantize(t, blocks).astype(np.float64)
+    x64 = widen(xb).astype(np.float64)
     for v in (x64, w64):
         mag = np.abs(v)
         assert mag.max() <= 2.0 ** 10 and (not bf16 or mag[mag > 0].min(initial=np.inf) >= 2.0 ** -40), \
             "an operand above 2^10 in magnitude (or not finite), or a nonzero BF16 operand below 2^-40"
     ref = x64 @ w64.T
     assert np.abs(ref).max() > 0, "a vacuous reference: every output 0"
-    y = gpu.prompt_gemm(xb, wb, bf16=bf16, B=B).view(F32)
+    y = (gpu.prompt_gemm(xb, wb, bf16=bf16, B=B) if t is None else gpu.native(t, blocks, xb, B=B)[0]).view(F32)
     bad, rel = np.count_nonzero(~np.isfinite(y)), emu.rel_norm(y, ref)
-    print(f"GM-REF {'bf16' if bf16 else 'fp16'} N {n} K {k} B {B}: rel_norm {rel:.3e}")
-    assert bad == 0 and rel < 5e-3, f"{REF_GATE[bf16]} (N {n}, K {k}, B {B}): rel_norm {rel:.3e}, {bad} not finite"
+    tag = "bf16" if bf16 else "fp16" if t is None else f"native {GGML_TYPES[t][0]}"
+    print(f"GM-REF {tag} N {n} K {k} B {B}: rel_norm {rel:.3e}")
+    assert bad == 0 and rel < 5e-3, (
+        f"{REF_GATE[bf16]} ({tag} N {n}, K {k}, B {B}): rel_norm {rel:.3e}, {bad} not finite")
 
 
 def whole(xb, wb, bf16):
@@ -300,7 +325,8 @@ def test_columns_do_not_depend_on_the_matrix_rows(bf16):
 
 def test_repeats_are_bit_identical():
     """GM-REPEAT (FP16): FP16 (6144, 2560) at B 512 in the handler's slices, into a y prefilled 0x00, then 0xFF, on one
-    pipeline, then into 0xFF on a freshly compiled one (basalt_gpu.pipeline's cache cleared)."""
+    pipeline, then into 0xFF on a freshly compiled one (basalt_gpu.pipeline's cache cleared). (native): Q4_K (640,
+    2560) at B 37 through gpu.native, the fp16 image and y prefilled 0x00, then 0xFF."""
     rng = np.random.default_rng(71)
     xb, wb = operands(rng, False, 512, 6144, 2560)
     key = (kernels.basalt_prompt_gemm_source(), "basalt_prompt_gemm", 512, {"GEMM_BF16": "0"})
@@ -315,6 +341,35 @@ def test_repeats_are_bit_identical():
         assert np.array_equal(y, runs[0]), (
             "port: every run bitwise identical (deterministic: no atomics, no split of K, no dependence on scheduling "
             f"or on y's prior bytes) (run {i} against run 1; fp16 N 6144 K 2560, B 512): {differ(y, runs[0])}")
+
+    blocks, x16 = weights(12, 2560, 640, rng), emu.half_bits(rng.standard_normal((37, 2560)).astype(F32))
+    (y, image), (again, image2) = (gpu.native(12, blocks, x16, B=37, fill=f) for f in (0x00, 0xFF))
+    assert (np.isfinite(y.view(F32)).all() and np.count_nonzero(y) and np.isfinite(emu.h2f(image)).all()
+            and np.count_nonzero(image)), "a vacuous first native run"
+    assert np.array_equal(again, y) and np.array_equal(image2, image), (
+        "port: every run bitwise identical (deterministic: no atomics, no split of K, no dependence on scheduling "
+        "or on the image's or y's prior bytes) (the run into 0xFF against the run into 0x00; native q4_k N 640 K "
+        f"2560, B 37): {differ(again, y)}, {np.count_nonzero(image2 != image)} image halves differ")
+
+
+@pytest.mark.parametrize("t", kernels.DEQUANT16_TYPES, ids=lambda t: GGML_TYPES[t][0])
+def test_two_stage_product_is_the_product_on_the_image(t):
+    """GM-COMP: gpu.native (basalt_dequant_g32 at DQ_OUT 1, then the product at GEMM_BF16 0) of fp16 activations by
+    test_basalt_mmvq's ``weights`` blocks (random bytes, every fp16 scale field a normal of magnitude in [2^-10,
+    2^-5)) of GGUF type ``t`` at (64, 2560), B 37, against the FP16 product on the host's image of the same blocks,
+    emu.cuda_half_bits(gguf_reference.dequantize(t, blocks)) (asserted live: finite, one output nonzero). Both sides
+    run the one product kernel at one (N, K, B), so equality needs GM-REPEAT's determinism alone."""
+    n, k, B = 64, 2560, 37
+    rng = np.random.default_rng((83, t))
+    blocks, xb = weights(t, k, n, rng), emu.half_bits(rng.standard_normal((B, k)).astype(F32))
+    host = emu.cuda_half_bits(gguf_reference.dequantize(t, blocks))
+    want = gpu.prompt_gemm(xb, host, bf16=False, B=B)
+    assert np.isfinite(want.view(F32)).all() and np.count_nonzero(want), "a vacuous reference"
+    y, image = gpu.native(t, blocks, xb, B=B)
+    assert np.array_equal(y, want), (
+        "port: native (dequant at DQ_OUT 1, then GEMM_BF16 0) bitwise equal to the FP16 product on "
+        f"emu.cuda_half_bits(gguf_reference.dequantize(t, blocks)) ({GGML_TYPES[t][0]} N {n} K {k}, B {B}): "
+        f"{differ(y, want)}; {np.count_nonzero(image != host)} image halves differ from the host's")
 
 
 # G9-F16's specials, float32 bits: to_f16's fp16 bits (__float2half_rn). +-0; the fp32 subnormals 0x00000001 and
