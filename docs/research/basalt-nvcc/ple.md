@@ -480,7 +480,7 @@ SIMD-groups.
   bitwise with a reference, and the contract's rule for kernels without a gated reference test applies. The bitwise
   oracle, R-emu, is `basalt_emu.gr_norm` and `basalt_emu.ple_gate`, `ple_broadcast` and `ple_conv`
   (`tests/kernels/basalt_emu.py`), a numpy emulation of sections 1 to 4: it takes the values of `rsqrtf_ftz`,
-  `sqrtf_ftz` and `expf_ftz` from the GPU, as `basalt_emu.py` does for `expf_neg` (`:337-340`: "MUFU.EX2 and
+  `sqrtf_ftz` and `expf_ftz` from the GPU, as `basalt_emu.py` does for `expf_neg` (`:339-342`: "MUFU.EX2 and
   fast::exp2 have no bit-exact host model"), and reproduces every other rounding, the flushes, the reduction orders and
   `rcp_ftz` bit for bit. `test_grouped_norm_bitwise_emu` and `test_postops_bitwise_emu`
   (`tests/kernels/test_basalt_ple.py`) compare the kernels with it bit for bit.
