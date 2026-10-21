@@ -297,13 +297,14 @@ def _f16_blocks(g, src, bad, tmp):
 
 
 def copy_op(g, name, n, k, rows=T, entry="bf16_w", x_dtype=BF16, q_dtype=DType.U8, s_dtype=F16, s_width=None,
-            copy_rows=None):
+            copy_rows=None, q_format=None):
     """``basalt_prompt_gemm`` entry ``bf16_w`` (Gemm::bf16_w) of x.<name> [rows, k] BF16 by the int8 copy ``name``,
     its codes ``hc8/<name>/q`` U8 [n, k] and scales ``hc8/<name>/s`` F16 [n, (k / 32 + 7) & ~7] (the hc lane's pack
-    rows, packs/basalt_hc8.py), into y.<name> [rows, n] F32; the other arguments replace one valid part. Returns the
-    two constants."""
+    rows, packs/basalt_hc8.py), into y.<name> [rows, n] F32; the other arguments replace one valid part (``q_format``:
+    the codes a weight of that format, U8 as every weight is). Returns the codes and the scales."""
     copy_rows = n if copy_rows is None else copy_rows
-    q = g.const(f"hc8/{name}/q", (copy_rows, k), q_dtype)
+    q = (g.weight(f"hc8/{name}/q", (copy_rows, k), q_format) if q_format else
+         g.const(f"hc8/{name}/q", (copy_rows, k), q_dtype))
     s = g.const(f"hc8/{name}/s", (copy_rows, (k // 32 + 7) & ~7 if s_width is None else s_width), s_dtype)
     op(g, "basalt_prompt_gemm", [g.input(f"x.{name}", (rows, k), x_dtype), q, s],
        [g.value(f"y.{name}", (rows, n), F32)], entry=entry)
@@ -314,13 +315,19 @@ def nbytes(v):
     return int(np.prod(v.shape)) * v.dtype.itemsize
 
 
-def _copy(**defect):
+def _copy(q_extra=0, s_slab=False, **defect):
     """A valid Gemm::bf16_w on the 4 x 64 copy c (srow 8), and the same with ``defect``. The pack holds exactly the
     graph's bytes of each constant, laid out as write_pack lays a copy (the codes at byte 256, the scales right after),
-    so emit_program's size check passes every case and the handler's own check meets the defect."""
+    so emit_program's size check passes every case and the handler's own check meets the defect. Or the rows are held
+    wrongly, which that check (a constant's aux row too short) does not see: the codes' row ``q_extra`` bytes longer
+    (a wider copy's), or the scales a block-lane-major slab of a second pack (``s_slab``)."""
     def build(g, src, bad, tmp):
         q, s = copy_op(g, "c", 4, 64, **(defect if bad else {}))
-        return {"packs": [pack(tmp, {q.name: (256, nbytes(q)), s.name: (256 + nbytes(q), nbytes(s))})]}
+        nq = nbytes(q) + (q_extra if bad else 0)
+        if bad and s_slab:
+            return {"packs": [pack(tmp, {q.name: (256, nq)}),
+                              pack(tmp.parent / f"{tmp.name}.slab", {s.name: (256, nbytes(s))}, slab=True)]}
+        return {"packs": [pack(tmp, {q.name: (256, nq), s.name: (256 + nq, nbytes(s))})]}
     return build
 
 
@@ -346,6 +353,11 @@ REFUSALS = [
     ("copy scale rows not srow wide", _copy(s_width=2), r"'hc8/c/s' is f16 \[4, 2\], not f16 \[4, 8\]"),
     ("copy not the product's N x K", _copy(copy_rows=5),
      "prefill gemm: an 8-bit copy is 5 x 64, the product wants 4 x 64"),
+    # a copy's rows are pack constants of exactly their bytes: the image reads all of them (hc_fused.cu:1212-1217)
+    ("copy codes a weight", _copy(q_format="q8_0"), r"'hc8/c/q' is not a constant; a copy's codes and scales are"),
+    ("copy scales a pack slab", _copy(s_slab=True), r"'hc8/c/s' is a pack slab; a copy's codes and scales are"),
+    ("copy codes' pack row longer than the codes", _copy(q_extra=256),
+     r"the copy's 'hc8/c/q' is 256 bytes of u8 \[4, 64\], but its pack entry holds 512"),
     ("convert to F32", _convert(y_dtype=F32), r"'y' is f32; the output is F16 \(to_f16\) or BF16 \(to_bf16\)"),
     # the valid to_bf16 op until dequant's bf16_rne_nonan merges into this branch
     ("convert to BF16 before dequant", _convert(y_dtype=BF16), "bf16_rne_nonan, which this branch does not have yet"),

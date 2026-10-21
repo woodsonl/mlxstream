@@ -13,6 +13,7 @@ product's N x K."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
@@ -95,7 +96,9 @@ def _gemm_copy(ctx: _Ctx, op: Op) -> None:
     ported. The image is rebuilt on every call, as basalt's is, and lists the scratch in ``writes``, so the barrier
     pass orders it behind the previous op's products and ahead of its own. N and K are the product's (y's columns,
     x's), as ``bf16_w`` takes them; a copy of another shape is refused with basalt's message (``:137-141``, where it
-    exits). The copy's pack rows bound every read: ``emit_program`` refuses a constant its pack row is too short for."""
+    exits). The image reads every byte of the codes and the scales, so each must be a constant held as rows (not a
+    weight, not a pack slab) whose pack row, if a pack holds it, is exactly its bytes, as ``_weight`` requires of a
+    weight's rows; basalt's reads stay inside the copy it allocated at its size (``hc_fused.cu:1212-1217``)."""
     (x, wq, ws), (y,) = op.inputs, op.outputs
     rows, macros = prompt_rows(ctx, op)
     n, k = ctx.shape(y)[-1], ctx.shape(x)[-1]
@@ -106,6 +109,14 @@ def _gemm_copy(ctx: _Ctx, op: Op) -> None:
                          f"{' x '.join(map(str, ctx.shape(wq)))}, the product wants {n} x {k}")
     _expect(ctx, op, wq, (n, k), DType.U8, "the copy's int8 codes")
     _expect(ctx, op, ws, (n, (k // 32 + 7) & ~7), DType.F16, "the copy's fp16 scales, (K / 32 + 7) & ~7 a row")
+    for v in (wq, ws):
+        if not v.is_const or any(v.name in pk.slabs for pk in ctx.packs):
+            raise ValueError(f"{op.kind}: {v.name!r} is {'a pack slab' if v.is_const else 'not a constant'}; a copy's "
+                             "codes and scales are the constants hc8/<name>/q and /s, rows as stored")
+        aux = next((pk.aux[v.name] for pk in ctx.packs if v.name in pk.aux), None)
+        if aux is not None and int(aux["nbytes"]) != (need := math.prod(ctx.shape(v)) * v.dtype.itemsize):
+            raise ValueError(f"{op.kind}: the copy's {v.name!r} is {need} bytes of {v.dtype.short} "
+                             f"{list(ctx.shape(v))}, but its pack entry holds {aux['nbytes']}")
     img = ctx.scratch("prompt_gemm_f16", 2 * n * k, shared=True)
     kern = ctx.kernel("basalt_hc8_dequant_bf16", kernels.basalt_prompt_hc8_source(), "basalt_hc8_dequant_bf16", {})
     prm = ctx.params("hc8_image", kernels.basalt_hc8_image_params(n, k))
