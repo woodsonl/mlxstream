@@ -75,7 +75,7 @@ of what this GPU's arithmetic flushes. The Metal helpers are those of `kernels/c
 and `cuda_nan`. Further:
 
 - L = fl(log2 e) = 0x3FB8AA3B. The SASS immediate `-1.4426950216293334961` is −L (0xBFB8AA3B), and `expf_ftz(x)` is
-  `ftz(fast::exp2(mul_ftz(x, L)))` (`basalt_fp.metal:111`).
+  `ftz(fast::exp2(mul_ftz(x, L)))` (`basalt_fp.metal:116`).
 - ex2(x), rsq(x), sq(x), rcp(x): the results of `MUFU.EX2`, `MUFU.RSQ`, `MUFU.SQRT` and `MUFU.RCP` (PTX
   `ex2.approx.ftz.f32`, `rsqrt.approx.ftz.f32`, `sqrt.approx.ftz.f32`, `rcp.approx.ftz.f32`), approximations of 2^x,
   1/√x, √x and 1/x with subnormal inputs and results flushed. NVIDIA documents their error bounds, not their bits.
@@ -199,7 +199,7 @@ Notes:
   commutative, so `warp_sum_ftz`'s single order gives the same bits.
 - **The scale.** `__fmaf_rn(scale, sum, 0.0f)` is an FFMA with a +0 addend: one rounding of scale·sum, a −0 product
   becomes +0, and a result that rounds to a subnormal is flushed to the zero of its sign. `fma_ftz(scale, sum, 0.0f)` is
-  that instruction, including the exact-value check at 2^-126 (`basalt_fp.metal:60-76`); `mul_ftz` would differ on the
+  that instruction, including the exact-value check at 2^-126 (`basalt_fp.metal:65-81`); `mul_ftz` would differ on the
   sign of a zero only. The scale is the host's constant 1/√2560 (section 7).
 - **The sign.** The SASS computes `(s > 0) - (s < 0)` as `FSETP.GT` and `FSETP.GEU` (greater, or equal, or unordered)
   with selects: 1 for s > 0, −1 for s < 0, and 0 for s = ±0 and for a NaN, since both of C's comparisons are false on
