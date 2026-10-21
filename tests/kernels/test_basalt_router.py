@@ -146,5 +146,6 @@ def test_a_token_does_not_depend_on_the_window():
     nonfinite = np.count_nonzero(~np.isfinite(one_w[regular]))
     msg = f"{bad} values of a token differ between window sizes (must be 0)"         # hc_fused_parity.cpp:333
     print(f"  {msg}   ({len(runs)} windows against {NT} one-token dispatches; non-finite {nonfinite})")
-    assert not bad, f"{msg}: " + "; ".join(off)
+    assert not bad, (f"{msg}: " + "; ".join(off) + "; if (std::memcmp(&by_t[T][ot + i], &by_t[t_hi][oh + i], 4) != 0) "
+                     "++bad; (hc_fused_parity.cpp:328)")
     assert not nonfinite, f"{nonfinite} non-finite weights of regular tokens (must be 0)"
