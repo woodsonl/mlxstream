@@ -53,8 +53,9 @@
   and x, window A runs rows 0..6 from the layer's state0; for n = 1..6, the commit of n rows (mt 7) of window A's own
   h, gate and beta and the raw qkv rows leaves the state and history from which window B runs rows n..6, and window
   B's row j of every output equals window A's row n + j bit for bit: h, gate, beta and the fp32 y, and on ``[rec]``
-  (dec_gdn_rec built with its y, GDN_Y_BOUND 1, D13) the q8_1 rows yq too; ``[stage]`` runs the per-stage chain,
-  gdn_ab_multi and gdn_conv_l2_multi into gdn_step_norm_multi. Every sentinel holds and every output is finite.
+  (dec_gdn_rec built with its y, GDN_Y_BOUND 1, D13) the q8_1 rows yq and win_qkv too; ``[stage]`` runs the
+  per-stage chain, gdn_ab_multi and gdn_conv_l2_multi into gdn_step_norm_multi. Every sentinel holds and every output
+  is finite.
 - DCM.9, NaNs and special words (contract invariant 5's NaN rule; none in basalt, which stores the state's float,
   verify_kernels.cu:327-330): parity's fixture with a quarter of each layer's conv history and qkv rows replaced at
   random by ``SPECIALS`` (subnormals, +-0, +-inf and the NaN payloads 0x7FA00001 and 0xFFC00000), committed for n =
@@ -383,10 +384,11 @@ def window(path, lay, state, qkv, z, x):
     """A GDN window over the rows of qkv, z and x from ``state`` (one layer's state and history) on ``path``: "rec",
     dec_gdn_rec built with its fp32 y (GDN_Y_BOUND 1, D13), or "stage", the per-stage chain, gdn_ab_multi and
     gdn_conv_l2_multi into gdn_step_norm_multi. Asserts every sentinel intact and every output finite (yq: its blocks'
-    d and sum halves). Returns {name: the output's rows}: h, gate, beta and y, and on rec the q8_1 rows yq."""
+    d and sum halves). Returns {name: the output's rows}: h, gate, beta and y, and on rec the q8_1 rows yq and the
+    qkv rows win_qkv."""
     if path == "rec":
         r = gdn_gpu.rec(lay, state, qkv, x, z, y=True)
-        out, ok = {"h": r.h, "gate": r.gate, "beta": r.beta, "y": r.y, "yq": r.yq}, r.ok
+        out, ok = {"h": r.h, "gate": r.gate, "beta": r.beta, "y": r.y, "yq": r.yq, "win_qkv": r.qkv}, r.ok
     else:
         gate, beta, ok_ab = gdn_gpu.ab(lay, x)
         h, ok_h = gdn_gpu.conv_l2(state, qkv, lay.conv_w)
