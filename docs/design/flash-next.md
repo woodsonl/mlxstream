@@ -81,6 +81,8 @@ library `logf` and binary64 `exp`):
   always true (`src/kernels/cuda/hc_fused.cu:1248`). It computes `rsqrtf` in the norm (`hc8_gr.cu:78`) and the library
   `expf` in the SiLU (`hc8_gr.cu:165`) and the sigmoid (`hc8_gr.cu:233`).
 
+The prompt path's source files, one bullet each:
+
 - `src/prefill/kernels.cu`, the prompt path's own kernels, builds the same way (`CMakeLists.txt:285`). Basalt's own
   expressions keep subnormals and every source division is `div.rn`; `.ftz` appears only inside two of the libdevice
   functions the file inlines, the library `expf` (`:642`, `:770`) and `powf` (`:751`), whose sites the later PRs add.
