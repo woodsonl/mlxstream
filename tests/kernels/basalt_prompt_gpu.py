@@ -2,7 +2,8 @@
 kernel reads its rows from StepState at slot 15 (monolith/kernels.py's PROMPT_ROWS), so ``run_rows`` is
 basalt_gpu.run with a StepState record bound there. A source compiles as the emitter registers it (the StepState
 struct spliced in after the prelude) with the dynamic-T program's row macros: STEP_STATE 1, T_SRC 0 and ROWS_MAX the
-compiled bound B; the static form (T_SRC 2) is the contract and program tiers' concern."""
+compiled bound B; the static form (T_SRC 2) is the contract and program tiers' concern, but for prompt_hc's ``static``
+runs (T_SRC 2 with T_STATIC_ROWS, ROWS_MAX staying B), HC-4's static check."""
 
 import numpy as np
 
