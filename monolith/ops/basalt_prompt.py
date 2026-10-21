@@ -1,7 +1,7 @@
 """basalt's prompt path (docs/design/flash-next.md): one op kind per distinct signature of the kernels a prompt chunk
 runs, ``basalt_prompt_<name>``, each lowered by ``compiler/emit_basalt_prompt.py`` to the dispatches of
-``kernels/common/basalt_prompt_*.metal`` with the macros, grids, threadgroups and params of ``monolith/kernels.py``'s
-builders. Each prompt PR appends its kinds here, with a bullet below.
+``kernels/common/basalt_*.metal``, with the sources and params records of ``monolith/kernels.py``'s builders.
+Each prompt PR appends its kinds here, with a bullet below.
 
 Values. Activations are row-major ``[T, n]``, a token's row after the one before. A weight is the tensor as shipped,
 ``[N, K]`` (N outputs over K inputs): a weight value whose format is the ggml type's name, or, for BF16 rows, a
