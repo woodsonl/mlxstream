@@ -17,22 +17,32 @@ fix no summation order; the port computes each output as one fp32 fma chain from
   second stage: the nearest bound, as no basalt test launches it), 1, 17 and 512 rows (attn_q's 12288 outputs at 1
   and 17), activations N(0, 1) and weights 0.02 N(0, 1); and Gemm::native end to end (``gpu.native``: the fp16
   image, then its product) at 37 rows, Q2_0 (512, 2560), Q4_K (640, 2560) and the ten GGUF types at (64, 2560),
-  against float64 on the exact dequantized weights (gguf_reference.dequantize), so the image's rounding counts.
+  against float64 on the exact dequantized weights (gguf_reference.dequantize), so the image's rounding counts; and
+  Gemm::bf16_w (``gpu.prompt_gemm_copy``: the copy's BF16 image, then its product) on hc8_parity's down and up copies,
+  (320, 10240) and (10240, 320), at 1, 37 and 512 rows, against float64 on the image's values (:269 on this entry's
+  product; GM-X holds it against the copy's exact values).
 
 basalt promises no invariance (cuBLAS picks the kernel per product, hc8_parity.cpp:263); the chain gives each by
-construction, and these gates keep it bit for bit against one whole-product dispatch (``whole``):
-- GM-ROWS (row invariance), BF16 (48, 2560) and FP16 (2560, 640): rows 0, 63, 64, 255 and 511 each alone, the first
-  63, 65, 17 and 37 rows at those bounds, the 512 rows permuted, row 5 at row 300 of fresh rows, explicit row slices of
-  64 and of 192 rows give the same rows as B 512; FP16 (2560, 6144) at B 512 in the handler's slices (more than one).
+construction, and these gates keep it bit for bit against one whole-product dispatch (``whole``; on a copy, behind
+its one image dispatch):
+- GM-ROWS (row invariance), BF16 (48, 2560), FP16 (2560, 640) and the copy entry on hc8_parity's down copy (320,
+  10240): rows 0, 63, 64, 255 and 511 each alone, the first 63, 65, 17 and 37 rows at those bounds, the 512 rows
+  permuted, row 5 at row 300 of fresh rows, explicit row slices of 64 and of 192 rows give the same rows as B 512;
+  FP16 (2560, 6144) and the down copy at B 512 in the handler's slices (more than one).
 - GM-STEP (the rows are StepState data, invariant 4): compiled at B 512 and run with t_this_step 1, 17, 65, 511, 512
   and 600 (prompt_rows clamps to B), the rows below min(r, B) are the B 512 rows and the rest keep 0xFF, every row at
   done 1; at B 37 and t_this_step 600 only the clamp keeps the row tile's loads and stores inside x and y.
 - GM-COLS (column invariance), BF16 (512, 2560) (48 columns hold neither n 65 at 37 nor a 192-column slice) and FP16
   (2560, 640), 37 rows: the w rows [r0, r0 + n) alone (n 1, 63, 65 at r0 0 and 37), the w rows permuted, explicit
-  column slices of 64 and of 192 give the whole product's columns.
+  column slices of 64 and of 192 give the whole product's columns. On the copy entry, HC8-9 (hc8_parity.cpp:263-266,
+  :271) at part 2's five shapes: basalt's row slices of a 1 Mi-element scratch (gemm.cu:143, :148-152: 102 rows of the
+  down copy, 3276 of the up, the inject's 4 whole), each slice's image multiplied at N = n, give the whole copy
+  entry's columns bitwise, where basalt allows es.rel() < 1e-5 for cuBLAS's change of kernel.
 - GM-REPEAT (determinism), FP16 (6144, 2560) at B 512 in the handler's slices: y prefilled 0x00, then 0xFF, on one
   pipeline, then on a freshly compiled one, every run the same bits; native Q4_K (640, 2560) at B 37, the fp16 image
-  and y prefilled 0x00, then 0xFF, the same image and y.
+  and y prefilled 0x00, then 0xFF, the same image and y; the copy entry on hc8_parity's up copy (10240, 320) at B 512
+  in the handler's slices, the BF16 image and y prefilled 0x00, then 0xFF, on one pair of pipelines, then on freshly
+  compiled ones, the same image and y.
 
 Gemm::native composes two stages (gemm.cu:169-185: dequant_f16 into the scratch, then Gemm::f16's product on it):
 - GM-COMP: ``gpu.native`` for each of the ten GGUF types at (64, 2560), 37 rows, bitwise equal to the FP16 product on
@@ -72,6 +82,7 @@ from monolith.formats.gguf import GGML_TYPES
 from monolith.packs.basalt_hc8 import quantize
 from tests.basalt_hc_ref import dequant_copy, hc8_parity_matrices
 from tests.contract import gguf_reference
+from tests.contract.test_basalt_ops import spliced
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu
 from tests.kernels import basalt_prompt_gpu as gpu
@@ -199,30 +210,42 @@ REF_FP16 = ((640, 2560), (2560, 640), (2560, 6144), (6144, 2560), (12288, 2560))
 # B 37: Q2_0 (the pack's routed and dense type) at attn_k's shape (:1605), Q4_K at the shared expert's gate (:1702),
 # and every type the dequantizer takes at one shape. The GGUF type is None on the rows above.
 REF_NATIVE = ((42, 512, 2560), (12, 640, 2560)) + tuple((t, 64, 2560) for t in kernels.DEQUANT16_TYPES)
+# Gemm::bf16_w on an int8 copy (``bf16`` "copy": a BF16 product, so truthy), hc down and hc up (prefill.cpp:1569,
+# :1571) at part 2's row counts: hc8_parity's down and up copies (``hc8_copies``).
+REF_COPY = ((320, 10240), (10240, 320))
 REF_ROWS = [(bf16, None, n, k, b) for bf16, shapes in ((True, REF_BF16), (False, REF_FP16)) for n, k in shapes
             for b in ((1, 17) if (n, k) == (12288, 2560) else (1, 17, 512))]
 REF_ROWS += [(False, t, n, k, 37) for t, n, k in REF_NATIVE]
+REF_ROWS += [("copy", None, n, k, b) for n, k in REF_COPY for b in (1, 37, 512)]
 REF_GATE = {   # the bound's standing per entry (ER-D5's label) with hc8_parity.cpp:269's criterion
     True: "hc8_parity.cpp:269, Gemm::bf16's gate at this pack's plain-BF16 shapes: "
           'expect(ex.rel() < 5e-3, "the product against the copy in double");',
     False: "nearest bound; no basalt test launches Gemm::native or Gemm::f16: hc8_parity.cpp:269 "
            'expect(ex.rel() < 5e-3, "the product against the copy in double");',
+    "copy": "hc8_parity.cpp:269, Gemm::bf16_w's own gate, here against its BF16 image's values (GM-X holds it against "
+            'the copy\'s exact values): expect(ex.rel() < 5e-3, "the product against the copy in double");',
 }
 
 
 @pytest.mark.parametrize("bf16, t, n, k, B", REF_ROWS,
-                         ids=[f"{'bf16' if b else 'fp16' if t is None else GGML_TYPES[t][0]}-{n}x{k}-B{B}"
-                              for b, t, n, k, B in REF_ROWS])
+                         ids=[f"{'copy' if b == 'copy' else 'bf16' if b else 'fp16' if t is None else GGML_TYPES[t][0]}"
+                              f"-{n}x{k}-B{B}" for b, t, n, k, B in REF_ROWS])
 def test_product_against_double(bf16, t, n, k, B):
     """GM-REF: y against x64 @ w64.T on the operands' exact values, emu.rel_norm over all B x N outputs (basalt
     samples 256, hc8_parity.cpp:253-262). A native row (GGUF type ``t``) runs gpu.native on test_basalt_mmvq's
     ``weights`` blocks, and its w64 is their exact dequantized values (gguf_reference.dequantize), so the fp16 image's
-    rounding counts against the bound. The fixture keeps every operand at most 2^10 and every nonzero BF16 one at
-    least 2^-40 (TG 7.1: nothing overflows, no partial sum is subnormal). Prints the measured value."""
+    rounding counts against the bound. A copy row runs ``product``'s copy entry (the image, then the product in the
+    handler's slices) on hc8_parity's copy of that shape, and its w64 is the values of the copy's BF16 image
+    (``host_image``, the kernel's bits by GM-DQ8): the product is what this row bounds, the image's rounding GM-X's.
+    The fixture keeps every operand at most 2^10 and every nonzero BF16 one at least 2^-40 (TG 7.1: nothing
+    overflows, no partial sum is subnormal). Prints the measured value."""
     rng = np.random.default_rng((n, k, B) if t is None else (t, n, k, B))
     to16, widen = (emu.bf16_bits, bf16_to_f32) if bf16 else (emu.half_bits, emu.h2f)
     xb = to16(rng.standard_normal((B, k)).astype(F32))
-    if t is None:
+    if bf16 == "copy":
+        wb = next(c[1:] for c in hc8_copies().values() if c[1].shape == (n, k))
+        w64 = bf16_to_f32(host_image(*wb)).astype(np.float64)
+    elif t is None:
         wb = to16(F32(0.02) * rng.standard_normal((n, k)).astype(F32))
         w64 = widen(wb).astype(np.float64)
     else:
@@ -235,19 +258,29 @@ def test_product_against_double(bf16, t, n, k, B):
             "an operand above 2^10 in magnitude (or not finite), or a nonzero BF16 operand below 2^-40"
     ref = x64 @ w64.T
     assert np.abs(ref).max() > 0, "a vacuous reference: every output 0"
-    y = (gpu.prompt_gemm(xb, wb, bf16=bf16, B=B) if t is None else gpu.native(t, blocks, xb, B=B)[0]).view(F32)
+    y = (product(xb, wb, bf16) if t is None else gpu.native(t, blocks, xb, B=B)[0]).view(F32)
     bad, rel = np.count_nonzero(~np.isfinite(y)), emu.rel_norm(y, ref)
-    tag = "bf16" if bf16 else "fp16" if t is None else f"native {GGML_TYPES[t][0]}"
+    tag = "copy" if bf16 == "copy" else "bf16" if bf16 else "fp16" if t is None else f"native {GGML_TYPES[t][0]}"
     print(f"GM-REF {tag} N {n} K {k} B {B}: rel_norm {rel:.3e}")
     assert bad == 0 and rel < 5e-3, (
         f"{REF_GATE[bf16]} ({tag} N {n}, K {k}, B {B}): rel_norm {rel:.3e}, {bad} not finite")
 
 
+def product(xb, w, bf16, slices=None):
+    """y's bits [len(xb), N] at B = len(xb): gpu.prompt_gemm of the bits ``xb`` by ``w`` [N, K], BF16 (``bf16``) or
+    FP16; ``bf16`` "copy", Gemm::bf16_w's by the copy ``w`` = (q, s) through gpu.prompt_gemm_copy (the image, then the
+    BF16 product). ``slices`` as theirs (None: the handler's rule)."""
+    if bf16 == "copy":
+        return gpu.prompt_gemm_copy(xb, *w, slices=slices)[0]
+    return gpu.prompt_gemm(xb, w, bf16=bf16, B=len(xb), slices=slices)
+
+
 def whole(xb, wb, bf16):
     """The reference of the invariance gates: the product as one dispatch over every row and column (never the
-    handler's slices), asserted live: every output finite (so no 0xFF word) and one nonzero."""
-    B, n = len(xb), len(wb)
-    y = gpu.prompt_gemm(xb, wb, bf16=bf16, B=B, slices=[(0, B, 0, n)])
+    handler's slices; on a copy, behind its one image dispatch), asserted live: every output finite (so no 0xFF word)
+    and one nonzero. ``wb`` and ``bf16`` as ``product``'s."""
+    B, n = len(xb), len(wb[0] if bf16 == "copy" else wb)
+    y = product(xb, wb, bf16, [(0, B, 0, n)])
     assert np.isfinite(y.view(F32)).all() and np.count_nonzero(y), f"a vacuous reference (B {B}, N {n})"
     return y
 
@@ -258,34 +291,42 @@ def differ(y, want):
 
 
 # GM-ROWS' and GM-STEP's shapes (N, K): BF16 ssm_alpha and ssm_beta (prefill.cpp:1587-1588), FP16 the shared expert's
-# down (:1705).
-ROW_SHAPES = {True: (48, 2560), False: (2560, 640)}
+# down (:1705); GM-ROWS' copy hc down (:1569), hc8_parity's down copy.
+ROW_SHAPES = {True: (48, 2560), False: (2560, 640), "copy": (320, 10240)}
 ROWS = ("port: every row bitwise equal to the same row of one whole-product dispatch at B 512 (row invariance: an "
         "output depends only on its x row, its w row and K)")
 
 
-@pytest.mark.parametrize("bf16", [True, False], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("bf16", [True, False, "copy"], ids=["bf16", "fp16", "copy"])
 def test_rows_do_not_depend_on_the_batch(bf16):
     """GM-ROWS: each run's rows against the same rows of the whole product at B 512 (equal to a live reference, so
     finite); for FP16 also (2560, 6144) at B 512 in the handler's own slices, more than one, against its whole
-    product."""
-    (n, k), tag = ROW_SHAPES[bf16], "bf16" if bf16 else "fp16"
-    rng = np.random.default_rng(43 if bf16 else 47)
-    xb, wb = operands(rng, bf16, 512, n, k)
+    product. ``copy`` (Gemm::bf16_w): the same runs through ``product``'s copy entry (the image, then the product) on
+    hc8_parity's down copy with BF16 activations drawn as the BF16 case's, and the B 512 run in the handler's own
+    slices, more than one; the narrow geometry of TG 7.5 (f) has no counterpart (one tile geometry, PG D2)."""
+    (n, k), tag = ROW_SHAPES[bf16], "copy" if bf16 == "copy" else "bf16" if bf16 else "fp16"
+    rng = np.random.default_rng(79 if bf16 == "copy" else 43 if bf16 else 47)
+    if bf16 == "copy":
+        xb, wb = operands(rng, True, 512, 1, k)[0], hc8_copies()["down"][1:]
+    else:
+        xb, wb = operands(rng, bf16, 512, n, k)
     ref, perm = whole(xb, wb, bf16), rng.permutation(512)
     runs = [(f"row {i} alone", xb[i:i + 1], None, ref[i:i + 1]) for i in (0, 63, 64, 255, 511)]
     runs += [(f"the first {b} rows at B {b}", xb[:b], None, ref[:b]) for b in (63, 65, 17, 37)]
     runs += [("the 512 rows permuted", xb[perm], None, ref[perm])]
     runs += [(f"row slices of {rb}", xb, [(r0, min(rb, 512 - r0), 0, n) for r0 in range(0, 512, rb)], ref)
              for rb in (64, 192)]
+    if bf16 == "copy":
+        assert len(kernels.basalt_prompt_gemm_slices(512, n, k)) > 1, "the down copy at B 512 is one slice"
+        runs += [("the handler's slices at B 512", xb, None, ref)]
     for what, x, slices, want in runs:
-        y = gpu.prompt_gemm(x, wb, bf16=bf16, B=len(x), slices=slices)
+        y = product(x, wb, bf16, slices)
         assert np.array_equal(y, want), f"{ROWS} ({what}; {tag} N {n} K {k}): {differ(y, want)}"
 
-    fresh = operands(rng, bf16, 512, 1, k)[0]
+    fresh = operands(rng, bool(bf16), 512, 1, k)[0]
     fresh[300] = xb[5]
     assert np.delete((fresh != xb).any(axis=1), 300).all(), "a fresh row equals the batch's row"
-    y = gpu.prompt_gemm(fresh, wb, bf16=bf16, B=512)
+    y = product(fresh, wb, bf16)
     assert np.array_equal(y[300], ref[5]) and np.isfinite(y.view(F32)).all(), (
         f"{ROWS} (row 5 at row 300 of fresh rows; {tag} N {n} K {k}): {differ(y[300], ref[5])} in row 300, "
         f"{np.count_nonzero(~np.isfinite(y.view(F32)))} not finite in the run")
@@ -318,12 +359,37 @@ def test_rows_from_step_state(bf16):
 # GM-COLS' shapes (N, K): BF16 indexer q and the router (prefill.cpp:1609, :1698), as GM-ROWS' 48 columns hold neither
 # n 65 at r0 37 nor a slice of 192; FP16 the shared expert's down (:1705).
 COL_SHAPES = {True: (512, 2560), False: (2560, 640)}
+# HC8-9's row slices (row0, n) of each copy, as Gemm::bf16_w cuts them for hc8_parity's small Gemm (src/prefill/
+# gemm.cu:143, :148-152; small.init(st, 1ll << 20, err), hc8_parity.cpp:214-215: a scratch of 1 Mi elements).
+HC8_SLICES = {"down": [(0, 102), (102, 102), (204, 102), (306, 14)],
+              "up": [(0, 3276), (3276, 3276), (6552, 3276), (9828, 412)], "inject": [(0, 4)]}
 
 
-@pytest.mark.parametrize("bf16", [True, False], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("bf16", [True, False, "copy"], ids=["bf16", "fp16", "copy"])
 def test_columns_do_not_depend_on_the_matrix_rows(bf16):
     """GM-COLS at 37 rows (a partial row tile): the w rows [r0, r0 + n) as their own matrix, the w rows permuted, and
-    explicit column slices of 64 and of 192, against the matching columns of the whole product."""
+    explicit column slices of 64 and of 192, against the matching columns of the whole product. ``copy`` (HC8-9,
+    src/kernels/hc8_parity.cpp:263-266, :271): at each of part 2's five shapes on its draws, Gemm::bf16_w in basalt's
+    row slices ``HC8_SLICES`` (derived from basalt's rule and asserted equal), each slice's image (gpu.hc8_image at
+    row0, n) multiplied at N = n (gpu.prompt_gemm), against columns [row0, row0 + n) of ``whole``'s copy entry over the
+    whole copy (basalt's one-slice y1): bitwise, where basalt allows es.rel() < 1e-5 for cuBLAS's change of kernel
+    (docs/design/flash-next.md:183-186: invariances stay bitwise)."""
+    if bf16 == "copy":
+        for (t, name), (x, _, _) in zip(PART2, part2_draws()):
+            _, q, s = hc8_copies()[name]
+            (n, k), full = q.shape, whole(x, (q, s), "copy")
+            rows = min(n, (1 << 20) // k)                                        # gemm.cu:143
+            cuts = [(r0, min(rows, n - r0)) for r0 in range(0, n, rows)]       # gemm.cu:148-152
+            assert cuts == HC8_SLICES[name], f"basalt's rule cuts the {name} copy into {cuts}, not {HC8_SLICES[name]}"
+            for r0, c in cuts:
+                image = gpu.hc8_image(q, s, n, k, r0, c).reshape(c, k)
+                y, want = gpu.prompt_gemm(x, image, bf16=True, B=t), full[:, r0:r0 + c]
+                assert np.array_equal(y, want), (
+                    'hc8_parity.cpp:266, :271: const bool sliced = es.rel() < 1e-5; expect(sliced, "row slices"); '
+                    "port: bitwise equal to the matching columns of the copy entry over the whole copy (column "
+                    f"invariance) ({name} copy T {t} N {n} K {k}, rows [{r0}, {r0 + c})): {differ(y, want)}; "
+                    f"{np.count_nonzero(image != host_image(q, s)[r0:r0 + c])} image values differ from the host's")
+        return
     (n, k), tag, B = COL_SHAPES[bf16], "bf16" if bf16 else "fp16", 37
     rng = np.random.default_rng(61 if bf16 else 67)
     xb, wb = operands(rng, bf16, B, n, k)
@@ -341,10 +407,38 @@ def test_columns_do_not_depend_on_the_matrix_rows(bf16):
             f"{differ(y, want)}")
 
 
-def test_repeats_are_bit_identical():
+@pytest.mark.parametrize("bf16", [False, "copy"], ids=["fp16", "copy"])
+def test_repeats_are_bit_identical(bf16):
     """GM-REPEAT (FP16): FP16 (6144, 2560) at B 512 in the handler's slices, into a y prefilled 0x00, then 0xFF, on one
     pipeline, then into 0xFF on a freshly compiled one (basalt_gpu.pipeline's cache cleared). (native): Q4_K (640,
-    2560) at B 37 through gpu.native, the fp16 image and y prefilled 0x00, then 0xFF."""
+    2560) at B 37 through gpu.native, the fp16 image and y prefilled 0x00, then 0xFF. ``copy`` (Gemm::bf16_w):
+    gpu.prompt_gemm_copy on hc8_parity's up copy (10240, 320) at B 512 in the handler's slices (the image, then seven
+    products, one queue run), the scratch and y prefilled 0x00, then 0xFF, on one pair of pipelines, then into 0xFF on
+    freshly compiled ones: the same image and y every run."""
+    if bf16 == "copy":
+        _, q, s = hc8_copies()["up"]
+        xb = emu.bf16_bits(np.random.default_rng(97).standard_normal((512, q.shape[1]), dtype=F32))
+
+        def pipelines():                         # the image's and the product's, as prompt_gemm_copy compiles them
+            return (basalt_gpu.pipeline(spliced(kernels.basalt_prompt_hc8_source()), "basalt_hc8_dequant_bf16"),
+                    gpu.prompt_pipeline(kernels.basalt_prompt_gemm_source(), "basalt_prompt_gemm", 512,
+                                        {"GEMM_BF16": "1"}))
+
+        psos = pipelines()
+        runs = [gpu.prompt_gemm_copy(xb, q, s, out_fill=f) for f in (0x00, 0xFF)]
+        assert all(a is b for a, b in zip(pipelines(), psos)), "the second run compiled a pipeline of its own"
+        basalt_gpu.pipeline.cache_clear()
+        runs.append(gpu.prompt_gemm_copy(xb, q, s))
+        assert not any(a is b for a, b in zip(pipelines(), psos)), "the third run reused a pipeline"
+        y, image = runs[0]
+        assert (np.isfinite(y.view(F32)).all() and np.count_nonzero(y) and np.isfinite(bf16_to_f32(image)).all()
+                and np.count_nonzero(image)), "a vacuous first copy run"
+        for i, (again, image2) in enumerate(runs[1:], 2):
+            assert np.array_equal(again, y) and np.array_equal(image2, image), (
+                "port: every run bitwise identical (deterministic: no atomics, no split of K, no dependence on "
+                f"scheduling or on the scratch's or y's prior bytes) (run {i} against run 1; copy up N 10240 K 320, "
+                f"B 512): {differ(again, y)}, {np.count_nonzero(image2 != image)} image values differ")
+        return
     rng = np.random.default_rng(71)
     xb, wb = operands(rng, False, 512, 6144, 2560)
     key = (kernels.basalt_prompt_gemm_source(), "basalt_prompt_gemm", 512, {"GEMM_BF16": "0"})
