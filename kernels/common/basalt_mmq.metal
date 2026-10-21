@@ -285,6 +285,9 @@ kernel void basalt_mmq(device const uint* xq [[buffer(0)]], device const GrpPtr*
     for (int q = 1; q < NITER; ++q)
         if ((mask >> q) & 1u) b[++m] = q;
     b[m + 1] = NITER;
+    // ponytail: a window re-reads its 128-row weight slab, so an expert's weights stream ceil(cnt / 8) times a product
+    // (26 ms a gate/up dispatch at B = 256 on the M3 Max); windows of 16 or 32 rows, up to J, inside one basalt tile
+    // change only wpre and no bit (spec-kernels-mmq.md 9.5).
     const int p0 = bounds[j] + 8 * u, ncol = min(8, bounds[j + 1] - p0);
     const int i = 128 * int(tg.x) + int(tid);
     device const ushort* wr = tab[plan[2 + j]].p + MAT_OFF + ulong(i) * (9 * BPNE);
@@ -296,20 +299,21 @@ kernel void basalt_mmq(device const uint* xq [[buffer(0)]], device const GrpPtr*
         for (int c = 0; c < 8; ++c) sum[c] = 0.0f;
         for (int q = b[pc]; q < b[pc + 1]; ++q)
             for (int s = 8 * q; s < 8 * q + 8; ++s) {
-                const Q20W wq = q2_0_load(wr + 9 * (s / 2), s % 2);
+                const Q20W wq = q2_0_load(wr + 9 * (s / 2), s % 2);             // mmq_load_tiles.cuh:42-58, :73
                 for (int c = 0; c < 8 && c < ncol; ++c) {
                     device const uint* yb = xq + (ulong(p0 + c) * ((K + 511) / 512 * 4) + ulong(s / 4)) * 36u;
+                    const float dB = as_type<float>(yb[s % 4]);                         // mmq_vec_dot.cuh:74
                     int ci = 0;
                     for (int k = 0; k < 4; ++k) {
                         ci = dp4a(int(yb[4 + 8 * (s % 4) + 2 * k]), wq.qx[k], ci);
                         ci = dp4a(int(yb[4 + 8 * (s % 4) + 2 * k + 1]), wq.qy[k], ci);
                     }
-                    sum[c] = fma_ftz(as_type<float>(yb[s % 4]), mul_ftz(wq.d2, float(ci)), sum[c]);
+                    sum[c] = fma_ftz(dB, mul_ftz(wq.d2, float(ci)), sum[c]);            // mmq_vec_dot.cuh:87
                 }
             }
         for (int c = 0; c < 8 && c < ncol; ++c) {
-            if (pp >= 0) S[c] = add_ftz(S[c], sum[c]);
-            else y[ulong(p0 + c) * LD + ulong(i)] = cuda_nan(m == 0 ? sum[c] : add_ftz(sum[c], S[c]));
+            if (pp >= 0) S[c] = add_ftz(S[c], sum[c]);                                          // mmq.cuh:646, :689
+            else y[ulong(p0 + c) * LD + ulong(i)] = cuda_nan(m == 0 ? sum[c] : add_ftz(sum[c], S[c]));   // :216, :765
         }
     }
 }
