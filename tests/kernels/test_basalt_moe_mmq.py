@@ -45,10 +45,17 @@ exists), then the Metal port's (kernels/common/basalt_mmq.metal).
 - test_mmq_plan_routed_id_out_of_range: a routed id outside [0, n_expert) in the chunk's partial last range sets
   StepState's error to BASALT_ERR_EXPERT_ID with done, and slot, src and plan keep their 0xFF fill (basalt refuses at
   prefill.cpp:1843, before its first write); a step that arrives with done set stores nothing at all.
-- test_mmq_q2_emulation_bit_for_bit (E1-E2, spec-tests-moe.md 5.4): kernel 1, then kernel 2 (basalt_mmq: every
-  launch's mul_mat_q<Q2_0> with its stream-k fixup folded per output element, in one dispatch) on each fixture
-  configuration: Xq's bytes and GU's bits equal the host emulator's (emu.mmq_moe at basalt's 170 multiprocessors), and
-  slots past rows_local keep the 0xFF fill."""
+- test_mmq_q2_emulation_bit_for_bit (E1-E5, spec-tests-moe.md 5.4): the chain, the plan kernels then kernels 1-4
+  (basalt_mmq: every launch's mul_mat_q<Q2_0> with its stream-k fixup folded per output element, in one dispatch a
+  product) in one command buffer, on each fixture configuration: Xq's bytes, GU's bits, Hq's bytes and D's bits equal
+  the host emulator's (emu.mmq_moe's steps at basalt's 170 multiprocessors, with the GPU's expf_ftz), slots past
+  rows_local keep the 0xFF fill, and the launches cover split and unsplit ones, tiles of three or more pieces and an
+  empty column tile.
+- test_mmq_down_padded_steps_signed_zero (M5): kernel 4 alone on crafted Hq and down weights whose chains are -0
+  before the down product's padded sub-blocks: the scales mmq_dA finds past each row (the next row's, the next launch
+  slot's row 0, the zeroed tail past a group's last slot) decide the zero's sign as basalt's group buffer does.
+- test_mmq_chain_routed_id_out_of_range: a routed id out of range through the whole chain stores nothing, not even
+  over an earlier chunk's plan, which kernels 1-4 would otherwise run on."""
 
 import functools
 
@@ -599,31 +606,139 @@ def test_mmq_plan_routed_id_out_of_range(n_expert, bad):
 
 @pytest.mark.parametrize("name", list(fx.CONFIGS))
 def test_mmq_q2_emulation_bit_for_bit(name):
-    """E1-E2 (spec-tests-moe.md 5.4; no basalt test: the tier-1 gates against the host emulator at basalt's 170
-    multiprocessors): kernel 1, then kernel 2 (basalt_mmq: mul_mat_q<Q2_0> and its stream-k fixup per output element,
-    every launch of the plan in one dispatch), on the configuration's x through its plan (emu.moe_plan's), compiled at
-    the multiple of 256 rows that holds its tokens: share's 12 at 256 (so 2440 slots must stay unwritten), kq's 256 and
-    wide's 512 at R = B; x's rows past R are NaN. E1: Xq's 32-value groups, d4 and codes (so every byte), equal the
-    emulator's slot for slot; E2: GU's bits equal the emulator's over all rows_local x 1280, kernel 2 reading kernel 1's
-    Xq. Each reports its first mismatch, and slots at or past rows_local keep the 0xFF fill in both. Xq and GU do not
-    depend on expf, so the cached host-expf emulation (_emulated) serves here; Hq and Dm do, and need the GPU's
-    expf_ftz. The configurations hold tile widths 8 to 128, split and unsplit gate/up launches and wide's launch of two
-    column tiles with an empty one (basalt_moe_fixture._coverage)."""
+    """E1-E5 (spec-tests-moe.md 5.4; no basalt test: the tier-1 gates against the host emulator at basalt's 170
+    multiprocessors): the chain gpu.moe_mmq, the plan kernels on the configuration's ids and then kernels 1-4 in one
+    command buffer, on its x, compiled at the multiple of 256 rows that holds its tokens: share's 12 at 256 (so 2440
+    slots must stay unwritten), kq's 256 and wide's 512 at R = B; x's rows past R are NaN. First the plan's words, slot
+    and src equal emu.moe_plan's (_check_plan), so a later mismatch is the kernels'. E1: Xq's 32-value groups, d4 and
+    codes (so every byte), equal the emulator's slot for slot; E2: GU's bits over all rows_local x 1280; E3: Hq's
+    groups, padding blocks 5-7 included; E4: D's bits over rows_local x 2560. Each reports its first mismatch, and
+    slots at or past rows_local keep the 0xFF fill in all four. Xq and GU do not depend on expf, so they are the cached
+    host-expf emulation's (_emulated); Hq and D are emulated from that GU with the GPU's expf_ftz (basalt_gpu.expf_ftz,
+    spec-tests-moe.md 5.4 step 3). E5: the configuration's launches at 170 include an unsplit one in each product, a
+    split gate/up launch with a tile of three or more pieces and a split down launch (but in share-outliers, whose last
+    group's 8 experts make 160 down tiles, unsplit), and in wide two column tiles with an empty one; the tile widths
+    run 8 to 128 (basalt_moe_fixture._coverage)."""
     cfg = fx.config(name)
     p, want = cfg.plan, _emulated(name)
+    hq = emu.mmq_quantize(emu.mmq_swiglu(want.gu, basalt_gpu.expf_ftz))
+    d = emu.mmq_product(hq, p, cfg.buf, cfg.offsets, "down", NSM)
     B, local = 256 * -(-cfg.T // 256), p.rows_local
     x = np.full((B, fx.N), np.nan, F32)
     x[:cfg.T] = cfg.x
-    xq = gpu.mmq_quantize(x, p, B=B)
-    (d4, codes), (wd4, wcodes) = _groups(xq[:local]), _groups(want.xq)
-    bad = np.argwhere((d4 != wd4) | (codes != wcodes).any(axis=-1))
-    assert not len(bad), (f"E1: {len(bad)} Xq groups differ from the emulator, first (slot, group) {tuple(bad[0])}: "
-                          f"d4 {d4[tuple(bad[0])]:#010x} for {wd4[tuple(bad[0])]:#010x}")
-    assert np.all(xq[local:] == 0xFF), f"E1: a slot at or past rows_local = {local} was written"
-    gu, want_gu = gpu.mmq(xq, p, cfg.buf, cfg.offsets, B=B), want.gu.view(np.uint32)
-    bad = np.argwhere(gu[:local] != want_gu)
-    assert not len(bad), (f"E2: {len(bad)} GU elements differ from the emulator, first (slot, column) "
-                          f"{tuple(bad[0])}: {gu[tuple(bad[0])]:#010x} for {want_gu[tuple(bad[0])]:#010x}")
-    assert np.all(gu[local:] == 0xFFFFFFFF), f"E2: a slot at or past rows_local = {local} was written"
-    print(f"\n{name}: B {B}, {local} slots, gate/up launches (ngx, J, ntx, grid) "
-          f"{[(la.ngx, la.J, la.ntx, la.grid) for la in emu.mmq_launches(p.bounds, 10, NSM)]}")
+    got = gpu.moe_mmq(x, cfg.ids, cfg.buf, cfg.offsets, B=B, n_expert=fx.E)
+    _check_plan(got, cfg.ids, B, n_expert=fx.E, what=name)
+    for e, a, w in (("E1 Xq", got.xq, want.xq), ("E3 Hq", got.hq, hq)):
+        (d4, codes), (wd4, wcodes) = _groups(a[:local]), _groups(w)
+        bad = np.argwhere((d4 != wd4) | (codes != wcodes).any(axis=-1))
+        assert not len(bad), (f"{e}: {len(bad)} groups differ from the emulator, first (slot, group) "
+                              f"{tuple(bad[0])}: d4 {d4[tuple(bad[0])]:#010x} for {wd4[tuple(bad[0])]:#010x}")
+    for e, a, w in (("E2 GU", got.gu, want.gu.view(np.uint32)), ("E4 D", got.d, d.view(np.uint32))):
+        bad = np.argwhere(a[:local] != w)
+        assert not len(bad), (f"{e}: {len(bad)} elements differ from the emulator, first (slot, column) "
+                              f"{tuple(bad[0])}: {a[tuple(bad[0])]:#010x} for {w[tuple(bad[0])]:#010x}")
+    for e, a in (("Xq", got.xq), ("GU", got.gu), ("Hq", got.hq), ("D", got.d)):
+        assert np.all(a[local:] == np.iinfo(a.dtype).max), f"{e}: a slot at or past rows_local = {local} was written"
+    la = {pr: fx.launches(cfg, pr) for pr in fx.PRODUCTS}
+    pieces = {pr: [max(len(emu.mmq_pieces(t)) for t in g.tiles.values()) for g in ls] for pr, ls in la.items()}
+    assert 1 in pieces["gate_up"] and 1 in pieces["down"] and max(pieces["gate_up"]) >= 3, (name, pieces)
+    assert max(pieces["down"]) > 1 or (name == "share-outliers" and la["down"][-1].ngx == 8), (name, pieces)
+    cnt = np.diff(p.bounds)
+    assert not name.startswith("wide") or any(g.ntx > 1 and any(jt * g.J >= c for c in cnt[g.j0: g.j0 + g.ngx]
+                                                                for jt in range(g.ntx)) for g in la["gate_up"]), name
+    print(f"\n{name}: B {B}, {local} slots; launches (ngx, J, ntx, grid, a tile's most pieces) at {NSM}: "
+          + "; ".join(f"{pr} {[(g.ngx, g.J, g.ntx, g.grid, n) for g, n in zip(la[pr], pieces[pr])]}" for pr in la))
+
+
+def test_mmq_down_padded_steps_signed_zero():
+    """M5 (spec-kernels-mmq.md 10, 9.6): kernel 4 alone (basalt_mmq with the down product's macros) at bound B = 2, on
+    17 one-row experts: two tokens route experts 3 j + 1 for j = 0..19 (table ids that are not launch slots), the last
+    three held on the CPU, so group 0's 16 experts run unsplit at 170 and group 1's one expert splits (a split tile's
+    fixup starts +0 + P, so it ends +0). Hq: groups 0-19 d4 2^-120 and codes -1, blocks 5-7 as the quantizer pads them
+    (d4 +0, codes 0). The down weights: codes 2 (w = +1) and d = +-2^-14, so every real step adds +-2^-129, which
+    flushes, and block 9 positive leaves every chain -0 before the last iteration's padded sub-blocks 20-23. Those run
+    with c = 0 and dB = +0, so fma_ftz(+0, mul_ftz(dA, 0), -0) (mmq_vec_dot.cuh:87) keeps -0 only where dA is negative:
+    the chain stays -0 only when both scales mmq_dA finds are negative, blocks 0 and 1 of the next row, of the next
+    launch slot's row 0 past row 2559, or the zeroed tail (+0) past group 0's last slot (prefill.cpp:608-611,
+    :2249-2251). The blobs sit as the fixture's, 0xFF after each and before odd ones, so a read past a matrix meets a
+    NaN scale. Gate: D's bits equal the emulator's (emu.mmq_product) and those signs' expectation: -0 under a next row
+    of two negative scales, +0 under two positive ones or mixed ones in either order; rows 2559 of slots 0-14 by the
+    next slot's row 0, -0 and +0 both occurring; slot 15's row 2559 +0 (the tail) though order[16]'s row 0 is
+    negative; slot 16 +0 throughout; the CPU's slots 17-19 keep the 0xFF fill. So a port that skips the padded steps,
+    reads row i's own scales or any past a matrix, reads +0 for every row 2559 or the next group's expert, or adds +0
+    onto a one-piece tile fails."""
+    rng = np.random.default_rng(12)
+    experts = 1 + 3 * np.arange(20)
+    plan = emu.moe_plan(experts.reshape(2, 10), fx.E, experts[17:])
+    assert (plan.n, plan.rows_local) == (17, 17) and np.array_equal(plan.order, experts[:17])
+    g0, g1 = emu.mmq_launches(plan.bounds, fx.PRODUCTS["down"][0], NSM)
+    assert (g0.ngx, g0.ntiles, g0.grid, g1.ngx, g1.ntiles, g1.grid) == (16, 320, 320, 1, 20, 170)
+    neg = rng.random((17, fx.N, 10)) < 0.5                 # each down block's scale negative, per slot, row and block
+    neg[..., 9] = False
+    neg[1:17, 0, :2] = (np.arange(1, 17) % 2 == 1)[:, None]   # row 0 of slot j: two negative scales for odd j
+    neg[16, 0, :2] = True                                  # order[16]'s row 0, behind group 0's last slot
+    blk = np.full((17, fx.N, 10, fx.QB), 0xAA, np.uint8)   # codes 2: w = +1
+    blk[..., :2] = np.where(neg, 0x8400, 0x0400).astype("<u2")[..., None].view(np.uint8)   # fp16 -+2^-14
+    at = np.arange(17) * (fx.BYTES + fx.SLACK) + 2 * (np.arange(17) % 2)
+    buf = np.full(17 * (fx.BYTES + fx.SLACK), 0xFF, np.uint8)
+    for j in range(17):
+        buf[at[j] + fx.DOWN_OFF: at[j] + fx.BYTES] = blk[j].ravel()
+    offsets = np.zeros(fx.E, np.int64)
+    offsets[plan.order] = at
+    hq = np.zeros((20, 8, kernels.MMQ_BLOCK_BYTES), np.uint8)
+    hq[:, :5, :16] = np.full((20, 5, 4), 2.0 ** -120, F32).view(np.uint8)
+    hq[:, :5, 16:] = 0xFF                                  # codes -1
+    both = neg[..., 0] & neg[..., 1]
+    nxt = np.zeros((17, fx.N), bool)                       # the padded steps' scales all negative: -0 kept
+    nxt[:16, :-1] = both[:16, 1:]                          # row i + 1 of the slot's own matrix
+    nxt[:15, -1] = both[1:16, 0]                           # past row 2559: the next launch slot's row 0
+    want = np.where(nxt, np.uint32(0x80000000), np.uint32(0))   # slot 15's row 2559 the tail; slot 16 split
+    mixed = neg[:16, 1:, 0] != neg[:16, 1:, 1]
+    assert (nxt[:16, :-1].any() and (~neg[:16, 1:, 0] & ~neg[:16, 1:, 1]).any() and (mixed & neg[:16, 1:, 0]).any()
+            and (mixed & neg[:16, 1:, 1]).any() and (both[:16, :-1] != both[:16, 1:]).any())
+    assert nxt[:15, -1].any() and not nxt[:15, -1].all() and both[16, 0] and not nxt[15, -1]
+    emu_d = emu.mmq_product(hq[:17], plan, buf, offsets, "down", NSM).view(np.uint32)
+    bad = np.argwhere(emu_d != want)
+    assert not len(bad), f"emulator: {len(bad)} elements differ from the signs' expectation, first {tuple(bad[0])}"
+    got = gpu.mmq(hq, plan, buf, offsets, B=2, product="down")
+    bad = np.argwhere(got[:17] != want)
+    assert not len(bad), (f"{len(bad)} D elements differ, first (slot, row) {tuple(bad[0])}: "
+                          f"{got[tuple(bad[0])]:#010x} for {want[tuple(bad[0])]:#010x}")
+    assert np.all(got[17:] == 0xFFFFFFFF), "a CPU slot (17-19) was written"
+    print(f"\n-0 elements: {np.count_nonzero(want)} of {want.size}; rows 2559 of slots 0-14 -0: "
+          f"{np.flatnonzero(nxt[:15, -1]).tolist()}")
+
+
+def test_mmq_chain_routed_id_out_of_range():
+    """eng-review D23: the plan test's chunk (R = 17 at bound B = 256, token 16 holding 512 and -1 among valid ids, at
+    basalt's 512 experts) through the chain gpu.moe_mmq, the plan kernels then kernels 1-4 in one command buffer. basalt
+    refuses inside its counting loop (``if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range";
+    return false; }``, prefill.cpp:1843), before any write: StepState takes error BASALT_ERR_EXPERT_ID and done, its
+    other words unchanged, and slot, src, plan, Xq, GU, Hq and D keep their 0xFF fill (mmq_hist, which plan_count writes
+    first, is scratch and not compared). Kernels 1-4 return at done, which 0xFF plan words cannot show (n = -1 stops
+    them at their own bounds), so the step runs again with slot, src and plan holding an earlier chunk's plan (the
+    share-plain fixture's 12 tokens, whose blobs the table holds): the refused step leaves those words as they were
+    and Xq, GU, Hq and D their fill; and once more arriving with done set (a later layer of the refused step), which
+    stores nothing at all, mmq_hist included."""
+    cfg = fx.config("share-plain")
+    ids = _plan_ids(np.random.default_rng(8), 17)
+    ids[16, 3:5] = 512, -1
+    x = np.zeros((256, fx.N), F32)
+    x[:cfg.T] = cfg.x
+    layout = StepStateLayout()
+    for prior, done in ((None, 0), (cfg.plan, 0), (cfg.plan, 1)):
+        got = gpu.moe_mmq(x, ids, cfg.buf, cfg.offsets, B=256, prior=prior, done=done)
+        want = layout.unpack(layout.pack({"t_this_step": 17, "done": done}))
+        if not done:
+            want.update(error=kernels.BASALT_ERR_EXPERT_ID, done=1)
+        what = f"prior {'share-plain' if prior else None}, done {done}"
+        assert got.state == want, (what, got.state["error"], got.state["done"])
+        slot, src = np.full((256, 10), -1, np.int32), np.full(2560, -1, np.int32)
+        plan = np.full(kernels.MMQ_PLAN_WORDS, -1, np.int32)
+        if prior is not None:
+            slot[:cfg.T], src[:10 * cfg.T], plan = prior.slot, prior.src, gpu.plan_words(prior)
+        for e, a, w in (("slot", got.slot, slot), ("src", got.src, src), ("plan", got.plan, plan)):
+            assert np.array_equal(a, w), f"{what}: {e} written"
+        for e, a in (("Xq", got.xq), ("GU", got.gu), ("Hq", got.hq), ("D", got.d)):
+            assert np.all(a == np.iinfo(a.dtype).max), f"{what}: {e} written"
+        assert not done or got.hist == b"\xff" * len(got.hist), f"{what}: mmq_hist written"

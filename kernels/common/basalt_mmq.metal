@@ -27,6 +27,8 @@
 //   fixup (:632-767). The tile's outputs are its pieces' chains, each from +0, folded in the fixup's order.
 // - mmq_code(v): the quantizer's roundf stored to a char as sm_120 converts it (spec-kernels-mmq.md 3.2).
 // - mmq_quantize_block(xi, blk, iqs): quantize_mmq_q8_1<D4>'s body (quantize.cu:39-81), which kernels 1 and 3 share.
+// - mmq_dA(tab, order, j, jl, i, s): the down product's weight scale past row i, where basalt's tile load reads its
+//   group buffer (spec-kernels-mmq.md 9.6), read in place.
 //
 // The kernels (spec-kernels-mmq.md 9.1). Each returns at StepState.done before its first load, so once the plan
 // refuses a routed id nothing more of the step is stored.
@@ -40,6 +42,8 @@
 //   launches it per group of 16 experts), one dispatch for all of them, into GU.
 // - basalt_mmq_swiglu_quantize (kernel 3): GU's split halves to Hq, mmq::swiglu (moe_mmq.cu:85-93) fused with the
 //   quantizer on H (prefill.cpp:2257-2258's group calls), compiled with the down product's macros (K = n_ff).
+// - basalt_mmq (kernel 4, compiled with the down product's macros, MMQ_DOWN 1): every group's down mul_mat_q<Q2_0> on
+//   Hq and the experts' down rows (prefill.cpp:2259-2264) into D, the padded last k iteration through mmq_dA.
 //
 // Macros (monolith/kernels.py basalt_mmq_macros): MMQ_TYPE (42 Q2_0, 8 Q8_0), K, NTY, LD, BPNE, BPI, NITER, MMQ_DOWN,
 // MMQ_DENSE, ROWS_PER_T, MMQ_SM_COUNT, MAT_OFF, MMQ_ERR, N_EXPERT, MMQ_RANGE; and PROMPT_ROWS' T_SRC, ROWS_MAX and
@@ -247,9 +251,27 @@ kernel void basalt_mmq_quantize(device const float* x [[buffer(0)]], device cons
     mmq_quantize_block(xi, xq + (ulong(tg.x) * (K / 128) + i0 / 128u) * 36u, i0 % 128u);          // :70-71
 }
 
-// Kernel 2 (spec-kernels-mmq.md 9.2-9.5): mul_mat_q<Q2_0> (mmq.cuh:390-864) of every launch of the plan, the gate/up
-// product's groups of prefill.cpp:2243-2256, in one dispatch, with the stream-k fixup (:632-767) folded per output
-// element. xq [10 B][pad512(K) / 128] blocks of 144 bytes, kernel 1's slots; tab [512] one GrpPtr per expert id, its
+// The down product's padded sub-blocks (spec-kernels-mmq.md 4.3, 9.6). Its rows of BPNE = 10 blocks are not a multiple
+// of BPI = 4, so its last k iteration (kb0 = 8) runs sub-blocks 2 BPNE .. 2 BPNE + 3, blocks BPNE and BPNE + 1 past
+// weight row i, which basalt's tile load reads from its group buffer: the group's down matrices packed in launch-slot
+// order, then MMQ_TAIL zeroed bytes (prefill.cpp:608-611, :848-849, :2249-2251). Their activation codes are Hq's
+// padding, 0, so c = 0 and only their dA reaches the sum: the sign of a -0 sum. mmq_dA reads that dA in place through
+// the address table, never past an expert's matrix: block b - BPNE of row i + 1; past the matrix's last row (NTY 128
+// rows) block b - BPNE of the next launch slot's row 0; past the group's last slot jl the tail's d = 0x0000.
+static inline float mmq_dA(device const GrpPtr* tab, device const int* order, int j, int jl, int i, int s) {
+    int b = s / 2;
+    if (b >= BPNE) { b -= BPNE; ++i; }            // block b - 10 of row i + 1
+    if (i == NTY * 128) {                         // past the expert's matrix
+        if (j == jl) return 0.0f;                 // MMQ_TAIL: d = 0x0000
+        i = 0; ++j;                               // the next slot's row 0
+    }
+    return h2f(tab[order[j]].p[MAT_OFF + (ulong(i) * BPNE + ulong(b)) * 9]);
+}
+
+// Kernels 2 and 4 (spec-kernels-mmq.md 9.2-9.6): mul_mat_q<Q2_0> (mmq.cuh:390-864) of every launch of the plan, the
+// gate/up product's groups of prefill.cpp:2243-2256 (kernel 2) or the down product's of :2259-2264 (kernel 4,
+// MMQ_DOWN), in one dispatch, with the stream-k fixup (:632-767) folded per output element. xq [10 B][pad512(K) / 128]
+// blocks of 144 bytes, kernel 1's slots (kernel 3's for the down product); tab [512] one GrpPtr per expert id, its
 // blob (what basalt gathers into its group buffers, prefill.cpp:2222-2240, read in place: weight row i at MAT_OFF + 9
 // BPNE i ushorts); plan its words; y [10 B][LD] floats, slot p's outputs at row p (basalt's ids_identity). Grid (NTY,
 // W_cap) x MMQ_THREADS, W_cap >= wpre[n] (monolith/kernels.py basalt_mmq_grids): threadgroup (it, w) computes weight
@@ -264,7 +286,8 @@ kernel void basalt_mmq_quantize(device const float* x [[buffer(0)]], device cons
 // activation codes, then sum = fma_ftz(dB, mul_ftz(dA, float(c)), sum) (mmq_vec_dot.cuh:87: I2FP, FMUL.FTZ dA * c,
 // FFMA.FTZ), dA the block's fp16 d (mmq_load_tiles.cuh:73), dB the activation group's d4 (mmq_vec_dot.cuh:74). One
 // piece is stored as it is (:216); else P_{m-1} .. P_0 are added from +0, nearest first (the fixup, :646, :689), and
-// that sum onto P_m (:765), add_ftz each. Stores through cuda_nan (sm_120's NaN).
+// that sum onto P_m (:765), add_ftz each. Stores through cuda_nan (sm_120's NaN). The down product's last iteration's
+// sub-blocks past row i run the same step with c = 0 and mmq_dA's dA, their weight codes never loaded.
 kernel void basalt_mmq(device const uint* xq [[buffer(0)]], device const GrpPtr* tab [[buffer(1)]],
                        device const int* plan [[buffer(2)]], device float* y [[buffer(3)]],
                        device const StepState* st [[buffer(15)]],
@@ -279,6 +302,7 @@ kernel void basalt_mmq(device const uint* xq [[buffer(0)]], device const GrpPtr*
         if (j + h < n && wpre[j + h] <= w) j += h;
     const int u = w - wpre[j];
     const MmqLaunch L = mmq_launch(bounds, n, j / 16, NTY);
+    const int jl = 16 * (j / 16) + L.ngx - 1;                                // the group's last launch slot
     const uint mask = mmq_piece_mask((int(tg.x) * L.ngx + j % 16) * L.ntx + 8 * u / L.J, L.ntiles, BPNE, BPI, L.grid);
     int b[NITER + 1], m = 0;                                                 // the pieces' first k iterations
     b[0] = 0;
@@ -299,16 +323,18 @@ kernel void basalt_mmq(device const uint* xq [[buffer(0)]], device const GrpPtr*
         for (int c = 0; c < 8; ++c) sum[c] = 0.0f;
         for (int q = b[pc]; q < b[pc + 1]; ++q)
             for (int s = 8 * q; s < 8 * q + 8; ++s) {
-                const Q20W wq = q2_0_load(wr + 9 * (s / 2), s % 2);             // mmq_load_tiles.cuh:42-58, :73
+                const bool pad = MMQ_DOWN && s >= 2 * BPNE;                     // past row i: c = 0, mmq_dA's dA
+                const Q20W wq = pad ? Q20W{} : q2_0_load(wr + 9 * (s / 2), s % 2);  // mmq_load_tiles.cuh:42-58, :73
+                const float dA = pad ? mmq_dA(tab, plan + 2, j, jl, i, s) : wq.d2;
                 for (int c = 0; c < 8 && c < ncol; ++c) {
                     device const uint* yb = xq + (ulong(p0 + c) * ((K + 511) / 512 * 4) + ulong(s / 4)) * 36u;
                     const float dB = as_type<float>(yb[s % 4]);                         // mmq_vec_dot.cuh:74
                     int ci = 0;
-                    for (int k = 0; k < 4; ++k) {
+                    for (int k = 0; k < 4 && !pad; ++k) {
                         ci = dp4a(int(yb[4 + 8 * (s % 4) + 2 * k]), wq.qx[k], ci);
                         ci = dp4a(int(yb[4 + 8 * (s % 4) + 2 * k + 1]), wq.qy[k], ci);
                     }
-                    sum[c] = fma_ftz(dB, mul_ftz(wq.d2, float(ci)), sum[c]);            // mmq_vec_dot.cuh:87
+                    sum[c] = fma_ftz(dB, mul_ftz(dA, float(ci)), sum[c]);               // mmq_vec_dot.cuh:87
                 }
             }
         for (int c = 0; c < 8 && c < ncol; ++c) {

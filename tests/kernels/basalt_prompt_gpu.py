@@ -85,47 +85,9 @@ def plan_words(plan):
 
 
 def mmq_plan(ids, *, B, n_expert=512, cpu_mask=None, hist=None, done=0):
-    """The plan kernels basalt_mmq_plan_count, _scan and _fill (basalt's host expert walk, prefill.cpp:1840-1932,
-    :1993-1996) in one command buffer, sharing one StepState, on the routed ids ``ids`` [R, 10] (R = len(ids) rows in
-    StepState), compiled at bound ``B`` with N_EXPERT ``n_expert``: ids' rows from R on hold 512 and -1, ids no kernel
-    may read; ``cpu_mask`` U32 [n_expert] (nonzero: basalt's on_cpu; default all zero); ``hist`` the mmq_hist scratch's
-    first bytes (default 0xFF: every range a kernel must not read counts absent pairs); ``done`` StepState's. slot,
-    src and plan start as 0xFF bytes. Returns slot int32 [B, 10], src int32 [10 B], plan int32 [MMQ_PLAN_WORDS],
-    hist's bytes and StepState's fields (``state``)."""
-    ids = np.asarray(ids, np.int32)
-    R, k = ids.shape
-    assert k == 10 and R <= B, f"ids {ids.shape} at bound {B}"
-    mask = np.zeros(n_expert, np.uint32) if cpu_mask is None else np.asarray(cpu_mask, np.uint32)
-    assert mask.shape == (n_expert,), mask.shape
-    macros = kernels.basalt_mmq_macros("gate_up", n_expert=n_expert)
-    pc, ps, pf = (prompt_pipeline(kernels.basalt_mmq_source(), f"basalt_mmq_plan_{s}", B, macros)
-                  for s in ("count", "scan", "fill"))
-    nr = -(-B // kernels.MMQ_RANGE)
-    rows = np.tile(np.array([512, -1], np.int32), 5 * B).reshape(B, 10)
-    rows[:R] = ids
-    dev = device()
-    b_ids, b_mask = nt.Buffer(dev, rows.tobytes()), nt.Buffer(dev, mask.tobytes())
-    b_hist = nt.Buffer(dev, 4 * nr * (512 + 1) if hist is None else hist)
-    b_plan, b_slot, b_src = (nt.Buffer(dev, n) for n in (4 * kernels.MMQ_PLAN_WORDS, 40 * B, 40 * B))
-    for b in (b_plan, b_slot, b_src) + ((b_hist,) if hist is None else ()):
-        b.fill(0xFF)
-    layout = StepStateLayout()
-    b_st = nt.Buffer(dev, layout.pack({"t_this_step": R, "done": done}))
-
-    def dispatch(pso, binds, grid, threads):
-        d = nt.Dispatch().pipeline(pso)
-        for slot, b in binds:
-            d = d.buffer(slot, b)
-        return d.buffer(15, b_st).grid(grid).threadgroup(threads)
-
-    r = nt.Queue(dev).run([dispatch(pc, [(0, b_ids), (1, b_hist)], nr, kernels.MMQ_THREADS),
-                           dispatch(ps, [(1, b_hist), (2, b_plan), (5, b_mask)], 1, 512),
-                           dispatch(pf, [(0, b_ids), (1, b_hist), (3, b_slot), (4, b_src)], nr,
-                                    10 * kernels.MMQ_RANGE)])
-    assert not r.error, r.error
-    i32 = lambda b: np.frombuffer(b.read(0, b.nbytes), np.int32)
-    return SimpleNamespace(slot=i32(b_slot).reshape(B, 10), src=i32(b_src), plan=i32(b_plan),
-                           hist=b_hist.read(0, b_hist.nbytes), state=layout.unpack(b_st.read(0, b_st.nbytes)))
+    """The plan kernels basalt_mmq_plan_count, _scan and _fill alone (basalt's host expert walk, prefill.cpp:1840-1932,
+    :1993-1996): moe_mmq without x, its arguments and its slot, src, plan, hist and state."""
+    return moe_mmq(None, ids, B=B, n_expert=n_expert, cpu_mask=cpu_mask, hist=hist, done=done)
 
 
 def mmq_quantize(x, plan, *, B):
@@ -191,3 +153,83 @@ def mmq_swiglu_quantize(gu, plan, *, B):
     hq = run_rows(pso, [gu.tobytes(), 4, plan_words(plan).tobytes(), nbytes], None, 0, (slots, kp // 512, 1),
                   (kernels.MMQ_THREADS, 1, 1), len(plan.slot), 0, fill=0xFF)[3]
     return np.frombuffer(hq, np.uint8).reshape(slots, kp // 128, kernels.MMQ_BLOCK_BYTES)
+
+
+def moe_mmq(x, ids, buf=None, offsets=None, *, B, n_expert=512, cpu_mask=None, hist=None, prior=None, done=0):
+    """One MoE half's routed experts through basalt's MMQ chain in one command buffer, compiled at bound ``B`` with
+    N_EXPERT ``n_expert``, every dispatch on kernels.basalt_mmq_grids' grid and one StepState at slot 15 (R = len(ids)
+    rows, ``done``): the plan kernels basalt_mmq_plan_count, _scan and _fill (basalt's host expert walk,
+    prefill.cpp:1840-1932, :1993-1996) on the routed ids ``ids`` [R, 10], whose rows from R on hold 512 and -1, ids no
+    kernel may read; then, unless ``x`` is None, kernels 1-4 (prefill.cpp:1990, :2241-2264): basalt_mmq_quantize of the
+    float32 rows ``x`` [B, 2560] through the plan's src, basalt_mmq with the gate/up product's macros,
+    basalt_mmq_swiglu_quantize and basalt_mmq with the down product's. Expert e's blob is at byte ``offsets[e]`` of
+    ``buf``, one buffer made resident with Dispatch.use and read through an I64 [512] table of GPU addresses (ids past
+    ``offsets`` 0). ``cpu_mask`` U32 [n_expert] (nonzero: basalt's on_cpu; default all zero); ``hist`` the mmq_hist
+    scratch's first bytes (default 0xFF: every range a kernel must not read counts absent pairs); ``prior`` an earlier
+    chunk's plan (basalt_emu.moe_plan's) whose slot, src and plan words those buffers hold before the step, else their
+    bytes start as 0xFF, as Xq's, GU's, Hq's and D's do. Returns slot int32 [B, 10], src int32 [10 B], plan int32
+    [MMQ_PLAN_WORDS], hist's bytes, StepState's fields (``state``) and, with ``x``, Xq uint8 [10 B, 20, 144], GU uint32
+    [10 B, 1280], Hq uint8 [10 B, 8, 144] and D uint32 [10 B, 2560]."""
+    ids = np.asarray(ids, np.int32)
+    R, k = ids.shape
+    assert k == 10 and R <= B, f"ids {ids.shape} at bound {B}"
+    mask = np.zeros(n_expert, np.uint32) if cpu_mask is None else np.asarray(cpu_mask, np.uint32)
+    assert mask.shape == (n_expert,), mask.shape
+    mg, md = (kernels.basalt_mmq_macros(p, n_expert=n_expert) for p in ("gate_up", "down"))
+    gg, gd = (kernels.basalt_mmq_grids(B, p) for p in ("gate_up", "down"))
+    rows = np.tile(np.array([512, -1], np.int32), 5 * B).reshape(B, 10)
+    rows[:R] = ids
+    slot, src = np.full((B, 10), -1, np.int32), np.full(10 * B, -1, np.int32)
+    plan = np.full(kernels.MMQ_PLAN_WORDS, -1, np.int32)
+    if prior is not None:
+        slot[:len(prior.slot)], src[:len(prior.src)], plan = prior.slot, prior.src, plan_words(prior)
+    dev = device()
+    b_ids, b_mask, b_slot, b_src, b_plan = (nt.Buffer(dev, a.tobytes()) for a in (rows, mask, slot, src, plan))
+    b_hist = nt.Buffer(dev, 4 * gg["basalt_mmq_plan_count"][0] * (512 + 1) if hist is None else hist)
+    if hist is None:
+        b_hist.fill(0xFF)
+    layout = StepStateLayout()
+    b_st = nt.Buffer(dev, layout.pack({"t_this_step": R, "done": done}))
+
+    def dispatch(name, macros, grid, binds, threads=kernels.MMQ_THREADS, use=None):
+        d = nt.Dispatch().pipeline(prompt_pipeline(kernels.basalt_mmq_source(), name, B, macros))
+        for s, b in binds:
+            d = d.buffer(s, b)
+        d = d.buffer(15, b_st).grid(*grid, 1).threadgroup(threads, 1, 1)
+        return d if use is None else d.use(use)
+
+    ds = [dispatch("basalt_mmq_plan_count", mg, gg["basalt_mmq_plan_count"], [(0, b_ids), (1, b_hist)]),
+          dispatch("basalt_mmq_plan_scan", mg, gg["basalt_mmq_plan_scan"], [(1, b_hist), (2, b_plan), (5, b_mask)],
+                   512),
+          dispatch("basalt_mmq_plan_fill", mg, gg["basalt_mmq_plan_fill"],
+                   [(0, b_ids), (1, b_hist), (3, b_slot), (4, b_src)], 10 * kernels.MMQ_RANGE)]
+    outs = {}
+    if x is not None:
+        slots, kd = 10 * B, int(md["K"])
+        x = np.ascontiguousarray(x, np.float32)
+        assert x.shape == (B, int(mg["K"])), f"x {x.shape} at bound {B}"
+        b_blobs = nt.Buffer(dev, np.ascontiguousarray(buf, np.uint8).tobytes())
+        tab = np.zeros(512, np.uint64)
+        tab[: len(offsets)] = b_blobs.gpu_address + np.asarray(offsets, np.uint64)
+        b_x, b_tab = nt.Buffer(dev, x.tobytes()), nt.Buffer(dev, tab.tobytes())
+        outs = {"xq": (np.uint8, (slots, int(mg["K"]) // 128, kernels.MMQ_BLOCK_BYTES)),
+                "gu": (np.uint32, (slots, int(mg["LD"]))),
+                "hq": (np.uint8, (slots, -(-kd // 512) * 4, kernels.MMQ_BLOCK_BYTES)),
+                "d": (np.uint32, (slots, int(md["LD"])))}
+        b = {n: nt.Buffer(dev, int(np.prod(s)) * np.dtype(t).itemsize) for n, (t, s) in outs.items()}
+        for o in b.values():
+            o.fill(0xFF)
+        ds += [dispatch("basalt_mmq_quantize", mg, gg["basalt_mmq_quantize"],
+                        [(0, b_x), (1, b_src), (2, b["xq"]), (3, b_plan)]),
+               dispatch("basalt_mmq", mg, gg["basalt_mmq"], [(0, b["xq"]), (1, b_tab), (2, b_plan), (3, b["gu"])],
+                        use=b_blobs),
+               dispatch("basalt_mmq_swiglu_quantize", md, gd["basalt_mmq_swiglu_quantize"],
+                        [(0, b["gu"]), (2, b_plan), (3, b["hq"])]),
+               dispatch("basalt_mmq", md, gd["basalt_mmq"], [(0, b["hq"]), (1, b_tab), (2, b_plan), (3, b["d"])],
+                        use=b_blobs)]
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+    i32 = lambda b: np.frombuffer(b.read(0, b.nbytes), np.int32)
+    return SimpleNamespace(slot=i32(b_slot).reshape(B, 10), src=i32(b_src), plan=i32(b_plan),
+                           hist=b_hist.read(0, b_hist.nbytes), state=layout.unpack(b_st.read(0, b_st.nbytes)),
+                           **{n: np.frombuffer(b[n].read(0, b[n].nbytes), t).reshape(s) for n, (t, s) in outs.items()})
