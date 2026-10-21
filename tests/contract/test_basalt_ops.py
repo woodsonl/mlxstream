@@ -411,6 +411,10 @@ def _aligned(kind, slot, offset):
         if kind == "basalt_q8_1":
             q8_1(g, "xq", [g.const("p", (2, 64), F32)])
             return {"packs": [pack(tmp, {"p": (at, 2 * 64 * 4)})]}
+        if kind == "basalt_gr_post":                                           # slots 0-2: r, block_out, inject
+            name, shape = (("r", (2, 10240)), ("block_out", (2, 2560)), ("inject", (2, 4)))[slot]
+            gr_post(g, **{"block_out": x, name: g.const("p", shape, F32)})
+            return {"packs": [pack(tmp, {"p": (at, shape[0] * shape[1] * 4)})]}
         if kind == "basalt_mmvf":
             v = g.const("p", *(((2, 2560), F32) if slot == 0 else ((128, 2560), DType.BF16)))
             gemv(g, kind, "y", v if slot == 0 else x, v if slot == 1 else weight(g, "dense/mmvf.q", src))
@@ -501,6 +505,9 @@ REFUSALS = [
     ("gr post residual not f32", _gr_post_value("r", (T, 10240), DType.BF16), r"'r' is bf16 \[2, 10240\], not f32"),
     ("gr post of no streams", _gr_post_value("inject", (T, 0), F32), r"unsupported shape \(n_embd 2560, hc 0, T 2\)"),
     ("gr post output over its residual", _gr_post_over_residual, "'r_out' and 'r' overlap in rb"),
+    ("gr post residual off 4 bytes", _aligned("basalt_gr_post", 0, 2), "slot 0 needs 4-byte alignment"),
+    ("gr post block output off 4 bytes", _aligned("basalt_gr_post", 1, 2), "slot 1 needs 4-byte alignment"),
+    ("gr post injections off 4 bytes", _aligned("basalt_gr_post", 2, 2), "slot 2 needs 4-byte alignment"),
 ]
 
 
