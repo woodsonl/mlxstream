@@ -725,7 +725,11 @@ def basalt_prompt_gemm_source() -> str:
     return PRELUDE + template("basalt_fp.metal") + PROMPT_ROWS + template("basalt_prompt_gemm.metal")
 
 
-PROMPT_GEMM_MACS = 1 << 31   # a placeholder until measured on this Mac: the padded multiply-adds a product dispatch may run
+# The padded multiply-adds a product dispatch may run, measured on 2026-10-20 on an Apple M3 Max (40 GPU cores, macOS
+# 27.0.1): whole products at B 256 with at least 40 threadgroups ran 769-2456 G MAC/s (three runs, each the least of 5
+# at a warm clock; one run alone gave 1 << 29); the slowest, FP16 640 x 2560 (one threadgroup per core) at 769, times
+# 0.5 ms, rounded down to a power of two.
+PROMPT_GEMM_MACS = 1 << 28
 
 
 def basalt_prompt_gemm_slices(rows: int, n: int, k: int) -> List[Tuple[int, int, int, int]]:

@@ -170,10 +170,14 @@ anywhere in the kernel's arithmetic.
 | code | `:1186` `(int8_t) v` | `F2I.TRUNC.NTZ R, R` | `char(v)` (v is an integer in [−127, 127]) |
 | err sums | `:1187-1188` | `FFMA R45 = s·v − x`: the PTX keeps `v * s - x[i]` as `mul.f32` and `sub.f32` (no rounding modifier, 32 of each), and `ptxas` fuses each pair into one `FFMA`, the file's one fusion past the PTX; `F2F.F64.F32`, `DMUL`, `DFMA`; the butterfly `DADD` ×10 (`:1194`) | not ported: `hc8_make` passes `err = nullptr`; were it ported, e[1] uses fma(s, v, −x), not fl(fl(v·s) − x) |
 
-`hc8_dequant_bf16_kernel` (`:1229-1244`), which only `hc8_parity` calls (`src/kernels/hc8_parity.cpp:103-105`):
-`I2F.S8` / `I2FP.F32.S32` (exact), `HADD2.F32 R8, -RZ, R8.H0_H0` (the scale), `FMUL R, s, f(v)` (no `.FTZ`), then
-`F2FP.BF16.F32.PACK_AB` (round to nearest even). The product is 0 or at least 2^-24 in magnitude, never subnormal, so
-Metal's `bfloat(s * float(v))` gives the same bits.
+`hc8_dequant_bf16_kernel` (`:1229-1244`), which `hc8_dequant_bf16` (`:1328-1333`) launches for `hc8_parity`
+(`src/kernels/hc8_parity.cpp:103-105`, `:325`) and for `Gemm::bf16_w` (`src/prefill/gemm.cu:136`, `:150`), the
+prompt path's products on a matrix held only as its copy: `I2F.S8` / `I2FP.F32.S32` (exact),
+`HADD2.F32 R8, -RZ, R8.H0_H0` (the scale), `FMUL R, s, f(v)` (no `.FTZ`), then `F2FP.BF16.F32.PACK_AB` (round to
+nearest even). For a finite scale the product is 0 or at least 2^-24 in magnitude, never subnormal, so Metal's
+`bfloat(s * float(v))` gives the same bits. An inf scale (absmax above 127 · 65504, codes 0) makes it 0 · inf = NaN,
+`FMUL`'s 0x7fffffff (sm_120 [H]) and Metal's 0x7fc00000 (`nan.md`'s `mul.f32` row); `nan.md` has no row for a
+NaN's BF16 conversion, so that group's stored BF16 is not claimed to be CUDA's.
 
 ## 2. `cn_x` (`:415-460`)
 
