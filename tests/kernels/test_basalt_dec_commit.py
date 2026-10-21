@@ -46,6 +46,15 @@
   n in {1, MT} rows equals ``commit_f32``, commit_pre_run's order in numpy float32 on the probed decays, bit for bit,
   and the same oracle flushing every input and result differs from it in value: group (a) at n = 1 (its state is
   +-0 on either build from the second row on), group (b) at n = MT.
+- DCM.8, a window after a commit continues the longer window (contract invariant 1 across the commit; none in basalt,
+  whose commit and window recurrences do the same per-token arithmetic, verify_kernels.cu:296-330 against
+  dec_gdn_rec.cu:248-259 and gdn_step_norm_body's update, verify_kernels.cu:417 and :423, so it ties the commit to the
+  window whose state it continues): on ``window_case``, tests/basalt_gdn_ref.py's make_layer and MT rows of qkv, z
+  and x, window A runs rows 0..6 from the layer's state0; for n = 1..6, the commit of n rows (mt 7) of window A's own
+  h, gate and beta and the raw qkv rows leaves the state and history from which window B runs rows n..6, and window
+  B's row j of every output equals window A's row n + j bit for bit: h, gate, beta and the fp32 y, and on ``[rec]``
+  (dec_gdn_rec built with its y, GDN_Y_BOUND 1, D13) the q8_1 rows yq too; ``[stage]`` runs the per-stage chain,
+  gdn_ab_multi and gdn_conv_l2_multi into gdn_step_norm_multi. Every sentinel holds and every output is finite.
 - DCM.9, NaNs and special words (contract invariant 5's NaN rule; none in basalt, which stores the state's float,
   verify_kernels.cu:327-330): parity's fixture with a quarter of each layer's conv history and qkv rows replaced at
   random by ``SPECIALS`` (subnormals, +-0, +-inf and the NaN payloads 0x7FA00001 and 0xFFC00000), committed for n =
@@ -61,7 +70,7 @@ import numpy as np
 import pytest
 
 from monolith import kernels
-from tests.basalt_gdn_ref import SEG_CASES, SEG_SEED, conv_tail, max_err, n_bad, randn, segments
+from tests.basalt_gdn_ref import N, SEG_CASES, SEG_SEED, ZV, conv_tail, make_layer, max_err, n_bad, randn, segments
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gdn_gpu as gdn_gpu
 from tests.kernels import basalt_gpu as gpu
@@ -91,6 +100,9 @@ CRIT7 = ("decay probe: for gates in `[-100, -88]`, `0 < g < 2^-126` and `|g - ex
          "0.1 to 1 and (b) gates randn 0.3 with `state0` randn scaled by `1e-39` and `k` of order 1; state bitwise "
          "equal to a numpy float32 + `basalt_emu.fma32` transcription with the probed `g`; power: the same oracle with "
          "`basalt_emu.ftz` on every input and result differs from it in each group")
+CRIT8 = ("window A over rows `0..6` from `state0`, commit `n = 1..6`, window B over rows `n..6` from the committed "
+         "state and history: `y_B[j] == y_A[n + j]` bitwise, for the per-stage float `y` and for `dec_gdn_rec`'s "
+         "outputs")
 CRIT9 = ("A NaN in row 0's `v` of one (head, col) makes that column's 128 state words `0x7FFFFFFF`, and every other "
          "word equals the NaN-free run's. The qkv rows and the initial history hold subnormals, +-0, +-inf and the NaN "
          "payloads `0x7FA00001` and `0xFFC00000`, and the history must equal the numpy word copy")
@@ -354,6 +366,51 @@ def test_gdn_commit_keeps_subnormals_like_the_ieee_build(n, subnormal_layer):
     i, f = (o.reshape(S, HV, S)[:, grp::2] for o in (ieee, ftz))
     assert np.any(i != f), (f"group ({'ab'[grp]}), {n} rows: the flushing oracle's state equals the IEEE one in "
                             f"value, so the fixture cannot tell the builds apart ({CRIT7})")
+
+
+# ---- DCM.8: a window after a commit continues the longer window -----------------------------------------------------
+
+@pytest.fixture(scope="module")
+def window_case():
+    """DCM.8's layer and window rows, on their own seed: tests/basalt_gdn_ref.py's make_layer (parity_seg's projection
+    types; the window runs none of its projections), whose state is state0, then MT rows each of qkv, z and x,
+    N(0, 1)."""
+    rng = np.random.default_rng(80)
+    return make_layer(14, 23, 14, rng), randn(rng, (MT, C), 1.0), randn(rng, (MT, ZV), 1.0), randn(rng, (MT, N), 1.0)
+
+
+def window(path, lay, state, qkv, z, x):
+    """A GDN window over the rows of qkv, z and x from ``state`` (one layer's state and history) on ``path``: "rec",
+    dec_gdn_rec built with its fp32 y (GDN_Y_BOUND 1, D13), or "stage", the per-stage chain, gdn_ab_multi and
+    gdn_conv_l2_multi into gdn_step_norm_multi. Asserts every sentinel intact and every output finite (yq: its blocks'
+    d and sum halves). Returns {name: the output's rows}: h, gate, beta and y, and on rec the q8_1 rows yq."""
+    if path == "rec":
+        r = gdn_gpu.rec(lay, state, qkv, x, z, y=True)
+        out, ok = {"h": r.h, "gate": r.gate, "beta": r.beta, "y": r.y, "yq": r.yq}, r.ok
+    else:
+        gate, beta, ok_ab = gdn_gpu.ab(lay, x)
+        h, ok_h = gdn_gpu.conv_l2(state, qkv, lay.conv_w)
+        y, ok_y = gdn_gpu.step_norm(state, h, gate, beta, z, lay.gamma)
+        out, ok = {"h": h, "gate": gate, "beta": beta, "y": y}, ok_ab and ok_h and ok_y
+    at = f"{path}, a window of {len(qkv)} rows"
+    assert ok, f"{at}: a store past the window's rows (a sentinel byte changed) ({CRIT8})"
+    for name, a in out.items():
+        v = np.ascontiguousarray(a.reshape(-1, kernels.Q8_1_BLOCK_BYTES)[:, :4]).view(np.float16) if name == "yq" else a
+        assert n_bad(v) == 0, f"{at}: {n_bad(v)} non-finite {name} values, want none ({CRIT8})"
+    return out
+
+
+@pytest.mark.parametrize("path", ["rec", "stage"])
+def test_gdn_window_after_a_commit_continues_the_longer_window(path, window_case):
+    lay, qkv, z, x = window_case
+    a = window(path, lay, lay.state, qkv, z, x)                       # window A: rows 0..6 from state0
+    for n in range(1, MT):
+        st, _ = gdn_gpu.gdn_commit(lay.state, a["h"], qkv, a["gate"], a["beta"], commit_record(n, 0), c=C, h_v=HV,
+                                   mt=MT)                             # window A's stored rows and the raw qkv rows
+        b = window(path, lay, st, qkv[n:], z[n:], x[n:])              # window B: rows n..6 from the committed layer
+        for name, rows in b.items():
+            assert_bits(f"{path}, {n} rows committed: window B's {name} rows 0..{MT - 1 - n} against window A's rows "
+                        f"{n}..{MT - 1}", rows, a[name][n:], CRIT8)
 
 
 # ---- DCM.9: a NaN the update makes is stored as sm_120's, the history's words as they came --------------------------
