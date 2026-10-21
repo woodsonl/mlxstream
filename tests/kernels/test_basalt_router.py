@@ -19,9 +19,12 @@ same bits. Basalt's router_top10_parity runs its generic ``router_top10``; the c
   :185-186): every token of "random normal" with the planted tokens in rows 1, 5, ..., 49, in the windows of tokens
   0..n-1 (n = 1..8 and 64), of widths 2..8 at row 56 and reversed, hc_fused_parity's window rule
   (hc_fused_parity.cpp:328, its message :333).
+- HR-RCP: how often the two divisions through the correctly rounded reciprocal, ``p = e / S`` and the weights, differ
+  from the correctly rounded quotient, and how often that changes a token's ten ids, on the emulation's intermediates
+  for the four fixtures and the 12 random windows (printed, not gated; docs/design/flash-next.md:135-136).
 
-Every test checks the sentinels (the ids' and weights' row past the window keeps its 0xFF bytes, ``gpu.top10``) and
-counts the weights' non-finite values."""
+Every test that runs the kernel checks the sentinels (the ids' and weights' row past the window keeps its 0xFF bytes,
+``gpu.top10``) and counts the weights' non-finite values."""
 
 import numpy as np
 
@@ -149,3 +152,31 @@ def test_a_token_does_not_depend_on_the_window():
     assert not bad, (f"{msg}: " + "; ".join(off) + "; if (std::memcmp(&by_t[T][ot + i], &by_t[t_hi][oh + i], 4) != 0) "
                      "++bad; (hc_fused_parity.cpp:328)")
     assert not nonfinite, f"{nonfinite} non-finite weights of regular tokens (must be 0)"
+
+
+def test_reciprocal_division_against_the_correctly_rounded_quotient():
+    """route's two divisions, ``p = e / S`` (native_router.cu:68-71) and the weights ``sel / tot`` (:98-99), are
+    ``rcp.approx.ftz`` then ``mul.ftz``; the port multiplies by the correctly rounded reciprocal (invariant 5). Count,
+    on route's emulation with the GPU's own ``expf_ftz``, how often each product differs from the correctly rounded
+    quotient (numpy's float32 division, flushed), and the tokens whose ten ids change when ranked on the correctly
+    rounded ``p``: printed, not gated, as the contract asks: "The tests count how often a quotient through the correctly
+    rounded reciprocal differs from the correctly rounded quotient." (docs/design/flash-next.md:135-136)."""
+    fixtures = {**ref.router_cases(), **random_windows()}           # every token regular
+    rank = lambda p: np.argsort(-p, axis=1, kind="stable")[:, :10]   # noqa: E731
+    counts = []
+    print()
+    for name, logits in fixtures.items():
+        n = len(logits)
+        _, _, e, S, sel, tot = ref.top10_emulation(logits, gpu.expf_ftz)
+        p_rcp, p_div = emu.mul_ftz(e, emu.rcp_ftz(S)[:, None]), emu.ftz(e / S[:, None])
+        w_rcp, w_div = emu.mul_ftz(sel, emu.rcp_ftz(tot)[:, None]), emu.ftz(sel / tot[:, None])
+        p_off, w_off = bits(p_rcp) != bits(p_div), bits(w_rcp) != bits(w_div)
+        id_off = (rank(p_rcp) != rank(p_div)).any(axis=1)
+        assert p_off.shape == (n, 512) and w_off.shape == (n, 10), (name, p_off.shape, w_off.shape)
+        counts.append((p_off.sum(), w_off.sum(), id_off.sum(), n))
+        print(f"  {name:<26} {p_off.sum()} of {p_off.size} p, {w_off.sum()} of {w_off.size} weights, "
+              f"{id_off.sum()} of {n} tokens' ids")
+    a, b, c, n = np.sum(counts, axis=0)
+    print(f"  router division: {a} of {512 * n} p ({a / (512 * n):.3%}) and {b} of {10 * n} weights "
+          f"({b / (10 * n):.3%}) through the correctly rounded reciprocal differ from the correctly rounded quotient; "
+          f"{c} of {n} tokens' ten ids change")
