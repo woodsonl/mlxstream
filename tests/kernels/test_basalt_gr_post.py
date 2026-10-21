@@ -60,8 +60,8 @@ PAIRS = ((1.5 * 2.0 ** -126, -(2.0 ** -126), 0x00000000),     # sum 2^-127, subn
          (0.75, -0.75, 0x00000000),                           # cancels: +0
          (-0.0, -0.0, 0x80000000),                            # -0 + -0
          (0.0, -0.0, 0x00000000),                             # +0 + -0
-         (0.5, 1e-40, 0x3F000000),                            # a subnormal residual is read as +0
-         (-1e-40, 3.0, 0x40400000),                           # so is a subnormal block output
+         (2.0 ** -126, -1e-40, 0x00800000),                   # a subnormal residual is read as -0 (were it kept: +0)
+         (-1e-40, 2.0 ** -126, 0x00800000),                   # so is a subnormal block output
          (2.0, None, 0x7FFFFFFF))                             # a NaN residual (0xffc00001): sm_120's NaN
 NAN_R = 0xFFC00001
 W_COL = len(PAIRS)                 # block output 1 and residual +0 in every stream: the output is the weight itself
