@@ -34,3 +34,6 @@ include = ["monolith*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "slow: a case whose own timing makes it minutes long; run it with -m slow",
+]

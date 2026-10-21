@@ -243,6 +243,10 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
 - `tests/kernels/test_basalt_q8_1.py` — adapted from `src/kernels/iq_multi_parity.cpp`'s `check_q8_1_finite` (MIT): the
   planted blocks, the host transcription of the quantization formula and the pass criterion. License:
   `third_party/BASALT-LICENSE`.
+- `runtime/src/basalt_pool.h`, `runtime/src/basalt_pool.cpp` and `tests/kernels/test_basalt_pool.py` — adapted
+  from `include/basalt/kernels/cpu/pool.hpp` and `src/kernels/cpu/pool.cpp` (MIT): the CPU expert pool's
+  structure, its epoch-tagged claim protocol, its park and its phase barriers, with the memory orders as written.
+  License: `third_party/BASALT-LICENSE`.
 - `runtime/src/basalt_cpu_expf.cpp`, `tests/kernels/test_basalt_cpu_expf.py` — adapted from
   `src/kernels/cpu/pool.cpp:434` (MIT): the CPU expert pool's SwiGLU, `(g / (1.f + std::exp(-g))) * u`, in its
   order of operations, which is the only arithmetic the pool itself performs. License:
