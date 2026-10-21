@@ -73,19 +73,23 @@ and the correctly rounded reciprocal, both flushed).
 
 `native_gr_post(residual, block_out, inject, output, n_embd, hc, stream)` (`:107-114`) launches
 `blocks(n_embd · hc)` blocks of `THREADS` = 256 (`:35`, `:83`) with `scale = 1.0f / float(hc)`, computed by the host
-compiler (correctly rounded; 0.25 exactly for hc = 4). Thread i < n_embd · hc writes `output[i]`; `output` may be
+code at launch (correctly rounded; 0.25 exactly for hc = 4). Thread i < n_embd · hc writes `output[i]`; `output` may be
 `residual` (`:72`, `native_gr_postops.hpp:22-24`), which is why `residual` is read with a plain `ld.global.f32`
 (`LDG.E`) and `inject`, `block_out` through the non-coherent path (`LDG.E.CONSTANT`).
 
 | Site | basalt | PTX | SASS (13.0, `native_gr_postops.sass.txt` rows 529-678) | Metal |
 |---|---|---|---|---|
-| indices | `:70` `c = int(i / n_embd), d = int(i % n_embd)` | `div.u32` (or `div.u64` when i or n_embd needs 64 bits) | `MUFU.RCP` of `UI2F.U32.RP` n_embd, `F2I.FTZ.U32.TRUNC.NTZ`, `IMAD.HI.U32` corrections (the integer-division idiom, exact); `__cuda_sm20_div_u64` otherwise | `c = i / n_embd`, `d = i - c * n_embd` in `uint` (`check_shape` bounds n_embd · hc by `INT_MAX`, `:79-82`) |
+| indices | `:70` `c = int(i / n_embd), d = int(i % n_embd)` | `div.u32` (or `div.u64` when i or n_embd needs 64 bits) | `MUFU.RCP` of `UI2F.U32.RP` n_embd, `F2I.FTZ.U32.TRUNC.NTZ`, `IMAD.HI.U32` corrections (the integer-division idiom, exact); `__cuda_sm20_div_u64` otherwise | `t = i / row`, `c = (i % row) / n_embd`, `d = i % n_embd` in `uint`, `row = hc · n_embd` (`check_shape` bounds n_embd · hc by `INT_MAX`, `:79-82`; `basalt_gr_post_params` bounds T · hc · n_embd below 2^32) |
 | SCALE(1/hc) | `:71`, `:40` `__fmaf_rn(scale, inject[c], 0.0f)` | `fma.rn.ftz.f32 %f3, %f1, %f2, 0f00000000` | `FFMA.FTZ R0, R0, UR4, RZ` (inject · scale + +0) | `a = fma_ftz(inject[c], scale, 0.0f)`: the +0 addend turns a −0 product into +0 (the comment `:37-38`), and `.FTZ` flushes a subnormal product |
 | `expf(-a)` | `:36` (`__expf` under `--use_fast_math`) | `mul.ftz.f32 %f4, %f3, 0fBFB8AA3B`; `ex2.approx.ftz.f32 %f5, %f4` | `FMUL.FTZ R4, R0, -1.4426950216293334961`; `MUFU.EX2 R4, R4` (no range scaling: the `.ftz` form) | `e = expf_ftz(-a)` |
 | `1 + e` | `:36` | `add.ftz.f32 %f6, %f5, 0f3F800000` | `FADD.FTZ R0, R4, 1` | `add_ftz(e, 1.0f)` |
 | `1.0f / (...)` | `:36` | `rcp.approx.ftz.f32 %f7, %f6` | `MUFU.RCP R0, R0` | `g = rcp_ftz(add_ftz(e, 1.0f))` (1 / +inf = +0 on both) |
 | SCALE(2) | `:71`, `:40` `__fmaf_rn(2.0f, g, 0.0f)` | `fma.rn.ftz.f32 %f8, %f7, 0f40000000, 0f00000000` | `FFMA.FTZ R5, R0, 2, RZ` | `w = fma_ftz(g, 2.0f, 0.0f)` (exact doubling: g lies in [+0, 1]) |
 | the write | `:73` `__fmaf_rn(block_out[d], weight, residual[i])` | `fma.rn.ftz.f32 %f11, %f9, %f8, %f10` | `FFMA.FTZ R5, R5, R2, R8` (w · block_out[d] + residual[i]); `STG.E` | `output[i] = cuda_nan(fma_ftz(block_out[d], w, residual[i]))` |
+
+The port runs a window's T tokens in one dispatch, so its loads are `inject[t · hc + c]`, `block_out[t · n_embd + d]`
+and `residual[i]`, and it computes `scale = 1.0f / float(hc)` in the kernel: a correctly rounded division in
+MTLMathModeSafe, so the host's value.
 
 The weight depends only on `inject[c]`: every thread of stream c recomputes it, with the same bits, so the port may
 compute it once per stream (threadgroup memory or a per-thread recomputation, either is exact). Nothing in `post`
