@@ -24,6 +24,22 @@ none), each kind seeing the classes on its inputs:
 - token 3: E1, an all-zero r row (stream 0: rs = fast::rsqrt(1e-6)), with E5's inj (-352, -400, 100, -100): -352 / 4
   = -88 has a subnormal sigmoid, -400 / 4 = -100 a zero one; gated -88 and -100 on all four streams of columns 0 and 1.
 
+gr_parity's bounds are the nearest bound; no basalt test launches these kernels (gr_parity gates decode's gr_read and
+gr_write). Its metrics, rel_diff (normalised L1, the reference first) and rel_terms (per element, against the terms'
+magnitudes), are src/kernels/gr_parity.cpp:136-156's, copied here until the hc lane's tests/basalt_hc_ref.py lands.
+Both run on the fixture without edge tokens at 1, 7 and 256 live rows and print each measured value:
+- HC-1 (``test_hc_read_double``): gr_norm_rs's rs and xn16, gr_mix_r's mixed, mixed_bf and mixed_h (MIX_BF 1) and
+  gr_silu's lo16 against float64 references, rs = 1 / sqrt(mean(r^2) + eps) per stream, xn = r rs w, mixed = sum_c r
+  rs w / (1 + exp(-gated)) / 4 (with that rs; the kernel reads the fixture's) and lo16 = (lo / 4) / (1 + exp(-lo / 4));
+  a BF16 or FP16 image's reference is that value rounded to float32, then by gr_parity's to_bf16 (:46-53, its
+  reference's own activation rounding, :96, :111) or to FP16 to nearest even. Per output rel_diff(want, got) <= 1e-4
+  (``const bool ok = rm <= 1e-4 && ri <= 1e-4;``, :566), no output non-finite.
+- HC-2 (``test_hc_write_double``): gr_write's and gr_write_norm_rs's R' against want = R + bo w_c, w_c = 2 / (1 +
+  exp(-inj_c / 4)) in float64 (:681, :684), worst rel_terms(want, got, R, bo w_c) < 1e-6 (``const bool streams_ok =
+  worst_stream < 1e-6;``, :689); then with inj = 0, where w_c = 1 and want = R + bo, worst rel_terms(want, got, R, bo)
+  < 1e-6 (``const bool plain = worst_plain < 1e-6;``, :641, :645); gr_write_norm_rs's rs and xn16 under HC-1's measure
+  on its own R' with w_next; no output non-finite.
+
 - HC-3 (``test_hc_twin``): at 1, 7 and 256 live rows every output word of the live rows equals the kind's twin
   (broadcast: e's 32-bit words in each stream; norm: basalt_emu.hc_norm, whose rs is the probe's fast::rsqrt of the
   argument fl(fl(S / n) + eps) the twin computes; silu and mix: basalt_emu.hc_silu and hc_mix, with the probe's
@@ -52,6 +68,7 @@ import numpy as np
 import pytest
 
 from monolith import kernels
+from monolith.formats.fp import bf16_to_f32
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_prompt_gpu as gpu
 
@@ -62,6 +79,10 @@ E6_S = 1.0                   # E6's s: twins' rs 0x424a13f8 (IEEE) vs 0x424a13f9
 E8_NAN = 0x7FA00001
 WORD = {4: np.uint32, 2: np.uint16}
 RSQRT, EXP_NEG = (partial(gpu.hc_probe, fn) for fn in ("rsqrt", "exp_neg"))   # the GPU's approximate operations
+NEAREST = "nearest bound; no basalt test launches this kernel: gr_parity.cpp"   # HC-1's and HC-2's gates (ER-D5)
+READ_GATE = f"{NEAREST}:566 const bool ok = rm <= 1e-4 && ri <= 1e-4;"
+STREAMS_GATE = f"{NEAREST}:689 const bool streams_ok = worst_stream < 1e-6;"
+PLAIN_GATE = f"{NEAREST}:645 const bool plain = worst_plain < 1e-6;"
 
 # kind: (entry, inputs, outputs as (words per token, bytes per word)), in the kernel's slot order
 KINDS = {"broadcast": ("prompt_gr_broadcast", ("e",), ((4 * N, 4),)),
@@ -145,6 +166,77 @@ def twin(kind, d, flush=False):
 
 def unwritten(g):
     return bool((g == np.iinfo(g.dtype).max).all())
+
+
+# gr_parity's metrics, as the hc lane's tests/basalt_hc_ref.py (gr-post) defines them; until it lands here, local copies
+def rel_terms(want, got, term_a, term_b):           # gr_parity.cpp:147-156, elementwise
+    """``|want - got| / (|term_a| + |term_b|)``, the denominator floored at 1e-30, with every argument converted to
+    float64 first, as basalt's ``double`` parameters are: a float32 denominator would round in binary32."""
+    want, got, term_a, term_b = (np.asarray(v, np.float64) for v in (want, got, term_a, term_b))
+    den = np.abs(term_a) + np.abs(term_b)
+    return np.abs(want - got) / np.where(den > 1e-30, den, 1e-30)
+
+
+def rel_diff(a, b):                                 # gr_parity.cpp:136-145
+    """The normalised L1 difference ``sum |a - b| / sum |a|`` in float64, the denominator floored at 1e-30."""
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    d, mag = np.abs(a - b).sum(), np.abs(a).sum()
+    return d / (mag if mag > 1e-30 else 1e-30)
+
+
+def norm_double(r, w):
+    """gr_norm_rs in float64 (gr_parity.cpp's reference, :76-86, in double throughout) for the rows ``r`` [T, 4n] and
+    the weights ``w`` [4n]: rs [T, 4] = 1 / sqrt(mean(r^2) + eps) per stream (eps the float32 1e-6, widened, as
+    ``(double) eps``) and xn [T, 4n] = r rs w."""
+    r = np.asarray(r, np.float64).reshape(len(r), 4, N)
+    rs = 1 / np.sqrt((r * r).mean(axis=2) + np.float64(EPS))
+    return rs, (r * rs[..., None] * np.asarray(w, np.float64).reshape(4, N)).reshape(len(r), 4 * N)
+
+
+def bf(x):
+    """gr_parity's to_bf16 (:46-53, to nearest even; emu.bf16_bits) of ``x`` rounded to float32, as a float32 value."""
+    return bf16_to_f32(emu.bf16_bits(np.asarray(x, F32)))
+
+
+def read_gate(case, want, got):
+    """HC-1's measure: rel_diff(want, got) <= 1e-4 with every value of ``got`` finite; prints the value."""
+    rel, bad = rel_diff(want, got), np.count_nonzero(~np.isfinite(got))
+    print(f"{case}: rel_diff {rel:.3e}")
+    assert bad == 0 and rel <= 1e-4, f"{READ_GATE} ({case}): rel_diff {rel:.3e}, {bad} not finite"
+
+
+@pytest.mark.parametrize("T", (1, 7, B))
+def test_hc_read_double(T):
+    d = fixture(edges=False)
+    rs, xn = norm_double(d["r"], d["w"])
+    mixed = (xn / (1 + np.exp(-d["gated"].astype(np.float64)))).reshape(B, 4, N).sum(axis=1) / 4
+    q = d["lo"].astype(np.float64) / 4
+    lo = q / (1 + np.exp(-q))
+    (rs_k, xn_k), (m_k, mbf_k, mh_k), (lo_k,) = (run(kind, d, T) for kind in ("norm", "mix", "silu"))
+    for name, want, got in (("norm rs", rs, rs_k.view(F32)), ("norm xn16", bf(xn), bf16_to_f32(xn_k)),
+                            ("mix mixed", mixed, m_k.view(F32)), ("mix mixed_bf", bf(mixed), bf16_to_f32(mbf_k)),
+                            ("mix mixed_h", emu.h2f(emu.half_bits(mixed.astype(F32))), emu.h2f(mh_k)),
+                            ("silu lo16", bf(lo), bf16_to_f32(lo_k))):
+        read_gate(f"HC-1 T {T} {name}", want[:T], got[:T])
+
+
+@pytest.mark.parametrize("T", (1, 7, B))
+def test_hc_write_double(T):
+    d = fixture(edges=False)
+    r, bo = d["r"].astype(np.float64)[:T], d["bo"].astype(np.float64)[:T]
+    for case, inj, gate in (("inj", d["inj"], STREAMS_GATE), ("inj 0", np.zeros_like(d["inj"]), PLAIN_GATE)):
+        w = 2 / (1 + np.exp(-inj.astype(np.float64)[:T] / 4))     # :681; 1 exactly at inj 0, so want = R + bo (:641)
+        bw = (bo[:, None, :] * w[..., None]).reshape(T, 4 * N)
+        e = {**d, "inj": inj}
+        (rp,), (rp2, rs_k, xn_k) = run("write", e, T), run("write_norm", e, T)
+        for name, got in (("write R'", rp), ("write_norm R'", rp2)):
+            g = got[:T].view(F32)
+            worst, bad = rel_terms(r + bw, g, r, bw).max(), np.count_nonzero(~np.isfinite(g))
+            print(f"HC-2 T {T} {case} {name}: worst rel_terms {worst:.3e}")
+            assert bad == 0 and worst < 1e-6, f"{gate} ({name}, {case}, {T} rows): worst {worst:.3e}, {bad} not finite"
+        rs, xn = norm_double(rp2[:T].view(F32), d["w_next"])      # write_norm's norm half, on its own R'
+        read_gate(f"HC-2 T {T} {case} write_norm rs", rs, rs_k[:T].view(F32))
+        read_gate(f"HC-2 T {T} {case} write_norm xn16", bf(xn), bf16_to_f32(xn_k[:T]))
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
