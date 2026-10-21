@@ -18,10 +18,12 @@ fix no summation order; the port computes each output as one fp32 fma chain from
 - GM-REF: the product (the handler's slices) against float64 on the same operand bits, ``emu.rel_norm``
   (hc8_parity.cpp:57-61's Err) over every output under hc8_parity.cpp:269's 5e-3, and no output non-finite, at the
   pack's BF16 shapes (Gemm::bf16's own gate, which hc8_parity applies at hc8's shapes) and FP16 ones (Gemm::native's
-  second stage: the nearest bound, as no basalt test launches it), 1, 17 and 512 rows (attn_q's 12288 outputs at 1
-  and 17), activations N(0, 1) and weights 0.02 N(0, 1); and Gemm::native end to end (``gpu.native``: the fp16
-  image, then its product) at 37 rows, Q2_0 (512, 2560), Q4_K (640, 2560) and the ten GGUF types at (64, 2560),
-  against float64 on the exact dequantized weights (gguf_reference.dequantize), so the image's rounding counts.
+  second stage: the nearest bound, as no basalt test gates Gemm::f16's product against a reference;
+  prefill_mmq_kq_test.cpp:241, :244 run it off this pack, its error printed, not gated), 1, 17 and 512 rows
+  (attn_q's 12288 outputs at 1 and 17), activations N(0, 1) and weights 0.02 N(0, 1); and Gemm::native end to end
+  (``gpu.native``: the fp16 image, then its product) at 37 rows, Q2_0 (512, 2560), Q4_K (640, 2560) and the ten GGUF
+  types at (64, 2560), against float64 on the exact dequantized weights (gguf_reference.dequantize), so the image's
+  rounding counts.
 
 basalt promises no invariance (cuBLAS picks the kernel per product, hc8_parity.cpp:263); the chain gives each by
 construction, and these gates keep it bit for bit against one whole-product dispatch (``whole``):
@@ -198,8 +200,8 @@ REF_ROWS += [(False, t, n, k, 37) for t, n, k in REF_NATIVE]
 REF_GATE = {   # the bound's standing per entry (ER-D5's label) with hc8_parity.cpp:269's criterion
     True: "hc8_parity.cpp:269, Gemm::bf16's gate at this pack's plain-BF16 shapes: "
           'expect(ex.rel() < 5e-3, "the product against the copy in double");',
-    False: "nearest bound; no basalt test launches Gemm::native or Gemm::f16: hc8_parity.cpp:269 "
-           'expect(ex.rel() < 5e-3, "the product against the copy in double");',
+    False: "nearest bound; no basalt test gates Gemm::native's or Gemm::f16's product against a reference: "
+           'hc8_parity.cpp:269 expect(ex.rel() < 5e-3, "the product against the copy in double");',
 }
 
 
