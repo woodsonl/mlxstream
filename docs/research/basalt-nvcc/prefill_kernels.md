@@ -135,7 +135,7 @@ The sequences shared by many sites:
   `bf(cuda_nan(ieee_add(f, -h)))` with f the value already passed through `cuda_nan` (`ieee_add`,
   `basalt_q8_1.metal:95`, is exact here: the difference is representable).
 - **warp_sum (`:21-25`).** `SHFL.BFLY` and `FADD` with offsets 16, 8, 4, 2, 1; v = fl(v + shfl). Metal: `warp_sum`
-  (`basalt_fp.metal:97`), or `warp_sum_ieee` (`basalt_q8_1.metal:206`) where a subnormal sum can occur.
+  (`basalt_fp.metal:102`), or `warp_sum_ieee` (`basalt_q8_1.metal:206`) where a subnormal sum can occur.
 - **block_sum (`:46-58`).** warp_sum in every warp; warp w's sum to `sh[w]`; warp 0 sums `sh[0..nw)` (zeros past nw)
   with warp_sum again, and `sh[0]` is broadcast. Metal: the same two butterflies through threadgroup memory, with a
   barrier at each `__syncthreads`.
@@ -157,7 +157,7 @@ The sequences shared by many sites:
      `rms_rows`. Metal: `fast::rsqrt`; no argument reaches the subnormal wrapper.
   3. The library `expf`, libdevice's `__nv_expf` inlined, whose one approximate step is `ex2.approx.ftz.f32`, in
      `route_kernel` (`:642`) and `gate_attn` (`:770`). Metal: the contract's `precise::exp`
-     (`flash-next.md:136-137`), or `nv_expf`, every other step transcribed, proposed in section 3 for the owner.
+     (`flash-next.md:153`), or `nv_expf`, every other step transcribed, proposed in section 3 for the owner.
   4. `powf`, libdevice's `__nv_powf` inlined, whose one approximate step is `rcp.approx.ftz.f32`, in `rope` (`:751`).
      Metal: `nv_powf` with `1.0f / x` there; for this pack's theta_scale no result depends on that reciprocal's last
      bits [M] (section 4).
@@ -279,7 +279,7 @@ On this pack's prompt path each GDN layer runs `gdn_gates` (`prefill.cpp:1589`),
 `gdn_conv_hist_kernel`; then always `gdn_l2_kernel`, `:905-915`), then `gdn_recurrence` (`prefill.cpp:1591`:
 `gdn_rec_wl_kernel`, then `gdn_out_norm_kernel`, `:916-928`). `gdn_warp_ok` (`:587-606`) selects the warp kernel on
 a card that holds all 128 of its threadgroups (`HK · GDN_WNCB`) at once, as basalt's 170-SM RTX 5090 does
-(`dense_tc.md:192-194`);
+(`dense_tc.md:193-195`);
 `gdn_rec_kh_kernel` and `gdn_rec_cols_pipe_kernel` are the fallbacks and `gdn_rec_parity`'s references (section 6).
 Both `eps` arguments are `EPS` = 1e-6f (`prefill.cpp:57`, `:1590-1591`).
 
@@ -412,7 +412,7 @@ shared expert: its gate and up projections (`prefill.cpp:1702-1703`), `swiglu_pa
 640) and its down projection (`prefill.cpp:1705`), all three on `Gemm::native`, and its gate logit `sg`, one BF16
 column (`prefill.cpp:1707`). After the routed experts, `moe_combine` (`prefill.cpp:2361`) sums their rows `Dm` with
 the shared expert's output; its result `bo` feeds `gr_write_norm_rs` or `gr_write` (section 1). `route` (`:929-937`) launches `route_kernel<16>` for `n_expert == 512`, this pack's count
-(`flash-next.md:212`); `route_kernel<8>` (256 experts) and `basalt::kernels::router_top10` (any other count) do not
+(`flash-next.md:228`); `route_kernel<8>` (256 experts) and `basalt::kernels::router_top10` (any other count) do not
 run here (section 7). The decode step's router is a different kernel (`hc_top10`, the hc lane's), so a token's
 expert weights from the prompt path and from decode need not share bits.
 
@@ -457,7 +457,7 @@ passes −q, of either sign) t saturates at 1 above about 87.34, where k = 252 a
 with d, every fma step stays normal, and from about 88.72 the scale multiply overflows to +inf on both machines
 (`ex2.approx.ftz` and `fast::exp2` themselves return +inf once f reaches 128).
 
-Metal: the contract maps the library `expf` to `metal::precise::exp` (`flash-next.md:136-137`); this page proposes
+Metal: the contract maps the library `expf` to `metal::precise::exp` (`flash-next.md:153`); this page proposes
 `nv_expf(d)`, a transcription, for the owner's decision (the paragraph after the code):
 
 ```
@@ -474,7 +474,7 @@ tiny and e = 1 on both machines, and for k ≠ 126 the fma results are far from 
 nonzero). `ex2.approx.ftz` maps to `fast::exp2` (invariant 5); both flush a subnormal input and output, and the
 output is subnormal only for f < −126, d below about −174.7, where e is +0 anyway. The scale multiply is the one
 step that writes a subnormal (k = 0, f < 0), so it is `ieee_mul`. A NaN d gives a NaN e. The contract's table
-maps the library `expf` to `metal::precise::exp` (`flash-next.md:136-137`), which is a different function:
+maps the library `expf` to `metal::precise::exp` (`flash-next.md:153`), which is a different function:
 `precise::exp` is not `__nv_expf`'s sequence, and the bits then differ wherever the two round differently.
 `nv_expf` reproduces every operation but `ex2.approx`, which follows the contract's own mapping; it extends the
 owner's libdevice decision (`origin/woodsonl/basalt-sampler:kernels/common/basalt_libdevice.metal` transcribes only
@@ -760,7 +760,7 @@ A NaN gate gives a NaN e (`FFMA.SAT` sends the NaN to 0, but f is NaN), a NaN de
 ### `kv_append_kernel` (`:775-817`), the fp16 branch
 
 One threadgroup of 64 threads per (token, KV head, 64-value group, K or V) (`dim3(T, 2, 8)`, `:841`); thread d
-converts one value. The contract keeps fp16 KV fully resident (`flash-next.md:416-417`): the call passes the fp16
+converts one value. The contract keeps fp16 KV fully resident (`flash-next.md:434-435`): the call passes the fp16
 pools whenever `kv_int8` is off (`prefill.cpp:1636-1638`), and the host copy (`host`) and the prompt path's staging
 pool (`stage`) belong to KV streaming, outside the contract. The int8 branch (`:795-816`) does not run on this pack
 (section 7).
@@ -773,7 +773,7 @@ pool (`stage`) belong to KV streaming, outside the contract. The int8 branch (`:
 | `:790` | `if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = h` | `STG.E.U16` | the same store; a negative page (a block not resident) writes nothing, and every store stays inside the pool's binding |
 
 The rows written here are the pool rows decode's attention reads, so `hf`'s bits are the format's: the qsa lane's
-decode append (`kv_append_step`, `f16_from_f32`, `flash-next.md:360`) writes the same fp16 encoding of its own
+decode append (`kv_append_step`, `f16_from_f32`, `flash-next.md:376`) writes the same fp16 encoding of its own
 keys, which are computed by a different kernel (section intro).
 
 ## 5. Conversions and copies
@@ -885,7 +885,7 @@ them. The port leaves them out; a later pack that needs one adds it with its own
 | `swiglu_il_kernel` | `:691-697` | the same FP16 expert path (`prefill.cpp:2280`) | section 3's SwiGLU on interleaved gate and up rows |
 | `gather_rows16_kernel` | `:705-712` | the same path, the `else` of `use_mmq` (`prefill.cpp:2009-2010`) | a copy of fp16 rows by index |
 | `rope_kernel<true>` | `:738-758` | `rope_table_for` returns no table (`src/kernels/cuda/native_rope.cu:99`; section 4) | the RoPE angle from a table instead of `powf`, `cosf` and `sinf` |
-| `kv_append_kernel`'s int8 branch | `:795-816` | the contract keeps fp16 KV (`flash-next.md:416-417`; section 4) | `fabsf`, an `fmaxf` butterfly over 64 values, `hf(amax / 127.0f)`, `__float2int_rn(x / sf)` clamped to ±127 |
+| `kv_append_kernel`'s int8 branch | `:795-816` | the contract keeps fp16 KV (`flash-next.md:434-435`; section 4) | `fabsf`, an `fmaxf` butterfly over 64 values, `hf(amax / 127.0f)`, `__float2int_rn(x / sf)` clamped to ±127 |
 | `to_bf16_kernel`'s `ylo` loop | `:831` | no prompt-path call passes `ylo` (section 5) | bf_lo of each element |
 | `round_f16_kernel` | `:822-825` | no caller outside `kernels.cu` (declared at `include/basalt/prefill/kernels.hpp:98`) | `__half2float(__float2half_rn(x))` |
 | `copy_f4_kernel` (`copy_f32_wide`, `:977-983`) | `:972-975` | no caller outside `kernels.cu` (declared at `kernels.hpp:67`) | a float4 copy |

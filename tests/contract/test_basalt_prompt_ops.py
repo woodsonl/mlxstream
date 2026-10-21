@@ -1,7 +1,7 @@
 """basalt's prompt-path op kinds (monolith/ops/basalt_prompt.py) as compiler/emit_basalt_prompt.py emits them over the
-synthetic .basalt file of tests/contract/test_basalt_ops.py: both kinds registered and covered; every dispatch equal to
-monolith/kernels.py's builders (function, macros, source, grid, threadgroup, params, written slot), with StepState bound
-at slot 15 and the row macros of the program's form (prompt_rows); no per-step value in a params record (invariant 4);
+synthetic .basalt file of test_basalt_ops.py: both kinds registered and covered; every dispatch equal to kernels.py's
+builders and the handlers' rules (function, macros, source, grid, threadgroup, params, written slot), with StepState at
+slot 15 and the row macros of the program's form (prompt_rows); no per-step value in a params record (invariant 4);
 the GEMM's static slices tiling every product once; Gemm::native's dequantization into the program's one FP16 scratch
 ordered ahead of its products and behind the previous op's; and each refusal, a valid input with exactly one defect
 refused by that defect's own check (its message). The GPU side is tests/kernels/test_basalt_prompt_program.py."""
@@ -84,11 +84,11 @@ FORMS = [(True, T, 128), (True, 17, 128), (False, T, 17), (False, 5, 17)]
 
 @pytest.mark.parametrize("dynamic, rows, t", FORMS, ids=["dynamic", "dynamic-static-rows", "static", "static-rows"])
 def test_dispatches_bind_step_state(src, monkeypatch, dynamic, rows, t):
-    """Every dispatch of both kinds is the builders' and binds (15, step_state, 0) once, with STEP_STATE 1, ROWS_MAX
-    the compiled rows B and T_SRC 0 (dynamic-T, T rows) or T_SRC 2 with T_STATIC_ROWS B. Under a budget of one tile
-    the products split into static slices, one dispatch each in basalt_prompt_gemm_slices' order, each with its own
-    record (row0, col0) and the grid of its block; each conversion is one dispatch over the bound's elements, its
-    output's dtype choosing CV_BF16."""
+    """Every dispatch of both kinds is the builders' (source, params, slices) and the handler's (grid, threadgroup,
+    macros) and binds (15, step_state, 0) once, with STEP_STATE 1, ROWS_MAX the compiled rows B and T_SRC 0 (dynamic-T,
+    T rows) or T_SRC 2 with T_STATIC_ROWS B. Under a budget of one tile the products split into static slices, one
+    dispatch each in basalt_prompt_gemm_slices' order, each with its own record (row0, col0) and the grid of its block;
+    each conversion is one dispatch over the bound's elements, its output's dtype choosing CV_BF16."""
     monkeypatch.setattr(kernels, "PROMPT_GEMM_MACS", TILE_K2560)
     g = Graph("step")
     prompt_graph(g, src, rows)
@@ -123,12 +123,12 @@ def test_dispatches_bind_step_state(src, monkeypatch, dynamic, rows, t):
 def test_native_orders_its_stages(src, monkeypatch, dynamic, rows, t):
     """Gemm::native (gemm.cu:169-185): dequant_f16 of the whole matrix into the scratch, then Gemm::f16's product on
     it. Two native ops in a row, the smaller image first (Q6_K 35 x 2560, then Q4_K 70 x 2560), each product sliced
-    under a budget of one tile: every dispatch is the builders' and binds (15, step_state, 0); each op's
-    dequantization (dequant's builders, DQ_OUT 1) comes first and writes the scratch at slot 1, and its slices
-    (GEMM_BF16 0) read the scratch at slot 1; both ops bind the program's one ws.T{t}.prompt_gemm_f16.shared, sized
-    to the larger image. The barrier pass (compiler/barriers.py's conflict rule) puts each op's products behind its
-    dequantization (read after write) and the second dequantization behind the first op's products (write after
-    read), so no product reads another op's image."""
+    under a budget of one tile: every dispatch is the builders' and the handler's and binds (15, step_state, 0); each
+    op's dequantization (dequant's builders, DQ_OUT 1) comes first and writes the scratch at slot 1, and its slices
+    (GEMM_BF16 0) read the scratch at slot 1; both ops bind the program's one ws.T{t}.prompt_gemm_f16.shared, sized to
+    the larger image. The barrier pass (compiler/barriers.py's conflict rule) puts each op's products behind its
+    dequantization (read after write) and the second dequantization behind the first op's products (write after read),
+    so no product reads another op's image."""
     monkeypatch.setattr(kernels, "PROMPT_GEMM_MACS", TILE_K2560)
     names = ("gguf/pair.14.23.0", "gguf/mmvq.12")
     g = Graph("step")
