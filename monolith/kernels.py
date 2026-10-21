@@ -11,6 +11,7 @@ from typing import List, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 from .formats import FORMATS
 from .formats.blm import PackInfo
+from .formats.gguf import ggml_row_bytes
 from .backends.metal.context import current_backend
 
 from .resources import kernel_root
@@ -787,6 +788,192 @@ def basalt_coupled_node(nv: int, id_vocab: int, cap: int, j: int, *, id_to_sub: 
         raise ValueError(f"basalt_coupled: {nv} logits need 1 to {BS_SPLIT_MAX_BLOCKS} blocks of {BS_BLOCK}")
     flags = (1 if id_to_sub else 0) | (2 if sub_to_id else 0)
     return struct.pack("<IIIIIIII", nv, id_vocab, cap, j, flags, 0, 0, 0)
+
+
+# ---- basalt's GDN decode window (kernels/common/basalt_gdn.metal; docs/research/basalt-nvcc/dec_gdn.md) ------------
+# The constants and the checks below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/dec_gdn_rec.cu:30-33
+# and :355-367 and include/basalt/kernels/dec_gdn.hpp:16-39 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT;
+# third_party/NOTICE).
+
+GDN_S = 128                   # the key and value head dim, the recurrent state's side (basalt's S)
+GDN_MT = 8                    # the window's most rows (kDecMaxT, kVerifyMaxT)
+GDN_THREADS = 512             # dec_gdn_rec's threadgroup: basalt's cluster of four 128-thread blocks
+GDN_N_EMBD = 2560             # the gate rows' width, 32 lanes x 8 bf16 x NJ = 10 (the only one basalt accepts)
+
+
+def basalt_gdn_source() -> str:
+    """basalt's GDN decode window: the shared helpers, the IEEE binary32 operations, the software binary64 and the
+    IEEE operations built on it (``basalt_ieee_f64.metal``), the q8_1 quantizers, libdevice's transcriptions and the
+    GDN steps and kernels (``basalt_gdn.metal``), in that order."""
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
+            + template("basalt_ieee_f64.metal") + template("basalt_q8_1.metal") + template("basalt_libdevice.metal")
+            + template("basalt_gdn.metal"))
+
+
+def basalt_gdn_params(t: int, c: int, n_embd: int, h_k: int, h_v: int, eps: float) -> bytes:
+    """The 32-byte ``BsGdnParams`` (basalt_gdn.metal): the window's width t, the channels c, n_embd, the key and value
+    heads h_k and h_v and eps, then two zero words. Refuses what host ``dec_gdn_rec`` exits on (dec_gdn_rec.cu:356): t
+    outside 1..8, n_embd other than 2560, no key head, value heads not a multiple of the key heads; and c other than
+    2 * 128 * h_k + 128 * h_v (q, k, then v), which basalt's DecRecArgs carries unchecked but every index assumes."""
+    if not 1 <= t <= GDN_MT:
+        raise ValueError(f"basalt_gdn: the window's width must be 1 to {GDN_MT}, got {t}")
+    if n_embd != GDN_N_EMBD:
+        raise ValueError(f"basalt_gdn: n_embd must be {GDN_N_EMBD}, got {n_embd}")
+    if h_k <= 0:
+        raise ValueError(f"basalt_gdn: h_k must be positive, got {h_k}")
+    if h_v % h_k != 0:
+        raise ValueError(f"basalt_gdn: h_v must be a multiple of h_k, got h_v {h_v} and h_k {h_k}")
+    want = 2 * GDN_S * h_k + GDN_S * h_v
+    if c != want:
+        raise ValueError(f"basalt_gdn: C must be 2 * {GDN_S} * h_k + {GDN_S} * h_v = {want}, got {c}")
+    return struct.pack("<IIIIIfII", t, c, n_embd, h_k, h_v, eps, 0, 0)
+
+
+# ---- basalt's prompt path: group dequantizers (kernels/common/basalt_dequant16.metal; docs/research/basalt-nvcc/dequant_bf16.md)
+# The type table and launch rules below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/dequant_bf16.cu
+# :190-240 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+DEQUANT16_TYPES = (2, 6, 8, 11, 12, 13, 14, 20, 23, 42)   # the GGUF types Gemm::native dequantizes on this pack
+DEQUANT16_OUT = {"f32": 0, "f16": 1, "bf16": 2}           # DQ_OUT: put's float, H16 and BF16 stores (:28-31)
+DEQUANT16_THREADS = 256                                   # threads per threadgroup, one per 32-value group (:221-222)
+
+
+def basalt_dequant16_source() -> str:
+    """basalt's ``dequant_kernel`` (dequant_bf16.cu:168-188) as ``basalt_dequant_g32``, one thread per 32-value group:
+    ``basalt_dequant16_grid`` threadgroups of 256 threads, 1-D. Bindings: 0 the matrix's blocks from its row 0, at
+    least (row0 + rows) * row bytes at any byte offset, of which rows [row0, row0 + rows) are read; 1 the output,
+    exactly rows * cols values, row-major (float for "f32", fp16 or BF16 bits for "f16" and "bf16"); 2 the
+    ``basalt_dequant16_params`` record."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_dequant16.metal")
+
+
+def basalt_dequant16_macros(type_id: int, out: str) -> Dict[str, str]:
+    """``DQ_TYPE`` (the ggml type id) and ``DQ_OUT`` (``out``: "f32", "f16" or "bf16", as dequant_f32, dequant_f16 and
+    dequant_bf16 store). basalt also takes Q5_1 (dequant_bf16.cu:194) and hands the i-quant types of ``iq_only`` to
+    iq_kernels.cu (:251, :261-265, :270-274); no tensor of this pack has them, so a type outside ``DEQUANT16_TYPES``
+    is refused."""
+    if type_id not in DEQUANT16_TYPES:
+        raise ValueError(f"basalt_dequant16: unsupported ggml type {type_id}")
+    if out not in DEQUANT16_OUT:
+        raise ValueError(f"basalt_dequant16: unsupported output {out!r}")
+    return {"DQ_TYPE": str(type_id), "DQ_OUT": str(DEQUANT16_OUT[out])}
+
+
+def basalt_dequant16_params(type_id: int, row0: int, rows: int, cols: int) -> bytes:
+    """``DequantG32Params`` (row bytes, row0, rows, groups per row: basalt's int64_t arguments, dequant_bf16.cu:171-172)
+    for rows [row0, row0 + rows) of ``cols`` values of type ``type_id``. Refused: a type ``basalt_dequant16_macros``
+    refuses; basalt's cols not whole blocks and rows <= 0 (:210-214) and its failed launch (``basalt_dequant16_grid``);
+    row0 < 0, the port's own (a load before the binding)."""
+    if type_id not in DEQUANT16_TYPES:
+        raise ValueError(f"basalt_dequant16: unsupported ggml type {type_id}")
+    if rows <= 0 or row0 < 0:
+        raise ValueError(f"basalt_dequant16: rows must be positive and row0 non-negative, got {rows} and {row0}")
+    row_bytes = ggml_row_bytes(type_id, cols)
+    basalt_dequant16_grid(rows, cols)
+    return struct.pack("<qqqq", row_bytes, row0, rows, cols // 32)
+
+
+def basalt_dequant16_grid(rows: int, cols: int) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup): ceil(rows * cols / 32 / 256) threadgroups of 256 (dequant_bf16.cu:216,
+    :221-222). A grid of no threadgroup or of more than ``CUDA_GRID_X`` is refused: basalt's launch fails on either
+    and it exits (:238-239)."""
+    grid = -(-(rows * (cols // 32)) // DEQUANT16_THREADS)
+    if not 0 < grid <= CUDA_GRID_X:
+        raise ValueError(f"basalt_dequant16: {rows} x {cols} values need {grid} threadgroups, outside 1..{CUDA_GRID_X}")
+    return grid, DEQUANT16_THREADS
+
+
+# ---- basalt's prompt path: the GEMM and the 16-bit conversions (kernels/common/basalt_prompt_gemm.metal; docs/research/basalt-nvcc/prefill_kernels.md) ----
+
+# The rows every prompt-path kernel reads (invariant 4): StepState.t_this_step clamped to the compiled bound ROWS_MAX in
+# a dynamic-T program (T_SRC 0), the compiled count T_STATIC_ROWS in a static one (T_SRC 2), whose advance resets
+# t_this_step to 1. A builder places it after its PRELUDE-led prefix, behind which the emitter splices the StepState
+# struct, and before its kernels. The row macros are uint literals ("64u"): MSL's min(uint, int) is ambiguous.
+PROMPT_ROWS = """
+inline uint prompt_rows(device const StepState* st) {          // invariant 4: the chunk's rows are StepState data
+#if T_SRC == 2
+  return T_STATIC_ROWS;                                        // a static program's compiled count
+#else
+  return min(st->t_this_step, ROWS_MAX);                       // ROWS_MAX: the program's bound, the buffers' rows
+#endif
+}
+"""
+
+
+def basalt_prompt_gemm_source() -> str:
+    """basalt's ``Gemm::bf16`` product and ``Gemm::native``'s FP16 product (``basalt_prompt_gemm``), and the
+    conversions ``to_f16`` and ``to_bf16`` (``basalt_prompt_convert``)."""
+    return PRELUDE + template("basalt_fp.metal") + PROMPT_ROWS + template("basalt_prompt_gemm.metal")
+
+
+# The padded multiply-adds a product dispatch may run, measured on 2026-10-20 on an Apple M3 Max (40 GPU cores, macOS
+# 27.0.1): whole products at B 256 with at least 40 threadgroups ran 769-2456 G MAC/s (three runs, each the least of 5
+# at a warm clock; one run alone gave 1 << 29); the slowest, FP16 640 x 2560 (one threadgroup per core) at 769, times
+# 0.5 ms, rounded down to a power of two.
+PROMPT_GEMM_MACS = 1 << 28
+
+
+def basalt_prompt_gemm_slices(rows: int, n: int, k: int) -> List[Tuple[int, int, int, int]]:
+    """The static slices ``(row0, nrows, col0, ncols)`` of a product at bound ``rows`` (B) with ``n`` outputs over
+    ``k``, each its own dispatch and params record, covering [0, Bp) x [0, n) once, Bp = 64 * ceil(B / 64). A slice
+    runs its tiles' 64 * ceil(nrows / 64) * 64 * ceil(ncols / 64) * k multiply-adds. Columns: CB = min(n, max(64, c)),
+    c the largest multiple of 64 with Bp * c * k <= PROMPT_GEMM_MACS (0 if none). Rows: Bp when c >= 64, else
+    RB = min(Bp, max(64, r)), r the largest multiple of 64 with r * 64 * k <= PROMPT_GEMM_MACS. So every slice is
+    within the budget or one tile, every row slice is a multiple of 64 tall and every column slice but the last (which
+    ends at n) a multiple of 64 wide: a slice's grid covers its block and no other. Slices change no bit (each output's
+    chain is the same in any slice)."""
+    if k <= 0 or k % 16:
+        raise ValueError(f"basalt_prompt_gemm: k must be a positive multiple of 16, got {k}")
+    if rows < 1 or n < 1:
+        raise ValueError(f"basalt_prompt_gemm: need at least one row and one output, got {rows} rows, {n} outputs")
+    bp = 64 * -(-rows // 64)
+    c = PROMPT_GEMM_MACS // (bp * k) // 64 * 64
+    cb = min(n, max(64, c))
+    rb = bp if c >= 64 else min(bp, max(64, PROMPT_GEMM_MACS // (64 * k) // 64 * 64))
+    return [(r0, min(rb, bp - r0), c0, min(cb, n - c0)) for r0 in range(0, bp, rb) for c0 in range(0, n, cb)]
+
+
+def basalt_prompt_gemm_params(n: int, k: int, row0: int, col0: int) -> bytes:
+    """``PromptGemmParams``: the product's n and k, the slice's first row and first column."""
+    return struct.pack("<4I", n, k, row0, col0)
+
+
+def basalt_prompt_convert_params(n: int) -> bytes:
+    """``PromptConvertParams``: the row width n (the conversion runs the chunk's rows times n elements)."""
+    return struct.pack("<I", n)
+
+
+# ---- basalt's prompt path: the hyper-connection kernels (kernels/common/basalt_prompt_hc.metal; docs/research/basalt-nvcc/prefill_kernels.md) ----
+
+# The rows one hyper-connection dispatch covers, measured on 2026-10-20 on an Apple M3 Max (40 GPU cores, macOS
+# 27.0.1): one-slice dispatches at B = R = 16384 (n 2560, lr 320) took 0.066-5.79 ms, 308-476 GB/s (three runs, each
+# the least of 5 at a warm clock; one run alone gave 1472); the slowest kind, write_norm (1.85 GB), finished 1415-1528
+# rows per 0.5 ms, and the least of those, rounded down to a multiple of 64, is the value.
+PROMPT_HC_ROWS = 1408
+
+
+def basalt_prompt_hc_source() -> str:
+    """basalt's prompt hyper-connection kernels (src/prefill/kernels.cu:85-204): the shared helpers, the IEEE binary32
+    operations, the software binary64 and ``fma_ieee`` on it, the q8_1 file (``ieee_div``, ``warp_sum_ieee``,
+    ``block_sum``; its quantizers compile along), the rows, then ``basalt_prompt_hc.metal``'s ``prompt_gr_*``."""
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
+            + template("basalt_ieee_f64.metal") + template("basalt_q8_1.metal") + PROMPT_ROWS
+            + template("basalt_prompt_hc.metal"))
+
+
+def basalt_prompt_hc_slices(B: int, rows: Optional[int] = None) -> List[Tuple[int, int]]:
+    """The static row slices ``(row0, S)`` of a hyper-connection op at bound ``B``, each its own dispatch and params
+    record: S = min(rows, B - row0), ``rows`` a positive multiple of 64, by default PROMPT_HC_ROWS as it is at the
+    call. So every slice but the last is a multiple of 64 rows. Slices change no bit (rows are independent)."""
+    rows = PROMPT_HC_ROWS if rows is None else rows
+    if rows <= 0 or rows % 64:
+        raise ValueError(f"basalt_prompt_hc: a slice must be a positive multiple of 64 rows, got {rows}")
+    return [(row0, min(rows, B - row0)) for row0 in range(0, B, rows)]
+
+
+def basalt_prompt_hc_params(row0: int) -> bytes:
+    """``PromptHcParams``: the slice's first row (a compile-time value: the rows come from StepState)."""
+    return struct.pack("<I", row0)
 
 
 # ---- the other decode kernels -------------------------------------------------------------------------------

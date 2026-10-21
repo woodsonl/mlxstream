@@ -4,7 +4,8 @@
 # adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu, src/kernels/cuda/iq_kernels.cu,
 # src/kernels/cuda/native_bf16.cu, src/kernels/cuda/dense_tc.cu, src/kernels/cuda/q5k_head.cu,
 # src/kernels/cuda/head_proxy.cuh, src/kernels/cuda/quantize_act.cu, src/kernels/cuda/s2_expert_grouped.cu,
-# include/basalt/kernels/q8_1_finite.hpp and include/basalt/kernels/f16_bits.hpp @
+# src/kernels/cuda/dec_gdn_rec.cu, src/kernels/cuda/verify_kernels.cu, src/prefill/kernels.cu,
+# include/basalt/kernels/q8_1_finite.hpp, include/basalt/kernels/f16_bits.hpp and src/kernels/hc8_parity.cpp @
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp ggml/src/ggml-common.h (kvalues_iq4nl),
 # ggml/src/ggml-quants.c (get_scale_min_k4), ggml/src/ggml-cuda/quantize.cu and ggml/src/ggml-cuda/mmvf.cu @
 # 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
@@ -32,10 +33,8 @@ def ftz(x):
     return np.where((b & 0x7F800000) == 0, (b & 0x80000000).view(F32), x).astype(F32)
 
 
-def fma32(a, b, c):
-    """a * b + c rounded once to float32 (to nearest even, on the grid with subnormals). a * b is exact in float64;
-    the float64 sum is rounded to odd (TwoSum gives its exact error), which a float32 cast then rounds correctly
-    (53 >= 24 + 2 bits)."""
+def _fma64_odd(a, b, c):
+    """a * b + c of float32 inputs as a float64 rounded to odd, fma32's and fma_metal's common step."""
     a, b, c = (np.asarray(v, F32).astype(np.float64) for v in (a, b, c))
     s = a * b
     t = s + c
@@ -43,9 +42,27 @@ def fma32(a, b, c):
     err = (s - (t - bp)) + (c - bp)
     even = (t.view(np.int64) & 1) == 0
     bump = (err != 0) & even & np.isfinite(t)
-    t = np.where(bump, np.nextafter(t, np.where(err > 0, np.inf, -np.inf)), t)
+    return np.where(bump, np.nextafter(t, np.where(err > 0, np.inf, -np.inf)), t)
+
+
+def fma32(a, b, c):
+    """a * b + c rounded once to float32 (to nearest even, on the grid with subnormals). a * b is exact in float64;
+    the float64 sum is rounded to odd (TwoSum gives its exact error), which a float32 cast then rounds correctly
+    (53 >= 24 + 2 bits)."""
     with np.errstate(over="ignore"):
-        return t.astype(F32)
+        return _fma64_odd(a, b, c).astype(F32)
+
+
+def fma_metal(a, b, c):
+    """This GPU's fma in MTLMathModeSafe as test_subnormals_in_safe_mode measures it (basalt_fp.metal's header): a
+    subnormal input reads as the zero of its sign, an exact result below 2^-126 in magnitude flushes to the zero of
+    its sign before rounding, and every other result is fma32's on the flushed inputs. So an exact 2^-126 - 2^-150
+    gives 0 here and 2^-126 in fma_ftz (.ftz flushes the rounded result). The test is on _fma64_odd's value, which is
+    below 2^-126 exactly when the exact result is: rounding to odd never reaches 2^-126, an even significand, from
+    below."""
+    t = _fma64_odd(ftz(a), ftz(b), ftz(c))
+    with np.errstate(over="ignore"):
+        return np.where(np.abs(t) < 2.0 ** -126, np.copysign(0.0, t), t).astype(F32)
 
 
 def add_ftz(a, b):
@@ -795,6 +812,198 @@ def q5k_proxy_final(cand, part, exact, map_, expf):
         s[:k] = add_ftz(s[:k], ed[c0:c0 + k])
     total = max_ftz(butterfly(s[None], add_ftz)[0], F32(1.0 if bi in rows else 0.0))
     return int(np.asarray(map_)[bi]), rcp_ftz(total), rows
+
+
+# ---- the GDN window (docs/research/basalt-nvcc/dec_gdn.md, verify_gdn.md) -----------------------------------------
+# dec_gdn_rec.cu and verify_kernels.cu build with nvcc's IEEE defaults: no flush, as numpy's float32 operations.
+# MUFU.EX2 and MUFU.RSQ have no bit-exact host model: ``exp2`` and ``rsqrt`` evaluate the port's stand-ins, the GPU's
+# fast::exp2 and fast::rsqrt, on a float32 array.
+
+L2E = np.uint32(0x3FB8AA3B).view(F32)      # log2(e) rounded: __expf's FMUL constant (-L2E, 0xBFB8AA3B, for __expf(-x))
+
+
+def sign_flip(x):
+    """-x by its bits: the sign flipped, every other bit kept."""
+    return (np.asarray(x, F32).view(np.uint32) ^ np.uint32(0x80000000)).view(F32)
+
+
+def ex2n(e, exp2):
+    """nvcc's non-ftz ex2.approx.f32 (dec_gdn.md, Notation): FSETP.GEU e, -126, so an argument below -126 (ordered) is
+    halved and MUFU.EX2's result squared by an IEEE multiply, which keeps a subnormal result."""
+    e = np.asarray(e, F32)
+    s = e < F32(-126.0)
+    r = np.asarray(exp2(np.where(s, e * F32(0.5), e).astype(F32)), F32)
+    with np.errstate(over="ignore"):                    # r * r of an unhalved row is discarded
+        return np.where(s, r * r, r).astype(F32)
+
+
+def expf_ieee(x, exp2):
+    """__expf(x) in an IEEE-built file: FMUL e, x, 0x3FB8AA3B (no FTZ), then ex2n(e). An __expf(-x) site is ex2n of
+    x * -L2E, the constant nvcc folds the negation into."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        e = np.asarray(x, F32) * L2E
+    return ex2n(e, exp2)
+
+
+def rsqrt_ieee(x, rsqrt):
+    """rsqrtf in an IEEE-built file (rsqn, dec_gdn.md Notation): FSETP.GEU |x|, 2^-126, so a zero or subnormal argument
+    (ordered: not NaN) is scaled by 2^24 before MUFU.RSQ and the result by 2^12."""
+    x = np.asarray(x, F32)
+    small = np.abs(x) < F32(2.0 ** -126)
+    with np.errstate(over="ignore", invalid="ignore"):
+        r = np.asarray(rsqrt(np.where(small, x * F32(2.0 ** 24), x).astype(F32)), F32)
+        return np.where(small, r * F32(4096.0), r).astype(F32)
+
+
+# ---- the prompt path's products (kernels/common/basalt_prompt_gemm.metal) -------------------------------------------
+# Gemm::bf16's product and Gemm::native's (Gemm::f16 on the FP16 image) are cuBLAS calls (src/prefill/gemm.cu:122-132,
+# :158-185), which fix no summation order; the port's is one fp32 fma chain per output, from +0 in increasing k.
+
+def gemm_chain(xb, wb, bf16, flush=True):
+    """basalt_prompt_gemm's outputs as bits, uint32 (R, N), for 16-bit operand bits ``xb`` (R, K) and ``wb`` (N, K),
+    BF16 if ``bf16`` else FP16: acc = fma_metal(x[t][k], w[n][k], acc) from +0 in increasing k, so subnormal BF16
+    operands read as zero and every partial sum whose exact value is below 2^-126 flushes; a NaN stored as sm_120's
+    0x7fffffff (cuda_nan). ``flush=False``: the same fold on fma32, an IEEE chain that keeps subnormals."""
+    widen = (lambda b: (np.asarray(b, np.uint16).astype(np.uint32) << 16).view(F32)) if bf16 else h2f
+    xf, wf = widen(xb), widen(wb)
+    fma = fma_metal if flush else fma32
+    acc = np.zeros((xf.shape[0], wf.shape[0]), F32)
+    for k in range(xf.shape[1]):
+        acc = fma(xf[:, k, None], wf[None, :, k], acc)
+    return np.where(np.isnan(acc), np.uint32(0x7FFFFFFF), acc.view(np.uint32))
+
+
+def rel_norm(y, ref):
+    """The GEMM gate's metric: src/kernels/hc8_parity.cpp:57-61's Err folded over every element of the float32 values
+    ``y`` (Err::add's a) against ``ref`` (its b), as part 2 feeds it (``ex.add(y1[t * ldy + n], (float) ref);``,
+    :261): ``ref`` cast to float32, |y - ref| in float32 widened to float64, each fold std::max's (a NaN never replaces
+    the running value, which starts at 0, so callers count non-finite outputs themselves), then rel():
+
+        struct Err {
+            double abs = 0, ref = 0;
+            void add(float a, float b) { abs = std::max(abs, (double) std::fabs(a - b)); ref = std::max(ref, (double) std::fabs(b)); }
+            double rel() const { return ref > 0 ? abs / ref : abs; }
+        };
+    """
+    with np.errstate(over="ignore", invalid="ignore"):
+        b = np.asarray(ref).astype(F32)
+        d = np.abs(np.asarray(y, F32) - b).astype(np.float64)
+    e = np.fmax.reduce(d.ravel(), initial=0.0)
+    r = np.fmax.reduce(np.abs(b).astype(np.float64).ravel(), initial=0.0)
+    return float(e / r) if r > 0 else float(e)
+
+
+# ---- the prompt path's hyper-connection kernels (kernels/common/basalt_prompt_hc.metal) -----------------------------
+# src/prefill/kernels.cu:85-204 builds with nvcc's IEEE defaults: each product, quotient and sum is numpy's float32
+# operation (the ieee_* helpers' semantics, subnormals kept) and each FFMA fma32, in the order
+# docs/research/basalt-nvcc/prefill_kernels.md section 1 records. fast::rsqrt and fast::exp2 have no bit-exact host
+# model: ``rsqrt`` and ``exp_neg`` evaluate the GPU's fast::rsqrt and expf_ieee(sign_flip(x)) on a float32 array
+# (basalt_prompt_gpu.hc_probe). ``flush=True`` flushes every operation's inputs and result (ftz): a flushing kernel's
+# model, which the tests' discrimination checks compare against.
+
+def hc_bits(x):
+    """fp32 store bits with a NaN as sm_120's 0x7fffffff (basalt_fp.metal's cuda_nan)."""
+    return np.where(np.isnan(x), np.uint32(0x7FFFFFFF), np.asarray(x, F32).view(np.uint32))
+
+
+def hc_ops(flush):
+    """fma, add, mul and div as the twins round them: fma32 and numpy's float32 add, multiply and divide (IEEE,
+    subnormals kept), or with ``flush`` each with its inputs and result flushed (ftz)."""
+    if flush:
+        return fma_ftz, add_ftz, mul_ftz, lambda a, b: ftz(ftz(a) / ftz(b))
+    return fma32, np.add, np.multiply, np.divide
+
+
+def hc_block_sum(v, flush=False):
+    """block_sum (kernels.cu:45-58) of each row of ``v`` [rows, ntg], thread k's value in column k: each SIMD-group's
+    butterfly, then SIMD-group 0's over the ntg / 32 partials padded with zeros to 32 lanes; lane 0's value, which
+    thread 0 stores. At ntg = 256: ((p0 + p4) + (p2 + p6)) + ((p1 + p5) + (p3 + p7)). IEEE adds (warp_sum_ieee), or
+    flushing ones with ``flush``."""
+    add = add_ftz if flush else np.add
+    v = np.asarray(v, F32)
+    t = np.zeros((len(v), 32), F32)
+    t[:, : v.shape[1] // 32] = butterfly(v.reshape(-1, 32), add).reshape(len(v), -1)
+    return butterfly(t, add)
+
+
+def hc_norm(r, w, eps, rsqrt, flush=False):
+    """prompt_gr_norm_rs's stores for the residual ``r`` [T, 4n] and the weights ``w`` [4n]: rs [T, 4] as fp32 bits and
+    xn16 [T, 4n] as BF16 bits. Row (t, c): thread k sums r[d]^2 over d = k + 256 j, j ascending, by fma32 from +0;
+    hc_block_sum; rs = rsqrt(fl(fl(S / n) + eps)), the argument computed here in basalt's order; xn16 =
+    bf(cuda_nan(fl(fl(r rs) w[c]))). ``flush``: every operation's inputs and result flushed."""
+    fma, add, mul, div = hc_ops(flush)
+    r = np.asarray(r, F32)
+    T, n = len(r), r.shape[1] // 4
+    x = r.reshape(4 * T, n // 256, 256)                         # [row, j, k]: d = k + 256 j
+    ss = np.zeros((4 * T, 256), F32)
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN rows
+        for j in range(n // 256):
+            ss = fma(x[:, j], x[:, j], ss)
+        rs = np.asarray(rsqrt(add(div(hc_block_sum(ss, flush), F32(n)), F32(eps))), F32).reshape(T, 4)
+        xn = mul(mul(r.reshape(T, 4, n), rs[..., None]), np.asarray(w, F32).reshape(4, n))
+    return hc_bits(rs), bf16_bits(hc_bits(xn).view(F32)).reshape(T, 4 * n)
+
+
+def hc_sigm(g, exp_neg, flush=False):
+    """sigm (kernels.cu:39) as the port computes it: 1 / (1 + exp_neg(g)), ``exp_neg`` the GPU's
+    expf_ieee(sign_flip(g)), the quotient correctly rounded (rcp.rn, ieee_div): subnormal for g below about -87.3, +0
+    below about -88.7."""
+    _, add, _, div = hc_ops(flush)
+    e = ftz(exp_neg(ftz(g))) if flush else exp_neg(g)
+    return div(F32(1), add(F32(1), np.asarray(e, F32)))
+
+
+def hc_mix(r, rs, w, gated, exp_neg, flush=False):
+    """prompt_gr_mix_r's stores for the residual ``r`` [T, 4n], gr_norm_rs's row scales ``rs`` [T, 4], the weights ``w``
+    [4n] and the gate logits ``gated`` [T, 4n]: mixed, mixed_bf and mixed_h [T, n] as fp32, BF16 and FP16 bits. Output
+    (t, d): s = fma32(fl(fl(r rs) w[c]), hc_sigm(gated), s) for c = 0..3 from +0 (hc_norm's product), then fl(s * 0.25),
+    stored as cuda_nan(s), bf(cuda_nan(s)) and hf(s). ``flush``: every operation's inputs and result flushed."""
+    fma, _, mul, _ = hc_ops(flush)
+    r = np.asarray(r, F32)
+    T, n = len(r), r.shape[1] // 4
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN rows
+        x = mul(mul(r.reshape(T, 4, n), np.asarray(rs, F32)[..., None]), np.asarray(w, F32).reshape(4, n))
+        sg = hc_sigm(np.asarray(gated, F32), exp_neg, flush).reshape(T, 4, n)
+        s = np.zeros((T, n), F32)
+        for c in range(4):
+            s = fma(x[:, c], sg[:, c], s)
+        s = mul(s, F32(0.25))
+    return hc_bits(s), bf16_bits(hc_bits(s).view(F32)), cuda_half_bits(s)
+
+
+def hc_silu(lo, exp_neg, flush=False):
+    """prompt_gr_silu's lo16 [T, lr] as BF16 bits for the low-rank rows ``lo`` [T, lr]: x = fl(lo * 0.25), v = fl(x /
+    fl(1 + exp_neg(x))), one correctly rounded division as the source writes it (not x sigm(x)), stored as
+    bf(cuda_nan(v)); ``exp_neg`` the GPU's expf_ieee(sign_flip(x)). ``flush``: every operation's inputs and result
+    flushed."""
+    _, add, mul, div = hc_ops(flush)
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN entries
+        x = mul(np.asarray(lo, F32), F32(0.25))
+        e = ftz(exp_neg(ftz(x))) if flush else exp_neg(x)
+        v = div(x, add(F32(1), np.asarray(e, F32)))
+    return bf16_bits(hc_bits(v).view(F32))
+
+
+def hc_write(r, bo, inj, exp_neg, flush=False):
+    """prompt_gr_write's R' [T, 4n] as fp32 bits for the residual ``r`` [T, 4n], the block output ``bo`` [T, n] and the
+    injection logits ``inj`` [T, 4]: R'[t, c, d] = fma32(bo[t, d], sc, r[t, c, d]) with sc = fl(sg + sg) (2.0f * sg is
+    an add) and sg = hc_sigm(fl(inj[t, c] * 0.25)) (sigm(inj / HC)), stored as cuda_nan. ``flush``: every operation's
+    inputs and result flushed."""
+    fma, add, mul, _ = hc_ops(flush)
+    r = np.asarray(r, F32)
+    T, n = len(r), r.shape[1] // 4
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN entries
+        sg = hc_sigm(mul(np.asarray(inj, F32), F32(0.25)), exp_neg, flush)
+        x = fma(np.asarray(bo, F32)[:, None, :], add(sg, sg)[..., None], r.reshape(T, 4, n))
+    return hc_bits(x).reshape(T, 4 * n)
+
+
+def hc_write_norm(r, bo, inj, w_next, eps, rsqrt, exp_neg, flush=False):
+    """prompt_gr_write_norm_rs's stores R' [T, 4n] (fp32 bits), rs [T, 4] (fp32 bits) and xn16 [T, 4n] (BF16 bits):
+    hc_write, then hc_norm of R' with the next half's weights ``w_next``, as the source promises (kernels.cu:125-127:
+    the same mapping and block_sum, so the same bits). ``flush``: every operation's inputs and result flushed."""
+    rp = hc_write(r, bo, inj, exp_neg, flush)
+    return (rp, *hc_norm(rp.view(F32), w_next, eps, rsqrt, flush))
 
 
 # ---- libdevice in the prompt rotation (docs/research/basalt-nvcc/prefill_kernels.md section 4) ---------------------

@@ -86,7 +86,8 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
 - `kernels/common/basalt_fp.metal` — through basalt's `src/kernels/cuda/native_mmvq.cu` (below), which adapts
   `ggml/src/ggml-cuda/{quantize.cu,vecdotq.cuh,mmvq.cu,common.cuh}` and `ggml/src/ggml-common.h` (MIT): the warp sum
   and max butterflies, the two-16-bit-load word read, the `__dp4a`, `__byte_perm`, `__vsubss4` and `__vsub4`
-  semantics and the IQ4 table lookup. License: `third_party/GGML-LICENSE`.
+  semantics and the IQ4 table lookup, and, through `dequant_bf16.cu`'s `f2bf`, the BF16 rounding of
+  `ggml_compute_fp32_to_bf16`. License: `third_party/GGML-LICENSE`.
 - `kernels/common/basalt_q8_1.metal` — through basalt's `native_mmvq.cu` and `iq_kernels.cu` (below), which adapt
   `ggml/src/ggml-cuda/quantize.cu` (MIT): the q8_1 block and its quantization rule. License: `third_party/GGML-LICENSE`.
 - `kernels/common/basalt_mmvq.metal` — through basalt's `src/kernels/cuda/native_mmvq.cu` (below), which adapts
@@ -123,6 +124,10 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `src/llama-sampler.cpp`'s `llama_sampler_penalties_apply` (MIT): the repeat penalty that multiplies a non-positive
   logit and divides any other, then subtracts the count times the frequency penalty plus the presence penalty for a
   counted token (`apply_penalties`, `penal`). License: `third_party/GGML-LICENSE`.
+- `kernels/common/basalt_dequant16.metal` — through basalt's `src/kernels/cuda/dequant_bf16.cu` (below), which
+  transcribes `ggml/src/ggml-quants.c`'s `dequantize_row_q2_0`, `_q4_0`, `_q5_0`, `_q8_0`, `_q3_K`, `_q4_K`, `_q5_K`,
+  `_q6_K`, `_iq4_nl`, `_iq4_xs` and `get_scale_min_k4`, and `ggml/src/ggml-common.h`'s `kvalues_iq4nl` (MIT): the
+  per-element dequantization rules of the ten types and the IQ4 codebook. License: `third_party/GGML-LICENSE`.
 
 ## Arm optimized-routines (ARM-software/optimized-routines, MIT OR Apache-2.0 WITH LLVM-exception; taken under MIT)
 
@@ -142,6 +147,14 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `src/core/mtp.cpp`. The test writer in `tests/contract/test_basalt_reader.py` follows `tools/model_file.py`'s
   `ModelWriter`. `tests/contract/test_gguf_formats.py` compiles basalt's references only from a checkout the user points
   `BASALT_SRC` at. License: `third_party/BASALT-LICENSE`.
+- `monolith/packs/basalt_hc8.py` — adapted from `src/kernels/cuda/hc_fused.cu:1171-1227` (MIT): `hc8_quant_kernel`'s
+  arithmetic re-implemented in numpy and `hc8_make`'s layout; the `BASALTH8` table of
+  `include/basalt/core/model_file.hpp:126-149` as `hc8_write` writes it (`src/core/model_file.cpp:438-485`); the matrix
+  lists of `src/core/verify.cpp:566-581` and `src/core/mtp.cpp:215-218`, `:488-503`, in the order `hc8_dump` writes
+  them (`src/core/verify.cpp:638-640`, `src/core/mtp.cpp:516-521`). License: `third_party/BASALT-LICENSE`.
+- `tests/basalt_hc_ref.py`, `tests/contract/test_basalt_hc8.py` — adapted from `src/kernels/cuda/hc_fused.cu:1171-1197`,
+  `src/core/model_file.cpp:487-513` and `src/kernels/hc8_parity.cpp:69-99` (MIT): a scalar transcription of
+  `hc8_quant_kernel`, `hc8_read`'s checks and hc8_parity's matrices. License: `third_party/BASALT-LICENSE`.
 - `kernels/common/basalt_fp.metal` — adapted from `src/kernels/cuda/native_mmvq.cu`, `src/kernels/cuda/iq_kernels.cu`,
   `include/basalt/kernels/dp4a.hpp` and `include/basalt/kernels/q8_1_finite.hpp` (MIT): `warp_sum`, `warp_max`,
   `load_int_b2`, the `DP4A` helper and the IQ4 table lookup (`native_mmvq.cu:441-457`), with the flush-to-zero and reciprocal helpers that write out the arithmetic nvcc
@@ -149,11 +162,13 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   IEEE-built `warp_sum` and the SwiGLU's `__expf(-g)` (`expf_neg`), in the arithmetic nvcc compiles for them
   (`docs/research/basalt-nvcc/experts.md`); from `native_mmvq.cu:180-240` and `:897-937`, the Q5_K decode and dot
   (`q5k_load`, `q5k_dot`) that `native_mmvq` and `src/kernels/cuda/q5k_head.cu` share, and from `q5k_head.cu`, a
-  fast-math file's `__expf` (`expf_ftz`; `docs/research/basalt-nvcc/q5k_head.md`). License:
-  `third_party/BASALT-LICENSE`.
+  fast-math file's `__expf` (`expf_ftz`; `docs/research/basalt-nvcc/q5k_head.md`); and from
+  `src/kernels/cuda/dequant_bf16.cu:20-27` and `src/prefill/kernels.cu:31-35`, the BF16 roundings `f2bf` (with its NaN
+  case) and `bf` (`bf16_rne_nonan`, without). License: `third_party/BASALT-LICENSE`.
 - `kernels/common/basalt_q8_1.metal` — adapted from `src/kernels/cuda/native_mmvq.cu:146-177` (the native and SwiGLU
-  quantizers), `src/kernels/cuda/iq_kernels.cu:1880-1900` (the IEEE quantizer) and `include/basalt/kernels/q8_1_finite.hpp`
-  (MIT), written in the rounding sequence nvcc compiles for them. License: `third_party/BASALT-LICENSE`.
+  quantizers), `src/kernels/cuda/iq_kernels.cu:1880-1900` (the IEEE quantizer), `include/basalt/kernels/q8_1_finite.hpp`
+  and `src/prefill/kernels.cu:45-58` (`block_sum`, the prompt path's threadgroup sum, basalt's own code) (MIT), written
+  in the rounding sequence nvcc compiles for them. License: `third_party/BASALT-LICENSE`.
 - `kernels/common/basalt_ieee.metal` — moved from `kernels/common/basalt_q8_1.metal` (above) with its header: `ieee_add`
   and `ieee_mul`, CUDA's `add.rn.f32` and `mul.rn.f32` with subnormal operands and results kept, which the IEEE
   quantizer's warp sum (`src/kernels/cuda/iq_kernels.cu:1880-1900`, MIT), the routed experts' SwiGLU product and the
@@ -283,10 +298,14 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   BF16 GEMVs' (`mmvf`; `bf16_bits`: `include/basalt/kernels/bf16_bits.hpp`'s rounding;
   `docs/research/basalt-nvcc/bf16.md`), `dense_tc`'s (`docs/research/basalt-nvcc/dense_tc.md`), the Q5_K head's
   top-1 and 2-bit proxy (`src/kernels/cuda/q5k_head.cu`, `src/kernels/cuda/head_proxy.cuh`;
-  `docs/research/basalt-nvcc/q5k_head.md`) and the drafter experts' (`f16_from_f32`:
+  `docs/research/basalt-nvcc/q5k_head.md`), the drafter experts' (`f16_from_f32`:
   `include/basalt/kernels/f16_bits.hpp:36-65` transcribed; `q8_0_scaled`, `s2_dots`, `s2_swiglu`:
   `src/kernels/cuda/quantize_act.cu` and `src/kernels/cuda/s2_expert_grouped.cu`;
-  `docs/research/basalt-nvcc/s2_experts.md`). License: `third_party/BASALT-LICENSE`.
+  `docs/research/basalt-nvcc/s2_experts.md`) and the prompt path's hyper-connection kernels' (`hc_norm`, `hc_mix`,
+  `hc_silu`, `hc_write`, `hc_write_norm`: `src/prefill/kernels.cu:85-204`'s arithmetic in nvcc's order, IEEE and flush
+  forms; `docs/research/basalt-nvcc/prefill_kernels.md`); and `rel_norm`, the GEMM gate's metric, `Err` of
+  `src/kernels/hc8_parity.cpp:57-61` in its float32 form (`gemm_chain`, `fma_metal` and `_fma64_odd` beside it are
+  the port's order and this GPU's measured `fma`, not basalt's). License: `third_party/BASALT-LICENSE`.
 - `runtime/src/basalt_cpu.h` and `runtime/src/basalt_cpu.cpp` — adapted from `src/kernels/cpu/expert.cpp:143-148`,
   `:336-370` and `:503-556` and `include/basalt/kernels/cpu/expert.hpp:25-61` (MIT): the `ActQ` struct and the
   geometry constants, `act_quant_q8_1`, and `q2_0_gguf_rows_multi` with `q2g_rows`, `q2g_row_multi` and
@@ -297,6 +316,39 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   as the AVX-512 semantics they are written in, and the shape of the per-token independence check of
   `src/kernels/cpu/expert_multi_test.cpp:56-72`, which exercises a kernel off this pack's path: the pattern
   transfers, not its code. License: `third_party/BASALT-LICENSE`.
+- `kernels/common/basalt_dequant16.metal` — adapted from `src/kernels/cuda/dequant_bf16.cu:17-188` (MIT):
+  `dequant_kernel` with `group32` for Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and Q2_0, `h2f`, the
+  three output conversions (`put`), `kv_iq4nl` and `scale_min_k4`, in the arithmetic nvcc compiles for them
+  (`docs/research/basalt-nvcc/dequant_bf16.md`). License: `third_party/BASALT-LICENSE`.
+- `monolith/kernels.py` — adapted from `src/kernels/cuda/dequant_bf16.cu:190-240` (MIT): `geometry` and `launch`'s
+  refusals and grid, as `basalt_dequant16_params` and `basalt_dequant16_grid`. License: `third_party/BASALT-LICENSE`.
+- `tests/kernels/test_basalt_prompt_dequant.py`, `tests/contract/test_basalt_dequant16_builders.py` — adapted from
+  `src/kernels/dequant_f16_parity.cpp:35-106`, `src/kernels/dequant_bf16_test.cpp:56-107` and
+  `src/kernels/elementwise_parity.cpp:438-472` (MIT): their fixtures (the `std::mt19937(7)` blocks with pinned
+  scales, the pack's tensors, the NaN-scale Q8_0 pair) and criteria, and `dequant_bf16.cu:190-205`'s type table.
+  License: `third_party/BASALT-LICENSE`.
+- `kernels/common/basalt_prompt_gemm.metal` — adapted from `src/prefill/gemm.cu:122-185` and
+  `src/prefill/kernels.cu:31-40` and `:818-833` (MIT): `Gemm::bf16`'s and `Gemm::native`'s products as one
+  fixed-order fma chain per output (the order is this port's: cuBLAS fixes none,
+  `docs/research/basalt-nvcc/prefill_kernels.md`), and `to_f16` and `to_bf16` with `hf` and `bf`. License:
+  `third_party/BASALT-LICENSE`.
+- `monolith/compiler/emit_basalt_prompt.py` — adapted from `src/prefill/prefill.cpp:1188-1199` (MIT): `native_proj`'s
+  and `bf16_proj`'s weight checks, as the refusals at emit time of an `entry` its weight contradicts, and the
+  hyper-connection wrappers' launch shapes (`src/prefill/kernels.cu:867-887`, `:893-900`, with `blocks_for` `:63`:
+  `T * HC` threadgroups of 256 for the two row kernels, `blocks_for(T * width)` otherwise) as the hc handlers' grids.
+  License: `third_party/BASALT-LICENSE`.
+- `tests/kernels/test_basalt_prompt_gemm.py` — adapted from `src/kernels/hc8_parity.cpp:253-262` and `:269` (MIT): the
+  GEMM gate's bound, `expect(ex.rel() < 5e-3, "the product against the copy in double");`, and its use of `Err`
+  over the product against double. License: `third_party/BASALT-LICENSE`.
+- `kernels/common/basalt_prompt_hc.metal` — adapted from `src/prefill/kernels.cu:39`, `:45-58`, `:85-170` and
+  `:192-204` (MIT): `gr_norm_rs_kernel`, `gr_mix_r_kernel`, `gr_write_norm_rs_kernel`, `gr_silu_kernel`,
+  `gr_write_kernel` and `gr_broadcast_kernel` with `sigm` and `block_sum`, written in the rounding sequence nvcc
+  compiles for them (`docs/research/basalt-nvcc/prefill_kernels.md`). License: `third_party/BASALT-LICENSE`.
+- `tests/kernels/test_basalt_prompt_hc.py` — adapted from `src/kernels/gr_parity.cpp` (MIT): its data distributions
+  (`:675`), the float64 references' forms with their activation rounding (`to_bf16`, `:46-53`) and the bounds
+  (`:566`, `:645`, `:689`), which `gr_parity` gates on decode's `gr.cu` kernels and the port applies as the nearest
+  basalt test's (`docs/design/flash-next.md`'s table of kernels without a reference test), with their metrics
+  `rel_diff` and `rel_terms` (`:136-156`). License: `third_party/BASALT-LICENSE`.
 
 ## NVIDIA CUDA Toolkit libdevice (13.0)
 

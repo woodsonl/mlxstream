@@ -72,3 +72,34 @@ static inline float ieee_mul(float a, float b) {
     }
     return as_type<float>(sign | (uint(k) << 23) + uint(r));            // r == 2^24 carries into the exponent
 }
+
+// ---- __expf and rsqrtf as an IEEE-built kernel computes them --------------------------------------------------------
+//
+// nvcc compiles both without .ftz (docs/research/basalt-nvcc/dec_gdn.md, Notation: ex2n, rsqn). __expf(x) is an IEEE
+// multiply by log2(e) (0x3FB8AA3B), then MUFU.EX2 with an argument below -126 halved and the result squared by an IEEE
+// multiply, so that subnormal results survive; rsqrtf(x) is MUFU.RSQ with a zero or subnormal argument scaled by 2^24
+// and the result by 2^12. fast::exp2 and fast::rsqrt stand in for MUFU.EX2 and MUFU.RSQ; the product, the square and
+// the prescale go through ieee_mul.
+
+// -x by its bits: the sign flipped, every other bit kept (unary minus on a subnormal is not measured on this GPU)
+static inline float sign_flip(float x) { return as_type<float>(as_type<uint>(x) ^ 0x80000000u); }
+
+// __expf(x). The halving test is FSETP.GEU's complement, e < -126 ordered: a subnormal e reads as zero here and is not
+// below -126, nor is NaN. __expf(-x) is expf_ieee(sign_flip(x)): nvcc folds the negation into the constant
+// (0xBFB8AA3B), and a correctly rounded product, ieee_mul's included, changes only its sign with an operand's.
+static inline float expf_ieee(float x) {
+    float e = ieee_mul(x, as_type<float>(0x3FB8AA3Bu));
+    const bool s = e < -126.0f;
+    if (s) e = e * 0.5f;
+    float r = fast::exp2(e);
+    if (s) r = ieee_mul(r, r);
+    return r;
+}
+
+// rsqrtf(x). small is FSETP.GEU's complement, |x| < 2^-126 ordered: a zero or a subnormal, read from the bits. A
+// scaled result is at least 2^51 in magnitude, infinite or NaN, so the plain postscale is exact.
+static inline float rsqrt_ieee(float x) {
+    const bool small = (as_type<uint>(x) & 0x7fffffffu) < 0x00800000u;
+    const float r = fast::rsqrt(small ? ieee_mul(x, 0x1p24f) : x);
+    return small ? r * 4096.0f : r;
+}
