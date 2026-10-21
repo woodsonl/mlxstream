@@ -201,16 +201,19 @@ FMUL and FADD is unflagged (IEEE).
 `:88-111`: `gdn_conv_commit_kernel` (one thread per channel, `c = blockIdx.x * blockDim.x + threadIdx.x`, 256 threads
 per block, `:867-871`) calls `gdn_conv_commit_one`, which reads `n = *n_keep` and calls `gdn_conv_commit_n`, the
 function the commit replay also runs for its conv items (section 7). Listing: `verify/nvcc130/conv.sass.txt` rows
-214-280.
+214-280. The port runs `gdn_conv_commit_n` only as the commit's conv item, `gdc_conv` in
+`kernels/common/basalt_gdn_commit.metal`, whose form the Metal column gives; `gdn_conv_commit_kernel`, which only
+`dec_commit_parity`'s reference side launches (`src/kernels/dec_commit_parity.cpp:78`), is not ported.
 
 | Line | Expression | SASS | Metal | Subnormal reachable |
 | --- | --- | --- | --- | --- |
-| `:96` | `seq[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];` (`src = n + j`, j < 3) | `LDG.E` 32-bit loads; no float instruction (the only one, `HFMA2 R7, -RZ, RZ, 0, 0`, loads a constant) | 32-bit word loads (`uint` or `float`: a move keeps the bits) | yes (any value of the conv input), immaterial: moved, never computed on |
-| `:98-100` | `hist[c * 3] = seq[0]; hist[c * 3 + 1] = seq[1]; hist[c * 3 + 2] = seq[2];` | `STG.E` 32-bit stores | 32-bit word stores | as `:96` |
+| `:96` | `seq[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];` (`src = n + j`, j < 3) | `LDG.E` 32-bit loads; no float instruction (the only one, `HFMA2 R7, -RZ, RZ, 0, 0`, loads a constant) | `uint` word loads through `device uint*` views of the history and the qkv rows, all three before any store: no float operation touches them | yes (any value of the conv input), immaterial: moved, never computed on |
+| `:98-100` | `hist[c * 3] = seq[0]; hist[c * 3 + 1] = seq[1]; hist[c * 3 + 2] = seq[2];` | `STG.E` 32-bit stores | `uint` word stores through the same view | as `:96` |
 
 The kernel has no float arithmetic; its bits are the inputs' bits. `n` comes from `*n_keep` unclamped (the replay's
-callers clamp it to `kVerifyMaxT`, `:358`, `:366`), so the window's row count bounds the `qkv` reads: the port checks
-`n` against its binding.
+callers clamp it to `kVerifyMaxT`, `:358`, `:366`), so the window's row count bounds the `qkv` reads. The port's
+commit clamps `n` to its window's row count (section 7) and returns before any item for `n <= 0`, so `gdc_conv` has
+no `if (n <= 0) return;`.
 
 ## 5. `gdn_ab_multi_kernel` and `gdn_ab_multi_unrolled_kernel`
 
@@ -315,22 +318,34 @@ step-norm kernel's state update (`:407-417`), with the same instruction sequence
 Line numbers are the pipe kernel's, `gdn_step_commit_block`'s in brackets. Listings:
 `verify/nvcc130/commitpipe.sass.txt`, `commitseg.sass.txt`, `stepcommit.sass.txt`.
 
+The port builds the pipe kernel alone, as `gdn_commit_layers` in `kernels/common/basalt_gdn_commit.metal` (its state
+item `gdc_state`, its conv item section 4's `gdc_conv`), whose form the Metal column gives. It clamps `n` to the row
+count of its window buffers (`n = min(commit[0], mt)`, `mt` in its params record), where basalt's clamp to
+`kVerifyMaxT` would read past a window of fewer rows; for every `commit[0]` up to `mt` the two give the same `n`. It
+loads an item's inputs when the item starts, without the next item's prefetch, which changes no bit: the loads are
+moves and the items write disjoint words. `gdn_commit_layers_seg_kernel` (the segmented batch form,
+`src/core/verify.cpp:3005`) and `gdn_step_commit_kernel` (no engine path launches it; `dec_commit_parity`'s
+reference side reaches it through `gdn_step_norm_multi`'s state-only branch, `:908-910`, from
+`src/kernels/dec_commit_parity.cpp:79-80`) are not ported.
+
 | Line | Expression | SASS (verbatim, source names) | Metal | Subnormal reachable |
 | --- | --- | --- | --- | --- |
 | `:315` [`:241`] | `const float gt = __expf(p.g[t]);` [`const float g = __expf(gate[(size_t) t * h_v + head]);`] | pipe: `UFMUL UR7, p.g[t], 1.4426950216293334961; UFSETP.GEU.AND UP1, UPT, UR7, -126, UPT; @!UP1 UFMUL UR7, UR7, 0.5; MUFU.EX2 R40, UR7; R2UR UR7, R40; @!UP1 UFMUL UR7, UR7, UR7`; step commit and seg: `FMUL y, gate, 1.4426950216293334961; FSETP.GEU.AND P0, PT, y, -126, PT; @!P0 FMUL y, y, 0.5; MUFU.EX2 g, y; @!P0 FMUL g, g, g`: `ex2n`, non-FTZ | `gt = expf_ieee(p.g[t])` | yes, material: as `:407` (a subnormal decay for gate in (-103.97, -87.34), which `fast::exp2` of the product alone flushes) |
-| `:318` [`:244`] | `for (int r = 0; r < RPG; ++r) kv = fmaf(p.s[r], sk[t][rg * RPG + r], kv);` (`kv = 0.0f`) | `FFMA kv, s0, sk0, RZ`, then 31 `FFMA kv, s_r, sk_r, kv`, r ascending | `kv = ieee_fma_any(s[r], sk[rg * RPG + r], kv)` from `0.0f`, r ascending | yes, material: as `:410` |
+| `:318` [`:244`] | `for (int r = 0; r < RPG; ++r) kv = fmaf(p.s[r], sk[t][rg * RPG + r], kv);` (`kv = 0.0f`) | `FFMA kv, s0, sk0, RZ`, then 31 `FFMA kv, s_r, sk_r, kv`, r ascending | `kv = fma_ieee(s[r], sk[t][rg * RPG + r], kv)` from `0.0f`, r ascending | yes, material: as `:410` |
 | `:321-322` [`:247`] | `kv_col = red[t & 1][0][col_local] + red[t & 1][1][col_local] + red[t & 1][2][col_local] + red[t & 1][3][col_local];` | `LDS` x4; `FADD` x3 left to right | `ieee_add(ieee_add(ieee_add(r0, r1), r2), r3)` | yes: as `:413` |
-| `:323` [`:248`] | `const float delta = (p.v[t] - gt * kv_col) * p.b[t];` | pipe: `FFMA d, kv_col, -UR7(gt), v; FMUL delta, b, d`; step commit: `FFMA d, -g, kv_col, v; FMUL delta, d, beta`: one contracted rounding, then the product | `delta = ieee_mul(ieee_fma_any(-gt, kv_col, v), b)` | yes, material: as `:414` |
-| `:325` [`:250`] | `p.s[r] = fmaf(gt, p.s[r], sk[t][rg * RPG + r] * delta);` | per r: `FMUL p, delta, sk_r; FFMA s_r, s_r, UR7(gt), p` (step commit: `FFMA s_r, g, s_r, p`) | `s[r] = ieee_fma_any(gt, s[r], ieee_mul(sk[rg * RPG + r], delta))` | yes, material: as `:417` |
-| `:327-330` [`:253`] | the state store | `STG` | a store | the stored bits are the state's |
+| `:323` [`:248`] | `const float delta = (p.v[t] - gt * kv_col) * p.b[t];` | pipe: `FFMA d, kv_col, -UR7(gt), v; FMUL delta, b, d`; step commit: `FFMA d, -g, kv_col, v; FMUL delta, d, beta`: one contracted rounding, then the product | `delta = ieee_mul(fma_ieee(sign_flip(gt), kv_col, v), b)`: the negation by the sign bit, which keeps a subnormal `gt` | yes, material: as `:414` |
+| `:325` [`:250`] | `p.s[r] = fmaf(gt, p.s[r], sk[t][rg * RPG + r] * delta);` | per r: `FMUL p, delta, sk_r; FFMA s_r, s_r, UR7(gt), p` (step commit: `FFMA s_r, g, s_r, p`) | `s[r] = fma_ieee(gt, s[r], ieee_mul(sk[t][rg * RPG + r], delta))` | yes, material: as `:417` |
+| `:327-330` [`:253`] | the state store | `STG` | `cuda_nan(s[r])` stored: a NaN, which sm_120's `FFMA` and `FMUL` write as `0x7fffffff` and this GPU's as `0x7fc00000`, as `0x7fffffff` (`nan.md`); every other value keeps its bits | the stored bits are the state's |
 
 No other float instruction acts on data: the `MUFU.RCP` rows of the seg kernel (`:272`, `:280`, `:300`, `:338`,
 `:342`, `:347`) are the unsigned integer divisions of its item and head indices (`I2F.U32.RP`, `MUFU.RCP`,
 `F2I.FTZ.U32.TRUNC`). The state the commit writes is therefore the state the step-norm kernel computes over the same
 kept tokens (`:417`/`:423` against `:325`, the same decay, `kv` chain, contraction and update): a Metal port that
-uses the same helpers in both keeps them bitwise equal, which `dec_commit_parity` checks. The contract lists `:315`
-among the approximate operations to map (`flash-next.md`, invariant 5, the commit replay's decay): `expf_ieee` is that
-mapping with CUDA's non-FTZ subnormal path (section 2).
+uses the same helpers in both keeps them bitwise equal, which `dec_commit_parity` checks. The port's commit and
+`dec_gdn_rec` call the same helpers, and `tests/kernels/test_basalt_dec_commit.py` checks the equality through a
+window run after a commit, which continues the window that ran the kept rows bit for bit (DCM.8). The contract
+lists `:315` among the approximate operations to map (`flash-next.md`, invariant 5, the commit replay's decay):
+`expf_ieee` is that mapping with CUDA's non-FTZ subnormal path (section 2).
 
 ## 8. `ple_hist_seg_kernel`
 

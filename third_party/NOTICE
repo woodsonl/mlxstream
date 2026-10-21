@@ -214,6 +214,11 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   with `gdn_ab_multi_unrolled_kernel` (one kernel) and `gdn_step_norm_multi_kernel` with `gdn_step_norm_body`, written
   in the rounding sequence nvcc compiles for them (`docs/research/basalt-nvcc/dec_gdn.md`,
   `docs/research/basalt-nvcc/verify_gdn.md`). License: `third_party/BASALT-LICENSE`.
+- `kernels/common/basalt_gdn_commit.metal` — adapted from `src/kernels/cuda/verify_kernels.cu:20-22`, `:88-101` and
+  `:265-361` and `include/basalt/kernels/verify_kernels.hpp:21-38` (MIT): `gdn_conv_commit_n`, `commit_pre_load`,
+  `commit_pre_run`, `commit_layers_body` and `gdn_commit_layers_pipe_kernel` on `GdnCommitLayers`' fields, without the
+  next item's prefetch, written in the rounding sequence nvcc compiles for them
+  (`docs/research/basalt-nvcc/verify_gdn.md`). License: `third_party/BASALT-LICENSE`.
 - `monolith/compiler/emit.py` — `_basalt_sample` adapted from `src/kernels/cuda/sampler.cu:887-922` and `:991-1019`
   (MIT): `sample_greedy_cluster`'s and `sample_tokens_probe`'s launches in their order, with their grids (8 threadgroups
   of 1,024 threads a row for the cluster argmax, 1,024 threads for the one-block kernels, 128 for the split part and 32
@@ -240,7 +245,10 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `include/basalt/kernels/dec_gdn.hpp:16-39` (MIT): the GDN window's constants (`GDN_S`, `GDN_MT`, `GDN_THREADS` and
   `GDN_N_EMBD`: `S`, `kDecMaxT`, the cluster's four blocks of `S` threads and `32 * 8 * NJ`) and, in
   `basalt_gdn_params`, host `dec_gdn_rec`'s refusals and the record of its `n_tok` and `DecRecArgs`' `C`, `n_embd`,
-  `h_k`, `h_v` and `eps` (`BsGdnParams`). License: `third_party/BASALT-LICENSE`.
+  `h_k`, `h_v` and `eps` (`BsGdnParams`); from `src/kernels/cuda/verify_kernels.cu:333-336` and `:859-865` and
+  `include/basalt/kernels/verify_kernels.hpp:32-38`, `GdnCommitLayers`' image without its pointers
+  (`basalt_gdn_commit_params`, with the launcher's `n_layers <= 0` as a refusal) and `commit_layers_body`'s item count
+  (`basalt_gdn_commit_grid`). License: `third_party/BASALT-LICENSE`.
 - `monolith/compiler/emit_basalt.py` — adapted from `src/kernels/cuda/native_mmvq.cu:1465-1475`, `:1490-1494`,
   `:1549-1552` and `:1563-1568`, `src/kernels/cuda/dense_tc.cu:1077-1082` and `:1107-1113`,
   `src/kernels/cuda/native_bf16.cu:139-171`, `src/kernels/cuda/iq_kernels.cu:2450-2455` and
@@ -299,6 +307,12 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
 - `tests/basalt_gdn_ref.py`, `tests/kernels/test_basalt_dec_gdn.py` and `tests/kernels/test_basalt_gdn_program.py` —
   adapted from `src/kernels/dec_gdn_parity.cpp` (MIT): its geometry, layer and segment fixtures, `cpu_seg`, `max_err`,
   pre-fills and pass criteria. License: `third_party/BASALT-LICENSE`.
+- `tests/kernels/test_basalt_dec_commit.py` and `tools/bench/basalt_gdn_commit.py` — adapted from
+  `src/kernels/dec_commit_parity.cpp` (its geometry and GDN fixture, `set_commit`'s record, the threadgroup counts, the
+  GDN half's criterion and `bench`'s block sweep), `src/kernels/dec_gdn_parity.cpp:370-407` and `:504-551`
+  (`cpu_commit`, `parity_seg`'s commit inputs and the `es < 1e-3` bound) and
+  `src/kernels/cuda/verify_kernels.cu:296-330` (`commit_pre_run`'s order of operations, which the test's `commit_f32`
+  transcribes) (MIT). License: `third_party/BASALT-LICENSE`.
 - `tests/kernels/basalt_emu.py` — adapted from `src/kernels/cuda/native_mmvq.cu`, `src/kernels/cuda/iq_kernels.cu`,
   `src/kernels/cuda/native_bf16.cu`, `src/kernels/cuda/dense_tc.cu`, `src/kernels/cuda/dec_gdn_rec.cu`,
   `src/kernels/cuda/verify_kernels.cu` and `include/basalt/kernels/q8_1_finite.hpp` (MIT): the iteration traits, and
