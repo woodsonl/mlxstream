@@ -349,8 +349,15 @@ No float arithmetic touches the data.
 `dec_gdn_parity` (`src/kernels/dec_gdn_parity.cpp:1-17`) runs `gdn_conv_l2_multi`, `gdn_ab_multi` and
 `gdn_step_norm_multi` as the reference (`:184-188` of that file, `qk_heads = 2 * HK`) and requires every output the
 fused path writes (h, gate, beta, the q8_1 of y, the out projection) to match bit for bit (`memcmp`, `:244-263`), at
-T = 1..8, each column equal to the same column of an eight-token window, the state untouched (`:297`). Its
-activations and state are random normal values, so the test never reaches the subnormal paths. The comparison below
+T = 1..8, each column equal to the same column of an eight-token window, the state untouched (`:297`). Its x and state
+are random normal values, but qkv and z, which the kernels read, are `native_mmvq` products of random GGUF bytes with
+normal fp16 scales (that file's `:78-93`, `:127-128`, `:181`, `:187`), so they can reach the subnormal paths. [M] On the
+port's draws of these distributions (`tests/kernels/test_basalt_dec_gdn.py`'s `gdnf_case` at T = 8, max |qkv| 1.1e3 to
+5.3e3 per combo), 120-278 h values per combo are subnormal, all on q and k channels, where the L2 scale (`:53`) takes a
+normal SiLU output (2.6e-37 to 1e-34) below 2^-126; and 50-349 y values are subnormal, with 11-138 z per combo in
+(-88.72, -87.34), where the sigmoid factor (`:441`) is subnormal (combo 1's z is a Q3_K product where basalt's is
+IQ3_S). [H] basalt's own draws, from the same distributions, reach them too. `parity_seg`'s qkv, z and x are random
+normal (`dec_gdn_parity.cpp:437-438`). The comparison below
 reads `dec_gdn_rec`'s own compile, the same compiler and flags (`dec_gdn_rec.cu` builds with the IEEE defaults too,
 `CMakeLists.txt:162`): `.context/gdn/nvcc/nvcc130/rec_kernel_2.sass.txt` and `.ptx.txt` (`rec_kernel<2>` and
 `rec_norm_kernel`), and `dec_gdn.md`'s record of that compile (cited as `dec_gdn.md` §n, its section and the
@@ -397,7 +404,8 @@ as sections 3 to 7 assign them, and `fma()` at exactly the three contractions ab
 
 The two pages agree on every compiled sequence. Their Metal columns differ at four points, which the plan settles
 once for both kernels: a Metal port whose fused and per-stage kernels took different helpers at a shared site would
-give different bits wherever a subnormal is reached, though not on `dec_gdn_parity`'s random normal data.
+give different bits wherever a subnormal is reached, and `dec_gdn_parity`'s inputs reach one at shared sites (above: h
+at the L2 scale, `:53`, and the sigmoid factor of y, `:441`, at point 2's logits in (-88.72, -87.34)).
 
 1. `__expf` where `1.0f + e` follows (`rec.cu:65`, `:109`, `:120` against `:46`, `:76`, `:151`, `:206`, `:441`):
    `dec_gdn.md` §6b writes `expf_neg`, this page `expf_ieee`. The bits are the same there (a subnormal `e` vanishes in
