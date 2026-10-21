@@ -53,8 +53,14 @@ gates it only through the products:
   (whole, and the down copy's rows [102, 204) and [306, 320)) and on a special copy whose groups have the scales
   0x0000, the fp16 subnormals 0x0001 and 0x0155, the largest finite 0x7bf8 and 0x7c00, whose 32 products 0 * inf
   store 0x7fff (sm_120's NaN), the only non-finite values; the output binding is exactly the image, then a guard of
-  0xFF values past it survives."""
+  0xFF values past it survives.
+- GM-COMP (copy): ``gpu.prompt_gemm_copy`` (the image, then the BF16 product, in one queue run) on the three copies at
+  37 rows, bitwise equal to the BF16 product on GM-DQ8's host image of the same copy.
+- GM-X (HC8-7) and GM-B (HC8-8): hc8_parity part 2's gates at its five shapes (:217-223) on its draws, the copy
+  entry against the copy's exact values in double (rel_norm under :269's 5e-3 on the 256 sampled outputs, and on
+  every output) and against the BF16 entry on the BF16 matrix (under :270's 5e-2)."""
 
+import functools
 import itertools
 
 import numpy as np
@@ -64,7 +70,7 @@ from monolith import kernels
 from monolith.formats.fp import bf16_to_f32
 from monolith.formats.gguf import GGML_TYPES
 from monolith.packs.basalt_hc8 import quantize
-from tests.basalt_hc_ref import hc8_parity_matrices
+from tests.basalt_hc_ref import dequant_copy, hc8_parity_matrices
 from tests.contract import gguf_reference
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu
@@ -364,13 +370,30 @@ def test_repeats_are_bit_identical():
         f"2560, B 37): {differ(again, y)}, {np.count_nonzero(image2 != image)} image halves differ")
 
 
-@pytest.mark.parametrize("t", kernels.DEQUANT16_TYPES, ids=lambda t: GGML_TYPES[t][0])
+@pytest.mark.parametrize("t", kernels.DEQUANT16_TYPES + ("copy",),
+                         ids=lambda t: t if t == "copy" else GGML_TYPES[t][0])
 def test_two_stage_product_is_the_product_on_the_image(t):
     """GM-COMP: gpu.native (basalt_dequant_g32 at DQ_OUT 1, then the product at GEMM_BF16 0) of fp16 activations by
     test_basalt_mmvq's ``weights`` blocks (random bytes, every fp16 scale field a normal of magnitude in [2^-10,
     2^-5)) of GGUF type ``t`` at (64, 2560), B 37, against the FP16 product on the host's image of the same blocks,
     emu.cuda_half_bits(gguf_reference.dequantize(t, blocks)) (asserted live: finite, one output nonzero). Both sides
-    run the one product kernel at one (N, K, B), so equality needs GM-REPEAT's determinism alone."""
+    run the one product kernel at one (N, K, B), so equality needs GM-REPEAT's determinism alone. ``copy``
+    (Gemm::bf16_w, gemm.cu:134-154): gpu.prompt_gemm_copy (basalt_hc8_dequant_bf16 over the whole copy, then the
+    product at GEMM_BF16 1, in one queue run) of BF16 activations N(0, 1) by each of ``hc8_copies``, B 37, against the
+    BF16 product on GM-DQ8's host image of the same copy, ``host_image(q, s)`` (asserted live)."""
+    if t == "copy":
+        rng = np.random.default_rng(89)
+        for name, (_, q, s) in hc8_copies().items():
+            (n, k), B = q.shape, 37
+            xb, host = emu.bf16_bits(rng.standard_normal((B, k), dtype=F32)), host_image(q, s)
+            want = gpu.prompt_gemm(xb, host, bf16=True, B=B)
+            assert np.isfinite(want.view(F32)).all() and np.count_nonzero(want), f"a vacuous reference ({name})"
+            y, image = gpu.prompt_gemm_copy(xb, q, s)
+            assert np.array_equal(y, want), (
+                "port: the copy entry (basalt_hc8_dequant_bf16, then GEMM_BF16 1) bitwise equal to the BF16 product on "
+                f"GM-DQ8's host image bits, host_image(q, s) ({name} copy N {n} K {k}, B {B}): {differ(y, want)}; "
+                f"{np.count_nonzero(image != host)} image values differ from the host's")
+        return
     n, k, B = 64, 2560, 37
     rng = np.random.default_rng((83, t))
     blocks, xb = weights(t, k, n, rng), emu.half_bits(rng.standard_normal((B, k)).astype(F32))
@@ -423,6 +446,14 @@ def test_to_f16_is_the_conversion():
 
 # ---- Gemm::bf16_w's first stage: the BF16 image of an int8 hyper-connection copy (basalt_prompt_hc8.metal) ----------
 
+@functools.lru_cache(maxsize=None)
+def hc8_copies():
+    """hc8_parity's three matrices as BF16 bits (tests/basalt_hc_ref.py's hc8_parity_matrices(seed=7)) with their
+    copies (the hc lane's ``quantize``): {name: (w, q, s)} for down, up and inject. Shared by the tests: never
+    written."""
+    return {name: (w, *quantize(w)) for name, w in zip(("down", "up", "inject"), hc8_parity_matrices(seed=7))}
+
+
 def host_image(q, s):
     """GM-DQ8's reference: the BF16 image of the copy with codes ``q`` (int8 bit patterns [rows, cols]) and scales
     ``s`` (fp16 bits [rows, srow]) as bits, uint16 [rows, cols]: bf16_bits(f32(q) * f32(f16 s)) per element (the
@@ -468,7 +499,7 @@ def test_hc8_image_bits():
     ``special_copy`` whole; then on ``special_copy`` with a guard of 2048 values past the image (the reach of the
     threadgroup's 220 idle threads), whose 0xFF bytes must survive. No image value is non-finite but the 0x7c00 group's
     32 NaNs, 0x7fff each. The fixtures' coverage is asserted first, so no special case passes vacuously."""
-    copies = dict(zip(("down", "up", "inject"), (quantize(w) for w in hc8_parity_matrices(seed=7))))
+    copies = {name: (q, s) for name, (_, q, s) in hc8_copies().items()}
     copies["special"] = special_copy()
     (qd, sd), (qx, sx) = copies["down"], copies["special"]
     k = np.arange(64)
@@ -501,3 +532,68 @@ def test_hc8_image_bits():
             f"non-finite; the 0xFF past n * cols kept ({name} rows [{row0}, {row0 + n}), guard {guard}): "
             f"{np.count_nonzero(img != ref)} values differ, {np.count_nonzero(nf)} non-finite where "
             f"{np.count_nonzero(nan)} are 0x7fff, {np.count_nonzero(tail != 0xFFFF)} guard values written")
+
+
+# ---- Gemm::bf16_w's product on the copies: hc8_parity part 2 (src/kernels/hc8_parity.cpp:209-275) -------------------
+
+# Part 2's shapes in its order (:217-223) as (T, the copy): hc down 512 x 320 x 10240, hc up 512 x 10240 x 320, inject
+# 512 x 4 x 10240, hc down 37 x 320 x 10240, hc up 1 x 10240 x 320 (T x N x K).
+PART2 = ((512, "down"), (512, "up"), (512, "inject"), (37, "down"), (1, "up"))
+PART2_IDS = [f"{name}-T{t}" for t, name in PART2]
+
+
+@functools.lru_cache(maxsize=None)
+def part2_draws():
+    """Part 2's draws for each of PART2's shapes, in its order: the activations x, the BF16 bits [T, K] of float32 N(0,
+    1) draws (:233-236), then the 256 sample pairs, each t drawn before its n (:253-255); [(x, ts, ns)]. One
+    default_rng(7) stream, first advanced past hc8_parity_matrices' three draws, as basalt's one mt19937(7) draws the
+    matrices before X (:80-84): a fresh default_rng(7) would repeat w_down's normals in the first 320 rows of the down
+    shape's x (x[t] about 50 w_down[t]: y[t][t] near 205 against at most about 10 elsewhere, a 20x laxer bound)."""
+    rng = np.random.default_rng(7)
+    for shape in ((320, 10240), (10240, 320), (4, 10240)):       # hc8_parity_matrices' draws, in its order
+        rng.standard_normal(shape, dtype=F32)
+    out = []
+    for t, name in PART2:
+        n, k = hc8_copies()[name][1].shape
+        x = emu.bf16_bits(rng.standard_normal((t, k), dtype=F32))
+        tn = np.array([(rng.integers(t), rng.integers(n)) for _ in range(256)])
+        out.append((x, tn[:, 0], tn[:, 1]))
+    return out
+
+
+@pytest.mark.parametrize("i", range(len(PART2)), ids=PART2_IDS)
+def test_hc8_product_against_the_copy_in_double(i):
+    """HC8-7, GM-X (src/kernels/hc8_parity.cpp:253-262, :269): the copy entry's y (gpu.prompt_gemm_copy: the image,
+    then the product in the handler's slices) against the copy's exact values in double, x64 @ dequant_copy(q, s).T
+    (q * f16(s), not the BF16 image the product multiplies), emu.rel_norm (:57-61's Err) on part 2's 256 sampled
+    outputs, as basalt gates it, and (the port's addition) on every output, each below 5e-3; no output non-finite.
+    Prints the measured values."""
+    (t, name), (x, ts, ns) = PART2[i], part2_draws()[i]
+    _, q, s = hc8_copies()[name]
+    n, k = q.shape
+    y = gpu.prompt_gemm_copy(x, q, s)[0].view(F32)
+    exact, x64 = dequant_copy(q, s, k), bf16_to_f32(x).astype(np.float64)
+    rel = emu.rel_norm(y[ts, ns], np.einsum("ij,ij->i", x64[ts], exact[ns]))
+    rel_all, bad = emu.rel_norm(y, x64 @ exact.T), np.count_nonzero(~np.isfinite(y))
+    print(f"GM-X {name} T {t} N {n} K {k}: rel_norm {rel:.3e} on the 256 samples, {rel_all:.3e} on every output")
+    assert bad == 0 and rel < 5e-3 and rel_all < 5e-3, (
+        'hc8_parity.cpp:269: expect(ex.rel() < 5e-3, "the product against the copy in double"); on its 256 sampled '
+        f"outputs, and (port) on every output ({name} T {t} N {n} K {k}): rel_norm {rel:.3e} on the samples, "
+        f"{rel_all:.3e} on every output, {bad} not finite")
+
+
+@pytest.mark.parametrize("i", range(len(PART2)), ids=PART2_IDS)
+def test_hc8_product_against_bf16(i):
+    """HC8-8, GM-B (src/kernels/hc8_parity.cpp:244-245, :250-252, :270): y1, the copy entry's y
+    (gpu.prompt_gemm_copy), against y0, the BF16 entry's on the BF16 matrix the copy was made from (gpu.prompt_gemm),
+    y0 the reference (eb.add(y1[...], y0[...])), emu.rel_norm over every output below 5e-2: the copy's quantization
+    error; no output of either non-finite. Prints the measured value."""
+    (t, name), (x, _, _) = PART2[i], part2_draws()[i]
+    w, q, s = hc8_copies()[name]
+    n, k = q.shape
+    y1, y0 = gpu.prompt_gemm_copy(x, q, s)[0].view(F32), gpu.prompt_gemm(x, w, bf16=True, B=t).view(F32)
+    rel, bad = emu.rel_norm(y1, y0), np.count_nonzero(~np.isfinite(y1)) + np.count_nonzero(~np.isfinite(y0))
+    print(f"GM-B {name} T {t} N {n} K {k}: rel_norm {rel:.3e}")
+    assert bad == 0 and rel < 5e-2, (
+        'hc8_parity.cpp:270: expect(eb.rel() < 5e-2, "the product against bf16"); over every output '
+        f"({name} T {t} N {n} K {k}): rel_norm {rel:.3e}, {bad} not finite")
