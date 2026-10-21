@@ -4,6 +4,7 @@ params and written slots) equal to monolith/kernels.py's builders, and each refu
 defect refused by that defect's own check (its message). The GPU side is tests/kernels/test_basalt_ops_program.py."""
 
 import json
+import struct
 
 import numpy as np
 import pytest
@@ -171,7 +172,8 @@ def test_registered_and_covered(src):
 def test_grid_builders_are_the_launchers():
     """The q8_1 and BF16 grid builders against the harness's own formulas (tests/kernels/basalt_gpu.py); the write's
     against basalt's ``blocks`` of 256 threads over T tokens' elements (native_gr_postops.cu:83, :111), and its record
-    refusing a dimension of 0 (``check_shape``, :79-82)."""
+    refused by each arm alone, ``check_shape``'s two (a dimension of 0, n_embd * hc past INT_MAX; :79-82) and the
+    port's 32-bit element bound (T * hc * n_embd at 2^32), and accepted at INT_MAX and at the last T below 2^32."""
     for n in (32, 256, 2560, 8 * 23040):
         assert kernels.basalt_q8_1_grid(n) == (-(-n // 256), 256)
     for n_in, n_out, t in ((2560, 128, 1), (2560, 1, 5), (640, 7, 8)):
@@ -179,8 +181,11 @@ def test_grid_builders_are_the_launchers():
         assert kernels.basalt_mmvf_grid(m, n_out) == (n_out, kernels.basalt_mmvf_block(n_in))
     assert [kernels.basalt_gr_post_grid(n, 4, t) for n, t in ((2560, 1), (2560, 8), (100, 3))] == \
         [(40, 256), (320, 256), (5, 256)]
-    with pytest.raises(ValueError, match=r"unsupported shape \(n_embd 2560, hc 0, T 1\)"):
-        kernels.basalt_gr_post_params(2560, 0, 1)
+    for n, hc, t in ((2560, 0, 1), (0, 4, 1), (2 ** 16, 2 ** 15, 1), (2 ** 20, 2 ** 10, 4)):
+        with pytest.raises(ValueError, match=rf"unsupported shape \(n_embd {n}, hc {hc}, T {t}\)"):
+            kernels.basalt_gr_post_params(n, hc, t)
+    for n, hc, t in ((2 ** 31 - 1, 1, 1), (2 ** 20, 2 ** 10, 3)):
+        assert kernels.basalt_gr_post_params(n, hc, t) == struct.pack("<IIII", n, hc, t, 0)
 
 
 def expected(gop, src, t):
