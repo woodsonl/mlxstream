@@ -23,6 +23,8 @@ none), each kind seeing the classes on its inputs:
   meets the tie).
 - token 3: E1, an all-zero r row (stream 0: rs = fast::rsqrt(1e-6)), with E5's inj (-352, -400, 100, -100): -352 / 4
   = -88 has a subnormal sigmoid, -400 / 4 = -100 a zero one; gated -88 and -100 on all four streams of columns 0 and 1.
+- token 4: E9, r = copysign(0, -w) at column ``E9_D`` (100) of every stream, so x = fl(fl(r rs) w) is -0 on all four
+  (rs > 0) and so is each of the mix's products x sigm(gated): its stores there show the chain's seed.
 
 gr_parity's bounds are the nearest bound; no basalt test launches these kernels (gr_parity gates decode's gr_read and
 gr_write). Its metrics, rel_diff (normalised L1, the reference first) and rel_terms (per element, against the terms'
@@ -53,7 +55,8 @@ Both run on the fixture without edge tokens at 1, 7 and 256 live rows and print 
   subnormal sigmoid), silu's in token 0's columns 8-11 (E7; its E2 words are BF16 zeros either way), write's and
   write_norm's in R' (and write_norm's xn16) at token 0's columns 5-6 (E2) and token 3's stream 0 (E5: inj -352, a
   subnormal sigmoid whose double is normal, on E1's zero row, so R' = fl(bo sc)), and write_norm's in token 2's
-  stream-1 rs (E6).
+  stream-1 rs (E6). A -0 seed for the mix's chain fails on E9: the twin's words at token 4's column 100 are +0, the
+  chain from -0 gives -0 (0x80000000, 0x8000, 0x8000).
   ``test_hc_probe_specials`` (K1): the probe's fast::rsqrt and expf_ieee(sign_flip(x)) on the specials match
   PTX's documented rsqrt.approx and ex2.approx: rsqrt(+inf) = +0, rsqrt(NaN) NaN, exp_neg(+inf) = +0, exp_neg(-100)
   and exp_neg(-inf) +inf, exp_neg(NaN) NaN.
@@ -78,6 +81,7 @@ B, N, LR = 256, 2560, 320
 EPS = F32(1e-6)              # the handler's HC_EPS, 0x358637BD (prompt_hc's)
 E6_S = 1.0                   # E6's s: twins' rs 0x424a13f8 (IEEE) vs 0x424a13f9 (flush) on the M3 Max; 2^-4 ties them
 E8_NAN = 0x7FA00001
+E9_D = 100                   # E9's column (token 4): four -0 products, which pin gr_mix_r's +0 seed
 WORD = {4: np.uint32, 2: np.uint16}
 RSQRT, EXP_NEG = (partial(gpu.hc_probe, fn) for fn in ("rsqrt", "exp_neg"))   # the GPU's approximate operations
 NEAREST = "nearest bound; no basalt test launches this kernel: gr_parity.cpp"   # HC-1's and HC-2's gates (ER-D5)
@@ -109,8 +113,8 @@ def fixture(edges=True):
 
 
 def plant(d):
-    """E1-E8 (the module docstring's map) in ``d``'s rows, in place."""
-    r, gated, lo, bo, e, inj = (d[k] for k in ("r", "gated", "lo", "bo", "e", "inj"))
+    """E1-E9 (the module docstring's map) in ``d``'s rows, in place."""
+    r, w, gated, lo, bo, e, inj = (d[k] for k in ("r", "w", "gated", "lo", "bo", "e", "inj"))
     for c in range(4):                                                    # token 0: E2 on every stream of r, gated
         r[0, c * N + 5: c * N + 7] = gated[0, c * N + 5: c * N + 7] = (1e-40, 1e-36)
     lo[0, 5:7] = bo[0, 5:7] = e[0, 5:7] = (1e-40, 1e-36)                  # E2
@@ -125,6 +129,7 @@ def plant(d):
     inj[3] = (-352, -400, 100, -100)                                      # E5
     for c in range(4):
         gated[3, c * N: c * N + 2] = (-88, -100)
+        r[4, c * N + E9_D] = np.copysign(F32(0), -w[c * N + E9_D])      # token 4: E9, x = -0 on every stream
 
 
 def alone(d, t):
@@ -266,6 +271,18 @@ def test_hc_twin(kind):
             "E2: no output word of token 0's columns 5-6 differs from a flushing kernel's"
         assert any(f[3, 0] != i[3, 0] for f, i in zip(flushed, want)), \
             "E5: no output word of token 3's column 0 (gated -88) differs from a flushing kernel's"
+        cols = np.arange(4) * N + E9_D            # E9: four -0 products, so the chain's seed decides the sign
+        x = np.multiply(np.multiply(d["r"][4, cols], d["rs"][4]), d["w"][cols])     # hc_mix's x, stream by stream
+        sg = emu.hc_sigm(d["gated"][4, cols], EXP_NEG)
+        assert (np.multiply(x, sg).view(np.uint32) == 0x80000000).all(), "E9: a product at token 4's column 100 not -0"
+        s = np.array([-0.0], F32)                 # the same chain from -0 (or from an unfused first product)
+        for c in range(4):
+            s = emu.fma32(x[c: c + 1], sg[c: c + 1], s)
+        s = np.multiply(s, F32(0.25))
+        neg = [emu.hc_bits(s)[0], emu.bf16_bits(emu.hc_bits(s).view(F32))[0], emu.cuda_half_bits(s)[0]]
+        seed = "the +0 seed (FFMA R0, R0, R3, RZ; kernels.cu:109, :114): a -0 seed would store -0"
+        assert [int(w[4, E9_D]) for w in want] == [0, 0, 0], f"E9: {seed}"
+        assert [int(v) for v in neg] == [0x80000000, 0x8000, 0x8000], f"E9: {seed}, and here it does not"
     if kind == "silu":                            # a flushing kernel fails on E7 (token 0, columns 8-11)
         flushed = twin(kind, d, flush=True)
         assert (flushed[0][0, 8:12] != want[0][0, 8:12]).any(), \
