@@ -335,3 +335,128 @@ def test_prompt_hc_covered_and_emits(src, dynamic, t):
         prm = o.bindings[-2][1]
         assert o.bindings == [(s, v, 0) for s, v in enumerate(values) if v] + [(7, prm, 0), (15, prog.step_state, 0)]
         assert (prog.buffers[prm].role, prog.buffers[prm].init) == ("params", kernels.basalt_prompt_hc_params(0)), kind
+
+
+def hc_op(g, kind, rows=T, n=HC_N, lr=HC_LR, cols=None, dtype=(), outs=3, eps=1e-6, w=None):
+    """One op of ``basalt_prompt_hc_<kind>`` over fresh inputs at ``rows`` rows: hc_graph's shapes and dtypes at the
+    defaults, or one defect: streams of ``n`` values (silu: rows of ``lr``), ``r`` of ``cols`` columns, ``dtype`` =
+    ``(output, dtype)`` for one output, a mix of ``outs`` outputs (1 to 4), the attr ``eps`` (None: absent), or the
+    norm weights ``w`` = ``(shape, dtype)``."""
+    bad = dict([dtype]) if dtype else {}
+
+    def inp(name, c):
+        return g.input(name, (rows, c), F32)
+
+    def out(name, c, dt=F32):
+        return g.value(name, (rows, c), bad.get(name, dt))
+
+    def weights(name, shape):
+        return g.input(name, *(w or (shape, F32)))
+
+    r = cols or 4 * n
+    if kind == "broadcast":
+        ins, os = [inp("e", n)], [out("r", r)]
+    elif kind == "norm":
+        ins, os = [inp("r", r), weights("w", (4 * n,))], [out("rs", 4), out("xn", 4 * n, BF16)]
+    elif kind == "silu":
+        ins, os = [inp("lo", lr)], [out("lo16", lr, BF16)]
+    elif kind == "mix":
+        ins = [inp("r", r), inp("rs", 4), weights("w", (4 * n,)), inp("gated", 4 * n)]
+        names = {1: ["mixed"], 2: ["mixed", "mixed_h"], 3: ["mixed", "mixed_bf", "mixed_h"],
+                 4: ["mixed", "mixed_bf", "mixed_h", "mixed_x"]}[outs]
+        os = [out(m, n, {"mixed_bf": BF16, "mixed_h": F16}.get(m, F32)) for m in names]
+    elif kind == "write":
+        ins, os = [inp("r", r), inp("bo", n), inp("inj", 4)], [out("r2", 4 * n)]
+    else:
+        ins = [inp("r", r), inp("bo", n), inp("inj", 4), weights("w_next", (1, 4 * n))]
+        os = [out("r2", 4 * n), out("rs", 4), out("xn", 4 * n, BF16)]
+    attrs = {"eps": eps} if kind in ("norm", "write_norm") and eps is not None else {}
+    op(g, f"basalt_prompt_hc_{kind}", ins, os, **attrs)
+
+
+STREAMS = ("broadcast", "norm", "mix", "write", "write_norm")      # the kinds with streams (silu has none)
+OTHER = {F32: F16, BF16: F16, F16: BF16}                          # a wrong dtype for each output dtype
+OUT_DTYPES = [("broadcast", "r", F32), ("norm", "rs", F32), ("norm", "xn", BF16), ("silu", "lo16", BF16),
+              ("mix", "mixed", F32), ("mix", "mixed_bf", BF16), ("mix", "mixed_h", F16), ("write", "r2", F32),
+              ("write_norm", "r2", F32), ("write_norm", "rs", F32), ("write_norm", "xn", BF16)]
+EPS_BAD = [("nan", float("nan")), ("0", 0.0), ("1e-45", 1e-45), ("2^-103", 2.0 ** -103), ("absent", None)]
+
+# (id, kind, the valid op's arguments, the defective op's, the refusal's message)
+HC_REFUSALS = [
+    # every stream kind: the file compiles only at HC_N >= 256 (gr_write_norm_rs's v[HC_N / 256]), so 256 is the least
+    *[(f"{k} streams below 256", k, {"n": 256}, {"n": 252}, "streams of 252 values; the hyper-connection kernels take "
+       "at least 256") for k in STREAMS],
+    *[(f"{k} streams not whole sweeps", k, {}, {"n": 2564}, "streams of 2564 values are not whole sweeps of 256 "
+       "threads") for k in ("norm", "write_norm")],
+    *[(f"{k} streams not a multiple of 4", k, {}, {"n": 2562}, "streams of 2562 values, not a multiple of 4")
+      for k in ("mix", "write", "broadcast")],
+    ("silu rows not a multiple of 4", "silu", {}, {"lr": 322}, "rows of 322 values, not a positive multiple of 4"),
+    ("silu rows of no values", "silu", {"lr": 4}, {"lr": 0}, "rows of 0 values, not a positive multiple of 4"),
+    # broadcast's n is the embedding's, so five streams of it; the others take n from r: columns not a multiple of 4
+    *[(f"{k} r not four streams", k, {}, {"cols": 5 * HC_N if k == "broadcast" else 4 * HC_N + 2},
+       r"'r' has \d+ columns, not four streams of 2560 \(basalt's HC = 4\)") for k in STREAMS],
+    ("norm w as BF16", "norm", {}, {"w": ((4 * HC_N,), BF16)}, r"'w' is bf16 \[10240\], not 10240 f32 values"),
+    *[(f"{k} {v} as {OTHER[dt]}", k, {}, {"dtype": (v, OTHER[dt])}, rf"'{v}' is {OTHER[dt]} \[2, \d+\], not {dt} ")
+      for k, v, dt in OUT_DTYPES],
+    *[(f"mix of {c} outputs", "mix", {}, {"outs": c}, f"4 inputs and {c} outputs; it takes 4 inputs and 2 or 3 outputs")
+      for c in (1, 4)],
+    # the least eps accepted is 2^-102 (the row norm's plain / and + give IEEE's bits from there up)
+    *[(f"{k} eps {name}", k, {"eps": 2.0 ** -102}, {"eps": e}, r"attr eps must be a finite float32 of at least 2\^-102")
+      for k in ("norm", "write_norm") for name, e in EPS_BAD],
+    *[(f"{k} rows from n_inject", k, {}, {"rows": N_INJ}, r"has the rows n_inject \(T_SRC 1\)")
+      for k in ("broadcast", "norm", "silu", "mix", "write", "write_norm")],
+    # the kernels index in 32 bits: B * 4n <= 2^32 - 256 (419430 * 10240 = 2^32 - 4096; 419431 rows overflow)
+    ("norm past 32-bit indices", "norm", {"rows": 419430}, {"rows": 419431},
+     "419431 rows of 10240 values overflow the kernels' 32-bit indices"),
+]
+
+
+@pytest.mark.parametrize("kind, good, bad, why", [r[1:] for r in HC_REFUSALS], ids=[r[0] for r in HC_REFUSALS])
+def test_prompt_hc_refusals(src, kind, good, bad, why):
+    """HC-6's refusals, one case each: the op of ``kind`` emits with ``good``, and the same op with ``bad`` instead,
+    its one defect, is refused by that defect's own check (its message)."""
+    for args in (good, bad):
+        g = Graph("step")
+        hc_op(g, kind, **args)
+        if args is good:
+            emit(g, src, 2)
+            continue
+        with pytest.raises(ValueError, match=why):
+            emit(g, src, 2)
+
+
+@pytest.mark.parametrize("dynamic", [True, False], ids=["dynamic", "static"])
+def test_prompt_hc_per_step_values_stay_out_of_params(src, monkeypatch, dynamic):
+    """HC-6, invariant 4: the program compiled at bound B serves every chunk, so a hyper-connection dispatch's macros
+    are exactly the rows' (STEP_STATE, T_SRC, ROWS_MAX, and T_STATIC_ROWS in a static program) and the op's shapes'
+    (HC_N, HC_LR, HC_EPS, MIX_BF), and its one params record, at slot 7, holds only its slice's first row, a
+    compile-time value. With PROMPT_HC_ROWS at 64, B = 256 gives each op four dispatches, of rows 0, 64, 128 and 192,
+    each with a 64-row grid and StepState at slot 15, which differ only in that record; two emits are byte-identical."""
+    monkeypatch.setattr(kernels, "PROMPT_HC_ROWS", 64)
+    layout = StepStateLayout(t_max=256)
+    progs = []
+    for _ in range(2):
+        g = Graph("step")
+        hc_graph(g)
+        progs.append(emit(g, src, 256, dynamic_t=dynamic, layout=layout))
+    assert progs[0].to_json() == progs[1].to_json()
+    prog = progs[0]
+    keys = {"STEP_STATE", "T_SRC", "ROWS_MAX", "HC_N", "HC_LR", "HC_EPS", "MIX_BF"} | (set() if dynamic else
+                                                                                     {"T_STATIC_ROWS"})
+    kinds = ("broadcast", "norm", "silu", "mix", "mix", "write_norm", "write")             # hc_graph's ops, in order
+    # a 64-row slice: 4 * 64 threadgroups for the two row kernels, 64 * width / 256 for the element kernels
+    grids = {"broadcast": 64 * 4 * HC_N // 256, "norm": 4 * 64, "silu": 64 * HC_LR // 256, "mix": 64 * HC_N // 256,
+             "write_norm": 4 * 64, "write": 64 * 4 * HC_N // 256}
+    assert len(prog.ops) == 4 * len(kinds)
+
+    def but_record(o):
+        return o.kernel, [b for b in o.bindings if b[0] != 7], o.threadgroup, o.meta["writes"]
+
+    for i, o in enumerate(prog.ops):
+        kind, row0 = kinds[i // 4], 64 * (i % 4)
+        assert o.name.startswith(f"basalt_prompt_hc_{kind}:") and o.grid == (grids[kind], 1, 1), o.name
+        assert set(prog.kernels[o.kernel].macros) == keys, o.name
+        assert [(s, off) for s, b, off in o.bindings if prog.buffers[b].role == "params"] == [(7, 0)], o.name
+        assert record(prog, o) == struct.pack("<I", row0), o.name
+        assert [b for b in o.bindings if b[0] == 15] == [(15, prog.step_state, 0)], o.name
+        assert but_record(o) == but_record(prog.ops[i - i % 4]), o.name
