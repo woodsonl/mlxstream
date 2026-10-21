@@ -1,5 +1,6 @@
 """basalt's prompt-path op kinds (monolith/ops/basalt_prompt.py) as compiler/emit_basalt_prompt.py emits them over the
-synthetic .basalt file of tests/contract/test_basalt_ops.py: both kinds registered and covered; every dispatch equal to
+synthetic .basalt file of tests/contract/test_basalt_ops.py: every kind registered and covered (the GEMM's two and
+the six hyper-connection kinds, HC-6); every dispatch equal to
 monolith/kernels.py's builders (function, macros, source, grid, threadgroup, params, written slot), with StepState bound
 at slot 15 and the row macros of the program's form (prompt_rows); no per-step value in a params record (invariant 4);
 the GEMM's static slices tiling every product once; Gemm::native's dequantization into the program's one FP16 scratch
