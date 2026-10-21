@@ -5,10 +5,11 @@
 # src/core/model_file.cpp:487-513 (hc8_read), src/kernels/hc8_parity.cpp:69-99 (hc8_parity's matrices),
 # src/kernels/gr_parity.cpp:136-156 (gr_parity's metrics), :433-454, :621-623, :675 (its write fixture), :679-688
 # (its double write), src/kernels/router_top10_parity.cpp:33-60 (its router reference), :87-88 (its weight metric),
-# :119-146 (its fixtures) and src/kernels/cuda/native_gr_postops.cu:65-74 (native_gr_post's arithmetic) @
-# b4c63b55754637f4c72ad53a0f791d425f71eb36, the last of which adapts ggml-org/llama.cpp
-# ggml/src/ggml-cuda/{dsv4-hc.cu,scale.cu,unary.cu,unary.cuh} @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT;
-# third_party/NOTICE).
+# :119-146 (its fixtures), src/kernels/cuda/native_gr_postops.cu:65-74 (native_gr_post's arithmetic) and
+# src/kernels/cuda/native_router.cu:46-100 (route, emulated) @ b4c63b55754637f4c72ad53a0f791d425f71eb36:
+# native_gr_post adapts ggml-org/llama.cpp ggml/src/ggml-cuda/{dsv4-hc.cu,scale.cu,unary.cu,unary.cuh} and route
+# adapts ggml-org/llama.cpp ggml/src/ggml-cuda/{topk-moe.cu,common.cuh}, both @
+# 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
 """Host references of basalt's hyper-connection unit for the port's tests: numpy only, no Metal, imported by every tier
 like ``tests/moe_synth.py``. Each is a transcription of basalt's source written apart from the code it checks, so the
 two cannot share a mistake.
@@ -28,6 +29,10 @@ two cannot share a mistake.
 * ``router_reference``, ``near_tie_guard``, ``rel_w``, ``router_cases``: router_top10_parity's double reference of the
   router's softmax and top 10 (``RENORM_CLAMP`` its floor), the guard that keeps near-ties out of its fixtures, its
   weight metric, and its four fixtures, drawn with numpy.
+* ``top10_emulation``: ``route`` (``src/kernels/cuda/native_router.cu:46-100``) as kernels/common/basalt_router.metal
+  computes it, every operation ``.FTZ`` through ``tests/kernels/basalt_emu.py``'s helpers, the exponential the
+  caller's; ``planted_rows``: the router's planted tokens (ties, signed zeros and subnormals, flushed exponentials and
+  products, overflows, infinities and NaNs).
 """
 
 import struct
@@ -234,3 +239,109 @@ def router_cases(seed=2024, nt=64, ne=512):     # router_top10_parity.cpp:119-14
     dom = np.zeros((nt, ne), np.float32)
     dom[np.arange(nt), np.arange(nt) % ne] = 20.0                           # "dominant expert" (:143-146)
     return {"random normal": rand, "all equal (ties)": equal, "12-way exact tie": tie12, "dominant expert": dom}
+
+
+FLT_MAX = np.finfo(np.float32).max
+
+
+def top10_emulation(logits, expf):                       # route, native_router.cu:46-100, as basalt_router.metal has it
+    """``route``'s top-10 of ``logits [n, 512]`` (float32) step by step, every operation ``.FTZ`` through
+    ``tests/kernels/basalt_emu.py``'s helpers, lanes as rows (``v[t, L, i]`` = logit of expert ``L + 32 i``), the
+    exponential ``expf`` passed in (the tests pass the GPU's own ``expf_ftz``: ``fast::exp2`` has no bit-exact host
+    model). Per token: (1) ``M``, the lane maxima's ``max_ftz`` butterfly; (2) ``e = expf(add_ftz(v, -M))``, the lane
+    sums in slot order, ``S`` their ``add_ftz`` butterfly, ``r = rcp_ftz(S)``; (3) ``p = mul_ftz(e, r)``, a NaN ``p``
+    replaced by ``-FLT_MAX``; (4) ten rounds of a strict-``>`` lane scan in slot order and the butterfly over (best,
+    expert) that takes the partner's on a larger value or an equal one of a lower id, asserting that all 32 lanes hold
+    the same (best bits, expert), the winner's ``p`` set to ``-inf`` and its value added to its lane's sum; (5) ``tot``,
+    the lane sums' butterfly floored at ``RENORM_CLAMP``, and the weights ``mul_ftz(sel, rcp_ftz(tot))``. Returns
+    ``(ids [n, 10] int32, weights [n, 10] float32, e [n, 512] in expert order, S [n], sel [n, 10], tot [n])``."""
+    v = np.ascontiguousarray(np.asarray(logits, F32).reshape(-1, 16, 32).transpose(0, 2, 1))
+    n, lanes, rows = v.shape[0], np.arange(32), np.arange(v.shape[0])
+    with np.errstate(invalid="ignore", over="ignore"):   # the degenerate tokens' infinities and NaNs
+        m = np.full((n, 32), -np.inf, F32)
+        for i in range(16):
+            m = emu.max_ftz(m, v[:, :, i])
+        big = emu.butterfly(m, emu.max_ftz)
+        e = np.asarray(expf(emu.add_ftz(v, -big[:, None, None])), F32)
+        s = np.zeros((n, 32), F32)
+        for i in range(16):
+            s = emu.add_ftz(s, e[:, :, i])
+        S = emu.butterfly(s, emu.add_ftz)
+        p = emu.mul_ftz(e, emu.rcp_ftz(S)[:, None, None])
+        p = np.where(np.isnan(p), -FLT_MAX, p).astype(F32)
+        ids, sel, ssum = np.zeros((n, 10), np.int32), np.zeros((n, 10), F32), np.zeros((n, 32), F32)
+        for rank in range(10):
+            best, expert = p[:, :, 0].copy(), np.broadcast_to(lanes, (n, 32)).copy()
+            for i in range(1, 16):
+                gt = p[:, :, i] > best
+                best, expert = np.where(gt, p[:, :, i], best).astype(F32), np.where(gt, lanes + 32 * i, expert)
+            for o in (16, 8, 4, 2, 1):
+                ob, oe = best[:, lanes ^ o], expert[:, lanes ^ o]
+                take = (ob > best) | ((ob == best) & (oe < expert))
+                best, expert = np.where(take, ob, best).astype(F32), np.where(take, oe, expert)
+            assert (expert == expert[:, :1]).all() and (best.view(np.uint32) == best[:, :1].view(np.uint32)).all(), \
+                "the selection butterfly left the lanes disagreeing"
+            w = expert[:, 0]
+            p[rows, w & 31, w >> 5] = -np.inf
+            ids[:, rank], sel[:, rank] = w, best[:, 0]
+            ssum[rows, w & 31] = emu.add_ftz(ssum[rows, w & 31], best[:, 0])
+        tot = emu.max_ftz(emu.butterfly(ssum, emu.add_ftz), F32(RENORM_CLAMP))
+        weights = emu.mul_ftz(sel, emu.rcp_ftz(tot)[:, None])
+    return ids, weights, e.transpose(0, 2, 1).reshape(n, 512), S, sel, tot
+
+
+def planted_rows(seed=20261021):
+    """The planted tokens of HR-EMU and HR-WIN, ``{name: logits [512] float32}``, an N(0, 1) background (numpy's,
+    ``seed``) where a row does not set every logit: "P1" 5.0 at experts 72, 8, 40 (lane 8, slots 2, 0, 1), 300 and 3,
+    4.0 at 200 and 201 (the tie rule within a lane and across lanes); "P2" 4.0 at five experts, 3.0 at the twelve ids
+    ``31 j + 7`` (a tie straddling ranks 9 and 10); "P3" every logit one of +0, -0, +-2^-130 (subnormals read as zero);
+    "P4" 0.0 at one expert, -80, -86, -88, -90 and -100 at three each, -200 elsewhere (flushed exponentials, ties among
+    zeros by id); "P5" ``FLT_MAX`` at one expert, ``-FLT_MAX`` and +-3e38 elsewhere (``add_ftz(v, -M)`` overflows);
+    "P6a" one ``-inf`` logit, "P6b" nine finite logits and the rest ``-inf`` (a tenth pick among zeros); "P7nan" one NaN
+    logit (0x7fffffff), "P7inf" one ``+inf`` logit, "P7ninf" every logit ``-inf`` (the degenerate tokens: every ``p``
+    NaN); "D" +0 at expert 40, 0x00000001 at 300, -0 at 7 and 0x80000001 at 3 over an N(0, 1) - 10 background (equal
+    ``p`` of distinct logits); "E" 0.0 at experts 400, 33 and 17, -100 elsewhere (zeros fill the top 10); "F" 0.0 at
+    experts 0, 50, ..., 400, -86 elsewhere (the multiply's flush at the tenth slot)."""
+    rng = np.random.default_rng(seed)
+    normal = lambda: rng.standard_normal(512, dtype=F32)              # noqa: E731
+    bits = lambda u: np.uint32(u).view(F32)                            # noqa: E731
+    rows = {}
+    r = normal()
+    r[[72, 8, 40, 300, 3]], r[[200, 201]] = 5.0, 4.0
+    rows["P1"] = r
+    r = normal()
+    r[[1, 120, 240, 360, 480]], r[31 * np.arange(12) + 7] = 4.0, 3.0
+    rows["P2"] = r
+    rows["P3"] = np.array([0.0, -0.0, 2.0 ** -130, -2.0 ** -130], F32)[rng.integers(0, 4, 512)]
+    r = np.full(512, -200.0, F32)
+    r[260] = 0.0
+    for x, at in ((-80, (17, 145, 401)), (-86, (63, 191, 319)), (-88, (100, 228, 356)), (-90, (3, 131, 259)),
+                  (-100, (44, 300, 511))):
+        r[list(at)] = x
+    rows["P4"] = r
+    r = np.array([-FLT_MAX, -3e38, 3e38], F32)[rng.integers(0, 3, 512)]
+    r[137] = FLT_MAX
+    rows["P5"] = r
+    r = normal()
+    r[5] = -np.inf
+    rows["P6a"] = r
+    r = np.full(512, -np.inf, F32)
+    r[10 + 60 * np.arange(9)] = rng.standard_normal(9, dtype=F32)
+    rows["P6b"] = r
+    r = normal()
+    r[123] = bits(0x7FFFFFFF)
+    rows["P7nan"] = r
+    r = normal()
+    r[300] = np.inf
+    rows["P7inf"] = r
+    rows["P7ninf"] = np.full(512, -np.inf, F32)
+    r = normal() - F32(10.0)
+    r[40], r[300], r[7], r[3] = 0.0, bits(0x00000001), -0.0, bits(0x80000001)
+    rows["D"] = r
+    r = np.full(512, -100.0, F32)
+    r[[400, 33, 17]] = 0.0
+    rows["E"] = r
+    r = np.full(512, -86.0, F32)
+    r[50 * np.arange(9)] = 0.0
+    rows["F"] = r
+    return rows

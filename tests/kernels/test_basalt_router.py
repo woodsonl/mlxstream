@@ -11,6 +11,10 @@ same bits. Basalt's router_top10_parity runs its generic ``router_top10``; the c
 - HR-REF: router_top10_parity's rule, ids exact and weights ``rel <= 1e-5`` (router_top10_parity.cpp:86-90), against
   its double host reference (``router_reference``) on its four fixtures, each one dispatch of its 64 tokens, behind a
   guard that refuses near-ties among the reference's ranks 0..10 (``near_tie_guard``).
+- HR-EMU: bit for bit against ``top10_emulation`` (``route``, native_router.cu:46-100, with the GPU's own
+  ``expf_ftz``) on the four fixtures, the planted tokens (``planted_rows``, one dispatch) and 12 random windows of 8
+  tokens; the planted tokens' literal outputs, and every regular token's selected sum at least 2^-9 (so the 2^-14
+  floor fires only on the degenerate tokens, whose weights show it: 0xff800000, not +0).
 
 Every test checks the sentinels (the ids' and weights' row past the window keeps its 0xFF bytes, ``gpu.top10``) and
 counts the weights' non-finite values."""
@@ -18,6 +22,7 @@ counts the weights' non-finite values."""
 import numpy as np
 
 from tests import basalt_hc_ref as ref
+from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
 
 NT = 64                            # router_top10_parity.cpp:121, one dispatch per case
@@ -48,4 +53,69 @@ def test_router_top10_parity():
             bad.append(f"{name}: {w_bad} weights: if (!(rel <= tol)) ++w_bad; tol = 1e-5 (router_top10_parity.cpp:90)")
         if nonfinite:
             bad.append(f"{name}: {nonfinite} non-finite weights (must be 0)")
+    assert not bad, "\n".join(bad)
+
+
+DEGENERATE = ("P7nan", "P7inf", "P7ninf")            # every p NaN: ids 0..9, every weight 0xff800000
+
+
+def bits(a):
+    return np.ascontiguousarray(a).view(np.uint32)
+
+
+def random_windows():
+    """The 12 random windows of 8 tokens, ``N(0, s^2)`` logits for s = 0.5, 2 and 6, four per scale, in that order:
+    float64 normals of ``default_rng(20261018)`` times s, rounded to float32."""
+    rng = np.random.default_rng(20261018)
+    return {f"N(0, {s}^2) window {j}": (rng.standard_normal((8, 512)) * s).astype(np.float32)
+            for s in (0.5, 2.0, 6.0) for j in range(4)}
+
+
+def test_matches_route_emulation():
+    planted = ref.planted_rows()
+    names = list(planted)
+    fixtures = {**ref.router_cases(), "planted rows": np.stack(list(planted.values())), **random_windows()}
+    bad, out = [], {}
+    for name, logits in fixtures.items():
+        n = len(logits)
+        ids, w = gpu.top10(logits, n)
+        want_ids, want_w, e, S, _, tot = ref.top10_emulation(logits, gpu.expf_ftz)
+        off = np.flatnonzero((ids != want_ids).any(1) | (bits(w) != bits(want_w)).any(1))
+        regular = ~np.isin(names, DEGENERATE) if name == "planted rows" else np.ones(n, bool)
+        nonfinite = np.count_nonzero(~np.isfinite(w[regular]))
+        print(f"  {name:<26} {len(off)} of {n} tokens differ from the emulation   non-finite {nonfinite}   "
+              f"min tot {tot[regular].min():.6e}")
+        if len(off):
+            k = off[0]
+            bad.append(f"{name}: {len(off)} tokens differ from route's emulation; the first, token {k}: ids "
+                       f"{ids[k].tolist()} against {want_ids[k].tolist()}, weights {[hex(b) for b in bits(w[k])]} "
+                       f"against {[hex(b) for b in bits(want_w[k])]}")
+        if nonfinite:
+            bad.append(f"{name}: {nonfinite} non-finite weights of regular tokens (must be 0)")
+        if not (tot[regular] >= 2.0 ** -9).all():                          # HR-CLAMP's GPU half
+            bad.append(f"{name}: a regular token's selected sum {tot[regular].min()!r} is below 2^-9")
+        out[name] = ids, w, e, S
+    ids, w, e, S = out["planted rows"]
+    row = {nm: k for k, nm in enumerate(names)}
+    first = lambda nm, m: ids[row[nm]][:m].tolist()                       # noqa: E731
+    literal = [
+        ("P1", first("P1", 7) == [3, 8, 40, 72, 300, 200, 201], "ids begin 3, 8, 40, 72, 300, 200, 201"),
+        ("P2", ids[row["P2"]][5:].tolist() == np.sort(31 * np.arange(12) + 7)[:5].tolist(),
+         "ranks 5..9 are the five lowest of the twelve ids 31 j + 7"),
+        ("P3", first("P3", 10) == list(range(10)) and (bits(w[row["P3"]]) == 0x3DCCCCCD).all(),
+         "ids 0..9, weights 0x3dcccccd"),
+        *((nm, first(nm, 10) == list(range(10)) and (bits(w[row[nm]]) == 0xFF800000).all(),
+           "ids 0..9, weights 0xff800000 (the floor fires)") for nm in DEGENERATE),
+        ("D", first("D", 4) == [3, 7, 40, 300], "ids begin 3, 7, 40, 300"),
+        ("E", first("E", 10) == [17, 33, 400, 0, 1, 2, 3, 4, 5, 6]
+         and bits(w[row["E"]]).tolist() == [0x3EAAAAAB] * 3 + [0] * 7,
+         "ids 17, 33, 400, 0..6, weights 0x3eaaaaab x 3 and +0 x 7"),
+        ("F", ids[row["F"]][9] == 1 and bits(w[row["F"]])[9] == 0, "the tenth id 1, its weight +0"),
+    ]
+    k = row["F"]                                  # F's precondition: e normal, e * r subnormal before the flush
+    ek, rk = float(e[k, 1]), float(emu.rcp_ftz(S[k]))
+    literal.append(("F", 2.0 ** -126 <= ek < np.inf and ek * rk < 2.0 ** -126,
+                    f"expert 1's e = {ek!r} normal and e * r = {ek * rk!r} below 2^-126"))
+    bad += [f"planted {nm}: {what}: ids {ids[row[nm]].tolist()}, weights {[hex(b) for b in bits(w[row[nm]])]}"
+            for nm, ok, what in literal if not ok]
     assert not bad, "\n".join(bad)
