@@ -30,6 +30,18 @@
 // - prompt_gr_silu (:161-170): 0 lo [B][HC_LR], 1 lo16 [B][HC_LR] (BF16). x = ieee_mul(lo, 0.25f), the / HC; y = 1 +
 //   expf_ieee(sign_flip(x)) plain (1 + a subnormal is 1 either way); lo16 = bf(ieee_div(x, y)), the source's true
 //   division (div.rn), not x * sigm(x).
+// - prompt_gr_write (:192-198): 0 R, 1 bo [B][HC_N], 2 inj [B][4], 3 R' [B][4 HC_N]. Thread i = t HC_D + c HC_N + d:
+//   sg = sigm(inj[t][c] * 0.25f), the quotient plain (it feeds only __expf(-q), which is 1 for any |q| below 2^-100,
+//   flushed or not; for a normal q the SASS's two FMULs, by -0.25 and log2 e, round as -q times log2 e does); sc =
+//   ieee_add(sg, sg) (2.0f * sg is an FADD; sg is subnormal for inj below about -349, sc need not be); R' =
+//   fma_ieee(bo[t][d], sc, R).
+// - prompt_gr_write_norm_rs (:125-160): 0 R, 1 bo, 2 inj, 3 w_next [4 HC_N], 4 R', 5 rs [B][4], 6 xn16 [B][4 HC_N]
+//   (BF16). gr_write on row (t, c), its HC_N / 256 values kept in registers, then gr_norm_rs's chain on them with
+//   w_next: the same mapping, +0 seed, block_sum and two products, so R' is gr_write's and rs and xn16 are gr_norm_rs's
+//   on that R' (:125-127), bit for bit.
+//   In both writes R and R' are two SSA values in two buffers (the arena never gives an output its own op's input
+//   slot), but one buffer would do: each element is read and written by the same thread, as in basalt's in-place
+//   kernels.
 // - prompt_gr_broadcast (:199-204): 0 e [B][HC_N], 1 R' [B][4 HC_N]: each of a token's four streams is its embedding
 //   row, copied as 32-bit words (NaN payloads and subnormals unchanged).
 //
@@ -97,6 +109,47 @@ kernel void prompt_gr_silu(device const float* lo [[buffer(0)]], device ushort* 
     const float x = ieee_mul(lo[i], 0.25f);                             // lo / HC: FMUL by 0.25
     const float y = 1.0f + expf_ieee(sign_flip(x));                     // 1 + __expf(-x)
     lo16[i] = bf16_rne_nonan(cuda_nan(ieee_div(x, y)));                 // div.rn: x / y, not x * sigm(x)
+}
+
+kernel void prompt_gr_write(device const float* R [[buffer(0)]], device const float* bo [[buffer(1)]],
+                            device const float* inj [[buffer(2)]], device float* R_out [[buffer(3)]],
+                            constant PromptHcParams& p [[buffer(7)]], device const StepState* st [[buffer(15)]],
+                            uint gid [[thread_position_in_grid]]) {
+    const uint i = p.row0 * HC_D + gid;                                 // t * HC_D + c * HC_N + d
+    if (st->done || i >= prompt_rows(st) * HC_D) return;
+    const uint t = i / HC_D, c = i % HC_D / uint(HC_N), d = i % uint(HC_N);
+    const float sg = sigm(inj[t * 4u + c] * 0.25f);                    // inj / HC plain: feeds only __expf(-q)
+    R_out[i] = cuda_nan(fma_ieee(bo[t * uint(HC_N) + d], ieee_add(sg, sg), R[i]));   // 2.0f * sg is FADD sg, sg
+}
+
+kernel void prompt_gr_write_norm_rs(device const float* R [[buffer(0)]], device const float* bo [[buffer(1)]],
+                                    device const float* inj [[buffer(2)]], device const float* w [[buffer(3)]],
+                                    device float* R_out [[buffer(4)]], device float* rs_out [[buffer(5)]],
+                                    device ushort* xn16 [[buffer(6)]], constant PromptHcParams& p [[buffer(7)]],
+                                    device const StepState* st [[buffer(15)]],
+                                    uint tg [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh[32];
+    const uint row = 4u * p.row0 + tg;                                  // t * 4 + c
+    if (st->done || row >= 4u * prompt_rows(st)) return;                // the whole threadgroup, before any barrier
+    const uint t = row / 4u, c = row % 4u;
+    const float sg = sigm(inj[t * 4u + c] * 0.25f);                    // gr_write's sc, the same sites
+    const float sc = ieee_add(sg, sg);
+    float v[HC_N / 256];                                                // basalt's GRW_PER: the row stays in registers
+    float ss = 0.0f;
+    for (uint j = 0u; j < uint(HC_N) / 256u; ++j) {                     // d = tid + 256 j, gr_norm_rs's order
+        const uint d = tid + 256u * j;
+        const float x = fma_ieee(bo[t * uint(HC_N) + d], sc, R[row * uint(HC_N) + d]);
+        R_out[row * uint(HC_N) + d] = cuda_nan(x);
+        v[j] = x;
+        ss = fma_ieee(x, x, ss);
+    }
+    const float rs = fast::rsqrt(block_sum(ss, sh, tid, 256u) / float(HC_N) + HC_EPS);
+    if (tid == 0u) rs_out[row] = cuda_nan(rs);
+    for (uint j = 0u; j < uint(HC_N) / 256u; ++j) {
+        const uint d = tid + 256u * j;
+        xn16[row * uint(HC_N) + d] = bf16_rne_nonan(cuda_nan(ieee_mul(ieee_mul(v[j], rs), w[c * uint(HC_N) + d])));
+    }
 }
 
 kernel void prompt_gr_broadcast(device const uint* e [[buffer(0)]], device uint* R_out [[buffer(1)]],

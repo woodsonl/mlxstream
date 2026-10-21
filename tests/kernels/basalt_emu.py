@@ -978,3 +978,25 @@ def hc_silu(lo, exp_neg, flush=False):
         e = ftz(exp_neg(ftz(x))) if flush else exp_neg(x)
         v = div(x, add(F32(1), np.asarray(e, F32)))
     return bf16_bits(hc_bits(v).view(F32))
+
+
+def hc_write(r, bo, inj, exp_neg, flush=False):
+    """prompt_gr_write's R' [T, 4n] as fp32 bits for the residual ``r`` [T, 4n], the block output ``bo`` [T, n] and the
+    injection logits ``inj`` [T, 4]: R'[t, c, d] = fma32(bo[t, d], sc, r[t, c, d]) with sc = fl(sg + sg) (2.0f * sg is
+    an add) and sg = hc_sigm(fl(inj[t, c] * 0.25)) (sigm(inj / HC)), stored as cuda_nan. ``flush``: every operation's
+    inputs and result flushed."""
+    fma, add, mul, _ = hc_ops(flush)
+    r = np.asarray(r, F32)
+    T, n = len(r), r.shape[1] // 4
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN entries
+        sg = hc_sigm(mul(np.asarray(inj, F32), F32(0.25)), exp_neg, flush)
+        x = fma(np.asarray(bo, F32)[:, None, :], add(sg, sg)[..., None], r.reshape(T, 4, n))
+    return hc_bits(x).reshape(T, 4 * n)
+
+
+def hc_write_norm(r, bo, inj, w_next, eps, rsqrt, exp_neg, flush=False):
+    """prompt_gr_write_norm_rs's stores R' [T, 4n] (fp32 bits), rs [T, 4] (fp32 bits) and xn16 [T, 4n] (BF16 bits):
+    hc_write, then hc_norm of R' with the next half's weights ``w_next``, as the source promises (kernels.cu:125-127:
+    the same mapping and block_sum, so the same bits). ``flush``: every operation's inputs and result flushed."""
+    rp = hc_write(r, bo, inj, exp_neg, flush)
+    return (rp, *hc_norm(rp.view(F32), w_next, eps, rsqrt, flush))

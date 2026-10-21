@@ -18,26 +18,33 @@ none), each kind seeing the classes on its inputs:
 - token 1: E3 a NaN and E4 +inf in r (stream 0 and stream 1, column 3), lo (columns 3 and 4) and inj (streams 0, 1).
 - token 2: E6, the tie row (stream 1): r[k] = 2^-70 s, r[k + 256] = (1 + 2^-12) s at k = 0, the rest 0, so thread
   k's first square is subnormal and decides the rounding of its sum (s = ``E6_S`` = 1, for which the IEEE and
-  flushing twins' rs differ); inj 0 on stream 0 (E5: 2 sigmoid = 1, gr_parity.cpp:641's plain add).
+  flushing twins' rs differ); inj 0 on stream 0 (E5: 2 sigmoid = 1, gr_parity.cpp:641's plain add) and -400 on
+  stream 1 (E5's zero sigmoid: sc = +0, so gr_write_norm_rs's R' row is E6's r, bit for bit, and its sum of squares
+  meets the tie).
 - token 3: E1, an all-zero r row (stream 0: rs = fast::rsqrt(1e-6)), with E5's inj (-352, -400, 100, -100): -352 / 4
   = -88 has a subnormal sigmoid, -400 / 4 = -100 a zero one; gated -88 and -100 on all four streams of columns 0 and 1.
 
 - HC-3 (``test_hc_twin``): at 1, 7 and 256 live rows every output word of the live rows equals the kind's twin
   (broadcast: e's 32-bit words in each stream; norm: basalt_emu.hc_norm, whose rs is the probe's fast::rsqrt of the
   argument fl(fl(S / n) + eps) the twin computes; silu and mix: basalt_emu.hc_silu and hc_mix, with the probe's
-  expf_ieee(sign_flip(x)) of the twin's arguments), the rows past them keep the 0xFF fill, the inputs keep their
+  expf_ieee(sign_flip(x)) of the twin's arguments; write and write_norm: basalt_emu.hc_write and hc_write_norm, the
+  latter hc_write followed by hc_norm with w_next), the rows past them keep the 0xFF fill, the inputs keep their
   bytes, and a run with done = 1 stores nothing; the mix at MIX_BF 0 (the drafter's KV pass, no BF16 image) stores the
   same mixed and mixed_h and leaves slot 5 at 0xFF. Discrimination, so a flushing kernel fails: broadcast's words
   differ from their flushed values on E2; norm's IEEE and flushing twins differ in token 0's xn16 (E2) and in token
   2's stream-1 rs (E6), mix's in token 0's columns 5-6 (E2) and token 3's column 0 (E5: gated -88 on every stream, a
-  subnormal sigmoid), silu's in token 0's columns 8-11 (E7; its E2 words are BF16 zeros either way).
+  subnormal sigmoid), silu's in token 0's columns 8-11 (E7; its E2 words are BF16 zeros either way), write's and
+  write_norm's in R' (and write_norm's xn16) at token 0's columns 5-6 (E2) and token 3's stream 0 (E5: inj -352, a
+  subnormal sigmoid whose double is normal, on E1's zero row, so R' = fl(bo sc)), and write_norm's in token 2's
+  stream-1 rs (E6).
   ``test_hc_probe_specials`` (K1): the probe's fast::rsqrt and expf_ieee(sign_flip(x)) on the specials match
   PTX's documented rsqrt.approx and ex2.approx: rsqrt(+inf) = +0, rsqrt(NaN) NaN, exp_neg(+inf) = +0, exp_neg(-100)
   and exp_neg(-inf) +inf, exp_neg(NaN) NaN.
 - HC-4 (``test_hc_rows_invariant``): bitwise, tokens 0, 1 and 255 of the 256-row run equal each token alone at one
   row; a static program's 7 rows (T_STATIC_ROWS) equal the dynamic 7; two runs give the same bytes; four forced 64-row
   slices equal the one-slice run at 256 and 100 live rows; broadcast's every stream equals e's words, E8's payload
-  included."""
+  included; write_norm's three outputs equal gr_write followed by gr_norm_rs on its R' with w_next (KE 3.4 (a),
+  (b))."""
 
 from functools import partial
 
@@ -60,7 +67,10 @@ RSQRT, EXP_NEG = (partial(gpu.hc_probe, fn) for fn in ("rsqrt", "exp_neg"))   # 
 KINDS = {"broadcast": ("prompt_gr_broadcast", ("e",), ((4 * N, 4),)),
          "norm": ("prompt_gr_norm_rs", ("r", "w"), ((4, 4), (4 * N, 2))),          # rs, xn16
          "silu": ("prompt_gr_silu", ("lo",), ((LR, 2),)),                           # lo16
-         "mix": ("prompt_gr_mix_r", ("r", "rs", "w", "gated"), ((N, 4), (N, 2), (N, 2)))}  # mixed, mixed_bf, mixed_h
+         "mix": ("prompt_gr_mix_r", ("r", "rs", "w", "gated"), ((N, 4), (N, 2), (N, 2))),  # mixed, mixed_bf, mixed_h
+         "write": ("prompt_gr_write", ("r", "bo", "inj"), ((4 * N, 4),)),                  # R'
+         "write_norm": ("prompt_gr_write_norm_rs", ("r", "bo", "inj", "w_next"),
+                        ((4 * N, 4), (4, 4), (4 * N, 2)))}                                 # R', rs, xn16
 
 
 def fixture(edges=True):
@@ -88,7 +98,7 @@ def plant(d):
     r[1, N + 3] = lo[1, 4] = inj[1, 1] = np.inf                           # E4
     r[2, N: 2 * N] = 0                                                    # token 2: E6 (k = 0)
     r[2, N], r[2, N + 256] = 2.0 ** -70 * E6_S, (1 + 2.0 ** -12) * E6_S
-    inj[2, 0] = 0                                                         # E5's inj 0
+    inj[2, :2] = (0, -400)                                                # E5's inj 0; -400 makes write_norm's R' E6's
     r[3, :N] = 0                                                          # token 3: E1
     inj[3] = (-352, -400, 100, -100)                                      # E5
     for c in range(4):
@@ -126,6 +136,10 @@ def twin(kind, d, flush=False):
         return [emu.hc_silu(d["lo"], EXP_NEG, flush)]
     if kind == "mix":
         return list(emu.hc_mix(d["r"], d["rs"], d["w"], d["gated"], EXP_NEG, flush))
+    if kind == "write":
+        return [emu.hc_write(d["r"], d["bo"], d["inj"], EXP_NEG, flush)]
+    if kind == "write_norm":
+        return list(emu.hc_write_norm(d["r"], d["bo"], d["inj"], d["w_next"], EPS, RSQRT, EXP_NEG, flush))
     raise KeyError(kind)
 
 
@@ -163,6 +177,15 @@ def test_hc_twin(kind):
         flushed = twin(kind, d, flush=True)
         assert (flushed[0][0, 8:12] != want[0][0, 8:12]).any(), \
             "E7: no lo16 word of token 0's columns 8-11 differs from a flushing kernel's"
+    if kind in ("write", "write_norm"):           # a flushing kernel fails on E2 (token 0) and E5 (token 3, stream 0)
+        flushed = twin(kind, d, flush=True)
+        for k in (0,) if kind == "write" else (0, 2):                     # R', and write_norm's xn16
+            assert (flushed[k][0, 5:7] != want[k][0, 5:7]).any(), \
+                f"E2: no word of output {k} at token 0's columns 5-6 differs from a flushing kernel's"
+            assert (flushed[k][3, :N] != want[k][3, :N]).any(), f"E5: no word of output {k} at token 3's stream 0 " \
+                "(inj -352 on E1's zero row) differs from a flushing kernel's"
+    if kind == "write_norm":                      # and on E6 (token 2, stream 1: sc = +0 leaves E6's r as R')
+        assert flushed[1][2, 1] != want[1][2, 1], "E6: the flushing twin's rs equals the IEEE twin's (E6_S)"
 
 
 def test_hc_probe_specials():
@@ -194,3 +217,7 @@ def test_hc_rows_invariant(kind):
         for c in range(4):
             assert np.array_equal(full[0][:, c * N: (c + 1) * N], words), f"stream {c} is not e's words"
             assert full[0][0, c * N + 7] == E8_NAN, f"stream {c}: E8's payload {full[0][0, c * N + 7]:#010x}"
+    if kind == "write_norm":                      # KE 3.4 (a), (b): gr_write, then gr_norm_rs on its R' with w_next
+        rp = run("write", d, B)[0]
+        for k, (f, g) in enumerate(zip(full, [rp, *run("norm", {"r": rp.view(F32), "w": d["w_next"]}, B)])):
+            assert np.array_equal(f, g), f"write_norm output {k} differs from gr_write followed by gr_norm_rs"
