@@ -192,15 +192,17 @@ drafter's KV rows at `:1015`), `gr_silu` (`:1570`), `gr_mix_r` (`:1573`), and at
 of such elements is subnormal; `r · rs · w` is subnormal for small enough `r` (rs is at most eps^-1/2 ≈ 1000);
 sigm(x) is subnormal for x below about −87.3 (Notation), so `x · sigm` and the fma chains can be; the residual update
 `fma(bo, sc, r)` can produce or read one. CUDA keeps all of these and the BF16, fp16 and fp32 images carry them, so
-every product and sum below uses an IEEE helper: `ieee_mul`, `ieee_add` and `warp_sum_ieee` (main), `ieee_div` for
-a divisor of at least 1 (main), and a general IEEE fma, here `ieee_fma_any(a, b, c)` (main's `ieee_fma` takes only
-an integer multiplier, `basalt_q8_1.metal:167`; the prompt path's GDN plan defines the general one). With them every
-product, sum and conversion gives CUDA's bits for every input; only `rsqrtf` and `__expf` follow the contract's
-approximate mappings. Every fp32 store of an arithmetic result (`rs_out`, `mixed`, `R`) writes `cuda_nan(x)`.
+every product and sum below where a subnormal can change a bit uses an IEEE helper (`/ N + eps`, `1.0f + e` and
+`inj / HC` stay plain: their rows and Notation show that none can there): `ieee_mul`, `ieee_add` and `warp_sum_ieee`
+(main), `ieee_div` for a divisor of at least 1 (main), and a general IEEE fma, here `ieee_fma_any(a, b, c)` (main's
+`ieee_fma` takes only an integer multiplier, `basalt_q8_1.metal:167`; the prompt path's GDN plan defines the general
+one). With them every product, sum and conversion gives CUDA's bits for every input; only `rsqrtf` and `__expf`
+follow the contract's approximate mappings. Every fp32 store of an arithmetic result (`rs_out`, `mixed`, `R`) writes
+`cuda_nan(x)`.
 
 ### `gr_norm_rs_kernel` (`:85-102`)
 
-Grid `T·HC` threadgroups of 256 threads (`:864`), one row `(t, c)` each; thread `tid` handles `d = tid + 256k`,
+Grid `T·HC` threadgroups of 256 threads (`:869`), one row `(t, c)` each; thread `tid` handles `d = tid + 256k`,
 k = 0..9 in order. Outputs `rs_out[row]`, the BF16 image `xn16` and, when non-null, its low part `xn16_lo`.
 
 | Line | Expression | SASS | Metal |
@@ -224,8 +226,8 @@ k = 0..9 in order. Outputs `rs_out[row]`, the BF16 image `xn16` and, when non-nu
 | `:114` | `s = fmaf(x, sigm(g[j]), s)` | c = 0: `FFMA s, x, sig, RZ`; c = 1, 2, 3: `FFMA s, x, sig, s` | `s = ieee_fma_any(x, sig, s)` from `s = 0.0f`, c ascending. fma(x, sig, +0) is not fl(x·sig) for a −0 product: (−0) + (+0) is +0, so the literal chain from `0.0f` is required |
 | `:116` | `s /= (float) HC` | `FMUL s, s, 0.25` | `ieee_mul(s, 0.25f)` (inexact only for a subnormal result) |
 | `:117` | `mixed[i] = s` | `STG` | `cuda_nan(s)` |
-| `:119-120` | `bf(s)`, `bf_lo(s, h)` | integer operations; `FADD d, s, -h` | as `gr_norm_rs` `:98`, `:100` |
-| `:122` | `hf(s)` | `F2FP.F16.F32.PACK_AB h, RZ, s` (`cuda_fp16.hpp:566`) | `cuda_nan_f16(f16_bits(s))` |
+| `:119-121` | `bf(s)`, `bf_lo(s, h)` | integer operations; `FADD d, s, -h` | as `gr_norm_rs` `:98`, `:100` |
+| `:123` | `hf(s)` | `F2FP.F16.F32.PACK_AB h, RZ, s` (`cuda_fp16.hpp:566`) | `cuda_nan_f16(f16_bits(s))` |
 
 ### `gr_silu_kernel` (`:161-170`)
 
