@@ -56,6 +56,10 @@ from tests.kernels import basalt_gdn_gpu as gg
 from tests.kernels import basalt_gpu as gpu
 
 GDNF_CASES = [(combo, t) for combo in range(len(COMBOS)) for t in range(1, MT + 1)]
+# parity_seg's criteria, verbatim (dec_gdn_parity.cpp:501, :502, :551; spec T§9's S8, S9 and S-gate rows)
+S8 = '`ec = std::max(ec, max_err(hs.data(), c.h.data(), c.h.size()));` -> `ec < 1e-4`'
+S9 = '`ey = std::max(ey, max_err(ys.data(), c.y.data(), c.y.size()));` -> `ey < 1e-3`'
+S_GATE = '`d == 0` of `ok = ok && d == 0 && ec < 1e-4 && ey < 1e-3 && es < 1e-3;`'
 
 
 @functools.lru_cache(maxsize=None)
@@ -217,7 +221,7 @@ def test_gdn_conv_l2_multi_matches_the_float64_reference(trial, nseg):
         assert n_bad(h) == 0, f"segment {k} (T={t}): {n_bad(h)} non-finite h values, want no non-finite value"
         nil = np.zeros((t, HV), F32)                                  # h reads no gate
         e = max_err(h, cpu_seg(st, seg.qkv[rows], seg.z[rows], layer.conv_w, layer.gamma, nil, nil, t).h)
-        assert e < 1e-4, f"segment {k} (T={t}): h: max_err {e:.3g}, want max_err < 1e-4"
+        assert e < 1e-4, f"segment {k} (T={t}): h: max_err {e:.3g}; want {S8}"
 
 
 @pytest.mark.parametrize("trial,nseg", SEG_CASES)
@@ -232,7 +236,7 @@ def test_gdn_step_norm_multi_matches_the_float64_reference(trial, nseg):
         for name, a in (("h", h), ("gate", gate), ("beta", beta), ("y", y)):
             assert n_bad(a) == 0, f"segment {k} (T={t}): {n_bad(a)} non-finite {name} values, want no non-finite value"
         e = max_err(y, cpu_seg(st, seg.qkv[rows], seg.z[rows], layer.conv_w, layer.gamma, gate, beta, t).y)
-        assert e < 1e-3, f"segment {k} (T={t}): y: max_err {e:.3g}, want max_err < 1e-3"
+        assert e < 1e-3, f"segment {k} (T={t}): y: max_err {e:.3g}; want {S9}"
 
 
 @pytest.mark.parametrize("trial,nseg", SEG_CASES)
@@ -248,10 +252,10 @@ def test_dec_gdn_rec_h_matches_the_float64_reference(trial, nseg):
         assert n_bad(r.h) == 0, f"{where}: {n_bad(r.h)} non-finite h values, want no non-finite value"
         for what, ref, new in (("h", h, r.h), ("win_qkv", seg.qkv[rows], r.qkv)):
             d, first = cmp_f(what, ref, new)
-            assert d == 0, f"{where}: {d} elements differ or are not finite, first {first}; want :551's `d == 0`"
+            assert d == 0, f"{where}: {d} elements differ or are not finite, first {first}; want {S_GATE}"
         nil = np.zeros((t, HV), F32)                                  # h reads no gate
         e = max_err(r.h, cpu_seg(st, seg.qkv[rows], seg.z[rows], layer.conv_w, layer.gamma, nil, nil, t).h)
-        assert e < 1e-4, f"{where}: h: max_err {e:.3g}, want max_err < 1e-4"
+        assert e < 1e-4, f"{where}: h: max_err {e:.3g}; want {S8}"
 
 
 @pytest.mark.parametrize("trial,nseg", SEG_CASES)
@@ -278,7 +282,7 @@ def test_dec_gdn_rec_y_matches_the_float64_reference(trial, nseg):
             assert n_bad(a) == 0, f"{where}: {n_bad(a)} non-finite {name} values, want no non-finite value"
         for what, ref, new in (("gate", gate, r.gate), ("beta", beta, r.beta)):
             d, first = cmp_f(what, ref, new)
-            assert d == 0, f"{where}: {d} elements differ or are not finite, first {first}; want :551's `d == 0`"
+            assert d == 0, f"{where}: {d} elements differ or are not finite, first {first}; want {S_GATE}"
         check_yq(where, y, r.yq)
         e = max_err(r.y, cpu_seg(st, qkv, z, layer.conv_w, layer.gamma, r.gate, r.beta, t).y)
-        assert e < 1e-3, f"{where}: y: max_err {e:.3g}, want max_err < 1e-3"
+        assert e < 1e-3, f"{where}: y: max_err {e:.3g}; want {S9}"
