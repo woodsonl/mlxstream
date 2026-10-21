@@ -114,12 +114,12 @@ def gemv(g, kind, name, x, *ws, rows=T, widths=None):
     return ys
 
 
-def gr_post(g, block_out, r=None, inject=None):
+def gr_post(g, block_out, r=None, inject=None, width=10240):
     """``basalt_gr_post`` of the residual ``r`` (default: an input ``r`` [T, 10240]), ``block_out`` [T, 2560] and the
-    injections ``inject`` (default: an input ``inject`` [T, 4]) into ``r_out`` [T, 10240]."""
+    injections ``inject`` (default: an input ``inject`` [T, 4]) into ``r_out`` [T, ``width``]."""
     r = g.input("r", (T, 10240), F32) if r is None else r
     inject = g.input("inject", (T, 4), F32) if inject is None else inject
-    y = g.value("r_out", (T, 10240), F32)
+    y = g.value("r_out", (T, width), F32)
     op(g, "basalt_gr_post", [r, block_out, inject], [y])
     return y
 
@@ -453,9 +453,15 @@ def _entry_rows(kind, rows):
 
 
 def _gr_post_value(name, shape, dtype):
-    """The write of ``one_op`` with its input ``name`` (``r`` or ``inject``) of ``shape`` and ``dtype`` instead."""
+    """The write of ``one_op`` with its input ``name`` (``r``, ``inject``, or ``block_out``: the input ``x``) of
+    ``shape`` and ``dtype`` instead, or with its output ``r_out`` of ``shape``'s width (f32)."""
     def build(g, src, bad, tmp):
-        gr_post(g, g.input("x", (T, 2560), F32), **({name: g.input(name, shape, dtype)} if bad else {}))
+        if name == "r_out":
+            gr_post(g, g.input("x", (T, 2560), F32), width=shape[1] if bad else 10240)
+        elif name == "block_out":
+            gr_post(g, g.input("x", shape, dtype) if bad else g.input("x", (T, 2560), F32))
+        else:
+            gr_post(g, g.input("x", (T, 2560), F32), **({name: g.input(name, shape, dtype)} if bad else {}))
         return {}
     return build
 
@@ -508,6 +514,12 @@ REFUSALS = [
     ("gr post residual of another width", _gr_post_value("r", (T, 4 * 2560 + 32), F32),
      r"'r' is f32 \[2, 10272\], not f32 \[2, 10240\] \(4 streams of the block output's 2560 values\)"),
     ("gr post residual not f32", _gr_post_value("r", (T, 10240), DType.BF16), r"'r' is bf16 \[2, 10240\], not f32"),
+    ("gr post block output not f32", _gr_post_value("block_out", (T, 2560), DType.BF16),
+     r"'x' is bf16 \[2, 2560\], not f32 \[2, 2560\] \(the block output's columns\)"),
+    ("gr post injections not f32", _gr_post_value("inject", (T, 4), DType.BF16),
+     r"'inject' is bf16 \[2, 4\], not f32 \[2, 4\] \(one injection per stream of each column\)"),
+    ("gr post output of another width", _gr_post_value("r_out", (T, 10208), F32),
+     r"'r_out' is f32 \[2, 10208\], not f32 \[2, 10240\] \(the residual's columns\)"),
     ("gr post of no streams", _gr_post_value("inject", (T, 0), F32), r"unsupported shape \(n_embd 2560, hc 0, T 2\)"),
     ("gr post output over its residual", _gr_post_over_residual, "'r_out' and 'r' overlap in rb"),
     ("gr post residual off 4 bytes", _aligned("basalt_gr_post", 0, 2), "slot 0 needs 4-byte alignment"),
