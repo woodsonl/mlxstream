@@ -16,11 +16,15 @@ comparison is bitwise; a NaN result compares by class (the kernels' stores canon
   beside products of 2^-149 to 2^-85; results that cancel into the subnormal range (c = -RN(a * b) moved by up to 4
   ulps) or round into it or up to 2^-126; products below 2^-126 of operands at least 2^-100 beside a c of 2^-100 to
   2^-97 (the fast path's premise: such a product cannot move the result); operands at the 2^-100 guard's edges with
-  results on both sides of it; every triple of zeros, ones, a subnormal, the edges, infinities and NaN. Fixed rows
-  with their bits: engineering review E3's two (a subnormal product of normal operands on a zero addend, and operands
-  of at least 2^-100 cancelling to 2^-146, which D6's literal guard returns as the hardware's +0), the two exact
-  products that round up to 2^-126, and the signs of zero products on +-0 addends (D10). The hardware's own ``fma``
-  must differ from IEEE on many rows, so that the slow path is what the rows check.
+  results on both sides of it; exact binary32 midpoint products of 2^-30 to 2^31 beside a nonzero c below 2^-100;
+  every triple of zeros, ones, a subnormal, the edges, infinities and NaN. Fixed rows with their bits: engineering
+  review E3's two (a subnormal product of normal operands on a zero addend, and operands of at least 2^-100 cancelling
+  to 2^-146, which D6's literal guard returns as the hardware's +0), the two exact products that round up to 2^-126,
+  the signs of zero products on +-0 addends (D10), and three exact results just off a binary32 midpoint (above one
+  near 1; below a subnormal one; below one near 2^-100, of a product under the guard) and their negations. The
+  hardware's own ``fma`` must differ from IEEE on many rows, so that the slow path is what the rows check; and
+  rounding to nearest in binary64, then binary32 (the slow path with ``f64_fma`` for ``f64_fma_odd``) must give the
+  wrong neighbour on the six and on many midpoint rows, so that its rounding to odd is checked too.
 - H.3: ``log1pf_nv`` (libdevice's ``__nv_log1pf``, dec_gdn.md section 6a) against ``basalt_emu.log1pf_nv``, which
   runs the whole sequence with IEEE subnormals and FADD.RZ through ``Fraction``: [2^-126, 2^-60] of both signs, some
   below 2^-125 (FMUL p, m, p subnormal); subnormals of both signs, which come back as they are; 64 ulps either side of
@@ -211,7 +215,14 @@ FIXED = [(0x1C800000, 0x1C800000, 0x00000000, 0x00000200),   # E3: 2^-70 * 2^-70
          (0xBF800000, 0x00000000, 0x80000000, 0x80000000),   # -1 * 0 + -0 = -0
          (0x80000000, 0x3F800000, 0x80000000, 0x80000000),   # -0 * 1 + -0 = -0
          (0xBF800000, 0x80000000, 0x80000000, 0x00000000),   # -1 * -0 + -0 = +0
-         (0x00000000, 0x00000000, 0x80000000, 0x00000000)]   # 0 * 0 + -0 = +0
+         (0x00000000, 0x00000000, 0x80000000, 0x00000000),   # 0 * 0 + -0 = +0
+         # double rounding (rounding to nearest in binary64, then binary32) gives the other neighbour on these six:
+         (0x3F800800, 0x3F800800, 0x00000001, 0x3F801001),   # (1 + 2^-12)^2, a midpoint, + 2^-149: up (0x3F801000)
+         (0xBF800800, 0x3F800800, 0x80000001, 0xBF801001),
+         (0x19FFFFFE, 0x1A000001, 0x00000201, 0x00000201),   # 2^-150 (1 - 2^-46) + 513 2^-149: down (0x00000202)
+         (0x99FFFFFE, 0x1A000001, 0x80000201, 0x80000201),
+         (0x3F800001, 0x017FFFFE, 0x0D800001, 0x0D800001),   # 2^-124 (1 - 2^-46) + 2^-100 (1 + 2^-23): a product
+         (0xBF800001, 0x017FFFFE, 0x8D800001, 0x8D800001)]   # below the guard, down (0x0D800002)
 
 
 def floats(rng, exp):
@@ -256,6 +267,19 @@ def h2_rows(rng, n=4096):
     # one of a, b at the guard's edge, the other in [0.5, 2), c at the edge or +-0: results on both sides of 2^-100
     e, m = rng.choice(EDGE, n) | sign(), floats(rng, rng.integers(126, 128, n))
     rows["edge"] = (*swap(e, m), np.where(k % 4 == 0, sign(), rng.choice(EDGE, n) | sign()))
+    # binary32 midpoints: a * b of 2^-30 to 2^31 with one bit, the 25th significant, below the 24 kept (odd parts of na
+    # and 26 - na bits whose product has 25), beside a nonzero c below 2^-100 (the slow path) and below half a binary64
+    # ulp of a * b: rounding to nearest twice ties to the even neighbour, the wrong one where c points to the odd one
+    na = rng.integers(2, 25, 4 * n)
+    oa, ob = rng.integers(1 << (na - 1), 1 << na) | 1, rng.integers(1 << (25 - na), 1 << (26 - na)) | 1
+    keep = oa * ob < 1 << 25
+    ma, mb = (oa << (24 - na))[keep][:n], (ob << (na - 2))[keep][:n]
+    assert len(ma) == n
+    ea = rng.integers(97, 158, n)
+    eb = 254 - ea + rng.integers(-30, 31, n)
+    rows["midpoint"] = (sign() | (ea.astype(U32) << U32(23)) | (ma - (1 << 23)).astype(U32),
+                        (eb.astype(U32) << U32(23)) | (mb - (1 << 23)).astype(U32),
+                        sign() | rng.integers(1, 0x0D800000, n, dtype=U32))
     v = np.array([0, 0x80000000, 0x3F800000, 0xBF800000, 0x00080000, 0x80080000, 0x0D800000, 0x8D7FFFFF,
                   0x7F800000, 0xFF800000, 0x7FC00000], U32)   # +-0, +-1, +-2^-130, the edges, +-inf, NaN
     rows["specials"] = tuple(g.ravel() for g in np.meshgrid(v, v, v, indexing="ij"))
@@ -293,6 +317,12 @@ def test_fma_ieee_matches_the_emulation():
     assert np.array_equal(hw[sl], c[sl]) and np.array_equal(want[sl], c[sl])
     edge = mag[at["edge"]]
     assert np.count_nonzero(edge < U32(0x0D800000)) > 100 and np.count_nonzero(edge >= U32(0x0D800000)) > 100
+    # double rounding gives the wrong neighbour on the six fixed traps and on many midpoint rows, each of which the
+    # guard sends to the slow path (c nonzero and below 2^-100): what they check is the slow path's rounding to odd
+    twice = lambda s: f32(a.view(F32)[s].astype(F64) * b.view(F32)[s].astype(F64) + c.view(F32)[s].astype(F64))
+    sl, mc = at["midpoint"], c[at["midpoint"]] & U32(0x7FFFFFFF)
+    assert np.all(twice(slice(nf - 6, nf)) != want[nf - 6:nf])
+    assert np.all((mc != 0) & (mc < U32(0x0D800000))) and np.count_nonzero(twice(sl) != want[sl]) > 1000
 
 
 # ---- H.3: log1pf_nv ------------------------------------------------------------------------------------------------
