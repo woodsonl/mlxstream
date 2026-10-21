@@ -3,10 +3,14 @@
 # adapted from basalt (jesdga95/basalt) src/kernels/elementwise_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
 # (MIT; third_party/NOTICE): the contraction check's pass criterion.
 """The platform facts the exact basalt port rests on, measured on this GPU in MTLMathModeSafe (the repository default):
-fp32 add, multiply, fma and division round to nearest even; how they treat subnormals; fp16 conversions; and that
+fp32 add, multiply, fma and division round to nearest even; how they and the compares treat subnormals; fp16
+conversions; round() against CUDA's roundf; that fma(a, b, 0.0f) is not folded to a * b; and that
 ``#pragma STDC FP_CONTRACT OFF`` stops contraction in a runtime-compiled source, told apart the way basalt's
 elementwise_parity does (src/kernels/elementwise_parity.cpp:410: ``if (mismatches || guards || fma_diff == 0) ++bad;``
 - the kernel must match the unfused result, and the inputs must be ones where fusing would change it)."""
+
+import math
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -16,7 +20,7 @@ from monolith.runtime import _native as nt
 from tests.kernels import basalt_emu as emu
 
 F32 = np.float32
-NCOL = 14                                    # one output column per operation of OPS
+NCOL = 16                                    # one output column per operation of OPS
 
 OPS = """
 kernel void ops(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
@@ -39,6 +43,8 @@ kernel void ops(device const float* a [[buffer(0)]], device const float* b [[buf
   o[11] = rcp_ftz(x);
   o[12] = abs_ftz(x);
   o[13] = fmin(x, y);
+  o[14] = round(x);
+  o[15] = fma(x, y, 0.0f);
 }
 """
 
@@ -229,3 +235,75 @@ kernel void conv(device const ushort* h [[buffer(0)]], device const float* f [[b
     assert np.array_equal(got[finite].view(np.uint32), emu.h2f(h)[finite].view(np.uint32))   # exact, fp16 subnormals too
     assert np.array_equal(got[~finite], emu.h2f(h)[~finite], equal_nan=True)   # infinities exact; NaN stays NaN
     assert np.array_equal(np.frombuffer(fh.read(0, 2 * n), np.uint16), emu.half_bits(f))     # round to nearest even
+
+
+def test_compares_read_subnormals_as_zero():
+    """Measured: ``<``, ``>`` and ``==`` read a subnormal operand as the zero of its sign, so two subnormals, or a
+    subnormal and a zero, compare equal; NaN is unordered and -0 equals +0, as IEEE says. The model is IEEE's compare
+    of the flushed operands, on every row. CUDA's setp without .ftz orders subnormals exactly, so an IEEE-built basalt
+    kernel's compares are ported on order-preserving keys of the bits (kernels/common/basalt_sampler.metal's okey,
+    f_gt, f_lt)."""
+    dev = nt.Device()
+    src = kernels.PRELUDE + kernels.template("basalt_fp.metal") + """
+kernel void cmp(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                device uint* out [[buffer(2)]], constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const float x = a[i], y = b[i];
+  out[i] = uint(x < y) | (uint(x > y) << 1) | (uint(x == y) << 2);
+}
+"""
+    pso = nt.Pipeline(nt.Library(dev, src, {}), "cmp")
+    s, s2, m = 1.5e-39, 3e-39, 2.0 ** -126                  # subnormals s < s2; the smallest normal
+    nan, inf = np.nan, np.inf
+    planted = np.array([(s, 0), (0, s), (s, s2), (-s, 0), (s, -s), (-s, -0.0), (s2, -s2), (m, s), (s, m), (m, 0),
+                        (0, -0.0), (nan, nan), (nan, s), (s, nan), (inf, s), (-inf, -s)], F32)
+    rng = np.random.default_rng(5)
+    n = 1 << 16
+    low = lambda: normals(rng, n, 0, 3)                    # subnormals (or zeros) and the two lowest binades
+    a = np.r_[planted[:, 0], low(), rng.integers(0, 1 << 32, n, dtype=np.uint64).astype(np.uint32).view(F32)]
+    b = np.r_[planted[:, 1], low(), rng.integers(0, 1 << 32, n, dtype=np.uint64).astype(np.uint32).view(F32)]
+    out = nt.Buffer(dev, 4 * len(a))
+    d = nt.Dispatch().pipeline(pso).buffer(0, nt.Buffer(dev, a.tobytes())).buffer(1, nt.Buffer(dev, b.tobytes()))
+    d = d.buffer(2, out).bytes(3, np.uint32(len(a)).tobytes()).grid(-(-len(a) // 256)).threadgroup(256)
+    r = nt.Queue(dev).run([d])
+    assert not r.error, r.error
+    got = np.frombuffer(out.read(0, 4 * len(a)), np.uint32)
+    code = lambda x, y: (x < y).astype(np.uint32) | ((x > y).astype(np.uint32) << 1) | ((x == y).astype(np.uint32) << 2)
+    lt, gt, eq = 1, 2, 4
+    # the planted rows: subnormals are zeros of their sign to the compare; NaN unordered; -0 == +0; normals ordered
+    assert got[: len(planted)].tolist() == [eq, eq, eq, eq, eq, eq, eq, gt, lt, gt, eq, 0, 0, 0, gt, lt]
+    assert np.array_equal(got, code(emu.ftz(a), emu.ftz(b)))
+    assert np.count_nonzero(got != code(a, b)) > n // 16    # IEEE's compare of the same bits differs on many rows
+
+
+def test_round_matches_cuda_roundf_but_for_the_zero_sign():
+    """Metal's round() against CUDA's roundf as nvcc compiles it: trunc(q + copysign(0.5, q)) with the add rounded
+    toward zero (LOP3.LUT, FADD.RZ, FRND.TRUNC; docs/research/basalt-nvcc/matvec.md section 3), on 0x3EFFFFFF, on
+    k + 0.5 - ulp, k + 0.5 and k + 0.5 + ulp for k = 0..127 (ulp() above: 0x3EFFFFFE at k = 0) and on their
+    negatives, 770 inputs. Bitwise, except the sign of a zero result for q in (-0.5, 0): round() gives +0 there where
+    roundf gives -0 (measured), and a q8_1 code converts it to int8, where both zeros are 0. Any other difference
+    changes the codes of main's q8_1 quantizers, which round with round()."""
+    h = np.arange(128, dtype=F32) + F32(0.5)
+    q = np.r_[np.uint32(0x3EFFFFFF).view(F32), np.c_[h - ulp(h), h, h + ulp(h)].ravel()]
+    q = np.r_[q, -q]
+    got = run_ops(q, np.zeros_like(q), np.zeros_like(q))[:, 14]
+
+    def rz(s):                                    # the Fraction s rounded toward zero to float32
+        f = F32(float(s))                         # one of the two float32 values around s
+        return np.nextafter(f, F32(0)) if abs(Fraction(float(f))) > abs(s) else f
+
+    want = np.array([np.trunc(rz(Fraction(float(v)) + Fraction(math.copysign(0.5, v)))) for v in q], F32)
+    zero_sign = (q > -0.5) & (q < 0)
+    assert len(q) == 770 and np.all(want[zero_sign] == 0) and np.all(got[zero_sign] == 0)
+    bad = q[~zero_sign][got[~zero_sign].view(np.uint32) != want[~zero_sign].view(np.uint32)]
+    assert bad.size == 0, f"round() is not roundf at {[hex(b) for b in bad.view(np.uint32)]}"
+    assert np.any(np.trunc(q + np.copysign(F32(0.5), q)) != want)    # the add rounded to nearest would differ
+
+
+def test_fma_with_a_zero_addend_is_not_folded():
+    """fma(a, b, 0.0f), with a and b read from a buffer, stays an fma: a -0 product plus the +0 addend gives +0, as the
+    FFMA chains nvcc starts from the zero register RZ do (docs/research/basalt-nvcc/experts.md, dense_tc.md); a fold
+    to a * b would give -0."""
+    got = run_ops(np.array([-1, 1], F32), np.array([0, -0.0], F32), np.zeros(2, F32)).view(np.uint32)
+    assert got[:, 1].tolist() == [0x80000000] * 2          # a * b is -0, so a fold would show
+    assert got[:, 15].tolist() == [0, 0]

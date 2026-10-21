@@ -49,8 +49,9 @@ current code wherever the two differ. Paths under `runtime/` are this repository
 | Compiler arithmetic | The kernels adapted from llama.cpp's arithmetic (`native_*.cu`, `qsa_dec_fused.cu`, `q5k_head.cu`, `q6k_head.cu`) and the prompt path's MMQ build with `--use_fast_math`: approximate `expf`, division and square root, denormals flushed. Every other kernel builds with nvcc's IEEE defaults, which still contract a multiply and an add into an FMA. Several of those IEEE-built kernels write approximate or flush-to-zero operations by hand, most of them to give a fast-math kernel's bits (the list below) | `CMakeLists.txt:185-202`, `:728`; `src/kernels/cuda/hc_fused.cu:1-5`; `src/kernels/cuda/dec_gdn_rec.cu:4-5` |
 
 **Approximate operations in IEEE-built kernels.** These decode and drafter kernels compute some operations with
-approximate or flush-to-zero instructions although their files build without `--use_fast_math`, and two of them call
-CUDA math library functions that are not correctly rounded (`log1pf`, and the library `expf`):
+approximate or flush-to-zero instructions although their files build without `--use_fast_math`, and four of them
+call CUDA math library functions that are not correctly rounded (`log1pf`, the library `expf`, and the sampler's
+library `logf` and binary64 `exp`):
 
 - `src/kernels/cuda/hc_fused.cu`, the fused hyper-connection read (decode and drafter): the router's GEMV and top-10
   as the fast-math build's flush-to-zero PTX, `fma`, `add`, `sub`, `mul` and `max` with `.ftz`, `ex2.approx.ftz.f32`
@@ -61,6 +62,9 @@ CUDA math library functions that are not correctly rounded (`log1pf`, and the li
   softplus (`:111`); `rsqrtf` in the norms (`:119`, `:228-229`, `:266`).
 - `src/kernels/cuda/verify_kernels.cu:315`, the GDN commit's replay (`gdn_commit_layers`, `src/core/verify.cpp:2133`):
   `__expf` in the decay.
+- `src/kernels/cuda/verify_kernels.cu`, the per-stage GDN kernels, `dec_gdn_parity`'s reference side (off the path):
+  `__expf` in the SiLU (`:46`), the beta (`:151`, `:206`), the softplus with `log1pf` (`:153-155`, `:208-210`), the
+  decay (`:407`) and the output gate (`:441`); `rsqrtf` in the norms (`:53`, `:431`, `:439`).
 - `src/kernels/cuda/qsa_dec_attn.cu`, the attention: `__expf` in the chunk softmax and the merge (`:259-260`, `:380`;
   the drafter's wide window, `:576-577`, `:667`); the output gate as `mul.ftz`, `ex2.approx.ftz`, `add.ftz` and
   `rcp.approx.ftz` (`:308-319`); the q8_1 rows' `max`, `abs` and `add` with `.ftz` and `div.approx.ftz.f32`
@@ -69,8 +73,11 @@ CUDA math library functions that are not correctly rounded (`log1pf`, and the li
 - The routed experts' SwiGLU: `__expf` (`src/kernels/cuda/gu2.cuh:387`, the chained pass decode runs,
   `src/kernels/cuda/iq_kernels.cu:2567`, `:2585`; otherwise `iq_kernels.cu:1918`). The drafter's Q2_0 experts' SwiGLU:
   `__expf` (`src/kernels/cuda/s2_expert_grouped.cu:170`).
-- `src/kernels/cuda/sampler.cu:311`: `__expf` in the probability of the drafter's greedy pick
-  (`src/core/mtp.cpp:1036`).
+- `src/kernels/cuda/sampler.cu`, the sampler: `__expf` in the probability of the drafter's greedy pick (`:311`;
+  `src/core/mtp.cpp:1036`), which this pack reaches only under `--exp spec_log=1` (`src/core/mtp.cpp:708-712`; the
+  2-bit proxy or the fused head top-1 returns first otherwise, `:1009-1019`) and as `q5k_head_parity`'s reference
+  (`src/kernels/q5k_head_parity.cpp:111`, `:130`); in the sampled tail (decode, sampled requests), the library `logf`
+  (`:403`) and the binary64 library `exp` (`:379`, `:410`).
 - `src/kernels/cuda/hc8_gr.cu`, the 8-bit hyper-connection read the drafter's prompt catch-up runs once per verify
   window: `MtpDrafter::prefill_cur` (`src/core/mtp.cpp:1393-1402`) records the forward without the fused read, which
   calls `gr_read` or `fused_gr_read_multi` (`:819-823`), and both run `hc8_gr_read_multi` because `hc8_enabled()` is
@@ -119,9 +126,10 @@ ones this pack runs.
    hyper-connection read, its router and the int8 copies, `dequant.md` for the GGUF dequantizers, `dequant_bf16.md`
    for the prompt path's group dequantizers, `prefill_kernels.md` for the prompt path's element-wise kernels and
    conversions, `experts.md` for the routed experts, `bf16.md` for the BF16 GEMVs, `dense_tc.md` for the window
-   projections, `q5k_head.md` for the Q5_K head, `s2_experts.md` for the drafter's experts, `nan.md` for the NaN each
-   store holds; the CPU expert tier runs on the host rather than the GPU, so its authority is glibc and gcc instead,
-   recorded in `docs/research/basalt-cpu-expf.md`): which multiply-adds fuse and
+   projections, `q5k_head.md` for the Q5_K head, `s2_experts.md` for the drafter's experts, `sampler.md` for the
+   sampler, `dec_gdn.md` and `verify_gdn.md` for the GDN window, its per-stage kernels and its commit, `nan.md` for the
+   NaN each store holds; the CPU expert tier runs on the host rather than the GPU, so its authority is glibc and gcc
+   instead, recorded in `docs/research/basalt-cpu-expf.md`): which multiply-adds fuse and
    with which operands, the operand order of each `a * b - c * d`, where `.FTZ` flushes subnormals, and each
    approximate instruction. The source alone does not settle it: nvcc's default `--fmad=true` fuses where the source
    writes no FMA, `ptxas` fuses further than the PTX (the Q4_K and Q5_K returns, `matvec.md` section 5) and replaces an
@@ -142,15 +150,35 @@ ones this pack runs.
    GPU flushes subnormal inputs and results of add,
    multiply, fma and division to the zero of their sign (MSL section 8.1 permits it), and `fmax` and `fmin` compare a
    subnormal as zero but return the chosen operand unflushed, the second one on a tie (measured,
-   `tests/kernels/test_basalt_platform.py`). An approximate division or reciprocal
+   `tests/kernels/test_basalt_platform.py`). This GPU's `<`, `>` and `==` also read a subnormal operand as the zero of
+   its sign (measured, `test_compares_read_subnormals_as_zero` in the same file), so wherever an IEEE-built kernel
+   orders or selects floats that may be subnormal, the Metal kernel compares order-preserving integer keys of their
+   bits: `-0` equals `+0`, and a NaN operand gives what CUDA's operator at that site gives. An approximate division or
+   reciprocal
    (`MUFU.RCP`, then `FMUL` for a division) becomes the correctly rounded reciprocal `1.0f / x` and the same multiply:
    it gives CUDA's bits wherever `MUFU.RCP` returns the correctly rounded reciprocal, which NVIDIA does not specify,
    and it needs no undocumented Metal behaviour. The tests count how often a quotient through the correctly rounded
    reciprocal differs from the correctly rounded quotient. For the other approximate operations basalt computes,
    whether a `--use_fast_math` file produces them or an IEEE-built kernel writes them (the list above), the mapping
    is the `metal::fast::` function of the same operation: `fast::exp2` of the product with log2(e) that `__expf` or
-   basalt's PTX forms, `fast::rsqrt` for `rsqrtf` (Table 8.2). MSL has no `log1p`, so `log1pf` gets a helper of its
-   own, and the library `expf` maps to `metal::precise::exp`. One helper serves each operation at every site, so
+   basalt's PTX forms, `fast::rsqrt` for `rsqrtf` (Table 8.2). In an IEEE-built kernel nvcc compiles `__expf` to that
+   product (an `FMUL` without `.FTZ`) and the non-`.ftz` `ex2.approx.f32`, which `ptxas` writes as `MUFU.EX2` with an
+   argument below -126 halved and the result squared by an IEEE multiply, so that subnormal results survive. It compiles
+   `rsqrtf` to the non-`.ftz` `rsqrt.approx.f32`, which scales a zero or subnormal argument by 2^24 and the result by
+   2^12 (`dec_gdn.md`, Notation). The Metal kernels write those sequences around `fast::exp2` and `fast::rsqrt` as
+   `expf_ieee` and `rsqrt_ieee` (`kernels/common/basalt_ieee.metal`), with the product, the square and the scalings
+   through `ieee_mul`. Their results then do not depend on what `fast::exp2` and `fast::rsqrt` do with a subnormal,
+   which MSL section 8.1 lets a GPU flush and which is not measured here. Two helpers written before `expf_ieee` keep
+   the bare `fast::exp2` until their lanes move them to it. One is `expf_neg` (`basalt_fp.metal`), in the routed and
+   drafter experts' SwiGLU, where `1 + e` is 1 for every e the halved branch produces (`experts.md` section 2). The
+   other is the sampler's `expf_approx` (`basalt_sampler.metal`), where such a term can change `probs` only through an
+   exact rounding tie (`sampler.md` section 3.3). MSL has no `log1p`, so `log1pf` is an exact transcription of
+   `__nv_log1pf` as nvcc 13.0 inlines it (`dec_gdn.md` section 6a, `log1pf_nv`), and the library `expf` maps to
+   `metal::precise::exp`. The sampler's library `logf` and binary64 `exp` have no
+   `metal::` counterpart with CUDA's bits (`precise::log` is not CUDA's `logf`, and MSL has no `double`), so they are
+   exact transcriptions of the sequences nvcc 13.0 inlines into `sampler.cu` (`sampler.md` sections 2.5-2.6), and the
+   sampler's binary64 arithmetic is software IEEE binary64 with subnormals (`kernels/common/basalt_f64.metal`). One
+   helper serves each operation at every site, so
    kernels that basalt checks bitwise against each other (`qsa_dec_attn_parity`, `dec_gdn_parity`, and
    `hc_fused_parity`'s window checks) stay bitwise equal on Metal. Where `MUFU.RCP` is not correctly rounded, where
    basalt approximates an exponential or a square root (`ex2.approx`, `rsqrtf`), and where it calls `log1pf` or the
@@ -410,7 +438,9 @@ These basalt tests do not run on this pack's path:
 - `gdn_parity`: the single-token GDN kernels of `gdn.cu` (`gdn_step`, `gdn_conv_step`, `gdn_l2_norm`,
   `gdn_out_norm`), which only the single-token layer calls (`src/core/layer.cpp:218-287`), through `block_layer` and
   `session_token`, which nothing in `src/program/` calls. The verify window runs `dec_gdn_rec`
-  (`src/core/verify.cpp:1205-1297`), which `dec_gdn_parity` checks against a double reference.
+  (`src/core/verify.cpp:1205-1297`), which `dec_gdn_parity` checks bitwise against the per-stage kernels, whose
+  segment outputs it grades against a double reference (`src/kernels/dec_gdn_parity.cpp:286-301`, `:501-502`); the
+  port also grades `dec_gdn_rec`'s own h and y against float64 (`tests/kernels/test_basalt_dec_gdn.py`).
 - `gr_parity`: its read checks (`:367`, `:566`, `:752`) run `gr_read` and `fused_gr_read` on BF16 matrices without
   an 8-bit copy, and this pack always reads through the copies (`src/kernels/cuda/hc_fused.cu:1248`). Its write
   checks (`:645`, `:689`) run `gr_write_kernel`, because `native_mmvf` defaults to false
@@ -481,6 +511,8 @@ same rule holds for any other ported kernel whose basalt tests end in a comparis
 | The attention's output gate, `native_qsa_gate_apply`'s arithmetic, which the merge reproduces (`src/kernels/cuda/qsa_dec_attn.cu:308-319`) | only a reference side (`src/kernels/qsa_dec_attn_parity.cpp:131`); `qsa_parity`'s gate check runs the fp16 `qsa_gate_apply` (`src/kernels/qsa_parity.cpp:1142-1154`) | `shared_expert_parity`'s rule for its sigmoid gate, `rel < 2e-6` (`src/kernels/shared_expert_parity.cpp:372`) |
 | `native_qsa_rms_norm_weighted`, the query and key norms with fp16 KV (`src/core/verify.cpp:1340-1341`; drafter, `src/core/mtp.cpp:727`, `:764`, `:792`) | only a reference side (`src/kernels/qsa_dec_fused_parity.cpp:111`, `:123`, `:125`) | `qsa_parity`'s rule for the pooled keys: `if (!(worst <= 1e-6)) {` (`src/kernels/qsa_parity.cpp:611`) |
 | `native_qsa_indexer_append`, the indexer key's norm, RoPE and pooling with fp16 KV (`src/core/verify.cpp:1478-1483`), which the commit replays (`native_qsa_indexer_commit_layers`, `:2134`) | `qsa_parity` compares it bitwise with the prompt path's batched append (`src/kernels/qsa_parity.cpp:1428-1437`) and its position-0 key with the table indexer (`:1495`); only the table indexer, `indexer_key_append`, meets a double reference (`:581`, `:611`) | the pooled keys against a double-precision reference with `rope_parity`'s bound for the native rotation: `if (!(rel <= 3e-3)) ++agree_bad;` (`src/kernels/rope_parity.cpp:400`) |
+| `sample_greedy_top_prob`, the drafter's greedy tail: the argmax and its softmax probability (`src/kernels/cuda/sampler.cu:249-325`, `:930-972`; `src/core/mtp.cpp:1036`, which this pack reaches only under `--exp spec_log=1`) | `sampler_parity` never calls it; `q5k_head_parity` runs it only as the reference side of the fused head top-1 (`src/kernels/q5k_head_parity.cpp:111`, `:130`) | `test_basalt_sampler_greedy_top_prob_vs_host`: the id equal to the host argmax, mapped, and on rows of finite logits the probability against the float64 softmax with `q5k_head_parity`'s bound: `if (logit_bad \|\| id_bad \|\| max_rel > 1e-5) fail = 1;` (`src/kernels/q5k_head_parity.cpp:145`) |
+| `dec_gdn_rec`'s gate and beta, per value head and token (`ab_one`, `src/kernels/cuda/dec_gdn_rec.cu:87-113`; stored at `:238-239`), in every verify window (`src/core/verify.cpp:1205-1297`) | `dec_gdn_parity` compares them only bitwise with `gdn_ab_multi`'s (`src/kernels/dec_gdn_parity.cpp:288-289`), and its double reference `cpu_seg` consumes the GPU's (`:496-499`) | `test_gdn_ab_multi_matches_the_float64_reference` (`tests/kernels/test_basalt_dec_gdn.py`): `gdn_ab_multi`'s gate and beta (`dec_gdn_rec`'s equal them bit for bit: `test_dec_gdn_rec_matches_the_per_stage_kernels_bitwise`) against float64 gates on `dec_gdn_parity`'s inputs (`ab64`, `tests/basalt_gdn_ref.py`), with the bound of the nearest stage, the conv's `ec`: `ok = ok && d == 0 && ec < 1e-4 && ey < 1e-3 && es < 1e-3;` (`src/kernels/dec_gdn_parity.cpp:551`) |
 | `Gemm::bf16`, the BF16 x BF16 product: the PLE value product and every BF16 projection without an int8 copy (`src/prefill/gemm.cu:122-132`; `src/prefill/prefill.cpp:1538`, `:1707`, and through `Gemm::bf16_w`'s fall-through, `gemm.cu:155`, at `prefill.cpp:1572`, `:1587`-`:1588`, `:1608`-`:1609`, `:1698`) | `hc8_parity` part 2 runs `Gemm::bf16` through `Gemm::bf16_w`, directly on a BF16 matrix (`src/kernels/hc8_parity.cpp:244`; `src/prefill/gemm.cu:155`) and on the BF16 image of an int8 copy (`hc8_parity.cpp:245-246`; `gemm.cu:151`), and gates only the copy's product against double (`hc8_parity.cpp:269`, on 256 sampled outputs, `:253-262`), at hc8's shapes | `hc8_parity`'s own gate on `Gemm::bf16`'s product, `expect(ex.rel() < 5e-3, "the product against the copy in double");` (`hc8_parity.cpp:269`), applied at this pack's plain-BF16 shapes on every output against float64; the chain bit for bit against its numpy twin; row, column, slice and repeat invariance bit for bit |
 | `Gemm::native`, a GGUF matrix dequantized into an FP16 image and multiplied by `Gemm::f16` (`src/prefill/gemm.cu:169-185`, `:158-167`; `src/prefill/prefill.cpp:1191` for every quantized projection, `:1535` for the PLE key) | no test runs `Gemm::native`; `prefill_mmq_kq_test` runs `Gemm::f16` in its FP16 expert path, off this pack (`tests/cuda/prefill_mmq_kq_test.cpp:241`, `:244`), and prints that path's error against double without a bound (`:370`, `:373`; only a non-finite output fails, `:269`); `dequant_f16_parity` checks only the first stage, the FP16 image (`src/kernels/dequant_f16_parity.cpp:73`, `:98`) | borrowed (nearest bound; no basalt test gates `Gemm::native`'s or `Gemm::f16`'s product against a reference): `expect(ex.rel() < 5e-3, "the product against the copy in double");` (`hc8_parity.cpp:269`) on every output against float64 on the exact dequantized values, so the FP16 image's rounding counts; the two stages bit for bit equal to the FP16 chain on the image; repeat invariance bit for bit |
 | `to_f16`, the PLE key operand for a quantized key matrix (`src/prefill/kernels.cu:818-821`, `hf` `:40`, launcher `:846-850`; `src/prefill/prefill.cpp:1534`) | no test runs `to_f16_kernel`; the nearest check, `dequant_f16_parity`'s store against `__float2half_rn` of the fp32 value (`src/kernels/dequant_f16_parity.cpp:73`), is the same rounding, bitwise | bit for bit against `emu.cuda_half_bits` on every special value (G9-F16) |

@@ -4,10 +4,14 @@
 # adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu, src/kernels/cuda/iq_kernels.cu,
 # src/kernels/cuda/native_bf16.cu, src/kernels/cuda/dense_tc.cu, src/kernels/cuda/q5k_head.cu,
 # src/kernels/cuda/head_proxy.cuh, src/kernels/cuda/quantize_act.cu, src/kernels/cuda/s2_expert_grouped.cu,
+# src/kernels/cuda/dec_gdn_rec.cu, src/kernels/cuda/verify_kernels.cu,
 # include/basalt/kernels/q8_1_finite.hpp, include/basalt/kernels/f16_bits.hpp and src/kernels/hc8_parity.cpp @
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp ggml/src/ggml-common.h (kvalues_iq4nl),
 # ggml/src/ggml-quants.c (get_scale_min_k4), ggml/src/ggml-cuda/quantize.cu and ggml/src/ggml-cuda/mmvf.cu @
 # 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+# log1pf_nv: transcribed from NVIDIA libdevice's __nv_log1pf as nvcc 13.0 (V13.0.48, -arch=sm_120 -lineinfo -O3
+# -DNDEBUG) inlined it into basalt's dec_gdn_rec.cu and verify_kernels.cu; SASS listing and transcription:
+# docs/research/basalt-nvcc/dec_gdn.md section 6a.
 """numpy emulation of basalt's float32 arithmetic as nvcc compiles it (docs/research/basalt-nvcc/matvec.md), for the
 bit-for-bit tests of the Metal port. Every float operation rounds once to float32, to nearest even on the float32
 grid, subnormals included (gradual underflow): numpy's float32 add, multiply and divide do; ``fma32`` does by rounding
@@ -15,6 +19,8 @@ the exact float64 sum to odd before the float32 cast. The ``*_ftz`` forms flush 
 rounded result if it is subnormal, as PTX defines ``.ftz`` (``fma.f32``: the exact value "rounded to single
 precision"; ``.ftz`` flushes "subnormal inputs and results"): an exact result in [2^-126 - 2^-150, 2^-126) gives
 2^-126, the tie 2^-126 - 2^-150 included (2^-126 is the even neighbour)."""
+
+from fractions import Fraction
 
 import numpy as np
 
@@ -807,6 +813,218 @@ def q5k_proxy_final(cand, part, exact, map_, expf):
         s[:k] = add_ftz(s[:k], ed[c0:c0 + k])
     total = max_ftz(butterfly(s[None], add_ftz)[0], F32(1.0 if bi in rows else 0.0))
     return int(np.asarray(map_)[bi]), rcp_ftz(total), rows
+
+
+# ---- the GDN window (docs/research/basalt-nvcc/dec_gdn.md, verify_gdn.md) -----------------------------------------
+# dec_gdn_rec.cu and verify_kernels.cu build with nvcc's IEEE defaults: no flush, as numpy's float32 operations.
+# MUFU.EX2 and MUFU.RSQ have no bit-exact host model: ``exp2`` and ``rsqrt`` evaluate the port's stand-ins, the GPU's
+# fast::exp2 and fast::rsqrt, on a float32 array.
+
+L2E = np.uint32(0x3FB8AA3B).view(F32)      # log2(e) rounded: __expf's FMUL constant (-L2E, 0xBFB8AA3B, for __expf(-x))
+
+
+def sign_flip(x):
+    """-x by its bits: the sign flipped, every other bit kept."""
+    return (np.asarray(x, F32).view(np.uint32) ^ np.uint32(0x80000000)).view(F32)
+
+
+def ex2n(e, exp2):
+    """nvcc's non-ftz ex2.approx.f32 (dec_gdn.md, Notation): FSETP.GEU e, -126, so an argument below -126 (ordered) is
+    halved and MUFU.EX2's result squared by an IEEE multiply, which keeps a subnormal result."""
+    e = np.asarray(e, F32)
+    s = e < F32(-126.0)
+    r = np.asarray(exp2(np.where(s, e * F32(0.5), e).astype(F32)), F32)
+    with np.errstate(over="ignore"):                    # r * r of an unhalved row is discarded
+        return np.where(s, r * r, r).astype(F32)
+
+
+def expf_ieee(x, exp2):
+    """__expf(x) in an IEEE-built file: FMUL e, x, 0x3FB8AA3B (no FTZ), then ex2n(e). An __expf(-x) site is ex2n of
+    x * -L2E, the constant nvcc folds the negation into."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        e = np.asarray(x, F32) * L2E
+    return ex2n(e, exp2)
+
+
+def rsqrt_ieee(x, rsqrt):
+    """rsqrtf in an IEEE-built file (rsqn, dec_gdn.md Notation): FSETP.GEU |x|, 2^-126, so a zero or subnormal argument
+    (ordered: not NaN) is scaled by 2^24 before MUFU.RSQ and the result by 2^12."""
+    x = np.asarray(x, F32)
+    small = np.abs(x) < F32(2.0 ** -126)
+    with np.errstate(over="ignore", invalid="ignore"):
+        r = np.asarray(rsqrt(np.where(small, x * F32(2.0 ** 24), x).astype(F32)), F32)
+        return np.where(small, r * F32(4096.0), r).astype(F32)
+
+
+def log1pf_nv(x):
+    """libdevice's __nv_log1pf as nvcc 13.0 inlined it into the softplus (dec_gdn_rec.cu:111, verify_kernels.cu:154
+    and :209), the SASS of dec_gdn.md section 6a operation for operation, on any float32: FADD.RZ t, x, 1 rounds the
+    exact sum (a Fraction) toward zero, the integer steps act on the bits, each FFMA is fma32 and each FADD and FMUL
+    numpy's IEEE operation, and the special block's predicates are ISETP on the bits and FSETP.NEU's IEEE compare
+    (NaN unordered). No pass-through: a zero or subnormal x runs the whole sequence."""
+    x = np.asarray(x, F32)
+    u32, c = np.uint32, lambda b: np.uint32(b).view(F32)
+
+    def add_rz1(v):                                     # FADD.RZ t, v, 1
+        if not np.isfinite(v):
+            return v + F32(1.0)
+        s = Fraction(float(v)) + 1
+        f = F32(float(s))                               # one of the two float32 values around s
+        return np.nextafter(f, F32(0.0)) if abs(Fraction(float(f))) > abs(s) else f
+
+    xb = x.view(u32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        t = np.array([add_rz1(v) for v in x.ravel()], F32).reshape(x.shape)
+        k = (t.view(u32) - u32(0x3F400000)) & u32(0xFF800000)            # IADD3, LOP3.LUT
+        m = (xb - k).view(F32)                                            # IADD3 m, x, -k
+        s = (u32(0x40800000) - k).view(F32)                               # IADD3 s, -k, 0x40800000
+        s = fma32(s, F32(0.25), F32(-1.0))
+        m = m + s
+        kf = k.view(np.int32).astype(F32) * c(0x34000000)                 # I2FP.F32.S32 (exact), FMUL by 2^-23
+        p = fma32(m, c(0xBD39BF78), c(0x3DD80012))
+        for b in (0xBE0778E0, 0x3E146475, 0xBE2A68DD, 0x3E4CAF9E, 0xBE800042, 0x3EAAAAE6, 0xBF000000):
+            p = fma32(p, m, c(b))
+        p = m * p
+        r = fma32(m, p, m)
+        r = fma32(kf, c(0x3F317218), r)                                   # + k ln 2
+        p0 = xb >= u32(0x7F800000)                                         # +inf, NaN, the sign set
+        p2 = p0 & (xb.view(np.int32) > np.int32(-0x40800000))             # and (int) bits > (int) 0xBF800000
+        r = np.where(p2, fma32(x, F32(np.inf), F32(np.inf)), r)
+        return np.where(p0 & (x == 0), F32(-0.0), r).astype(F32)          # FSEL r, r, -RZ, x != 0
+
+
+def q8_1_rec(x):
+    """dec_gdn_rec's q8_1 rows (norm_q8, dec_gdn_rec.cu:115-132) as nvcc compiles them (dec_gdn.md section 6c): the
+    absolute values, the max butterfly (FMNMX without FTZ or NAN: a NaN lane loses, a signaling one too, nan.md; the
+    host's fmax returns NaN for a signaling operand, so the NaNs are quieted first), the sum butterfly (FADD) and the
+    amax == 0 test without flushing; d by FMUL.FTZ with fl(1/127) and the codes by MUFU.RCP then FMUL.FTZ, as
+    q8_1_native's; roundf, the clamp, and a NaN code 0. A subnormal amax gives d = +0 and codes rcp(+0) = inf times a
+    flushed value: NaN, code 0."""
+    v = np.asarray(x, F32).reshape(-1, 32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        amax = butterfly(np.where(np.isnan(v), F32(np.nan), np.abs(v)), np.fmax)
+        s = butterfly(v, np.add)
+        d = q8_1_finite(mul_ftz(amax, RCP127))
+        q = roundf(mul_ftz(v, rcp_ftz(d)[:, None]))
+    return q8_1_pack(d, s, q8_1_codes(q, amax))
+
+
+# The shared steps of kernels/common/basalt_gdn.metal, each from the SASS rows of dec_gdn.md section 1 and
+# verify_gdn.md sections 2-5 (every FFMA an fma32, every FMUL, FADD and div.rn or rcp.rn numpy's float32 operation).
+
+def gdn_conv(v0, v1, v2, x, w0, w1, w2, w3):
+    """The conv sum (dec_gdn_rec.cu:64, verify_kernels.cu:45): FMUL p, w1, v1; FFMA s, w0, v0, p; FFMA s, w2, v2, s;
+    FFMA sum, x, w3, s (dec_gdn.md section 6d)."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        p = np.asarray(w1, F32) * np.asarray(v1, F32)
+        return fma32(x, w3, fma32(w2, v2, fma32(w0, v0, p)))
+
+
+def gdn_silu(s, exp2):
+    """SiLU (dec_gdn_rec.cu:65, verify_kernels.cu:46): FMUL e, s, -log2(e); ex2n; FADD d, r, 1; div.rn(s, d), the
+    correctly rounded quotient."""
+    s = np.asarray(s, F32)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        return (s / (ex2n(s * -L2E, exp2) + F32(1.0))).astype(F32)
+
+
+def gdn_sum4(p0, p1, p2, p3):
+    """FADD a, p0, p1; FADD a, a, p2; FADD a, a, p3."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return ((np.asarray(p0, F32) + np.asarray(p1, F32)) + np.asarray(p2, F32)) + np.asarray(p3, F32)
+
+
+def gdn_l2_scale(y, ss, eps, rsqrt):
+    """The q/k L2 scale (dec_gdn_rec.cu:228-229, verify_kernels.cu:53), which the kernels write at the call site: FADD
+    x, ss, eps; rsqn(x); FMUL y, y, r."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return (np.asarray(y, F32) * rsqrt_ieee(np.asarray(ss, F32) + np.asarray(eps, F32), rsqrt)).astype(F32)
+
+
+def gdn_ab_dot(w, x):
+    """The alpha or beta logit (dec_gdn_rec.cu:89-108, verify_kernels.cu:183-203) of each row of bf16 weights ``w``
+    (uint16, a multiple of 8 per row) against the same row of float32 activations ``x``: lane L's FFMA chain, the
+    first on RZ, over the words j = L, L + 32, ... below n / 8, the word's elements 8j .. 8j + 7 in order (a weight
+    widened by its bits, << 16); then the butterfly's FADDs, lane 0's sum."""
+    w, x = np.asarray(w, np.uint16), np.asarray(x, F32)
+    n = w.shape[1]
+    wf = (w.astype(np.uint32) << np.uint32(16)).view(F32)
+    v = np.zeros((len(w), 32), F32)
+    for j0 in range(0, n // 8, 32):
+        j = j0 + np.arange(32)
+        for e in range(8):
+            k = np.minimum(8 * j + e, n - 1)
+            v = np.where(j < n // 8, fma32(wf[:, k], x[:, k], v), v)
+    with np.errstate(over="ignore", invalid="ignore"):
+        return butterfly(v, np.add)
+
+
+def gdn_beta(v, exp2):
+    """beta (dec_gdn_rec.cu:109, verify_kernels.cu:151, :206): FMUL e, v, -log2(e); ex2n; FADD d, r, 1; rcp.rn(d), the
+    correctly rounded reciprocal."""
+    v = np.asarray(v, F32)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        return (F32(1.0) / (ex2n(v * -L2E, exp2) + F32(1.0))).astype(F32)
+
+
+def gdn_gate(v, dt, sa, exp2):
+    """The gate (dec_gdn_rec.cu:110-112, verify_kernels.cu:153-155, :208-210): FADD u, dt, v; FSETP.GT u, 20 keeps u,
+    else libdevice's log1pf of __expf(u); FMUL g, sa, sp."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        u = np.asarray(dt, F32) + np.asarray(v, F32)
+        sp = np.where(u > F32(20.0), u, log1pf_nv(expf_ieee(u, exp2)))
+        return (np.asarray(sa, F32) * sp).astype(F32)
+
+
+RSQRT128 = np.uint32(0x3DB504F3).view(F32)      # rsqrtf((float) S) as nvcc folds it: RN(2^-3.5)
+
+
+def gdn_kv(s, k):
+    """kv (dec_gdn_rec.cu:251, verify_kernels.cu:410) of each row of 32 state values ``s`` against ``k`` (the rows on
+    the last axis): FFMA kv, s_0, k_0, RZ, then 31 FFMA, r ascending."""
+    s, k = np.asarray(s, F32), np.asarray(k, F32)
+    kv = np.zeros(np.broadcast_shapes(s.shape, k.shape)[:-1], F32)
+    for r in range(s.shape[-1]):
+        kv = fma32(s[..., r], k[..., r], kv)
+    return kv
+
+
+def gdn_delta(g, kv_col, v, b):
+    """delta (dec_gdn_rec.cu:255, verify_kernels.cu:414): FFMA d, -g, kv_col, v (contracted); FMUL delta, d, b."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return (fma32(sign_flip(g), kv_col, v) * np.asarray(b, F32)).astype(F32)
+
+
+def gdn_update(s, k, q, g, delta):
+    """The state update and o (dec_gdn_rec.cu:259-260, verify_kernels.cu:423-424) of each row of 32 state values (the
+    last axis; ``g`` and ``delta`` per row): FMUL p, delta, k_r; FFMA s_r, g, s_r, p; then o's chain, FFMA o, s_r,
+    q_r, o on the updated s_r, the first on RZ. Returns the updated rows and o."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        kd = np.asarray(k, F32) * np.asarray(delta, F32)[..., None]
+    s = fma32(np.asarray(g, F32)[..., None], s, kd)
+    return s, gdn_kv(s, q)
+
+
+def gdn_oc(o0, o1, o2, o3):
+    """oc (dec_gdn_rec.cu:265-266, verify_kernels.cu:431): gdn_sum4's three FADDs, FMUL by 0x3DB504F3."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return (gdn_sum4(o0, o1, o2, o3) * RSQRT128).astype(F32)
+
+
+def gdn_sq32(oc):
+    """sq32 (dec_gdn_rec.cu:136-137, verify_kernels.cu:432-434) of each row of 32 columns: FMUL q, oc, oc, then the
+    butterfly's FADDs (every lane's sum)."""
+    oc = np.asarray(oc, F32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        return butterfly(oc * oc, np.add)
+
+
+def gdn_out(oc, ss, eps, gam, z, exp2, rsqrt):
+    """The gated RMS norm (dec_gdn_rec.cu:119-120, verify_kernels.cu:439-441): FFMA x, ss, 0.0078125, eps; rsqn(x);
+    FMUL by oc, then by gam; the sigmoid of z as gdn_beta's; FMUL."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        scale = rsqrt_ieee(fma32(ss, F32(0.0078125), eps), rsqrt)
+        return (((np.asarray(oc, F32) * scale) * np.asarray(gam, F32)) * gdn_beta(z, exp2)).astype(F32)
 
 
 # ---- the prompt path's products (kernels/common/basalt_prompt_gemm.metal) -------------------------------------------

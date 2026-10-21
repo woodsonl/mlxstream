@@ -7,7 +7,7 @@
 // basalt_quantize_q8_0_scaled quantizes the activations, then moe_grouped_s2 (s2_expert_grouped.cu:1085-1122) is four
 // dispatches in order: basalt_s2_gu, basalt_s2_swiglu, basalt_quantize_q8_0_scaled over the intermediate and
 // basalt_s2_down.
-// Needs basalt_fp.metal and basalt_q8_1.metal ahead of it.
+// Needs basalt_fp.metal, basalt_ieee.metal and basalt_q8_1.metal ahead of it.
 //
 // Both files build with nvcc's IEEE defaults: every float operation is IEEE's, subnormals kept
 // (docs/research/basalt-nvcc/s2_experts.md). This GPU flushes subnormals, and here the activation scale is the

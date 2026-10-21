@@ -266,7 +266,7 @@ Q8_1_THREADS = 256          # basalt's QUANT_THREADS: one thread per value
 def basalt_q8_1_source() -> str:
     """The native, SwiGLU and IEEE q8_1 quantizers (``native_quantize_q8_1``, ``native_swiglu_quantize_q8_1``,
     ``quantize_q8_1``)."""
-    return PRELUDE + template("basalt_fp.metal") + template("basalt_q8_1.metal")
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_q8_1.metal")
 
 
 def basalt_q8_1_params(n_values: int) -> bytes:
@@ -330,7 +330,8 @@ def basalt_experts_source() -> str:
     """basalt's ``native_expert_grouped`` for Q2_0 gate/up and down: ``basalt_expert_gu``, ``basalt_expert_swiglu_q8_1``
     and ``basalt_expert_down``, dispatched in that order. The gate/up and down kernels take basalt's ``grp_ptr`` at
     buffer(1): one 64-bit GPU address a group (each 2-byte aligned, inside a buffer the dispatch makes resident)."""
-    return PRELUDE + template("basalt_fp.metal") + template("basalt_q8_1.metal") + template("basalt_experts.metal")
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_q8_1.metal")
+            + template("basalt_experts.metal"))
 
 
 def basalt_expert_layout(n_embd: int, n_ff: int) -> Dict[str, int]:
@@ -398,7 +399,8 @@ def basalt_s2_experts_source() -> str:
     moe_grouped_s2's ``basalt_s2_gu``, ``basalt_s2_swiglu``, ``basalt_quantize_q8_0_scaled`` (the intermediate) and
     ``basalt_s2_down``, dispatched in that order. The gate/up and down kernels take basalt's ``grp_ptr`` at buffer(0):
     one 64-bit GPU address a group (each 2-byte aligned, inside a buffer the dispatch makes resident)."""
-    return PRELUDE + template("basalt_fp.metal") + template("basalt_q8_1.metal") + template("basalt_s2_experts.metal")
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_q8_1.metal")
+            + template("basalt_s2_experts.metal"))
 
 
 CUDA_GRID_X, CUDA_GRID_Y = 2 ** 31 - 1, 65535   # CUDA's largest gridDim.x and .y: a larger basalt launch exits
@@ -700,6 +702,131 @@ def basalt_q5k_proxy_params(n_cap: int, *, row0: int = 0, n: int = 0, n_rows: Op
             or (n_rows is not None and not 0 < n_rows <= min(n_cap, 2 ** 31 - 1))):
         raise ValueError(f"basalt_q5k_proxy: rows out of range (row0 {row0}, n {n}, n_rows {n_rows}, n_cap {n_cap})")
     return struct.pack("<IIII", row0, n, n_cap, n_rows or 0)
+
+
+# ---- basalt's sampler (kernels/common/basalt_sampler.metal; docs/research/basalt-nvcc/sampler.md) ---------------
+# The launch rules and records below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/sampler.cu:172, :335,
+# :528-530, :981-1007 and :1057-1060 and include/basalt/kernels/sampler.hpp:15-29 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+def basalt_sampler_source() -> str:
+    """basalt's sampler family: the shared helpers, the software binary64 (``basalt_f64.metal``), libdevice's ``exp``
+    and ``logf`` (``basalt_libdevice.metal``) and the sampler kernels (``basalt_sampler.metal``), in that order."""
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
+            + template("basalt_libdevice.metal") + template("basalt_sampler.metal"))
+
+
+BS_BLOCK = 4096               # logits per block of the split path (sampler.cu:529-530)
+BS_SEL_MAX = 64               # the longest top-k list
+BS_SPLIT_MAX_BLOCKS = 64      # the split path's widest vocabulary: 64 blocks, 262,144 logits
+BS_SPLIT_MAX_ROWS = 64        # and its most rows
+BS_AM_CTAS = 8                # bs_greedy_partial's threadgroups per row (basalt's kAmCtas)
+
+
+def basalt_sampler_mode(greedy: bool, temperature: float, penalty_last_n: int, bias: bool) -> int:
+    """The ``mode`` word of a request (sampler.cu:988-1011): 0 greedy, the cluster argmax alone; 1 greedy with a
+    penalty window or a logit bias, the one-block greedy kernel after it; 2 sampled. Greedy is basalt's
+    ``p.greedy || p.temperature <= 0.0f`` on the float32 the record holds, so a NaN temperature samples."""
+    if greedy or struct.unpack("<f", struct.pack("<f", temperature))[0] <= 0.0:
+        return 1 if penalty_last_n > 0 or bias else 0
+    return 2
+
+
+def basalt_sampler_params(vocab: int, t_rows: int, n_blocks: int, hist_len: int, *, mode: int = 0, bias: bool = False,
+                          probe: bool = False, id_map: bool = False, top_k: int = 20, top_p: float = 0.95,
+                          min_p: float = 0.0, temperature: float = 1.0, min_keep: int = 1, penalty_last_n: int = 0,
+                          penalty_repeat: float = 1.0, penalty_freq: float = 0.0, penalty_present: float = 0.0) -> bytes:
+    """The 64-byte ``BsSampleParams`` (basalt_sampler.metal): the program's vocab, rows, split blocks and history
+    width, then the request's mode, flags (1 bias, 2 probe, 4 the top-prob kernel's subset map) and basalt's
+    SamplerParams fields, with its defaults. Refuses what basalt's dispatcher exits on (sampler.cu:981-987): no rows
+    or vocabulary, and a penalty window without a history; min_p above 1 is basalt's to accept."""
+    if vocab <= 0 or t_rows <= 0:
+        raise ValueError(f"basalt_sampler: vocab and t_rows must be positive, got {vocab}, {t_rows}")
+    if mode not in (0, 1, 2):
+        raise ValueError(f"basalt_sampler: mode must be 0, 1 or 2, got {mode}")
+    if penalty_last_n > 0 and hist_len <= 0:
+        raise ValueError(f"basalt_sampler: penalty_last_n = {penalty_last_n} needs a history (hist_len = {hist_len})")
+    flags = (1 if bias else 0) | (2 if probe else 0) | (4 if id_map else 0)
+    return struct.pack("<IIIIIIifffiifffI", vocab, t_rows, n_blocks, hist_len, mode, flags, top_k, top_p, min_p,
+                       temperature, min_keep, penalty_last_n, penalty_repeat, penalty_freq, penalty_present, 0)
+
+
+def basalt_sampler_path(t_max: int, vocab: int) -> str:
+    """The sampled path a program takes, chosen at build from its rows and vocabulary (sampler.cu:1007): ``"split"``
+    (bs_split_part, bs_split_merge) when the window has at most 64 rows and the vocabulary at most 64 blocks of 4,096
+    logits, else ``"one_block"`` (bs_sample_one_block). Both give the same bits."""
+    if -(-vocab // BS_BLOCK) <= BS_SPLIT_MAX_BLOCKS and t_max <= BS_SPLIT_MAX_ROWS:
+        return "split"
+    return "one_block"
+
+
+BS_COUPLED_IMAGE = struct.Struct("<ifffiifffIQQB7sQ")   # basalt's SamplerParams as it lies in memory: 72 bytes
+
+
+def basalt_coupled_params(*, top_k: int = 20, top_p: float = 0.95, min_p: float = 0.0, temperature: float = 1.0,
+                          min_keep: int = 1, penalty_last_n: int = 0, penalty_repeat: float = 1.0,
+                          penalty_freq: float = 0.0, penalty_present: float = 0.0, seed: int = 0, counter: int = 0,
+                          greedy: bool = False, pad0: int = 0, pad1: bytes = bytes(7), logit_bias: int = 0) -> bytes:
+    """The coupled draft's request, basalt's 72-byte SamplerParams image (sampler.hpp:15-29; basalt_sampler.metal's
+    BsCoupledSampler), with its defaults: the nine 4-byte chain fields, the padding word ``pad0``, the seed at 40, the
+    counter at 48 (the coupled merge draws with its step record's cell + 1 instead), greedy at 56 and its padding
+    ``pad1``, and the logit_bias pointer's slot at 64, which no coupled kernel reads (the drafter applies no bias).
+    Every per-request value is in it, so the host writes it to the staging buffer the round's stage node copies. min_p
+    above 1 is basalt's to accept."""
+    return BS_COUPLED_IMAGE.pack(top_k, top_p, min_p, temperature, min_keep, penalty_last_n, penalty_repeat,
+                                 penalty_freq, penalty_present, pad0, seed, counter, int(greedy), pad1, logit_bias)
+
+
+def basalt_coupled_node(nv: int, id_vocab: int, cap: int, j: int, *, id_to_sub: bool = False,
+                        sub_to_id: bool = False) -> bytes:
+    """A coupled draft node's 32-byte ``BsCoupledParams`` (basalt_sampler.metal), its structure, written at build: the
+    draft row's nv logits, the id_vocab token ids, the ring's history capacity cap (its first cap slots the round's
+    base, then the round's drafts) and the draft's index j in the round; flags 1 when the id_to_sub map is bound, 2
+    when sub_to_id is (basalt's non-null maps; without them a slot is its token id). Refuses what basalt's
+    coupled_draft_sample exits on (sampler.cu:1057-1060): no logits, or more blocks than the merge's 64."""
+    if nv <= 0 or -(-nv // BS_BLOCK) > BS_SPLIT_MAX_BLOCKS:
+        raise ValueError(f"basalt_coupled: {nv} logits need 1 to {BS_SPLIT_MAX_BLOCKS} blocks of {BS_BLOCK}")
+    flags = (1 if id_to_sub else 0) | (2 if sub_to_id else 0)
+    return struct.pack("<IIIIIIII", nv, id_vocab, cap, j, flags, 0, 0, 0)
+
+
+# ---- basalt's GDN decode window (kernels/common/basalt_gdn.metal; docs/research/basalt-nvcc/dec_gdn.md) ------------
+# The constants and the checks below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/dec_gdn_rec.cu:30-33
+# and :355-367 and include/basalt/kernels/dec_gdn.hpp:16-39 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT;
+# third_party/NOTICE).
+
+GDN_S = 128                   # the key and value head dim, the recurrent state's side (basalt's S)
+GDN_MT = 8                    # the window's most rows (kDecMaxT, kVerifyMaxT)
+GDN_THREADS = 512             # dec_gdn_rec's threadgroup: basalt's cluster of four 128-thread blocks
+GDN_N_EMBD = 2560             # the gate rows' width, 32 lanes x 8 bf16 x NJ = 10 (the only one basalt accepts)
+
+
+def basalt_gdn_source() -> str:
+    """basalt's GDN decode window: the shared helpers, the IEEE binary32 operations, the software binary64 and the
+    IEEE operations built on it (``basalt_ieee_f64.metal``), the q8_1 quantizers, libdevice's transcriptions and the
+    GDN steps and kernels (``basalt_gdn.metal``), in that order."""
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
+            + template("basalt_ieee_f64.metal") + template("basalt_q8_1.metal") + template("basalt_libdevice.metal")
+            + template("basalt_gdn.metal"))
+
+
+def basalt_gdn_params(t: int, c: int, n_embd: int, h_k: int, h_v: int, eps: float) -> bytes:
+    """The 32-byte ``BsGdnParams`` (basalt_gdn.metal): the window's width t, the channels c, n_embd, the key and value
+    heads h_k and h_v and eps, then two zero words. Refuses what host ``dec_gdn_rec`` exits on (dec_gdn_rec.cu:356): t
+    outside 1..8, n_embd other than 2560, no key head, value heads not a multiple of the key heads; and c other than
+    2 * 128 * h_k + 128 * h_v (q, k, then v), which basalt's DecRecArgs carries unchecked but every index assumes."""
+    if not 1 <= t <= GDN_MT:
+        raise ValueError(f"basalt_gdn: the window's width must be 1 to {GDN_MT}, got {t}")
+    if n_embd != GDN_N_EMBD:
+        raise ValueError(f"basalt_gdn: n_embd must be {GDN_N_EMBD}, got {n_embd}")
+    if h_k <= 0:
+        raise ValueError(f"basalt_gdn: h_k must be positive, got {h_k}")
+    if h_v % h_k != 0:
+        raise ValueError(f"basalt_gdn: h_v must be a multiple of h_k, got h_v {h_v} and h_k {h_k}")
+    want = 2 * GDN_S * h_k + GDN_S * h_v
+    if c != want:
+        raise ValueError(f"basalt_gdn: C must be 2 * {GDN_S} * h_k + {GDN_S} * h_v = {want}, got {c}")
+    return struct.pack("<IIIIIfII", t, c, n_embd, h_k, h_v, eps, 0, 0)
 
 
 # ---- basalt's prompt path: group dequantizers (kernels/common/basalt_dequant16.metal; docs/research/basalt-nvcc/dequant_bf16.md)
