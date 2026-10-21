@@ -12,8 +12,8 @@ import pytest
 
 from monolith import kernels
 from monolith.compiler.coverage import check_coverage
-from monolith.compiler.emit import _Ctx, basalt_windows
-from monolith.compiler.emit_basalt_prompt import prompt_rows
+from monolith.compiler.emit import HANDLERS, _Ctx, basalt_windows
+from monolith.compiler.emit_basalt_prompt import BASALT_PROMPT_HANDLERS, prompt_rows
 from monolith.core import DType, Graph
 from monolith.core.ir import OpClass
 from monolith.core.shapes import N_INJ, T
@@ -248,3 +248,90 @@ def test_refusals(src, tmp_path, build, why):
             continue
         with pytest.raises(ValueError, match=why):
             emit(g, src, 2, packs, **kw)
+
+
+# ---- the hyper-connection kinds (HC-6; kernels/common/basalt_prompt_hc.metal) -------------------------------------
+
+HC_KINDS = {"basalt_prompt_hc_broadcast": "prompt_gr_broadcast", "basalt_prompt_hc_norm": "prompt_gr_norm_rs",
+            "basalt_prompt_hc_silu": "prompt_gr_silu", "basalt_prompt_hc_mix": "prompt_gr_mix_r",
+            "basalt_prompt_hc_write": "prompt_gr_write", "basalt_prompt_hc_write_norm": "prompt_gr_write_norm_rs"}
+HC_N, HC_LR = 2560, 320                         # basalt's N and LR (src/prefill/kernels.cu:18-19)
+HC_EPS = "as_type<float>(0x358637BDu)"          # basalt's EPS 1e-6 (prefill.cpp:57) as float32 bits
+HC_EPS0 = "as_type<float>(0x00000000u)"         # the kinds without eps compile 0
+
+
+def hc_graph(g, rows=T, n=HC_N, lr=HC_LR):
+    """One half of a layer's hyper-connection at ``rows`` rows, every kind once and the mix in both forms: broadcast
+    of e into r; norm of r by w ``[4n]`` into rs, xn; silu of lo; mix of r, rs, w, gated into mixed, mixed_bf, mixed_h
+    and, without the BF16 image (the drafter's KV pass), into mixed2, mixed_h2; write_norm of r, bo, inj by w_next
+    ``[1, 4n]`` into r2, rs2, xn2; write of r2, bo, inj into r3."""
+    def inp(name, cols):
+        return g.input(name, (rows, cols), F32)
+
+    def out(name, cols, dtype=F32):
+        return g.value(name, (rows, cols), dtype)
+
+    e, lo, gated, bo, inj = inp("e", n), inp("lo", lr), inp("gated", 4 * n), inp("bo", n), inp("inj", 4)
+    w, w_next = g.input("w", (4 * n,), F32), g.input("w_next", (1, 4 * n), F32)
+    r, rs, r2 = out("r", 4 * n), out("rs", 4), out("r2", 4 * n)
+    op(g, "basalt_prompt_hc_broadcast", [e], [r])
+    op(g, "basalt_prompt_hc_norm", [r, w], [rs, out("xn", 4 * n, BF16)], eps=1e-6)
+    op(g, "basalt_prompt_hc_silu", [lo], [out("lo16", lr, BF16)])
+    mix = [r, rs, w, gated]
+    op(g, "basalt_prompt_hc_mix", mix, [out("mixed", n), out("mixed_bf", n, BF16), out("mixed_h", n, F16)])
+    op(g, "basalt_prompt_hc_mix", mix, [out("mixed2", n), out("mixed_h2", n, F16)])
+    op(g, "basalt_prompt_hc_write_norm", [r, bo, inj, w_next], [r2, out("rs2", 4), out("xn2", 4 * n, BF16)], eps=1e-6)
+    op(g, "basalt_prompt_hc_write", [r2, bo, inj], [out("r3", 4 * n)])
+
+
+def test_prompt_hc_registered():
+    """HC-6: the six kinds registered (MAP over rows, each bound to its own name on every profile), each with its
+    handler in BASALT_PROMPT_HANDLERS, the one emit.HANDLERS calls."""
+    for kind in HC_KINDS:
+        od = OPS.get(kind)
+        assert (od.klass, od.domain_kind, od.binding_for(PROFILE.key).kernel) == (OpClass.MAP, "rows", kind), kind
+        assert HANDLERS[kind] is BASALT_PROMPT_HANDLERS[kind], kind
+
+
+@pytest.mark.parametrize("dynamic, t", [(True, 128), (False, 17)], ids=["dynamic", "static"])
+def test_prompt_hc_covered_and_emits(src, dynamic, t):
+    """HC-6: a graph using all six kinds passes the coverage guard and emits, one dispatch per op (one slice: B = t
+    is below PROMPT_HC_ROWS), each the builders': its entry of basalt_prompt_hc_source with the rows' macros and HC_N,
+    HC_LR, MIX_BF, HC_EPS (silu at HC_N 256, its file's least; HC_LR 0, MIX_BF 0 and eps 0 where the kernel reads
+    none), the values at the kernel's slots, the slice's record (row0 0) at slot 7 and StepState at 15, basalt's launch
+    shape (T * HC threadgroups of 256 for the two norms, blocks_for(T * width) for the others, kernels.cu:867-900), the
+    outputs' slots as its writes and the label of its kind and weight (else its first input)."""
+    g = Graph("step")
+    hc_graph(g)
+    assert {o.kind for o in g.ops} == set(HC_KINDS)
+    check_coverage(g, PROFILE)
+    prog = emit(g, src, t, dynamic_t=dynamic, layout=LAYOUT)
+    source = kernels.basalt_prompt_hc_source().replace(kernels.PRELUDE, kernels.PRELUDE + LAYOUT.to_msl() + "\n", 1)
+    n, lr = HC_N, HC_LR
+
+    def blocks(width):
+        return -(-t * width // 256)
+
+    # per dispatch: (kind, HC_N, HC_LR, MIX_BF, HC_EPS, the values bound from slot 0 (None: no binding), grid, writes,
+    # the label's value)
+    want = [("broadcast", n, 0, 0, HC_EPS0, ["e", "r"], blocks(4 * n), [1], "e"),
+            ("norm", n, 0, 0, HC_EPS, ["r", "w", "rs", "xn"], 4 * t, [2, 3], "w"),
+            ("silu", 256, lr, 0, HC_EPS0, ["lo", "lo16"], blocks(lr), [1], "lo"),
+            ("mix", n, 0, 1, HC_EPS0, ["r", "rs", "w", "gated", "mixed", "mixed_bf", "mixed_h"], blocks(n), [4, 5, 6],
+             "w"),
+            ("mix", n, 0, 0, HC_EPS0, ["r", "rs", "w", "gated", "mixed2", None, "mixed_h2"], blocks(n), [4, 6], "w"),
+            ("write_norm", n, 0, 0, HC_EPS, ["r", "bo", "inj", "w_next", "r2", "rs2", "xn2"], 4 * t, [4, 5, 6],
+             "w_next"),
+            ("write", n, 0, 0, HC_EPS0, ["r2", "bo", "inj", "r3"], blocks(4 * n), [3], "r2")]
+    assert len(prog.ops) == len(want)
+    for o, (kind, hc_n, hc_lr, mix_bf, eps, values, grid, writes, label) in zip(prog.ops, want):
+        kind = f"basalt_prompt_hc_{kind}"
+        k = prog.kernels[o.kernel]
+        macros = {**row_macros(t, not dynamic), "HC_N": str(hc_n), "HC_LR": str(hc_lr), "MIX_BF": str(mix_bf),
+                  "HC_EPS": eps}
+        assert (k.function, k.macros, k.source) == (HC_KINDS[kind], macros, source), kind
+        assert (o.name, o.grid, o.threadgroup, o.threadgroup_memory, o.meta["writes"]) == (
+            f"{kind}:{label}", (grid, 1, 1), (256, 1, 1), [], writes), kind
+        prm = o.bindings[-2][1]
+        assert o.bindings == [(s, v, 0) for s, v in enumerate(values) if v] + [(7, prm, 0), (15, prog.step_state, 0)]
+        assert (prog.buffers[prm].role, prog.buffers[prm].init) == ("params", kernels.basalt_prompt_hc_params(0)), kind
