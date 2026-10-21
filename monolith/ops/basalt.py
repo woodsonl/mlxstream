@@ -1,7 +1,8 @@
-"""basalt's single-dispatch GEMVs and q8_1 quantizers (OI-013; docs/design/flash-next.md): one op kind per basalt host
-launcher, whose kernel and grid follow from the shape alone, as the launcher picks them. Each op is one dispatch of a
-merged kernel (``kernels/common/basalt_*.metal``); the emitter (``compiler/emit_basalt.py``) takes its macros, grid,
-threadgroup and params from ``monolith/kernels.py``'s builders only, never from the profile's crew or core count.
+"""basalt's single-dispatch GEMVs, q8_1 quantizers (OI-013) and hyper-connection write (OI-005;
+docs/design/flash-next.md): one op kind per basalt host launcher, whose kernel and grid follow from the shape alone, as
+the launcher picks them. Each op is one dispatch of a merged kernel (``kernels/common/basalt_*.metal``); the emitter
+(``compiler/emit_basalt.py``) takes its macros, grid, threadgroup and params from ``monolith/kernels.py``'s builders
+only, never from the profile's crew or core count.
 
 Values. A weight is the GGUF tensor as shipped, ``[n_out, n_in]`` values: a weight value whose format is the ggml type's
 name, or, for BF16 rows, a constant whose dtype is (a ``.basalt`` file's ``dense`` rows; ``packs/basalt.py``), never a
