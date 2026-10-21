@@ -15,6 +15,10 @@ same bits. Basalt's router_top10_parity runs its generic ``router_top10``; the c
   ``expf_ftz``) on the four fixtures, the planted tokens (``planted_rows``, one dispatch) and 12 random windows of 8
   tokens; the planted tokens' literal outputs, and every regular token's selected sum at least 2^-9 (so the 2^-14
   floor fires only on the degenerate tokens, whose weights show it: 0xff800000, not +0).
+- HR-WIN: invariant 1 on the kernel alone, bitwise against its own one-token calls (docs/design/flash-next.md:86-91,
+  :185-186): every token of "random normal" with the planted tokens in rows 1, 5, ..., 49, in the windows of tokens
+  0..n-1 (n = 1..8 and 64), of widths 2..8 at row 56 and reversed, hc_fused_parity's window rule
+  (hc_fused_parity.cpp:328, its message :333).
 
 Every test checks the sentinels (the ids' and weights' row past the window keeps its 0xFF bytes, ``gpu.top10``) and
 counts the weights' non-finite values."""
@@ -119,3 +123,28 @@ def test_matches_route_emulation():
     bad += [f"planted {nm}: {what}: ids {ids[row[nm]].tolist()}, weights {[hex(b) for b in bits(w[row[nm]])]}"
             for nm, ok, what in literal if not ok]
     assert not bad, "\n".join(bad)
+
+
+def test_a_token_does_not_depend_on_the_window():
+    planted = ref.planted_rows()
+    W = ref.router_cases()["random normal"].copy()
+    at = 1 + 4 * np.arange(len(planted))                      # rows 1, 5, ..., 49
+    W[at] = np.stack(list(planted.values()))
+    one = [gpu.top10(W[k:k + 1], 1) for k in range(NT)]       # every token alone: its T = 1 value
+    one_ids, one_w = np.concatenate([i for i, _ in one]), np.concatenate([w for _, w in one])
+    runs = {f"tokens 0..{n - 1}": np.arange(n) for n in (*range(1, 9), NT)}
+    runs.update({f"rows 56..{55 + n}": 56 + np.arange(n) for n in range(2, 9)})
+    runs["W reversed"] = np.arange(NT)[::-1]                  # token k in row 63 - k
+    bad, off = 0, []
+    for name, rows in runs.items():
+        ids, w = gpu.top10(W[rows], len(rows))
+        d = np.count_nonzero(ids != one_ids[rows]) + np.count_nonzero(bits(w) != bits(one_w[rows]))   # :328
+        bad += d
+        if d:
+            off.append(f"{name}: {d} values")
+    regular = ~np.isin(np.arange(NT), at[[list(planted).index(nm) for nm in DEGENERATE]])
+    nonfinite = np.count_nonzero(~np.isfinite(one_w[regular]))
+    msg = f"{bad} values of a token differ between window sizes (must be 0)"         # hc_fused_parity.cpp:333
+    print(f"  {msg}   ({len(runs)} windows against {NT} one-token dispatches; non-finite {nonfinite})")
+    assert not bad, f"{msg}: " + "; ".join(off)
+    assert not nonfinite, f"{nonfinite} non-finite weights of regular tokens (must be 0)"
