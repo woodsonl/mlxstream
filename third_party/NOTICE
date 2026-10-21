@@ -166,8 +166,9 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `src/kernels/cuda/dequant_bf16.cu:20-27` and `src/prefill/kernels.cu:31-35`, the BF16 roundings `f2bf` (with its NaN
   case) and `bf` (`bf16_rne_nonan`, without). License: `third_party/BASALT-LICENSE`.
 - `kernels/common/basalt_q8_1.metal` — adapted from `src/kernels/cuda/native_mmvq.cu:146-177` (the native and SwiGLU
-  quantizers), `src/kernels/cuda/iq_kernels.cu:1880-1900` (the IEEE quantizer) and `include/basalt/kernels/q8_1_finite.hpp`
-  (MIT), written in the rounding sequence nvcc compiles for them. License: `third_party/BASALT-LICENSE`.
+  quantizers), `src/kernels/cuda/iq_kernels.cu:1880-1900` (the IEEE quantizer), `include/basalt/kernels/q8_1_finite.hpp`
+  and `src/prefill/kernels.cu:45-58` (`block_sum`, the prompt path's threadgroup sum, basalt's own code) (MIT), written
+  in the rounding sequence nvcc compiles for them. License: `third_party/BASALT-LICENSE`.
 - `kernels/common/basalt_ieee.metal` — moved from `kernels/common/basalt_q8_1.metal` (above) with its header: `ieee_add`
   and `ieee_mul`, CUDA's `add.rn.f32` and `mul.rn.f32` with subnormal operands and results kept, which the IEEE
   quantizer's warp sum (`src/kernels/cuda/iq_kernels.cu:1880-1900`, MIT), the routed experts' SwiGLU product and the
@@ -297,10 +298,12 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   BF16 GEMVs' (`mmvf`; `bf16_bits`: `include/basalt/kernels/bf16_bits.hpp`'s rounding;
   `docs/research/basalt-nvcc/bf16.md`), `dense_tc`'s (`docs/research/basalt-nvcc/dense_tc.md`), the Q5_K head's
   top-1 and 2-bit proxy (`src/kernels/cuda/q5k_head.cu`, `src/kernels/cuda/head_proxy.cuh`;
-  `docs/research/basalt-nvcc/q5k_head.md`) and the drafter experts' (`f16_from_f32`:
+  `docs/research/basalt-nvcc/q5k_head.md`), the drafter experts' (`f16_from_f32`:
   `include/basalt/kernels/f16_bits.hpp:36-65` transcribed; `q8_0_scaled`, `s2_dots`, `s2_swiglu`:
   `src/kernels/cuda/quantize_act.cu` and `src/kernels/cuda/s2_expert_grouped.cu`;
-  `docs/research/basalt-nvcc/s2_experts.md`); and `rel_norm`, the GEMM gate's metric, `Err` of
+  `docs/research/basalt-nvcc/s2_experts.md`) and the prompt path's hyper-connection kernels' (`hc_norm`, `hc_mix`,
+  `hc_silu`, `hc_write`, `hc_write_norm`: `src/prefill/kernels.cu:85-204`'s arithmetic in nvcc's order, IEEE and flush
+  forms; `docs/research/basalt-nvcc/prefill_kernels.md`); and `rel_norm`, the GEMM gate's metric, `Err` of
   `src/kernels/hc8_parity.cpp:57-61` in its float32 form (`gemm_chain`, `fma_metal` and `_fma64_odd` beside it are
   the port's order and this GPU's measured `fma`, not basalt's). License: `third_party/BASALT-LICENSE`.
 - `runtime/src/basalt_cpu.h` and `runtime/src/basalt_cpu.cpp` — adapted from `src/kernels/cpu/expert.cpp:143-148`,
@@ -330,11 +333,22 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `docs/research/basalt-nvcc/prefill_kernels.md`), and `to_f16` and `to_bf16` with `hf` and `bf`. License:
   `third_party/BASALT-LICENSE`.
 - `monolith/compiler/emit_basalt_prompt.py` — adapted from `src/prefill/prefill.cpp:1188-1199` (MIT): `native_proj`'s
-  and `bf16_proj`'s weight checks, as the refusals at emit time of an `entry` its weight contradicts. License:
-  `third_party/BASALT-LICENSE`.
+  and `bf16_proj`'s weight checks, as the refusals at emit time of an `entry` its weight contradicts, and the
+  hyper-connection wrappers' launch shapes (`src/prefill/kernels.cu:867-887`, `:893-900`, with `blocks_for` `:63`:
+  `T * HC` threadgroups of 256 for the two row kernels, `blocks_for(T * width)` otherwise) as the hc handlers' grids.
+  License: `third_party/BASALT-LICENSE`.
 - `tests/kernels/test_basalt_prompt_gemm.py` — adapted from `src/kernels/hc8_parity.cpp:253-262` and `:269` (MIT): the
   GEMM gate's bound, `expect(ex.rel() < 5e-3, "the product against the copy in double");`, and its use of `Err`
   over the product against double. License: `third_party/BASALT-LICENSE`.
+- `kernels/common/basalt_prompt_hc.metal` — adapted from `src/prefill/kernels.cu:39`, `:45-58`, `:85-170` and
+  `:192-204` (MIT): `gr_norm_rs_kernel`, `gr_mix_r_kernel`, `gr_write_norm_rs_kernel`, `gr_silu_kernel`,
+  `gr_write_kernel` and `gr_broadcast_kernel` with `sigm` and `block_sum`, written in the rounding sequence nvcc
+  compiles for them (`docs/research/basalt-nvcc/prefill_kernels.md`). License: `third_party/BASALT-LICENSE`.
+- `tests/kernels/test_basalt_prompt_hc.py` — adapted from `src/kernels/gr_parity.cpp` (MIT): its data distributions
+  (`:675`), the float64 references' forms with their activation rounding (`to_bf16`, `:46-53`) and the bounds
+  (`:566`, `:645`, `:689`), which `gr_parity` gates on decode's `gr.cu` kernels and the port applies as the nearest
+  basalt test's (`docs/design/flash-next.md`'s table of kernels without a reference test), with their metrics
+  `rel_diff` and `rel_terms` (`:136-156`). License: `third_party/BASALT-LICENSE`.
 
 ## NVIDIA CUDA Toolkit libdevice (13.0)
 

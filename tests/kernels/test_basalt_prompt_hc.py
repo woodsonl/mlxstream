@@ -26,7 +26,8 @@ none), each kind seeing the classes on its inputs:
 
 gr_parity's bounds are the nearest bound; no basalt test launches these kernels (gr_parity gates decode's gr_read and
 gr_write). Its metrics, rel_diff (normalised L1, the reference first) and rel_terms (per element, against the terms'
-magnitudes), are src/kernels/gr_parity.cpp:136-156's, copied here until the hc lane's tests/basalt_hc_ref.py lands.
+magnitudes), are src/kernels/gr_parity.cpp:136-156's, copied here until the hc lane's gr-post adds them to
+tests/basalt_hc_ref.py.
 Both run on the fixture without edge tokens at 1, 7 and 256 live rows and print each measured value:
 - HC-1 (``test_hc_read_double``): gr_norm_rs's rs and xn16, gr_mix_r's mixed, mixed_bf and mixed_h (MIX_BF 1) and
   gr_silu's lo16 against float64 references, rs = 1 / sqrt(mean(r^2) + eps) per stream, xn = r rs w, mixed = sum_c r

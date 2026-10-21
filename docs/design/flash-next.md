@@ -81,9 +81,18 @@ library `logf` and binary64 `exp`):
   always true (`src/kernels/cuda/hc_fused.cu:1248`). It computes `rsqrtf` in the norm (`hc8_gr.cu:78`) and the library
   `expf` in the SiLU (`hc8_gr.cu:165`) and the sigmoid (`hc8_gr.cu:233`).
 
-The prompt path's own kernels, `src/prefill/kernels.cu`, build the same way (`CMakeLists.txt:285`) and write `__expf`,
-`rsqrtf` and `log1pf` too (for example `src/prefill/kernels.cu:39`, `:74`, `:214`); the prompt path's port lists the
-ones this pack runs.
+- `src/prefill/kernels.cu`, the prompt path's own kernels, builds the same way (`CMakeLists.txt:285`). Basalt's own
+  expressions keep subnormals and every source division is `div.rn`; `.ftz` appears only inside two of the libdevice
+  functions the file inlines, the library `expf` (`:642`, `:770`) and `powf` (`:751`), whose sites the later PRs add.
+  The file writes `__expf`, `rsqrtf` and `log1pf`, and calls the library `expf` and `powf`
+  (`docs/research/basalt-nvcc/prefill_kernels.md`). The hyper-connection kernels this pack runs are `gr_norm_rs`,
+  `gr_mix_r`, `gr_silu`, `gr_write_norm_rs`, `gr_write` and `gr_broadcast` (its §1). They compute `__expf` through
+  `sigm` (`:39`) at `:114`, `:139` and `:197`, and directly at `:166`; each maps to `expf_ieee(sign_flip(x))`, the one
+  helper at every IEEE-built `__expf` site, and each result is followed by `1 + e`. They compute `rsqrtf` at `:94` and
+  `:150`, mapped to `metal::fast::rsqrt`; its argument is at least `eps`, so it is never subnormal. Every other
+  operation rounds correctly. Wherever it can see a subnormal it runs through `ieee_mul`, `ieee_div`, `ieee_add` or
+  `fma_ieee`. `fma_ieee` sits at every `FFMA`: the source's `fmaf` (`:114`, `:145`, `:197`) and the two sums ptxas
+  contracts (`:93`, `:148`).
 
 - `src/prefill/gemm.cu`, the prompt path's fp16 and BF16 products, has no device code: each product is one
   `cublasGemmEx` (`gemm.cu:122-132`, `:158-167`), so cuBLAS picks the kernel, the summation order and the subnormal
@@ -498,6 +507,12 @@ same rule holds for any other ported kernel whose basalt tests end in a comparis
 | `Gemm::native`, a GGUF matrix dequantized into an FP16 image and multiplied by `Gemm::f16` (`src/prefill/gemm.cu:169-185`, `:158-167`; `src/prefill/prefill.cpp:1191` for every quantized projection, `:1535` for the PLE key) | no test runs `Gemm::native` or `Gemm::f16`; `dequant_f16_parity` checks only the first stage, the FP16 image (`src/kernels/dequant_f16_parity.cpp:73`, `:98`) | borrowed (nearest bound; no basalt test launches `Gemm::native`): `expect(ex.rel() < 5e-3, "the product against the copy in double");` (`hc8_parity.cpp:269`) on every output against float64 on the exact dequantized values, so the FP16 image's rounding counts; the two stages bit for bit equal to the FP16 chain on the image; repeat invariance bit for bit |
 | `to_f16`, the PLE key operand for a quantized key matrix (`src/prefill/kernels.cu:818-821`, `hf` `:40`, launcher `:846-850`; `src/prefill/prefill.cpp:1534`) | no test runs `to_f16_kernel`; the nearest check, `dequant_f16_parity`'s store against `__float2half_rn` of the fp32 value (`src/kernels/dequant_f16_parity.cpp:73`), is the same rounding, bitwise | bit for bit against `emu.cuda_half_bits` on every special value (G9-F16) |
 | `to_bf16`, the PLE value operand (`src/prefill/kernels.cu:826-833`, `bf` `:31-35`, launcher `:856-860`; `src/prefill/prefill.cpp:1531`, `:1536`) | no test runs `to_bf16_kernel` or `bf`; `bf16_bits_test` checks `bf16_from_f32` bitwise over every fp32 pattern against ggml's rule (`src/kernels/bf16_bits_test.cpp:47`) and, on every non-NaN input, against `previous_bf16` (`:57`), whose `u = (u + ((u >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;` (`:30`) is `bf`'s arithmetic; on a NaN, `bf` keeps the carry that `bf16_from_f32` replaced | bit for bit against `emu.bf16_bits` on every special value, NaNs included (G9-BF16) |
+| `gr_norm_rs` (`src/prefill/kernels.cu:85-102`; `src/prefill/prefill.cpp:1567`, the drafter's KV pass `:1015`) | none: `gr_parity`'s read checks run decode's `gr_read` and `fused_gr_read` (`src/kernels/gr_parity.cpp:367`, `:566`, `:752`) | nearest bound; no basalt test launches this kernel: `rs` and `xn16` against a double-precision read, `const bool ok = rm <= 1e-4 && ri <= 1e-4;` (`src/kernels/gr_parity.cpp:566`); bitwise against a host twin and across row counts |
+| `gr_mix_r` (`src/prefill/kernels.cu:103-124`; `src/prefill/prefill.cpp:1573`, `:1019`) | none: `gr_parity`'s read checks run decode's `gr_read` and `fused_gr_read` (`src/kernels/gr_parity.cpp:367`, `:566`, `:752`) | nearest bound; no basalt test launches this kernel: the FP32, BF16 and FP16 mix against a double-precision read, `const bool ok = rm <= 1e-4 && ri <= 1e-4;` (`src/kernels/gr_parity.cpp:566`); bitwise against a host twin and across row counts |
+| `gr_silu` (`src/prefill/kernels.cu:161-170`; `src/prefill/prefill.cpp:1570`, `:1017`) | none: `gr_parity`'s read checks run decode's `gr_read` and `fused_gr_read` (`src/kernels/gr_parity.cpp:367`, `:566`, `:752`) | nearest bound; no basalt test launches this kernel: the BF16 SiLU against a double-precision read, `const bool ok = rm <= 1e-4 && ri <= 1e-4;` (`src/kernels/gr_parity.cpp:566`); bitwise against a host twin and across row counts |
+| `gr_write` (`src/prefill/kernels.cu:192-198`; `src/prefill/prefill.cpp:2379`) | none: `gr_parity`'s write checks run decode's `gr_write_kernel` (`src/kernels/cuda/gr.cu:246`) | nearest bound; no basalt test launches this kernel: against a double-precision write, `const bool streams_ok = worst_stream < 1e-6;` (`src/kernels/gr_parity.cpp:689`) and, at zero injection, `const bool plain = worst_plain < 1e-6;` (`:645`); bitwise against a host twin and across row counts |
+| `gr_write_norm_rs` (`src/prefill/kernels.cu:125-160`; `src/prefill/prefill.cpp:2376`) | none: `gr_parity`'s write checks run decode's `gr_write_kernel` (`src/kernels/cuda/gr.cu:246`) | nearest bound; no basalt test launches this kernel: `gr_write`'s bounds on the streams and `gr_norm_rs`'s on `rs` and the BF16 image; bitwise equal to `gr_write` followed by `gr_norm_rs` |
+| `gr_broadcast`, the embedding copied into the four streams (`src/prefill/kernels.cu:199-204`; `src/prefill/prefill.cpp:1311`) | none | no basalt test launches this kernel; bitwise: every stream equals the embedding's words, NaN payloads included |
 
 The ported `route_window_parity` also runs the shapes this path uses, 2560 to 128 and 2560 to 512.
 
