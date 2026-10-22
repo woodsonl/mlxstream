@@ -40,8 +40,10 @@ float64 references. In every test every output is finite and every sentinel inta
 - A2, the port's addition (spec T§5.5: basalt grades dec_gdn_rec's fp32 y against nothing), as S9: dec_gdn_rec's own
   y (built with GDN_Y_BOUND 1, decision D13) within ``max_err < 1e-3`` of ``cpu_seg``'s y fed the kernel's gate and
   beta, no non-finite value in its h, gate, beta, y or yq; its gate, beta and yq equal the per-stage chain's (G3, G4
-  and G6 on the segment), its state's bytes unchanged; and the engine's build, GDN_Y_BOUND 0, run on the same inputs,
-  writes the same yq and window stores bit for bit (engineering review E6).
+  and G6 on the segment), and by ``cmp_f`` its y the chain's y (flash-next.md's tier-1 rule, the per-stage chain
+  being basalt's reference side; yq's bytes hide most of y's rounding differences); its state's bytes unchanged; and
+  the engine's build, GDN_Y_BOUND 0, run on the same inputs, writes the same yq and window stores bit for bit
+  (engineering review E6).
 """
 
 import functools
@@ -283,6 +285,10 @@ def test_dec_gdn_rec_y_matches_the_float64_reference(trial, nseg):
         for what, ref, new in (("gate", gate, r.gate), ("beta", beta, r.beta)):
             d, first = cmp_f(what, ref, new)
             assert d == 0, f"{where}: {d} elements differ or are not finite, first {first}; want {S_GATE}"
+        d, first = cmp_f("y", y, r.y)
+        assert d == 0, (f"{where}: {d} y elements differ from gdn_step_norm_multi's or are not finite, first {first}; "
+                        "want them bitwise equal (the port's addition: the per-stage chain is basalt's reference side, "
+                        "flash-next.md's tier-1 rule)")
         check_yq(where, y, r.yq)
         e = max_err(r.y, cpu_seg(st, qkv, z, layer.conv_w, layer.gamma, r.gate, r.beta, t).y)
         assert e < 1e-3, f"{where}: y: max_err {e:.3g}; want {S9}"
