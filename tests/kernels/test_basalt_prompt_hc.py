@@ -53,11 +53,11 @@ Both run on the fixture without edge tokens at 1, 7 and 256 live rows and print 
   same mixed and mixed_h and leaves slot 5 at 0xFF. Discrimination, so a flushing kernel fails: broadcast's words
   differ from their flushed values on E2; norm's IEEE and flushing twins differ in token 0's xn16 (E2) and in token
   2's stream-1 rs (E6), mix's in token 0's columns 5-6 (E2) and token 3's column 0 (E5: gated -88 on every stream, a
-  subnormal sigmoid), silu's in token 0's columns 8-11 (E7; its E2 words are BF16 zeros either way), write's and
-  write_norm's in R' (and write_norm's xn16) at token 0's columns 5-6 (E2) and token 3's stream 0 (E5: inj -352, a
-  subnormal sigmoid whose double is normal, on E1's zero row, so R' = fl(bo sc)), and write_norm's in token 2's
-  stream-1 rs (E6). A -0 seed for the mix's chain fails on E9: the twin's words at token 4's column 100 are +0, the
-  chain from -0 gives -0 (0x80000000, 0x8000, 0x8000).
+  subnormal sigmoid), silu's in token 0's columns 8-11 (E7; its E2 words are the same either way: column 5's a BF16
+  zero, column 6's normal), write's and write_norm's in R' (and write_norm's xn16) at token 0's columns 5-6 (E2) and
+  token 3's stream 0 (E5: inj -352, a subnormal sigmoid whose double is normal, on E1's zero row, so R' = fl(bo sc)),
+  and write_norm's in token 2's stream-1 rs (E6). A -0 seed for the mix's chain fails on E9: the twin's words at token
+  4's column 100 are +0, the chain from -0 gives -0 (0x80000000, 0x8000, 0x8000).
   ``test_hc_probe_specials`` (K1): the probe's fast::rsqrt and expf_ieee(sign_flip(x)) on the specials match
   PTX's documented rsqrt.approx and ex2.approx: rsqrt(+inf) = +0, rsqrt(NaN) NaN, exp_neg(+inf) = +0, exp_neg(-100)
   and exp_neg(-inf) +inf, exp_neg(NaN) NaN.
