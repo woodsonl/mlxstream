@@ -6,8 +6,8 @@
 // @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE), written in the rounding sequence nvcc
 // compiles for them (docs/research/basalt-nvcc/sampler.md).
 //
-// basalt's sampler family on Metal. Needs basalt_fp.metal, basalt_ieee.metal, basalt_f64.metal and
-// basalt_libdevice.metal ahead of it (monolith/kernels.py's basalt_sampler_source()).
+// basalt's sampler family on Metal. Needs basalt_fp.metal, basalt_ieee.metal, basalt_f64.metal, basalt_ieee_f64.metal
+// and basalt_libdevice.metal ahead of it (monolith/kernels.py's basalt_sampler_source()).
 //
 // The entry points need STEP_STATE=1 and the StepState struct (the emitter splices it in): every one returns at its
 // first instruction when st->done or its row is at or past st->t_this_step. Without STEP_STATE only the helpers
@@ -36,18 +36,6 @@
 // H.3). Every other case (a zero or subnormal operand, a result the hardware may have flushed) is rounded from the
 // software binary64. A NaN from the software is 0x7fffffff, NVIDIA's canonical NaN; the hardware's NaN keeps its own
 // bits.
-
-// a / b for any operands, and ieee_div_any(1, x) for rcp.rn.f32: the binary64 quotient, rounded to nearest even and
-// then to binary32. That double rounding is the correctly rounded quotient: on the normal grid since 53 >= 2 * 24 + 2
-// (Figueroa), and on the subnormal grid because a quotient of floats off a midpoint lies more than 2^-48 of itself
-// from it, beyond binary64's rounding, while one on a midpoint stays on it (H.3). (basalt_q8_1.metal's ieee_div
-// covers b >= 1 only.)
-static inline float ieee_div_any(float a, float b) {
-    const float q = a / b;
-    const uint ab = as_type<uint>(a), bb = as_type<uint>(b);
-    if ((ab & 0x7f800000u) != 0u && (bb & 0x7f800000u) != 0u && !(fabs(q) < 0x1p-125f)) return q;
-    return as_type<float>(f32_from_f64(f64_div(f64_from_f32(ab), f64_from_f32(bb))));
-}
 
 // fma(a, b, c), the penalty's fma(float(count), freq, present) (sampler.cu:75): the exact a * b + c rounded to odd in
 // binary64 and then to nearest even in binary32, which is the correctly rounded fma (53 >= 24 + 2: Boldo and

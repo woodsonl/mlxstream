@@ -25,3 +25,15 @@ static inline float fma_ieee(float a, float b, float c) {
         return r;
     return as_type<float>(f32_from_f64(f64_fma_odd(f64_from_f32(ab), f64_from_f32(bb), f64_from_f32(cb))));
 }
+
+// a / b for any operands, and ieee_div_any(1, x) for rcp.rn.f32: the binary64 quotient, rounded to nearest even and
+// then to binary32. That double rounding is the correctly rounded quotient: on the normal grid since 53 >= 2 * 24 + 2
+// (Figueroa), and on the subnormal grid because a quotient of floats off a midpoint lies more than 2^-48 of itself
+// from it, beyond binary64's rounding, while one on a midpoint stays on it (H.3). (basalt_q8_1.metal's ieee_div
+// covers b >= 1 only.)
+static inline float ieee_div_any(float a, float b) {
+    const float q = a / b;
+    const uint ab = as_type<uint>(a), bb = as_type<uint>(b);
+    if ((ab & 0x7f800000u) != 0u && (bb & 0x7f800000u) != 0u && !(fabs(q) < 0x1p-125f)) return q;
+    return as_type<float>(f32_from_f64(f64_div(f64_from_f32(ab), f64_from_f32(bb))));
+}

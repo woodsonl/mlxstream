@@ -23,7 +23,8 @@ pattern), against host references. Every comparison is bitwise.
   binade, and products whose lowest bits only the alignment's sticky bit sees), subnormal results, overflow (to inf,
   and to DBL_MAX when rounded to odd) and every triple of specials.
 - H.3: the binary32 operations with IEEE subnormals: ``ieee_add`` and ``ieee_mul`` (basalt_ieee.metal), ``ieee_div_any``
-  and ``ieee_fma_count`` (basalt_sampler.metal), against each exact value as a ``Fraction`` rounded once to nearest
+  (basalt_ieee_f64.metal) and ``ieee_fma_count`` (basalt_sampler.metal), against each exact value as a ``Fraction``
+  rounded once to nearest
   even (``round32``, checked against the host's float32 add, multiply and divide and basalt_emu's fma), on uniform
   patterns and planted classes, more than half of the rows with a subnormal operand or result: every exponent field,
   subnormals and the lowest binades, products and quotients at the bottom of the range, a subnormal c that moves a

@@ -710,10 +710,11 @@ def basalt_q5k_proxy_params(n_cap: int, *, row0: int = 0, n: int = 0, n_rows: Op
 # b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 
 def basalt_sampler_source() -> str:
-    """basalt's sampler family: the shared helpers, the software binary64 (``basalt_f64.metal``), libdevice's ``exp``
-    and ``logf`` (``basalt_libdevice.metal``) and the sampler kernels (``basalt_sampler.metal``), in that order."""
+    """basalt's sampler family: the shared helpers, the software binary64 (``basalt_f64.metal``) and the IEEE operations
+    built on it (``basalt_ieee_f64.metal``), libdevice's ``exp`` and ``logf`` (``basalt_libdevice.metal``) and the
+    sampler kernels (``basalt_sampler.metal``), in that order."""
     return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
-            + template("basalt_libdevice.metal") + template("basalt_sampler.metal"))
+            + template("basalt_ieee_f64.metal") + template("basalt_libdevice.metal") + template("basalt_sampler.metal"))
 
 
 BS_BLOCK = 4096               # logits per block of the split path (sampler.cu:529-530)
