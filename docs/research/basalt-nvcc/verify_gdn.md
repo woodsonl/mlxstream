@@ -438,12 +438,16 @@ For the contract (`flash-next.md`): its list of approximate operations names `:3
 the per-stage kernels' `__expf` (`:46`, `:76`, `:151`, `:154`, `:206`, `:209`, `:241`, `:407`, `:441`), `log1pf`
 (`:154`, `:209`) and run-time `rsqrtf` (`:53`, `:83`, `:439`) are approximate in the same way and belong on it, with
 `rsqrtf((float) S)` (`:431`) as the folded constant. Three helpers the rows above need do not exist on origin/main; the unmerged `origin/woodsonl/basalt-sampler` (read at
-`2acc918`) settles one of them:
+`2acc918`) has one of them:
 
 - `ieee_fma_any`: that branch has it as `ieee_fma_count` (`kernels/common/basalt_sampler.metal:77-86`), a correctly
   rounded fma for any operands: the hardware's `fma` when all three exponent fields are nonzero and the result is at
-  least 2^-125, otherwise `basalt_f64.metal`'s binary64 fma rounded to odd, then to binary32. The port reuses it under
-  one general name in `basalt_ieee.metal` rather than writing a second one.
+  least 2^-125, otherwise `basalt_f64.metal`'s binary64 fma rounded to odd, then to binary32. The port writes its own,
+  `fma_ieee` (`kernels/common/basalt_ieee_f64.metal`), with the same slow path and its own fast-path guard
+  (`IEEE_SMALL`, 2^-100, on the operands and the result). It cannot go in `basalt_ieee.metal`: `monolith/kernels.py`'s
+  `basalt_q8_1_source()`, `basalt_experts_source()` and `basalt_s2_experts_source()` include that file without
+  `basalt_f64.metal`, and a helper there calling `f64_fma_odd` would stop them compiling. `ieee_fma_count` stays the
+  sampler's.
 - `expf_ieee`: not on that branch. Its `expf_approx` (`basalt_sampler.metal:90-93`,
   `fast::exp2(ieee_mul(x, 0x3fb8aa3b))`) is the contract's literal mapping, "without ex2.approx's branch for subnormal
   results"; like `expf_neg`, it writes zero where CUDA's halving and squaring below 2^-126 gives a subnormal, and that
