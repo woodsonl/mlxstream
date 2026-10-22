@@ -1,7 +1,7 @@
 // Copyright (c) 2023-2026 The ggml authors (MIT)
 // Copyright (c) 2026 Jesús Gulfo (MIT)
-// Adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_ple_postops.cu:37-89, src/kernels/cuda/ple.cu:46-52,
-// src/kernels/cuda/elementwise.cu:222-227 and src/kernels/cuda/verify_kernels.cu:506-512
+// Adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_ple_postops.cu:37-89 and :122-158,
+// src/kernels/cuda/ple.cu:46-52, src/kernels/cuda/elementwise.cu:222-227 and src/kernels/cuda/verify_kernels.cu:506-512
 // @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE); native_ple_postops.cu's arithmetic adapts
 // ggml-org/llama.cpp ggml/src/ggml-cuda/{reduce_rows.cuh,sumrows.cu,unary.cu} @
 // 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
@@ -49,6 +49,16 @@
 // D / 256 threadgroups of 256 threads, the snapshot and the restore 64 threadgroups of 256 threads in grid-stride
 // loops of two and six passes (monolith/kernels.py's PLE_GRIDS). The gate's block size fixes its reduction order, so
 // its pipeline must accept 512 threads.
+//
+// The prompt build alone (PROMPT_GUARD: basalt_fp.metal's row guard) adds native_ple_postops_batch's entries
+// (native_ple_postops.cu:382-397), over a chunk's R = prompt_rows(st) rows (StepState's count clamped to the
+// program's bound B): basalt_ple_broadcast_batch and basalt_ple_conv_batch, element (t, c) of the chunk as
+// basalt_ple_broadcast and basalt_ple_conv (tap k reads the chunk's normalized row p = t - 9 + 3k, or history row
+// 9 + p when p < 0; no conv store; result out of place, where basalt adds into hidden), and basalt_ple_history_batch,
+// channel c's row r becoming normalized row R - 9 + r, or old row R + r when that is negative (word moves; R = 0
+// stores nothing). Their grids are basalt's at T = B (monolith/kernels.py's basalt_ple_batch_grids): 40 B
+// threadgroups of 256 threads for the broadcast and the convolution, 40 for the history; a thread past the chunk
+// returns, as every thread does once the session is done.
 //
 // The rounding sequence nvcc compiles for these kernels: docs/research/basalt-nvcc/ple.md
 #pragma STDC FP_CONTRACT OFF
@@ -132,3 +142,45 @@ kernel void basalt_ple_restore(device uint* dst [[buffer(0)]], device const uint
     idx = min(idx, int(SNAP_SLOTS) - 1);
     for (uint i = i0; i < HS; i += n) dst[i] = src[uint(idx) * HS + i];
 }
+
+#if PROMPT_GUARD
+kernel void basalt_ple_broadcast_batch(device const float* value [[buffer(0)]], device const float* gate [[buffer(1)]],
+                                       device float* gated [[buffer(2)]],
+                                       uint i [[thread_position_in_grid]] PROMPT_GUARD_ARGS) {
+    const uint T = prompt_rows(guard_st);
+    if (guard_st->done || i >= T * D) return;
+    const uint t = i / D, d = i % D;
+    gated[i] = cuda_nan(mul_ftz(value[t * N + d % N], gate[t * H + d / N]));
+}
+
+kernel void basalt_ple_conv_batch(device const float* history [[buffer(0)]],
+                                  device const float* normalized [[buffer(1)]], device const ushort* taps [[buffer(2)]],
+                                  device const float* hidden [[buffer(3)]], device const float* gated [[buffer(4)]],
+                                  device float* result [[buffer(5)]],
+                                  uint i [[thread_position_in_grid]] PROMPT_GUARD_ARGS) {
+    const uint T = prompt_rows(guard_st);
+    if (guard_st->done || i >= T * D) return;
+    const int t = int(i / D), c = int(i % D);
+    float sum = 0.0f;
+    for (int k = 0; k < 4; ++k) {
+        const int p = t - 9 + 3 * k;                              // the token this tap reads (k == 3: this one)
+        const float x = p >= 0 ? normalized[uint(p) * D + uint(c)] : history[uint(c) * HIST + uint(9 + p)];
+        const float term = mul_ftz(x, h2f(taps[uint(c) * 4u + uint(k)]));
+        sum = k == 0 ? term : add_ftz(sum, term);
+    }
+    const float act = mul_ftz(sum, rcp_ftz(add_ftz(1.0f, expf_ftz(-sum))));
+    result[i] = cuda_nan(add_ftz(hidden[i], add_ftz(gated[i], act)));
+}
+
+kernel void basalt_ple_history_batch(device uint* history [[buffer(0)]], device const uint* normalized [[buffer(1)]],
+                                     uint c [[thread_position_in_grid]] PROMPT_GUARD_ARGS) {
+    const uint T = prompt_rows(guard_st);
+    if (guard_st->done || T == 0u || c >= D) return;
+    uint h[HIST];
+    for (uint r = 0; r < HIST; ++r) {
+        const int p = int(T) - 9 + int(r);                        // the chunk's row that becomes row r, if p >= 0
+        h[r] = p >= 0 ? normalized[uint(p) * D + c] : history[c * HIST + (T + r)];
+    }
+    for (uint r = 0; r < HIST; ++r) history[c * HIST + r] = h[r];
+}
+#endif

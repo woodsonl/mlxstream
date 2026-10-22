@@ -3,13 +3,17 @@ the GPU tests, on tests/kernels/basalt_gpu.py's device, pipelines and runs: one 
 starting as 0xFF bytes, and GPU probes of the basalt_fp.metal helpers whose values the numpy emulation
 (tests/kernels/basalt_emu.py) takes from the GPU. The history's moves (advance, snapshot, restore) run on words, each
 binding between GUARD bytes of 0xA5 (basalt's guards, ple_parity.cpp:178-190). ``chain`` runs the whole block, row by
-row, as the window op dispatches it: main's q8_1, mmvq and mmvf, then the block's kernels."""
+row, as the window op dispatches it: main's q8_1, mmvq and mmvf, then the block's kernels. The prompt path's five
+entries (``*_batch``: the prompt builds of the norm and the gate, and the three batch kernels) compile through
+basalt_prompt_gpu.prompt_pipeline at the bound B of their exact-size buffers and run on its run_rows, the chunk's rows
+in StepState at slot 15."""
 
 import numpy as np
 
 from monolith import kernels
 from monolith.runtime import _native as nt
 from tests.kernels import basalt_gpu as gpu
+from tests.kernels.basalt_prompt_gpu import prompt_pipeline, run_rows
 
 GUARD = 64                                  # bytes of 0xA5 on both sides of a guarded binding (16 floats)
 HS = kernels.PLE_HIST * kernels.PLE_D       # a history's words
@@ -275,3 +279,77 @@ def rsqrtf_ftz(x):
 def sqrtf_ftz(x):
     """basalt_fp.metal's sqrtf_ftz (``sqrtf`` in a fast-math file) on the GPU, elementwise: the values the gate uses."""
     return _helper("sqrtf_ftz", x)
+
+
+# ---- the prompt path: native_ple_postops_batch's entries (native_ple_postops.cu:382-397), one run each ------------
+def _batch(entry, stage, B, buffers, params, rows, done):
+    """``entry``'s prompt build at bound ``B`` (prompt_pipeline: the dynamic-T row macros beside PLE_PROMPT_MACROS, and
+    basalt_gr_norm_macros(PLE_N) for the norm), its source looked up on monolith.kernels now, run once by run_rows in
+    basalt's launch at T = B (``kernels.basalt_ple_batch_grids(B)[stage]``) with ``rows`` (t_this_step) and ``done``
+    in StepState: ``buffers`` (bytes, or a byte count for an output, which starts as 0xFF bytes) at 0, 1, ... and
+    ``params`` (if any) at 3. Returns the buffers' bytes. The block size fixes the norm's and the gate's reduction
+    order, so every pipeline must take its whole block."""
+    norm = entry == "basalt_gr_norm"
+    source = kernels.basalt_gr_norm_source(prompt=True) if norm else kernels.basalt_ple_source(prompt=True)
+    macros = {**kernels.PLE_PROMPT_MACROS, **(kernels.basalt_gr_norm_macros(kernels.PLE_N) if norm else {})}
+    pso = prompt_pipeline(source, entry, B, macros)
+    grid, threads = kernels.basalt_ple_batch_grids(B)[stage]
+    assert pso.max_threads_per_threadgroup >= threads, (entry, pso.max_threads_per_threadgroup, threads)
+    return run_rows(pso, buffers, params, 3, (grid, 1, 1), (threads, 1, 1), rows, 0, 0xFF, done)
+
+
+def gr_norm_batch(x, gamma, rows, done=0):
+    """``basalt_gr_norm``'s prompt build as basalt's ``rms_rep_kernel`` (native_ple_postops.cu:97-121, launched at
+    :389, :390 and :393) at bound B: the B rows ``x`` (B, PLE_D), each PLE_H rows of PLE_N values, row r of the 4 B
+    normalized with row r % PLE_H of ``gamma`` (PLE_D values) and eps = PLE_RMS_EPS, into an output that starts as 0xFF
+    bytes; (B, PLE_D) float32."""
+    x = _words(x, kernels.PLE_D)
+    out = _batch("basalt_gr_norm", "norm", len(x), [x.tobytes(), _words(gamma, kernels.PLE_D).tobytes(), 4 * x.size],
+                 kernels.basalt_gr_norm_params(kernels.PLE_N, kernels.PLE_H, kernels.PLE_RMS_EPS), rows, done)
+    return np.frombuffer(out[2], np.float32).reshape(x.shape)
+
+
+def gate_batch(key, query, rows, done=0):
+    """``basalt_ple_gate``'s prompt build as basalt's batch launches ``gate_kernel`` (native_ple_postops.cu:391) at
+    bound B: one threadgroup of 512 threads per stream, 4 B of them, on the B rows of normalized key and query values
+    (B, PLE_D) each, into gates that start as 0xFF bytes; (B, PLE_H) float32."""
+    key, query = _words(key, kernels.PLE_D), _words(query, kernels.PLE_D)
+    assert key.shape == query.shape, (key.shape, query.shape)
+    out = _batch("basalt_ple_gate", "gate", len(key), [key.tobytes(), query.tobytes(), 4 * kernels.PLE_H * len(key)],
+                 kernels.basalt_ple_gate_params(), rows, done)
+    return np.frombuffer(out[2], np.float32).reshape(len(key), kernels.PLE_H)
+
+
+def broadcast_batch(value, gate, rows, done=0):
+    """``basalt_ple_broadcast_batch`` (``broadcast_batch_kernel``, native_ple_postops.cu:122-127, launched at :392) at
+    bound B: row t's PLE_N values ``value`` (B, PLE_N) times each of its PLE_H gates ``gate`` (B, PLE_H), into rows
+    that start as 0xFF bytes; (B, PLE_D) float32."""
+    value, gate = _words(value, kernels.PLE_N), _words(gate, kernels.PLE_H)
+    assert len(value) == len(gate), (value.shape, gate.shape)
+    out = _batch("basalt_ple_broadcast_batch", "broadcast", len(value),
+                 [value.tobytes(), gate.tobytes(), 4 * kernels.PLE_D * len(value)], None, rows, done)
+    return np.frombuffer(out[2], np.float32).reshape(len(value), kernels.PLE_D)
+
+
+def conv_batch(hist, normalized, taps, hidden, gated, rows, done=0):
+    """``basalt_ple_conv_batch`` (``conv_residual_batch_kernel``, native_ple_postops.cu:128-145, launched at :394) at
+    bound B: ``hist`` the history (HS values in basalt's layout, row r of channel c at c * 9 + r), ``taps`` the fp16
+    kernel (float16 or its bits) at [k + 4 c], and the B rows ``normalized``, ``hidden`` and ``gated`` (B, PLE_D) each,
+    into a result that starts as 0xFF bytes, out of place where basalt adds into hidden; (B, PLE_D) float32."""
+    normalized, hidden, gated = (_words(a, kernels.PLE_D) for a in (normalized, hidden, gated))
+    assert normalized.shape == hidden.shape == gated.shape, (normalized.shape, hidden.shape, gated.shape)
+    ins = [_words(hist, HS).tobytes(), normalized.tobytes(),
+           np.ascontiguousarray(taps).view(np.uint16).reshape(4 * kernels.PLE_D).tobytes(), hidden.tobytes(),
+           gated.tobytes()]
+    out = _batch("basalt_ple_conv_batch", "conv", len(normalized), ins + [4 * normalized.size], None, rows, done)
+    return np.frombuffer(out[5], np.float32).reshape(normalized.shape)
+
+
+def history_batch(hist, normalized, rows, done=0):
+    """``basalt_ple_history_batch`` (``history_batch_kernel``, native_ple_postops.cu:146-158, launched at :395) at
+    bound B, on words: the history ``hist`` (HS words in basalt's layout) updated in place past the chunk's rows of
+    the B rows ``normalized`` (B, PLE_D). Returns the history after the run, HS uint32."""
+    normalized = _words(normalized, kernels.PLE_D)
+    out = _batch("basalt_ple_history_batch", "history", len(normalized),
+                 [_words(hist, HS).tobytes(), normalized.tobytes()], None, rows, done)
+    return np.frombuffer(out[0], np.uint32)

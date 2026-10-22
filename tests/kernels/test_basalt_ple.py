@@ -113,7 +113,20 @@ gamma rows and eps = f32(1e-6) (native_ple_postops.cu:352-353, :358), unless sta
   builds, as the tests above build them (no guard macro, no PROMPT_ROWS), and their prompt builds through
   ``basalt_prompt_gpu.prompt_pipeline`` at bounds 64 and 256 with ``PLE_PROMPT_MACROS`` (PROMPT_GUARD 1, and the
   dynamic-T row macros beside) compile, each norm and gate pipeline taking its whole block; the decode build of
-  basalt_ple.metal has none of the prompt path's batch entries (``BATCH_ENTRIES``)."""
+  basalt_ple.metal has none of the prompt path's batch entries (``BATCH_ENTRIES``).
+- B-HIST ``test_history_batch_counts`` (spec T§7.5's T-BATCH, its bound H1's criterion; T§8's X-H in form (c)):
+  basalt_ple_history_batch (``basalt_ple_gpu.history_batch``) at bound 256 for counts n in 1..10, 17, 64 and 256
+  (t_this_step = n), against H-ORACLE of the initial history and normalized rows 0 to n - 1, byte for byte, criterion
+  quoted: ``if (std::memcmp(actual.data(), expected.data(), count * sizeof(float)) != 0) {`` (ple_parity.cpp:210).
+  The bases are distinct exact integers (``history_batch_fixture``), so a word moved from the wrong row or channel
+  shows. PATTERNS are planted in every normalized row, as X-H plants them, and at fixed channels in every row of the
+  initial history, rotating with the row ("in both W and H", spec T§8), so both of the kernel's loads move them; at
+  counts 1 to 8 the planted words of old rows n..8 are asserted in new rows 0..8 - n, so the history branch cannot
+  pass vacuously.
+- B-H1 ``test_history_batch_regression``: H1 (ple_parity.cpp:177-214) as written, on basalt_ple_history_batch at count
+  1 and bound 256: H1's initial history and 12 tokens (``h1_fixture``), each token's row in row 0 of a normalized
+  buffer whose other rows hold 0xFF bytes, the history the GPU returned fed to the next run, each run followed by the
+  host shift (:203-204) and H1's memcmp (:210), then ``++bad;`` (:212)."""
 
 import functools
 
@@ -725,3 +738,59 @@ def test_guard_variants_compile():
         f"batch entry: builder forms other than PRELUDE + basalt_fp.metal (+ PROMPT_ROWS) + the file: {forms}; builds "
         f"failed: {failed}; pipelines below their block (build, max, block): {narrow}; batch entries in the decode "
         f"build: {present}")
+
+
+# ---- B-HIST and B-H1: the prompt path's history (spec T§7.5's T-BATCH, T§8's X-H in form (c)) ---------------------
+BOUND = 256                                     # the prompt program's bound B the history runs compile at
+COUNTS = (*range(1, HIST + 2), 17, 64, BOUND)   # t_this_step: across the history's boundary, then up to the bound
+FIXED = np.arange(0, D, PLANT)                  # the channels whose every initial history row holds a planted word
+
+
+@functools.lru_cache(maxsize=1)
+def history_batch_fixture():
+    """B-HIST's words: the initial history (HS words, basalt's layout) and BOUND normalized rows, (BOUND, D). The bases
+    are distinct exact integers, H1's history ``-float(c * 16 + r + 1)`` and normalized[t][c] = float(t * D + c + 1)
+    (asserted), so a word moved from the wrong row or channel shows. PATTERNS are planted in every normalized row as
+    X-H plants them and in every history row at the channels FIXED, the j-th of them holding PATTERNS[(j + r) % 7] in
+    row r, so that each old row's planted word differs from the rows beside it (asserted)."""
+    hist = h1_fixture()[0].reshape(D, HIST)
+    normalized = bits((np.arange(BOUND)[:, None] * D + np.arange(D) + 1).astype(F32))
+    assert np.unique(np.concatenate([hist.ravel(), normalized.ravel()])).size == HS + BOUND * D, "B-HIST: bases"
+    for r in range(HIST):
+        hist[FIXED, r] = PATTERNS[(np.arange(FIXED.size) + r) % PATTERNS.size]
+    for t in range(BOUND):
+        planted = np.arange(t, D, PLANT)
+        normalized[t, planted] = PATTERNS[np.arange(planted.size) % PATTERNS.size]
+    assert (hist[FIXED, 1:] != hist[FIXED, :-1]).all(), "B-HIST: a planted word repeats between history rows"
+    return hist.ravel(), normalized
+
+
+@pytest.mark.parametrize("n", COUNTS)
+def test_history_batch_counts(n):
+    hist, normalized = history_batch_fixture()
+    want = h_oracle(hist.view(F32), normalized.view(F32)[:n], n).view(np.uint32)
+    got = ple_gpu.history_batch(hist, normalized, n)
+    h, w, g = (a.reshape(D, HIST) for a in (hist, want, got))
+    assert all(np.isin(PATTERNS, w[:, r]).all() for r in range(HIST)), "B-HIST: every pattern in every expected row"
+    moved = n >= HIST or bool((g[FIXED, :HIST - n] == h[FIXED, n:]).all())
+    wrong = [(int(i) // HIST, int(i) % HIST) for i in np.flatnonzero(got != want)]
+    assert got.tobytes() == want.tobytes() and moved, (
+        "B-HIST, H1's criterion `if (std::memcmp(actual.data(), expected.data(), count * sizeof(float)) != 0) {` "
+        f"(ple_parity.cpp:210) against H-ORACLE: count {n}: (channel, row) {wrong[:8]} of {len(wrong)} words differ; "
+        f"at counts 1 to 8, old rows n..8's planted words in new rows 0..8 - n: {moved}")
+
+
+def test_history_batch_regression():
+    hist, normalized = h1_fixture()
+    rows = np.full((BOUND, D), 0xFFFFFFFF, np.uint32)     # rows 1 to BOUND - 1 hold 0xFF bytes, as an output starts
+    actual, expected, bad = hist, hist, []
+    for token in range(TOKENS):
+        rows[0] = normalized[token]
+        actual = ple_gpu.history_batch(actual, rows, 1)    # the GPU's history, chained as basalt's stays on device
+        expected = host_shift(expected, normalized[token])
+        if actual.tobytes() != expected.tobytes():
+            bad.append(token)
+    assert not bad, (
+        "B-H1, H1 on basalt_ple_history_batch at count 1: `if (std::memcmp(actual.data(), expected.data(), count * "
+        "sizeof(float)) != 0) {` (ple_parity.cpp:210), then `++bad;` (:212): history mismatch after token "
+        f"{bad}")

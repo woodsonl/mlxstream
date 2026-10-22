@@ -823,7 +823,8 @@ def basalt_gr_norm_grid(n_rows: int, macros: Mapping[str, str]) -> Tuple[int, in
 # The launch rules and constants below are adapted from basalt (jesdga95/basalt)
 # src/kernels/cuda/native_ple_postops.cu:36, :352-359, src/kernels/cuda/ple.cu:36, :210,
 # src/kernels/cuda/elementwise.cu:277-287, src/kernels/cuda/verify_kernels.cu:1086-1090,
-# include/basalt/kernels/ngram.hpp:30-41 and include/basalt/kernels/verify_kernels.hpp:21 @
+# include/basalt/kernels/ngram.hpp:30-41, include/basalt/kernels/verify_kernels.hpp:21 and
+# src/kernels/cuda/native_ple_postops.cu:387-395 (the batch's launch grids) @
 # b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 
 PLE_N = 2560            # a hyper-connection stream's width (NG_N_EMBD)
@@ -852,7 +853,9 @@ def basalt_ple_source(prompt: bool = False) -> str:
     ``conv_residual_kernel`` (``basalt_ple_conv``), ``history_advance_kernel`` (``basalt_ple_advance``),
     ``copy_from_mapped_kernel`` as the history's snapshot (``basalt_ple_snapshot``) and ``copy_indexed_kernel`` as the
     commit's restore (``basalt_ple_restore``). With ``prompt``, the prompt build: PROMPT_ROWS ahead of the kernels,
-    compiled with PLE_PROMPT_MACROS and the row macros."""
+    compiled with PLE_PROMPT_MACROS and the row macros; it adds ``broadcast_batch_kernel``
+    (``basalt_ple_broadcast_batch``), ``conv_residual_batch_kernel`` (``basalt_ple_conv_batch``) and
+    ``history_batch_kernel`` (``basalt_ple_history_batch``)."""
     return PRELUDE + template("basalt_fp.metal") + (PROMPT_ROWS if prompt else "") + template("basalt_ple.metal")
 
 
@@ -864,6 +867,20 @@ def basalt_ple_gate_params() -> bytes:
     bits = int((np.float32(1) / np.sqrt(np.float32(PLE_N))).view(np.uint32))
     assert bits == 0x3CA1E89B, hex(bits)
     return struct.pack("<4I", bits, 0, 0, 0)
+
+
+def basalt_ple_batch_grids(rows: int) -> Dict[str, Tuple[int, int]]:
+    """native_ple_postops_batch's launches at T = ``rows``, the prompt program's bound B: per stage (threadgroups,
+    threads), from basalt's rows = T * H and blocks = ceil(T * D / 256) (native_ple_postops.cu:387-388)."""
+    blocks = -(-rows * PLE_D // 256)
+    norm = basalt_gr_norm_grid(PLE_H * rows, basalt_gr_norm_macros(PLE_N))
+    return {
+        "norm": norm,                           # :389, :390, :393: rms_rep_kernel<<<rows, 1024>>>
+        "gate": (PLE_H * rows, 512),            # :391: gate_kernel<<<rows, 512>>>
+        "broadcast": (blocks, 256),             # :392: broadcast_batch_kernel<<<blocks, 256>>>
+        "conv": (blocks, 256),                  # :394: conv_residual_batch_kernel<<<blocks, 256>>>
+        "history": (PLE_D // 256, 256),         # :395: history_batch_kernel<<<D / 256, 256>>>
+    }
 
 
 # ---- basalt's prompt path: the GEMM and the 16-bit conversions (kernels/common/basalt_prompt_gemm.metal; docs/research/basalt-nvcc/prefill_kernels.md) ----
