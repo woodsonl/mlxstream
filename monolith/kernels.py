@@ -782,8 +782,8 @@ def basalt_gr_post_grid(n_embd: int, hc: int, t: int) -> Tuple[int, int]:
 
 
 # ---- basalt's router top-10 (kernels/common/basalt_router.metal; docs/research/basalt-nvcc/hc_fused.md section 8)
-# The grid below is adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_router.cu:121-128 @
-# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+# The grid and its count check below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_router.cu
+# :121-128 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 
 def basalt_router_source() -> str:
     """basalt's ``route`` (``native_router_top10``, ``native_router_top10_multi``) and the fused read's ``hc_top10``
