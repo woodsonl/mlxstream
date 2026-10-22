@@ -164,9 +164,9 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `:433-454`, `:620-692` (MIT): the double write, its metrics, fixture and pass criteria; and from
   `src/kernels/cuda/native_gr_postops.cu:65-74` (MIT): `native_gr_post`'s arithmetic as nvcc compiles it
   (`gr_post_emulation`; `docs/research/basalt-nvcc/native_gr_postops.md`); and from
-  `src/kernels/router_top10_parity.cpp:33-60`, `:83-107`, `:119-164` (MIT): the router's double reference, its
-  fixtures, criteria and floor assertion, and from `src/kernels/cuda/native_router.cu:46-100`: the emulation of
-  `route`. License: `third_party/BASALT-LICENSE`.
+  `src/kernels/router_top10_parity.cpp:33-60`, `:83-107`, `:119-146` (MIT): the router's double reference, its
+  fixtures and criteria, and from `src/kernels/cuda/native_router.cu:46-100`: the emulation of `route`. License:
+  `third_party/BASALT-LICENSE`.
 - `kernels/common/basalt_fp.metal` — adapted from `src/kernels/cuda/native_mmvq.cu`, `src/kernels/cuda/iq_kernels.cu`,
   `include/basalt/kernels/dp4a.hpp` and `include/basalt/kernels/q8_1_finite.hpp` (MIT): `warp_sum`, `warp_max`,
   `load_int_b2`, the `DP4A` helper and the IQ4 table lookup (`native_mmvq.cu:441-457`), with the flush-to-zero and reciprocal helpers that write out the arithmetic nvcc
