@@ -402,7 +402,11 @@ def test_image_builders():
     assert kernels.basalt_hc8_image_params(10240, 320, 9828) == struct.pack("<4I", 320, 16, 9828, 412)
     assert kernels.basalt_hc8_image_grid(320, 10240) == kernels.basalt_hc8_image_grid(10240, 320) == (1600, 256)
     for args, why in [((4, 48), "cols must be a positive multiple of 32, got 48"),
+                      ((4, 0), "cols must be a positive multiple of 32, got 0"),
+                      ((4, -32), "cols must be a positive multiple of 32, got -32"),
                       ((4, 64, 0, 0), "need at least one row, got n 0"),
+                      ((4, 64, 0, -1), "need at least one row, got n -1"),
+                      ((4, 64, -1, 2), r"rows \[-1, 1\) outside the copy's 4"),
                       ((4, 64, 2, 3), r"rows \[2, 5\) outside the copy's 4"),
                       ((65536, 32768), r"a 65536 x 32768 copy has 2\^31 values or more")]:
         with pytest.raises(ValueError, match=why):
