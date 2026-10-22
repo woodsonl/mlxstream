@@ -11,6 +11,7 @@ from typing import List, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 from .formats import FORMATS
 from .formats.blm import PackInfo
+from .formats.gguf import ggml_row_bytes
 from .backends.metal.context import current_backend
 
 from .resources import kernel_root
@@ -701,6 +702,163 @@ def basalt_q5k_proxy_params(n_cap: int, *, row0: int = 0, n: int = 0, n_rows: Op
             or (n_rows is not None and not 0 < n_rows <= min(n_cap, 2 ** 31 - 1))):
         raise ValueError(f"basalt_q5k_proxy: rows out of range (row0 {row0}, n {n}, n_rows {n_rows}, n_cap {n_cap})")
     return struct.pack("<IIII", row0, n, n_cap, n_rows or 0)
+
+
+# ---- basalt's prompt path: group dequantizers (kernels/common/basalt_dequant16.metal; docs/research/basalt-nvcc/dequant_bf16.md)
+# The type table and launch rules below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/dequant_bf16.cu
+# :190-240 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+DEQUANT16_TYPES = (2, 6, 8, 11, 12, 13, 14, 20, 23, 42)   # the GGUF types Gemm::native dequantizes on this pack
+DEQUANT16_OUT = {"f32": 0, "f16": 1, "bf16": 2}           # DQ_OUT: put's float, H16 and BF16 stores (:28-31)
+DEQUANT16_THREADS = 256                                   # threads per threadgroup, one per 32-value group (:221-222)
+
+
+def basalt_dequant16_source() -> str:
+    """basalt's ``dequant_kernel`` (dequant_bf16.cu:168-188) as ``basalt_dequant_g32``, one thread per 32-value group:
+    ``basalt_dequant16_grid`` threadgroups of 256 threads, 1-D. Bindings: 0 the matrix's blocks from its row 0, at
+    least (row0 + rows) * row bytes at any byte offset, of which rows [row0, row0 + rows) are read; 1 the output,
+    exactly rows * cols values, row-major (float for "f32", fp16 or BF16 bits for "f16" and "bf16"); 2 the
+    ``basalt_dequant16_params`` record."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_dequant16.metal")
+
+
+def basalt_dequant16_macros(type_id: int, out: str) -> Dict[str, str]:
+    """``DQ_TYPE`` (the ggml type id) and ``DQ_OUT`` (``out``: "f32", "f16" or "bf16", as dequant_f32, dequant_f16 and
+    dequant_bf16 store). basalt also takes Q5_1 (dequant_bf16.cu:194) and hands the i-quant types of ``iq_only`` to
+    iq_kernels.cu (:251, :261-265, :270-274); no tensor of this pack has them, so a type outside ``DEQUANT16_TYPES``
+    is refused."""
+    if type_id not in DEQUANT16_TYPES:
+        raise ValueError(f"basalt_dequant16: unsupported ggml type {type_id}")
+    if out not in DEQUANT16_OUT:
+        raise ValueError(f"basalt_dequant16: unsupported output {out!r}")
+    return {"DQ_TYPE": str(type_id), "DQ_OUT": str(DEQUANT16_OUT[out])}
+
+
+def basalt_dequant16_params(type_id: int, row0: int, rows: int, cols: int) -> bytes:
+    """``DequantG32Params`` (row bytes, row0, rows, groups per row: basalt's int64_t arguments, dequant_bf16.cu:171-172)
+    for rows [row0, row0 + rows) of ``cols`` values of type ``type_id``. Refused: a type ``basalt_dequant16_macros``
+    refuses; basalt's cols not whole blocks and rows <= 0 (:210-214) and its failed launch (``basalt_dequant16_grid``);
+    row0 < 0, the port's own (a load before the binding)."""
+    if type_id not in DEQUANT16_TYPES:
+        raise ValueError(f"basalt_dequant16: unsupported ggml type {type_id}")
+    if rows <= 0 or row0 < 0:
+        raise ValueError(f"basalt_dequant16: rows must be positive and row0 non-negative, got {rows} and {row0}")
+    row_bytes = ggml_row_bytes(type_id, cols)
+    basalt_dequant16_grid(rows, cols)
+    return struct.pack("<qqqq", row_bytes, row0, rows, cols // 32)
+
+
+def basalt_dequant16_grid(rows: int, cols: int) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup): ceil(rows * cols / 32 / 256) threadgroups of 256 (dequant_bf16.cu:216,
+    :221-222). A grid of no threadgroup or of more than ``CUDA_GRID_X`` is refused: basalt's launch fails on either
+    and it exits (:238-239)."""
+    grid = -(-(rows * (cols // 32)) // DEQUANT16_THREADS)
+    if not 0 < grid <= CUDA_GRID_X:
+        raise ValueError(f"basalt_dequant16: {rows} x {cols} values need {grid} threadgroups, outside 1..{CUDA_GRID_X}")
+    return grid, DEQUANT16_THREADS
+
+
+# ---- basalt's hyper-connection write (kernels/common/basalt_gr_post.metal;
+# docs/research/basalt-nvcc/native_gr_postops.md)
+# The shape check and grid below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_gr_postops.cu:35
+# and :79-83 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+def basalt_gr_post_source() -> str:
+    """basalt's ``native_gr_post`` (``basalt_gr_post``): the hyper-connection write of T tokens' residual stacks."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_gr_post.metal")
+
+
+def basalt_gr_post_params(n_embd: int, hc: int, t: int) -> bytes:
+    """``basalt_gr_post``'s record (n_embd, hc, T, 0): positive dimensions with n_embd * hc at most INT_MAX, basalt's
+    ``check_shape`` (native_gr_postops.cu:79-82), any T >= 1, and T * hc * n_embd below 2^32, the kernel's 32-bit
+    element index."""
+    if n_embd < 1 or hc < 1 or t < 1 or n_embd * hc > 2 ** 31 - 1 or t * hc * n_embd >= 2 ** 32:
+        raise ValueError(f"basalt_gr_post: unsupported shape (n_embd {n_embd}, hc {hc}, T {t})")
+    return struct.pack("<IIII", n_embd, hc, t, 0)
+
+
+def basalt_gr_post_grid(n_embd: int, hc: int, t: int) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup): one thread per element of the T rows, in threadgroups of 256 (basalt's
+    ``THREADS`` and ``blocks``, native_gr_postops.cu:35, :83)."""
+    return -(-t * hc * n_embd // 256), 256
+
+
+# ---- basalt's grouped RMSNorm (kernels/common/basalt_gr_norm.metal; docs/research/basalt-nvcc/ple.md) ----
+# The launch rules below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_gr_norm.cu:85-100 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+def basalt_gr_norm_source() -> str:
+    """basalt's ``native_gr_rms_norm_weighted``, ``weighted_rms_norm<256>`` and ``<1024>`` (``basalt_gr_norm``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_gr_norm.metal")
+
+
+def basalt_gr_norm_macros(n_cols: int) -> Dict[str, str]:
+    """basalt's block choice (native_gr_norm.cu:93-96): 256 threads below 1024 columns, 1024 from there."""
+    return {"NORM_BLOCK": "1024" if n_cols >= 1024 else "256"}
+
+
+def basalt_gr_norm_params(n_cols: int, gamma_rows: int, eps: float) -> bytes:
+    """``GrNormParams``: n_cols, gamma_rows (row r is normalized with gamma row r % gamma_rows) and eps as float32
+    bits. basalt's refusals (native_gr_norm.cu:87), eps taken as its float: n_cols outside its int's 1..INT_MAX (which
+    also keeps the column loop's counter from wrapping), or eps not finite or below 0; and a gamma_rows below 1."""
+    import numpy as np
+
+    with np.errstate(over="ignore"):
+        e = np.float32(eps)
+    if not 0 < n_cols < 2 ** 31 or gamma_rows <= 0 or not np.isfinite(e) or e < 0:
+        raise ValueError(f"basalt_gr_norm: require 1 <= n_cols <= INT_MAX, gamma_rows >= 1 and a finite eps >= 0 "
+                         f"(n_cols {n_cols}, gamma_rows {gamma_rows}, eps {eps})")
+    return struct.pack("<4I", n_cols, gamma_rows, int(e.view(np.uint32)), 0)
+
+
+def basalt_gr_norm_grid(n_rows: int, macros: Mapping[str, str]) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup): one threadgroup of NORM_BLOCK threads per row; basalt refuses
+    n_rows below 1 (native_gr_norm.cu:87)."""
+    if n_rows <= 0:
+        raise ValueError(f"basalt_gr_norm: n_rows must be positive, got {n_rows}")
+    return n_rows, int(macros["NORM_BLOCK"])
+
+
+# ---- basalt's n-gram block (kernels/common/basalt_ple.metal; docs/research/basalt-nvcc/ple.md) ----
+# The launch rules and constants below are adapted from basalt (jesdga95/basalt)
+# src/kernels/cuda/native_ple_postops.cu:36, :352-359, src/kernels/cuda/ple.cu:36, :210,
+# src/kernels/cuda/elementwise.cu:277-287, src/kernels/cuda/verify_kernels.cu:1086-1090,
+# include/basalt/kernels/ngram.hpp:30-41 and include/basalt/kernels/verify_kernels.hpp:21 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+PLE_N = 2560            # a hyper-connection stream's width (NG_N_EMBD)
+PLE_H = 4               # the hyper-connection streams (NG_HC)
+PLE_D = 10240           # their channels, PLE_H * PLE_N (NG_HC_DIM)
+PLE_HIST = 9            # the history's rows (NG_HIST)
+PLE_SNAP_SLOTS = 8      # the per-row snapshots: a verify window's most rows (kVerifyMaxT)
+PLE_RMS_EPS = 1e-6      # the three grouped norms' eps (NG_RMS_EPS)
+
+PLE_GRIDS = {           # entry (basalt_ple_<name>) -> (threadgroups, threads), basalt's launches
+    "gate": (4, 512),           # native_ple_postops.cu:355: gate_kernel<<<H, 512>>>, one block per stream
+    "broadcast": (40, 256),     # native_ple_postops.cu:356: broadcast_kernel<<<D / 256, 256>>>
+    "conv": (40, 256),          # native_ple_postops.cu:359: conv_residual_kernel<<<D / 256, 256>>>
+    "advance": (40, 256),       # ple.cu:210: (NG_HC_DIM + THREADS - 1) / THREADS blocks of THREADS = 256 (:36)
+    "snapshot": (64, 256),      # elementwise.cu:284-285: min(ceil(n4 / 256), 64) blocks of 256, n4 = 23,040 float4s
+    "restore": (64, 256),       # verify_kernels.cu:1087-1088: min(ceil(n / 256), 64) blocks of 256, n = 92,160
+}
+
+
+def basalt_ple_source() -> str:
+    """basalt's ``gate_kernel`` (``basalt_ple_gate``), ``broadcast_kernel`` (``basalt_ple_broadcast``),
+    ``conv_residual_kernel`` (``basalt_ple_conv``), ``history_advance_kernel`` (``basalt_ple_advance``),
+    ``copy_from_mapped_kernel`` as the history's snapshot (``basalt_ple_snapshot``) and ``copy_indexed_kernel`` as the
+    commit's restore (``basalt_ple_restore``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_ple.metal")
+
+
+def basalt_ple_gate_params() -> bytes:
+    """``PleGateParams``: the gate's scale as float32 bits, basalt's host constant ``1.0f / std::sqrt(float(N))``
+    (native_ple_postops.cu:355; host code, which --use_fast_math leaves IEEE), 0x3CA1E89B."""
+    import numpy as np
+
+    bits = int((np.float32(1) / np.sqrt(np.float32(PLE_N))).view(np.uint32))
+    assert bits == 0x3CA1E89B, hex(bits)
+    return struct.pack("<4I", bits, 0, 0, 0)
 
 
 # ---- basalt's sampler (kernels/common/basalt_sampler.metal; docs/research/basalt-nvcc/sampler.md) ---------------

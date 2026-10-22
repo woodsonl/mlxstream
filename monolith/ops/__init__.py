@@ -7,6 +7,6 @@ basalt's sampler (``basalt_sample``) and basalt's GDN decode window (``basalt_gd
 profile."""
 
 from .registry import OPS, CostModel, KernelBinding, OpDef, register_op
-from . import attention, basalt, basalt_gdn, basalt_sample, draft, embed, gdn, gemv, moe, norm, sample  # noqa: F401  (registration)
+from . import attention, basalt, basalt_gdn, basalt_ple, basalt_sample, draft, embed, gdn, gemv, moe, norm, sample  # noqa: F401  (registration)
 
 __all__ = ["OPS", "CostModel", "KernelBinding", "OpDef", "register_op"]
