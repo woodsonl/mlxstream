@@ -1,7 +1,7 @@
 """Single-kernel runs of basalt's GDN decode window (kernels/common/basalt_gdn.metal) for the GPU tests, on the geometry
-of tests/basalt_gdn_ref.py.
+of tests/basalt_gdn_ref.py, and of its commit (``gdn_commit``, on the geometry its arguments give).
 
-- Every entry point reads one ``BsGdnParams`` record (``params``: ``kernels.basalt_gdn_params``) at buffer 16; buffer
+- Every window kernel reads one ``BsGdnParams`` record (``params``: ``kernels.basalt_gdn_params``) at buffer 16; buffer
   15, StepState's slot, stays unbound.
 - ``launch`` binds each input at exactly its bytes, so shader validation sees a read past one, and each output as its
   rows plus one sentinel row, every byte 0xFF (NaN as a float). A window of width T writes rows t < T only, so every
@@ -15,6 +15,9 @@ of tests/basalt_gdn_ref.py.
 - ``rec``: ``dec_gdn_rec``, the window itself: its four window stores (win_qkv, win_h, win_gate, win_beta, rows
   t < T of MT) and its q8_1 rows yq from a layer's state and the window's qkv, x and z rows, with the state's bytes
   after the run and the run's result; ``y=True`` builds it with ``GDN_Y_BOUND`` 1 and binds its fp32 y at buffer 17.
+- ``gdn_commit``: ``gdn_commit_layers`` (kernels/common/basalt_gdn_commit.metal), the commit, on the record
+  ``kernels.basalt_gdn_commit_params`` at buffer 7, through ``basalt_gpu.run``: the state with a 4 KiB 0xFF tail and
+  ``used`` as two 0xFF words, both checked after the dispatch.
 """
 
 from typing import NamedTuple
