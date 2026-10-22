@@ -979,7 +979,7 @@ def basalt_prompt_hc_params(row0: int) -> bytes:
 # ---- basalt's prompt path: the attention half's row kernels (kernels/common/basalt_prompt_qsa.metal; docs/research/basalt-nvcc/prefill_kernels.md) ----
 
 def basalt_prompt_qsa_source() -> str:
-    """basalt's prompt attention row kernels (src/prefill/kernels.cu:726-734): the q8_1 builder's source (the shared
+    """basalt's prompt attention row kernels (src/prefill/kernels.cu:726-758): the q8_1 builder's source (the shared
     helpers, the IEEE binary32 operations, ``ieee_div``, ``warp_sum_ieee`` and ``block_sum``; its quantizers compile
     along), the software binary64 and ``fma_ieee`` on it, libdevice's transcriptions, the rows, then
     ``basalt_prompt_qsa.metal``'s ``prompt_*`` entries."""

@@ -449,3 +449,121 @@ def test_rope_kernel_angle_bit_for_bit():
                               f"{bad[0][0]}, {'s' if bad[0][1] >= 32 else 'c'} of pair {bad[0][1] % 32}")
         bad = np.argwhere(got != emu.rope_emu(x, c[k][:, None], s[k][:, None]))
         assert not len(bad), f"p0 {p0}: {len(bad)} words differ from the twin, the first at {bad[0]}"
+
+
+@pytest.mark.parametrize("name", ["A2", "A6", "A8"])
+def test_rope_rotation_bit_for_bit(name):
+    """RO-2 (TA 3.2, D25): the rotation's two FFMA sites, y[pair] = fma(c, a, -fl(b s)) and y[pair + 32] = fma(c, b,
+    fl(a s)) (the SASS's FMUL, then FFMA), bitwise. Head 0 of every token is the probe row (a = 1, b = 0), so the
+    kernel's stores there are its own (c, s) (RO-3 holds them to the twins); every word of every head equals
+    basalt_emu.rope_emu with those (c, s), over 256 tokens from position 0: random rows and, in head 1 at positions
+    1..32 (where s is not +0), TA 3.2's IEEE rows (i) a of 1e-40 N(0, 1) (subnormal) beside b = 0, so that c a and a s
+    are the results, (ii) b of 1e-40 N(0, 1) beside a = 0 and (iii) a and b of 1e-36 N(0, 1), whose b s falls subnormal
+    at a small s, D25's (iv) a and b of 1e-38 N(0, 1), whose results round into the subnormals, and a subnormal and a
+    -0 among the copied dims. The flushing twin (every
+    operation's inputs and result flushed) must differ from the IEEE twin in each of (i)-(iv). A second run plants
+    D25's NaN and infinite entries: a NaN a or b stores cuda_nan's 0x7fffffff at both words of its pair, an infinite b
+    times s = +0 (position 0) a NaN 0x7fffffff, the others the twin's words; NaN payloads among the copied dims keep
+    their bits."""
+    heads, dim, _ = ROPE_SHAPES[name]
+    x = rope_fixture(heads, dim).reshape(B, heads, dim)
+    x[:, 0, :32], x[:, 0, 32:64] = 1, 0                                     # the probe head
+    rng = np.random.default_rng(756)
+    groups = {"(i)": (1e-40, 0), "(ii)": (0, 1e-40), "(iii)": (1e-36, 1e-36), "(iv)": (1e-38, 1e-38)}
+    for g, (sa, sb) in enumerate(groups.values()):                          # tokens 1-8, 9-16, 17-24, 25-32
+        x[1 + 8 * g: 9 + 8 * g, 1, :32] = rng.standard_normal((8, 32)) * sa
+        x[1 + 8 * g: 9 + 8 * g, 1, 32:64] = rng.standard_normal((8, 32)) * sb
+    x[33, 1, 64:66] = (1e-40, -0.0)
+    got = rope(x.reshape(B, -1), heads, dim, B, 0)
+    c, s = got[:, :1, :32].view(F32), got[:, :1, 32:64].view(F32)          # per token, for every head
+    want = emu.rope_emu(x, c, s)
+    bad = np.argwhere(got != want)
+    assert not len(bad), f"{name}: {len(bad)} words differ from the twin, the first at {bad[0]}"
+    flushed = emu.rope_emu(x, c, s, flush=True)
+    for g, label in enumerate(groups):
+        t = slice(1 + 8 * g, 9 + 8 * g)
+        assert (flushed[t, 1] != want[t, 1]).any(), f"{name} {label}: the flushing twin's words equal the IEEE twin's"
+    v = x.view(U32)
+    v[0, 1, 0], v[3, 1, 34] = 0x7FA00001, 0xFFC00005                        # NaN a at position 0, NaN b at 3
+    x[0, 1, 37], x[0, 1, 9] = np.inf, -np.inf                               # inf b where s = +0, -inf a
+    x[3, 1, 4], x[3, 1, 38] = np.inf, -np.inf
+    v[5, 1, 100], v[5, 1, 70] = 0x7FA00002, 0xFF800001                      # copied NaN payloads
+    got = rope(x.reshape(B, -1), heads, dim, B, 0, finite=False)
+    assert np.array_equal(got[:, :1, :64].view(F32), np.concatenate([c, s], axis=-1)), f"{name}: (c, s) moved"
+    bad = np.argwhere(got != emu.rope_emu(x, c, s))
+    assert not len(bad), f"{name}: {len(bad)} words differ from the twin with NaN and inf entries, the first at {bad[0]}"
+    assert (got[0, 1, [0, 32, 5]] == 0x7FFFFFFF).all() and (got[3, 1, [2, 34]] == 0x7FFFFFFF).all(), "a NaN's words"
+    assert got[5, 1, 100] == 0x7FA00002 and got[5, 1, 70] == 0xFF800001, f"{name}: a copied NaN lost its payload"
+
+
+@pytest.mark.parametrize("name", ["A2", "A6", "A8"])
+def test_rope_row_invariance(name):
+    """RO-4 (TA 3.2): one threadgroup per (token, head) and nothing shared between them (the grid of host :1021-1023),
+    so token t alone (its rows copied to token 0, R = 1 from position p0 + t) equals token t's rows of the 256-token
+    run from p0, bitwise, t in {0, 1, 255}, at p0 = 105600 (pair 0 takes the Payne-Hanek path from token 15 on, so
+    both paths run); dims 64.. of every head keep x's bits; a second run stores the same bits; a run with
+    StepState.done = 1 stores nothing."""
+    heads, dim, _ = ROPE_SHAPES[name]
+    x = rope_fixture(heads, dim)
+    p0 = SLOW_CHUNKS[0]
+    full = rope(x, heads, dim, B, p0)
+    for t in (0, 1, B - 1):
+        xt = x.copy()
+        xt[0] = x[t]
+        assert np.array_equal(rope(xt, heads, dim, 1, p0 + t)[0], full[t]), f"{name}: token {t} alone differs"
+    assert np.array_equal(full[..., 64:], x.view(U32).reshape(B, heads, dim)[..., 64:]), f"{name}: a copied dim moved"
+    assert np.array_equal(rope(x, heads, dim, B, p0), full), f"{name}: two runs differ"
+    rope(x, heads, dim, B, p0, done=1)
+
+
+def rope_worst(got, x, pos):
+    """TA 3.2's measure of the words ``got`` [T, heads, dim] for the inputs ``x`` [T, heads, dim] at the positions
+    ``pos`` [T], against float64: theta = pos 1e7^(-2 pair / 64) exactly (rope_parity's ang = p * pow(theta, -2.0 * i /
+    n_rot), :67-84), ref[pair] = a cos - b sin and ref[pair + 32] = a sin + b cos, the other dims x; rel = |got - ref| /
+    max(max_d |x|, 1e-30) for each (token, head) row of dim values (rope_parity.cpp:392-399). Returns the worst rel."""
+    xr = np.asarray(x, np.float64)
+    th = np.asarray(pos, np.float64)[:, None, None] * 1e7 ** (-2 * np.arange(32) / 64)
+    a, b = xr[..., :32], xr[..., 32:64]
+    ref = xr.copy()
+    ref[..., :32], ref[..., 32:64] = a * np.cos(th) - b * np.sin(th), a * np.sin(th) + b * np.cos(th)
+    scale = np.maximum(np.abs(xr).max(axis=-1, keepdims=True), 1e-30)
+    return float((np.abs(got.view(F32).astype(np.float64) - ref) / scale).max())
+
+
+ROPE_GATED = 16384     # positions below it are gated: one maximal chunk (m.T <= 16384, prefill.cpp:1251-1253)
+ROPE_RUNS = ([(n, R, 0) for n, (_, _, counts) in ROPE_SHAPES.items() for R in counts]
+             + [(n, B, p0) for p0 in (16128, 32512) for n in ("A2", "A6", "A8")])
+
+
+@pytest.mark.parametrize("name,R,p0", ROPE_RUNS)
+def test_rope_vs_double(name, R, p0):
+    """RO-1 (TA 3.2). Nearest bound; no basalt test launches this kernel: rope_parity.cpp:400, ``if (!(rel <= 3e-3))
+    ++agree_bad;`` (and :429, the same rule at scaling None), gates basalt's fast-math native rotation against its
+    float64 table path, rel = |got - ref| / the row's largest |x|. Here against float64 at the exact angle, at every
+    call shape (A2, A6, A8 at T in {1, 7, 256} from position 0 and at 256 tokens from 16128; draft_kv's D16 at nb in
+    {1, 192}), gated at positions up to 16383: the float32 angle's error grows with the position, so the bound can
+    fail past about 19,000 (TA 3.2), and the worst over 32512..32767 is printed, not gated. Dims 64.. keep x's bits."""
+    heads, dim, _ = ROPE_SHAPES[name]
+    xb = rope_fixture(heads, dim)
+    got, x = rope(xb, heads, dim, R, p0), xb[:R].reshape(R, heads, dim)
+    assert np.array_equal(got[..., 64:], x.view(U32)[..., 64:]), f"{name}: a copied dim moved"
+    worst = rope_worst(got, x, p0 + np.arange(R))
+    gated = p0 + R <= ROPE_GATED
+    print(f"RO-1 {name} ({R} tokens from {p0}): worst {worst:.3e}{'' if gated else ', recorded, not gated'}")
+    assert worst <= 3e-3 or not gated, f"{ROPE_GATE} ({name}, {R} tokens from {p0}): worst {worst:.3e}"
+
+
+@pytest.mark.parametrize("name", ["A2", "A6", "A8"])
+def test_rope_vs_double_r5_positions(name):
+    """RO-1 (TA 3.2) at rope_parity R5's positions (r * 127) % 2048, r = 0..383 (rope_parity.cpp:368-369), one token
+    per run (R = 1 at that position; token 0 the r-th of 384 rows from default_rng(400)), held to
+    test_rope_vs_double's bound. (D16 has A2's shape, so A2's pipeline.)"""
+    heads, dim, _ = ROPE_SHAPES[name]
+    rows = rope_fixture(heads, dim, 384).reshape(384, 1, heads, dim)
+    x = rope_fixture(heads, dim)
+    worst = 0.0
+    for r in range(384):
+        x[0] = rows[r].reshape(-1)
+        worst = max(worst, rope_worst(rope(x, heads, dim, 1, r * 127 % 2048), rows[r], [r * 127 % 2048]))
+    print(f"RO-1 {name} (R5's 384 positions): worst {worst:.3e}")
+    assert worst <= 3e-3, f"{ROPE_GATE} ({name}, R5's positions): worst {worst:.3e}"
