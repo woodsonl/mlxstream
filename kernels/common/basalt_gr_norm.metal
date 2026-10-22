@@ -1,6 +1,7 @@
 // Copyright (c) 2023-2026 The ggml authors (MIT)
 // Copyright (c) 2026 Jesús Gulfo (MIT)
-// Adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_gr_norm.cu:37-100
+// Adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_gr_norm.cu:37-100; its prompt form is
+// src/kernels/cuda/native_ple_postops.cu:97-121 (rms_rep_kernel)
 // @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE), which adapts ggml-org/llama.cpp
 // ggml/src/ggml-cuda/{norm.cu,common.cuh} @ 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
 //
@@ -33,7 +34,8 @@ struct GrNormParams { uint n_cols; uint gamma_rows; uint eps_bits; uint pad; };
 kernel void basalt_gr_norm(device const float* x [[buffer(0)]], device const float* gamma [[buffer(1)]],
                            device float* y [[buffer(2)]], constant GrNormParams& p [[buffer(3)]],
                            uint r [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
-                           ushort sg [[simdgroup_index_in_threadgroup]]) {
+                           ushort sg [[simdgroup_index_in_threadgroup]] PROMPT_GUARD_ARGS) {
+    PROMPT_GUARD_RETURN(r / PROMPT_TOKEN_ROWS)                    // basalt_fp.metal's prompt guard; empty in decode
     const uint t = 32u * uint(sg) + uint(lane);                   // basalt's threadIdx.x: warp t / 32, lane t % 32
     device const float* in = x + ulong(r) * p.n_cols;
     device const float* g = gamma + ulong(r % p.gamma_rows) * p.n_cols;

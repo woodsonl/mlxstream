@@ -108,7 +108,12 @@ gamma rows and eps = f32(1e-6) (native_ple_postops.cu:352-353, :358), unless sta
   ``if (!std::all_of(ends.begin(), ends.end(), [](uint8_t x) { return x == 0xa5; })) ++bad;`` (:936), for every
   buffer; "rows from T to T_MAX − 1 of every multi-row output still hold their sentinel" (T§8), 0xFF in normalized,
   result and the snapshots; and rows below T equal the exact-size run's (``block``) byte for byte, so the guards and
-  offsets change nothing else. The exact-size half is every test's validated pass (plan §4.9)."""
+  offsets change nothing else. The exact-size half is every test's validated pass (plan §4.9).
+- B-VARIANTS ``test_guard_variants_compile``: the macro forms of basalt_fp.metal's prompt guard. Both files' decode
+  builds, as the tests above build them (no guard macro, no PROMPT_ROWS), and their prompt builds through
+  ``basalt_prompt_gpu.prompt_pipeline`` at bounds 64 and 256 with ``PLE_PROMPT_MACROS`` (PROMPT_GUARD 1, and the
+  dynamic-T row macros beside) compile, each norm and gate pipeline taking its whole block; the decode build of
+  basalt_ple.metal has none of the prompt path's batch entries (``BATCH_ENTRIES``)."""
 
 import functools
 
@@ -123,6 +128,7 @@ from tests.contract.gguf_reference import q2_0
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
 from tests.kernels import basalt_ple_gpu as ple_gpu
+from tests.kernels.basalt_prompt_gpu import prompt_pipeline
 
 F32, F64 = np.float32, np.float64
 SIGMAS = (1e-3, 1e-2, 1.0, 1e2)
@@ -672,3 +678,50 @@ def test_store_bounds_guards(t):
         "== 0xa5; })) ++bad;` (:936) on every binding: guards broken on {broken}; \"rows from T to T_MAX − 1 of every "
         f"multi-row output still hold their sentinel\": (output, row) {touched} were written; rows below T equal the "
         f"exact-size run's, and the restore of n_keep = 1 equals slot 0: (output, row) {wrong} differ (T = {t})")
+
+
+BATCH_ENTRIES = ("basalt_ple_broadcast_batch", "basalt_ple_conv_batch", "basalt_ple_history_batch")  # prompt-only
+
+
+def test_guard_variants_compile():
+    fp = kernels.PRELUDE + kernels.template("basalt_fp.metal")
+    builders = {"basalt_gr_norm.metal": kernels.basalt_gr_norm_source, "basalt_ple.metal": kernels.basalt_ple_source}
+    forms = [f for f, b in builders.items() if b() != fp + kernels.template(f)
+             or b(prompt=True) != fp + kernels.PROMPT_ROWS + kernels.template(f)]
+    norm_prompt = {**kernels.PLE_PROMPT_MACROS, **kernels.basalt_gr_norm_macros(N)}
+    builds = [(f"decode basalt_gr_norm, {m}", int(m["NORM_BLOCK"]),
+               lambda m=m: gpu.pipeline(kernels.basalt_gr_norm_source(), "basalt_gr_norm", tuple(sorted(m.items()))))
+              for m in (kernels.basalt_gr_norm_macros(2), kernels.basalt_gr_norm_macros(N))]
+    builds += [(f"decode basalt_ple_{e}", threads,
+                lambda e=e: gpu.pipeline(kernels.basalt_ple_source(), f"basalt_ple_{e}"))
+               for e, (_, threads) in kernels.PLE_GRIDS.items()]
+    for b in (64, 256):
+        builds += [(f"prompt basalt_gr_norm at bound {b}", int(norm_prompt["NORM_BLOCK"]),
+                    lambda b=b: prompt_pipeline(kernels.basalt_gr_norm_source(prompt=True), "basalt_gr_norm", b,
+                                                norm_prompt)),
+                   (f"prompt basalt_ple_gate at bound {b}", kernels.PLE_GRIDS["gate"][1],
+                    lambda b=b: prompt_pipeline(kernels.basalt_ple_source(prompt=True), "basalt_ple_gate", b,
+                                                kernels.PLE_PROMPT_MACROS))]
+    failed, narrow, present = [], [], []
+    for label, threads, build in builds:
+        try:
+            pso = build()
+        except RuntimeError as e:
+            failed.append(f"{label}: {e}")
+            continue
+        if pso.max_threads_per_threadgroup < threads:
+            narrow.append((label, pso.max_threads_per_threadgroup, threads))
+    for name in BATCH_ENTRIES:
+        try:
+            gpu.pipeline(kernels.basalt_ple_source(), name)
+            present.append(name)
+        except RuntimeError as e:
+            if "no kernel named" not in str(e):
+                failed.append(f"decode {name}: {e}")
+    assert not forms and not failed and not narrow and not present, (
+        "B-VARIANTS, each of these compiles: both files' decode builds as the decode tests build them (no guard "
+        "macro), without PROMPT_ROWS; and their prompt builds through prompt_pipeline with PLE_PROMPT_MACROS, so with "
+        "PROMPT_GUARD=1 and the dynamic-T row macros (ROWS_MAX f\"{B}u\"); a decode build of basalt_ple.metal has no "
+        f"batch entry: builder forms other than PRELUDE + basalt_fp.metal (+ PROMPT_ROWS) + the file: {forms}; builds "
+        f"failed: {failed}; pipelines below their block (build, max, block): {narrow}; batch entries in the decode "
+        f"build: {present}")

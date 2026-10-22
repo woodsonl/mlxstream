@@ -785,9 +785,11 @@ def basalt_gr_post_grid(n_embd: int, hc: int, t: int) -> Tuple[int, int]:
 # The launch rules below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_gr_norm.cu:85-100 @
 # b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 
-def basalt_gr_norm_source() -> str:
-    """basalt's ``native_gr_rms_norm_weighted``, ``weighted_rms_norm<256>`` and ``<1024>`` (``basalt_gr_norm``)."""
-    return PRELUDE + template("basalt_fp.metal") + template("basalt_gr_norm.metal")
+def basalt_gr_norm_source(prompt: bool = False) -> str:
+    """basalt's ``native_gr_rms_norm_weighted``, ``weighted_rms_norm<256>`` and ``<1024>`` (``basalt_gr_norm``). With
+    ``prompt``, the prompt build, basalt's ``rms_rep_kernel`` (native_ple_postops.cu:97-121): PROMPT_ROWS ahead of the
+    kernel, compiled with PLE_PROMPT_MACROS and the row macros."""
+    return PRELUDE + template("basalt_fp.metal") + (PROMPT_ROWS if prompt else "") + template("basalt_gr_norm.metal")
 
 
 def basalt_gr_norm_macros(n_cols: int) -> Dict[str, str]:
@@ -840,13 +842,18 @@ PLE_GRIDS = {           # entry (basalt_ple_<name>) -> (threadgroups, threads), 
     "restore": (64, 256),       # verify_kernels.cu:1087-1088: min(ceil(n / 256), 64) blocks of 256, n = 92,160
 }
 
+# A prompt build's guard (basalt_fp.metal), beside the row macros: basalt's batch launches the norms and the gate at
+# rows = T * H (native_ple_postops.cu:387), so their row r is token r / PLE_H's.
+PLE_PROMPT_MACROS = {"PROMPT_GUARD": "1", "PROMPT_TOKEN_ROWS": str(PLE_H)}
 
-def basalt_ple_source() -> str:
+
+def basalt_ple_source(prompt: bool = False) -> str:
     """basalt's ``gate_kernel`` (``basalt_ple_gate``), ``broadcast_kernel`` (``basalt_ple_broadcast``),
     ``conv_residual_kernel`` (``basalt_ple_conv``), ``history_advance_kernel`` (``basalt_ple_advance``),
     ``copy_from_mapped_kernel`` as the history's snapshot (``basalt_ple_snapshot``) and ``copy_indexed_kernel`` as the
-    commit's restore (``basalt_ple_restore``)."""
-    return PRELUDE + template("basalt_fp.metal") + template("basalt_ple.metal")
+    commit's restore (``basalt_ple_restore``). With ``prompt``, the prompt build: PROMPT_ROWS ahead of the kernels,
+    compiled with PLE_PROMPT_MACROS and the row macros."""
+    return PRELUDE + template("basalt_fp.metal") + (PROMPT_ROWS if prompt else "") + template("basalt_ple.metal")
 
 
 def basalt_ple_gate_params() -> bytes:

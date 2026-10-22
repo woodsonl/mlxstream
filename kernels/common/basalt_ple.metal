@@ -65,7 +65,8 @@ struct PleGateParams { uint scale_bits; uint pad[3]; };
 kernel void basalt_ple_gate(device const float* key [[buffer(0)]], device const float* query [[buffer(1)]],
                             device float* gate [[buffer(2)]], constant PleGateParams& gp [[buffer(3)]],
                             uint b [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
-                            ushort sg [[simdgroup_index_in_threadgroup]]) {
+                            ushort sg [[simdgroup_index_in_threadgroup]] PROMPT_GUARD_ARGS) {
+    PROMPT_GUARD_RETURN(b / PROMPT_TOKEN_ROWS)                    // basalt_fp.metal's prompt guard; empty in decode
     const uint t = 32u * uint(sg) + uint(lane);                   // basalt's threadIdx.x: warp t / 32, lane t % 32
     float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (uint j = 0; j < 8u; ++j) {

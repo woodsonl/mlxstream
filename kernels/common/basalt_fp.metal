@@ -49,6 +49,8 @@
 // - rsqrtf_ftz, sqrtf_ftz: rsqrtf(x) and sqrtf(x) in a --use_fast_math file, rsqrt.approx.ftz.f32 and
 //   sqrt.approx.ftz.f32 (MUFU.RSQ and MUFU.SQRT with .ftz): fast::rsqrt and fast::sqrt of the flushed input, the
 //   result flushed (docs/research/basalt-nvcc/ple.md sections 1-2).
+// - PROMPT_GUARD_ARGS, PROMPT_GUARD_RETURN(token): the prompt program's row guard (the port's own; empty unless
+//   PROMPT_GUARD is set): StepState at slot 15, and a return once the session is done or token >= prompt_rows.
 #pragma STDC FP_CONTRACT OFF
 
 static inline float ftz(float x) {
@@ -291,3 +293,14 @@ static inline float q5k_dot(thread const Q5KW& r, device const uint* x, int iqs)
 // path the operands are at least 1e-6 and the results normal, so there they never change a value.
 static inline float rsqrtf_ftz(float x) { return ftz(fast::rsqrt(ftz(x))); }
 static inline float sqrtf_ftz(float x) { return ftz(fast::sqrt(ftz(x))); }
+
+// The prompt program's row guard (prompt/spec-repo.md section 2.2): StepState at slot 15, and a thread whose token
+// is at or past the chunk's rows (prompt_rows, kernels.py's PROMPT_ROWS) returns before any barrier, as does every
+// thread once the session is done. PROMPT_GUARD is set only together with PROMPT_ROWS, T_SRC and ROWS_MAX.
+#if PROMPT_GUARD
+#define PROMPT_GUARD_ARGS , device const StepState* guard_st [[buffer(15)]]
+#define PROMPT_GUARD_RETURN(token) if (guard_st->done || (token) >= prompt_rows(guard_st)) return;
+#else
+#define PROMPT_GUARD_ARGS
+#define PROMPT_GUARD_RETURN(token)
+#endif
