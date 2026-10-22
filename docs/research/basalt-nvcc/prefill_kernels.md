@@ -794,13 +794,14 @@ n is a per-step count (T rows times a width), read from the step's state (invari
 | `:820` | `y[i] = hf(x[i])` | `LDG`; `F2FP.F16.F32.PACK_AB d, RZ, x` (`cuda_fp16.hpp:566`, unrolled by four); `STG.E.U16` | `cuda_nan_f16(f16_bits(x))` (Notation): a NaN of any payload stores 0x7fff |
 
 The loop's trip count uses the integer division of Notation (`I2F.U32.RP`, `MUFU.RCP`, `F2I.FTZ.U32.TRUNC.NTZ`,
-`:819`), which is exact. Metal: the same grid-stride loop, bounded by n.
+`:819`), which is exact. Metal: one thread per element, `i < prompt_rows(st) * n` (the chunk's rows times the
+width), with no loop; each element is independent, so the geometry changes no bit.
 
 ### `to_bf16_kernel` (`:826-833`)
 
 | Line | Expression | SASS | Metal |
 |---|---|---|---|
-| `:829` | `h = bf(x[i])` | `LDG`; `SHF.R.U32.HI t, RZ, 0x10, u`; `LOP3.LUT t, t, 0x1, RZ, 0xc0`; `IADD3 u, u, 0x7fff, t`; `SHF.R.U32.HI h, RZ, 0x10, u` (`:33-34`) | `bf(as_type<uint>(x))` on the loaded bits, no `cuda_nan`: x is only loaded, so its bits are its producer's (a NaN stored by a ported kernel already carries `cuda_nan`'s 0x7fffffff, whose image is 0x8000) |
+| `:829` | `h = bf(x[i])` | `LDG`; `SHF.R.U32.HI t, RZ, 0x10, u`; `LOP3.LUT t, t, 0x1, RZ, 0xc0`; `IADD3 u, u, 0x7fff, t`; `SHF.R.U32.HI h, RZ, 0x10, u` (`:33-34`) | `bf16_rne_nonan(x)` (`basalt_fp.metal`), bf's integer steps on the loaded bits, no `cuda_nan`: x is only loaded, so its bits are its producer's (a NaN stored by a ported kernel already carries `cuda_nan`'s 0x7fffffff, whose image is 0x8000) |
 | `:830` | `y[i] = h` | `STG.E.U16` | the same |
 | `:831` | `if (ylo) ylo[i] = bf_lo(x[i], h)` | a second copy of the loop: `FADD r, x, -h32` (`:38`), then bf(r) | not run: every prompt-path call passes no `ylo` (the default `nullptr`, `include/basalt/prefill/kernels.hpp:96`); bf_lo is on the path inside the hyper-connection kernels (section 1), where Notation gives its Metal form |
 
