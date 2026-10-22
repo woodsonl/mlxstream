@@ -2,7 +2,7 @@
 ``emit.HANDLERS``. Each handler emits one dispatch with the macros, grid, threadgroup and params of
 ``monolith/kernels.py``'s builders, after the checks basalt's launchers make (shapes, column counts, pointer alignment)
 and the ones its call sites satisfy (the IEEE q8_1 rows feed only the routed experts; outputs are contiguous columns); a
-static program only (one per window width).
+static program only (one per window width; the GDN commit's, one per session, run after every window).
 """
 
 # The launcher checks are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu:1465-1475, :1490-1494,
