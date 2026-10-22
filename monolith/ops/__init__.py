@@ -9,4 +9,6 @@ profile."""
 from .registry import OPS, CostModel, KernelBinding, OpDef, register_op
 from . import attention, basalt, basalt_gdn, basalt_ple, basalt_sample, draft, embed, gdn, gemv, moe, norm, sample  # noqa: F401  (registration)
 
+from . import basalt_prompt  # noqa: F401  (registration: basalt's prompt path, ops/basalt_prompt.py)
+
 __all__ = ["OPS", "CostModel", "KernelBinding", "OpDef", "register_op"]
