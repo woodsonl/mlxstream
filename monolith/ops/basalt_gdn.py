@@ -42,7 +42,8 @@ window's accepted rows into the state after the host has chosen them, is a separ
   - ``state`` and the four stores are the window's graph states, shared by name with every window program;
     ``commit`` is a graph input the host writes once it has chosen n_keep, basalt's record of 2 + MT words (word 0
     n_keep, word 1 n_keep - 1, word 2 + t the position of kept row t or -1), never a params record; the commit reads
-    word 0. The names are the model package's: the op checks roles, shapes and dtypes, not names.
+    word 0. The names are the model package's: the op checks roles, shapes and dtypes, and of the names only that the
+    record's is no StepState field's (an input so named binds that field).
   - Semantics: n = min(commit[0], MT); for n <= 0 nothing but ``used`` is stored. Otherwise ``state`` becomes the
     layer's recurrent state and conv history after the window's rows 0 .. n - 1, bit for bit basalt's
     ("gdn_conv_commit and gdn_step_norm_multi's state-only commit, bitwise", verify_kernels.hpp:29-31): the delta rule
@@ -50,8 +51,9 @@ window's accepted rows into the state after the host has chosen them, is a separ
     rows]. ``used[0]`` is the n it used, or 0.
   - The rules the handler enforces: exactly these six inputs and one output; the state and the four stores graph
     states and ``commit`` a graph input, of exactly those shapes and dtypes; ``updates=`` names the state alone; MT 1
-    to 8 and C - 128 HV a positive multiple of 256 (``kernels.basalt_gdn_commit_params``); a static program, a
-    dynamic-T program refused: the record, not StepState, carries the count, and the kernel reads no StepState.
+    to 8 and C - 128 HV a positive multiple of 256 (``kernels.basalt_gdn_commit_params``); ``commit`` not named after
+    a StepState field (which binds StepState); a static program, a dynamic-T program refused: the record, not
+    StepState, carries the count, and the kernel reads no StepState.
   - Dispatch: 128-thread threadgroups, one per item: 4 HV state items (a value head's block of 32 columns) and
     ceil(C / 128) conv items (128 channels' histories), 272 at Flash-Next's layer (C = 10240, HV = 48).
 * Names, for the model package and the prompt lane that writes the same state: ``gdn.{i}.state`` and

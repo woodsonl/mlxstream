@@ -13,8 +13,9 @@ the GPU side is tests/kernels/test_basalt_dec_commit.py.
 - CT.3: a commit program of Flash-Next's 36 GDN layers, all reading the one record, has a barrier before its first
   dispatch only: each layer's dispatch writes its own state and output.
 - CT.4: the refusals, each a valid commit (or record) with exactly one defect refused by that defect's own check (its
-  message): the handler's (a dynamic-T program, the input count, the roles, ``updates``, each dtype, the shapes, and
-  MT = 9 and C - 128 HV, which reach the packer's checks) and the packer's.
+  message): the handler's (a dynamic-T program, the input count, the roles, ``updates``, each dtype, the shapes,
+  MT = 9 and C - 128 HV, which reach the packer's checks, and a record named after a StepState field, which would bind
+  StepState) and the packer's.
 - The packer (monolith/kernels.py ``basalt_gdn_commit_params`` and ``basalt_gdn_commit_grid``): the record's 48 bytes at
   the contract's shapes and at basalt's multi-layer strides, and the threadgroup count.
 """
@@ -126,10 +127,12 @@ def test_basalt_gdn_commit_params_record_and_grid():
     assert kernels.basalt_gdn_commit_grid(C, HV) == 272 and kernels.basalt_gdn_commit_grid(C, HV, 36) == 9792
 
 
-def emit_commit(mt=MT, c=C, values=None, updates=True, dynamic_t=False):
-    """Layer 0's commit over ``spec(0, mt, c)`` with ``values`` replacing its entries, emitted alone."""
+def emit_commit(mt=MT, c=C, values=None, updates=True, dynamic_t=False, record="commit"):
+    """Layer 0's commit over ``spec(0, mt, c)`` with ``values`` replacing its entries and the record named ``record``
+    (renamed in place, its slot kept), emitted alone."""
     g = Graph("commit")
-    commit_op(g, {**spec(0, mt, c), **(values or {})}, updates=updates)
+    commit_op(g, {(record if k == "commit" else k): v for k, v in {**spec(0, mt, c), **(values or {})}.items()},
+              updates=updates)
     return emit_program(g, pack=[], profile=PROFILE, t=1, tail=None, dynamic_t=dynamic_t)
 
 
@@ -179,6 +182,8 @@ REFUSALS = [
     ("handler MT of 9", _handler({"mt": 9}), "mt must be 1 to 8, got 9"),
     ("handler C - 128 HV not whole 256s", _handler({"c": C + 128}),
      "C - 128 * h_v must be a positive multiple of 256, got 4224 (C 10368, h_v 48)"),
+    ("handler record named after a StepState field", _handler({"record": "accepted"}),
+     "'accepted' names a StepState field; the commit record is a host-written input buffer of its own"),
     # the packer alone
     ("packer h_v of 0", _packer({"h_v": 0}), "h_v must be at least 1, got 0"),
     ("packer C - 128 h_v of 0", _packer({"c": 128 * HV}),

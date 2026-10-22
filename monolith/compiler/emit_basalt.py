@@ -279,6 +279,9 @@ def _gdn_commit(ctx: _Ctx, op: Op) -> None:
     prm = ctx.params("basalt_gdn_commit", kernels.basalt_gdn_commit_params(c, hv, mt))
     k = ctx.kernel("basalt_gdn_commit", kernels.basalt_gdn_commit_source(), "gdn_commit_layers", {})
     bindings = [_bind(ctx, op, i, v, 4) for i, v in enumerate([*op.inputs, used])]
+    if bindings[5][1] == ctx.program.step_state:
+        raise ValueError(f"{op.kind}: {commit.name!r} names a StepState field; the commit record is a host-written "
+                         "input buffer of its own, never StepState")
     ctx.add(k, bindings + [(7, prm, 0)], (kernels.basalt_gdn_commit_grid(c, hv), 1, 1), (128, 1, 1), op.kind,
             writes=[0, 6])
 
