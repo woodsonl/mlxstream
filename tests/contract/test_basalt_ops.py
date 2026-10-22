@@ -187,7 +187,8 @@ def test_grid_builders_are_the_launchers():
     refused by each arm alone, ``check_shape``'s two (a dimension of 0, n_embd * hc past INT_MAX; :79-82) and the
     port's 32-bit element bound (T * hc * n_embd at 2^32), and accepted at INT_MAX and at the last T below 2^32. The
     top-10's: one 32-thread threadgroup per token, the multi launcher's ``dim3(n_tok)`` blocks, of which ``route``
-    keeps only the first 32-thread row (native_router.cu:52, :125)."""
+    keeps only the first 32-thread row (native_router.cu:52, :125), and fewer than one token refused, as that launcher
+    refuses ``n_tok < 1`` (:122)."""
     for n in (32, 256, 2560, 8 * 23040):
         assert kernels.basalt_q8_1_grid(n) == (-(-n // 256), 256)
     for n_in, n_out, t in ((2560, 128, 1), (2560, 1, 5), (640, 7, 8)):
@@ -201,6 +202,9 @@ def test_grid_builders_are_the_launchers():
     for n, hc, t in ((2 ** 31 - 1, 1, 1), (2 ** 20, 2 ** 10, 3)):
         assert kernels.basalt_gr_post_params(n, hc, t) == struct.pack("<IIII", n, hc, t, 0)
     assert [kernels.basalt_router_grid(n) for n in (1, 8, 64)] == [(1, 32), (8, 32), (64, 32)]
+    for n in (0, -1):
+        with pytest.raises(ValueError, match=rf"{n} tokens; basalt's multi launcher takes at least one"):
+            kernels.basalt_router_grid(n)
 
 
 def expected(gop, src, t):

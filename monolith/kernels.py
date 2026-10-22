@@ -793,7 +793,10 @@ def basalt_router_source() -> str:
 
 def basalt_router_grid(n_tok: int) -> Tuple[int, int]:
     """(threadgroups, threads per threadgroup): one SIMD-group per token, threadgroup k token k (basalt's multi
-    launcher's ``dim3(n_tok)`` blocks, native_router.cu:121-128, without the 224 threads ``route`` returns at once)."""
+    launcher's ``dim3(n_tok)`` blocks, native_router.cu:121-128, without the 224 threads ``route`` returns at once).
+    Fewer than one token is refused, as the multi launcher refuses ``n_tok < 1`` (:122)."""
+    if n_tok < 1:
+        raise ValueError(f"basalt_router_top10: {n_tok} tokens; basalt's multi launcher takes at least one")
     return n_tok, 32
 
 

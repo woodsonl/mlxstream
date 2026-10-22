@@ -208,13 +208,13 @@ def _gr_post(ctx: _Ctx, op: Op) -> None:
 def _router_top10(ctx: _Ctx, op: Op) -> None:
     # no overlap check (the one-token launcher's, native_router.cu:114-115): a view keeps its base's dtype and
     # trailing shape, so no graph makes two of the F32 [T, 512], I32 [T, 10] and F32 [T, 10] values share bytes
-    t = _columns(ctx, op)                                    # no other T bound: the multi launcher takes any count
+    t = _columns(ctx, op)                                    # no other T bound: the multi launcher takes any count >= 1
+    grid, threads = kernels.basalt_router_grid(t)            # its refusal of fewer than one token
     (logits,), (ids, weights) = op.inputs, op.outputs
     _expect(ctx, op, logits, (t, 512), DType.F32, "the 512 router logits of each column")
     _expect(ctx, op, ids, (t, 10), DType.I32, "the ten expert ids of each column")
     _expect(ctx, op, weights, (t, 10), DType.F32, "the ten weights of each column")
     k = ctx.kernel("basalt_router", kernels.basalt_router_source(), "basalt_router_top10", {})
-    grid, threads = kernels.basalt_router_grid(t)
     ctx.add(k, [_bind(ctx, op, 0, logits, 4), _bind(ctx, op, 1, ids, 4), _bind(ctx, op, 2, weights, 4)],
             (grid, 1, 1), (threads, 1, 1), f"{op.kind}:{logits.name}", writes=[1, 2])
 
