@@ -11,7 +11,10 @@ slab (as ``ops/basalt.py`` says).
 Rows. T, the first output's rows, is the chunk's row count: ``StepState.t_this_step`` clamped to the compiled bound B
 in the dynamic-T prompt program (``kernels.PROMPT_ROWS``; every grid is encoded at B and a threadgroup past the chunk's
 rows returns before its first barrier), the compiled count in a static one. Rows never come from an attr or a params
-record (invariant 4). Outputs are exactly ``[T, N]``: no ``ldy`` and no ``beta`` (no prompt-path call passes another).
+record (invariant 4). Outputs are exactly ``[T, N]``: no ``ldy`` and no ``beta``. No prompt-path call passes a nonzero
+``beta``. The only ``ldy`` other than N, 96, is passed by the GDN layer's ``ssm_alpha`` and ``ssm_beta`` products of
+48 outputs into one ``ab`` buffer (``src/prefill/prefill.cpp:1587``-``:1588``); the port gives them two ops with
+``[T, 48]`` outputs.
 
 Programs. The dynamic-T prompt program at bound B (one per session; every chunk, the short last one included, runs
 through it) and static programs (the tests') are both accepted; every dispatch binds StepState at slot 15 in both.
