@@ -2,9 +2,10 @@
 the dynamic-T prompt program once, at its chunk bound B, and replays it for every chunk with StepState.t_this_step set
 to the chunk's rows (monolith/generate.py:604); this tier runs the handlers' dispatches (compiler/emit_basalt_prompt.py)
 that way, through Engine, over a synthetic .basalt file (tests/contract/test_basalt_ops.py ``write_file``), and checks
-what the single-kernel tier (tests/kernels/test_basalt_prompt_gemm.py) cannot see: that the handlers bind what the
-kernels read, and that a program's rows are StepState data (dynamic-T) or its compiled count (static). The GEMM's
-kinds join ``graph``; the hyper-connection kinds run as the contract tier's ``hc_graph`` (HC-5).
+what the single-kernel tier (tests/kernels/test_basalt_prompt_gemm.py, tests/kernels/test_basalt_prompt_hc.py) cannot
+see: that the handlers bind what the kernels read, and that a program's rows are StepState data (dynamic-T) or its
+compiled count (static). The GEMM's kinds join ``graph``; the hyper-connection kinds run as the contract tier's
+``hc_graph`` (HC-5).
 
 - GM-PROG: Gemm::bf16 (src/prefill/gemm.cu:122-132) of BF16 rows by dense/a, 48 BF16 rows over 2560 inputs
   (ssm_alpha's shape, src/prefill/prefill.cpp:1587), and Gemm::native (:169-185) of FP16 rows by gguf/b, Q2_0 256 x
