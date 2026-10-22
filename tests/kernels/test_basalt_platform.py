@@ -241,7 +241,7 @@ def test_compares_read_subnormals_as_zero():
     """Measured: ``<``, ``>`` and ``==`` read a subnormal operand as the zero of its sign, so two subnormals, or a
     subnormal and a zero, compare equal; NaN is unordered and -0 equals +0, as IEEE says. The model is IEEE's compare
     of the flushed operands, on every row. CUDA's setp without .ftz orders subnormals exactly, so an IEEE-built basalt
-    kernel's compares are ported on order-preserving keys of the bits (kernels/common/basalt_sampler.metal's okey,
+    kernel's compares are ported on order-preserving keys of the bits (kernels/common/basalt_ieee.metal's okey,
     f_gt, f_lt)."""
     dev = nt.Device()
     src = kernels.PRELUDE + kernels.template("basalt_fp.metal") + """

@@ -172,7 +172,8 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
 - `kernels/common/basalt_ieee.metal` — moved from `kernels/common/basalt_q8_1.metal` (above) with its header: `ieee_add`
   and `ieee_mul`, CUDA's `add.rn.f32` and `mul.rn.f32` with subnormal operands and results kept, which the IEEE
   quantizer's warp sum (`src/kernels/cuda/iq_kernels.cu:1880-1900`, MIT), the routed experts' SwiGLU product and the
-  sampler compute with. License: `third_party/BASALT-LICENSE`.
+  sampler compute with. `okey`, `fnan`, `f_gt`, `f_lt` and `fmaxf_bits` moved from `kernels/common/basalt_sampler.metal`
+  (below) with their comments. License: `third_party/BASALT-LICENSE`.
 - `kernels/common/basalt_mmvq.metal` — adapted from `src/kernels/cuda/native_mmvq.cu:179-1172` (MIT): the
   one-column `native_*_mmvq_kernel`s and `native_mmvq_multi_kernel` with the format traits' `load` / `apply` split,
   for Q2_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL, Q4_0, Q5_0 and Q8_0, in the exact and the upstream layouts, written
