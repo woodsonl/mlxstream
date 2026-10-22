@@ -213,9 +213,9 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
 - `kernels/common/basalt_ple.metal` — adapted from `src/kernels/cuda/native_ple_postops.cu:37-89`,
   `src/kernels/cuda/ple.cu:46-52`, `src/kernels/cuda/elementwise.cu:222-227` and
   `src/kernels/cuda/verify_kernels.cu:506-512` (MIT): `gate_kernel`, `broadcast_kernel` and `conv_residual_kernel`,
-  written in the rounding sequence nvcc compiles for them (`docs/research/basalt-nvcc/ple.md`);
-  `history_advance_kernel`, `copy_from_mapped_kernel` and `copy_indexed_kernel`, word for word. License:
-  `third_party/BASALT-LICENSE`.
+  written in the rounding sequence nvcc compiles for them (`docs/research/basalt-nvcc/ple.md`); `history_advance_kernel`
+  and `copy_from_mapped_kernel`, word for word; and `copy_indexed_kernel` with the port's bound: an index past the last
+  snapshot slot restores slot 7, where basalt's kernel has none. License: `third_party/BASALT-LICENSE`.
 - `monolith/kernels.py` — adapted from `src/kernels/cuda/dense_tc.cu:35-42`, `:52-54`, `:698-702` and `:1017-1105`
   (MIT): `Fmt<TYPE>::SB` (`DENSE_TC_SB`), and in `basalt_dense_tc_variant` the variant rule of `launch<TYPE>` with
   `one_ok`, `one_row_stride` and `one_smem_bytes<TYPE, 24>`; `dense_tc_supported` (`_dense_tc_check`) and
