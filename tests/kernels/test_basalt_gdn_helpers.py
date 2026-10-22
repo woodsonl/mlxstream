@@ -56,10 +56,11 @@ comparison is bitwise; a NaN result compares by class (the kernels' stores canon
   and adjacent dot elements, that cancel below 2^-126; L2 operands with a subnormal y or a zero or subnormal
   ``ss + eps``; gate arguments with ``u = v + dt`` in [-104, -87] (a subnormal ``__expf(u)``) against ``ssm_a`` on both
   sides of 1, and u at 20; whole rows of subnormal bf16 weights against activations near 2^100, tiny weights against
-  tiny activations, and zero weights (a dot of +0: the chains start from +0); infinities and NaNs. Each kernel also
-  stores the step in this GPU's plain operations, which must differ from IEEE's on many rows of each class built for
-  a subnormal path; the other order of the conv's taps 0 and 1 must differ on many random rows, and the random rows
-  must be near float64.
+  tiny activations, and zero weights (a dot of +0: the chains start from +0); zero conv taps and x against weights of
+  the opposite sign (every product -0, a sum of -0: the conv starts from tap 1's FMUL); infinities and NaNs. Each
+  kernel also stores the step in this GPU's plain operations, which must differ from IEEE's on many rows of each class
+  built for a subnormal path; the other order of the conv's taps 0 and 1 must differ on many random rows, and the
+  random rows must be near float64.
 - H.6: the recurrence and output steps (basalt_gdn.metal: the decay ``expf_ieee(gate)``, ``gdn_kv``, kv_col by
   ``gdn_sum4``, ``gdn_delta``, ``gdn_update`` (the state update and o), ``gdn_oc``, ``gdn_sq32``, ss by ``gdn_sum4``,
   ``gdn_out``) against ``basalt_emu``'s twins, which follow the SASS rows (dec_gdn.md sections 1-2, verify_gdn.md
@@ -632,11 +633,16 @@ def h5_conv_rows(rng, n=2048):
     tail = np.where(k % 2 == 0, floats(rng, np.zeros((n, 4), int)) & SIGN, floats(rng, rng.integers(50, 61, (n, 4))))
     special = rng.standard_normal((n // 8, 8)).astype(F32).view(U32)
     special[np.arange(n // 8), rng.integers(0, 8, n // 8)] = rng.choice(H5_SPECIAL, n // 8)
-    return {"random": np.c_[rng.standard_normal((n, 4)) * 2, rng.standard_normal((n, 4)) * 0.3].astype(F32).view(U32),
+    rows = {"random": np.c_[rng.standard_normal((n, 4)) * 2, rng.standard_normal((n, 4)) * 0.3].astype(F32).view(U32),
             "tiny": floats(rng, rng.integers(52, 66, (n, 8))),        # 2^-75 to 2^-62: products below 2^-123
             "subnormal": np.c_[np.where(k % 2 == 0, big, sub), np.where(k % 2 == 0, sub, big)],   # beside 2^20 to 2^60
             "cancel": np.c_[a ^ SIGN, a, tail[:, :2], w0, b, tail[:, 2:]],
             "special": special}
+    # each tap and x a zero of either sign, each weight nonzero of the opposite sign: every product -0, the one input
+    # on which the sum's start shows (-0 from tap 1's FMUL, +0 from an FFMA on RZ); drawn last, the others' rows kept
+    zs = rng.integers(0, 2, (n // 8, 4), dtype=U32) << U32(31)
+    rows["zero"] = np.c_[zs, (rng.standard_normal((n // 8, 4)).astype(F32).view(U32) & U32(0x7FFFFFFF)) | (zs ^ SIGN)]
+    return rows
 
 
 def test_gdn_conv_matches_the_emulation():
@@ -646,6 +652,8 @@ def test_gdn_conv_matches_the_emulation():
     with np.errstate(invalid="ignore"):                     # the signaling-NaN rows raise the flag in the casts
         want = emu.gdn_conv(*v.T)
     assert_bits("gdn_conv", got[:, 0], want, *v.T)
+    z = got[at["zero"], 0]
+    assert np.all(z == SIGN), f"zero taps: {[hex(g) for g in np.unique(z)]}, not -0 (the sum starts from tap 1's FMUL)"
     # the rows exercise what they claim: the plain fma chain differs on the small classes, and the other order of taps
     # 0 and 1 (tap 0's product rounded alone) on the random rows (dec_gdn.md section 6d)
     exercised(differ(got[:, 1], want.view(U32)), at, {"tiny": 1000, "subnormal": 1500, "cancel": 300})
