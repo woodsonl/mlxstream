@@ -1027,3 +1027,23 @@ def nv_expf_emu(x, exp2):
         f = fma32(x, lo, fma32(x, L2E, -(j + cn)))
         s = (j.view(np.uint32) << np.uint32(23)).view(F32)
         return (np.asarray(exp2(f), F32) * s).astype(F32)
+
+
+# ---- the prompt path's MoE element-wise kernels (kernels/common/basalt_prompt_moe.metal) ----------------------------
+# src/prefill/kernels.cu:626-723 builds with nvcc's IEEE defaults: each product, quotient and sum is numpy's float32
+# operation (the ieee_* helpers' semantics, subnormals kept), in the order docs/research/basalt-nvcc/prefill_kernels.md
+# section 3 records. fast::exp2 has no bit-exact host model: ``exp_neg`` evaluates the GPU's expf_ieee(sign_flip(x)) on
+# a float32 array (basalt_prompt_gpu.hc_probe("exp_neg", .)). ``flush=True`` flushes every operation's inputs and
+# result (ftz): a flushing kernel's model, which the tests' discrimination checks compare against.
+
+def swiglu_pair_emu(g, u, exp_neg, flush=False):
+    """basalt_prompt_swiglu_pair's h16 as FP16 bits for the shared expert's gate ``g`` and up ``u`` (kernels.cu:698-704,
+    swiglu_q8_1's expression with an FP16 store): e = exp_neg(g), q = fl(g / fl(1 + e)) correctly rounded, p = fl(q *
+    u), then hf_sat (:41-44): a NaN p stores 0x7fff, any other is clamped to [-65504, 65504] and rounded to nearest even
+    (cuda_half_bits). ``flush``: every operation's inputs and result flushed."""
+    _, add, mul, div = hc_ops(flush)
+    g, u = np.asarray(g, F32), np.asarray(u, F32)
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN entries
+        e = ftz(exp_neg(ftz(g))) if flush else exp_neg(g)
+        p = mul(div(g, add(F32(1), np.asarray(e, F32))), u)
+    return cuda_half_bits(np.clip(p, F32(-65504.0), F32(65504.0)))

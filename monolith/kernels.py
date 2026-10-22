@@ -977,6 +977,36 @@ def basalt_prompt_hc_params(row0: int) -> bytes:
     return struct.pack("<I", row0)
 
 
+# ---- basalt's prompt path: router, route counts, shared-expert SwiGLU, expert combine (kernels/common/basalt_prompt_moe.metal; docs/research/basalt-nvcc/prefill_kernels.md) ----
+
+def basalt_prompt_moe_source() -> str:
+    """basalt's prompt MoE element-wise kernels (src/prefill/kernels.cu:626-723): the q8_1 builder's source (the shared
+    helpers, the IEEE binary32 operations, ``ieee_div`` and ``warp_sum_ieee``; its quantizers compile along), the
+    software binary64 with ``fma_ieee`` and ``ieee_div_any`` on it, libdevice's transcriptions (``nv_expf``), the rows,
+    then ``basalt_prompt_moe.metal``'s ``basalt_prompt_*`` entries."""
+    return (basalt_q8_1_source() + template("basalt_f64.metal") + template("basalt_ieee_f64.metal")
+            + template("basalt_libdevice.metal") + PROMPT_ROWS + template("basalt_prompt_moe.metal"))
+
+
+def basalt_prompt_moe_launch(kernel: str, rows: int, n_expert: int = 512,
+                             top_k: int = 10) -> Tuple[Dict[str, str], Tuple[int, int, int], Tuple[int, int, int]]:
+    """``(macros, grid, threads)`` of ``basalt_prompt_moe.metal``'s entry ``kernel`` at bound ``rows`` (B; a dispatch
+    reads its chunk's rows from StepState, and the emitter's ``prompt_rows`` gives the row macros): the widths every
+    entry's pipeline takes, MOE_E (experts), MOE_K (picks per token), MOE_F (the shared expert's width) and MOE_N (the
+    residual's, basalt's N), and basalt's launches at B rows in threadgroups of 256 (kernels.cu:929-947, :961-964,
+    :995-999): route ceil(B / 8), a SIMD-group per token; route_count min(64, ceil(10 B / 256)) over a grid-stride
+    loop; swiglu_pair ceil(640 B / 256) and moe_combine ceil(2560 B / 256), a thread per element. Only
+    ``route_kernel<16>`` runs on this path, so ``n_expert`` other than 512 or ``top_k`` other than 10 is refused."""
+    if n_expert != 512 or top_k != 10:
+        raise ValueError(f"basalt_prompt_moe: route_kernel<16> takes 512 experts and 10 picks a token, got {n_expert} "
+                         f"experts and {top_k} picks")
+    grids = {"basalt_prompt_route": -(-rows // 8), "basalt_prompt_route_count": min(64, -(-10 * rows // 256)),
+             "basalt_prompt_swiglu_pair": -(-640 * rows // 256), "basalt_prompt_moe_combine": -(-2560 * rows // 256)}
+    if kernel not in grids:
+        raise ValueError(f"basalt_prompt_moe: no entry {kernel!r}; the file's are {', '.join(grids)}")
+    return {"MOE_E": "512", "MOE_K": "10", "MOE_F": "640", "MOE_N": "2560"}, (grids[kernel], 1, 1), (256, 1, 1)
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
