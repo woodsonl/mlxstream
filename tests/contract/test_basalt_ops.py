@@ -25,8 +25,9 @@ from monolith.packs.packer import ALIGN
 from tests.contract.test_basalt_reader import write_basalt
 from tests.contract.test_basalt_windows import PROFILE
 
-F32, U8 = DType.F32, DType.U8
-KINDS = ("basalt_q8_1", "basalt_mmvq", "basalt_mmvf", "basalt_dense_tc", "basalt_dense_tc_pair", "basalt_gr_post")
+F32, I32, U8 = DType.F32, DType.I32, DType.U8
+KINDS = ("basalt_q8_1", "basalt_mmvq", "basalt_mmvf", "basalt_dense_tc", "basalt_dense_tc_pair", "basalt_gr_post",
+         "basalt_router_top10")
 Q8_1_FUNCTIONS = {"native": "native_quantize_q8_1", "swiglu": "native_swiglu_quantize_q8_1", "ieee": "quantize_q8_1"}
 QK = kernels.Q8_1_BLOCK_BYTES
 
@@ -124,6 +125,15 @@ def gr_post(g, block_out, r=None, inject=None, width=10240):
     return y
 
 
+def top10(g, logits=None, ids=(10, I32), weights=(10, F32)):
+    """``basalt_router_top10`` of ``logits`` (default: an input ``logits`` [T, 512] F32) into ``top10.ids`` [T, 10] I32
+    and ``y.top10.w`` [T, 10] F32 (``ids``, ``weights``: another (width, dtype))."""
+    logits = g.input("logits", (T, 512), F32) if logits is None else logits
+    outs = [g.value("top10.ids", (T, ids[0]), ids[1]), g.value("y.top10.w", (T, weights[0]), weights[1])]
+    op(g, "basalt_router_top10", [logits], outs)
+    return outs
+
+
 def emit(g, src, t=1, packs=(), **kw):
     return emit_program(g, pack=[src, *packs], profile=PROFILE, t=t, tail=None, **kw)
 
@@ -139,7 +149,8 @@ def spliced(source):
 
 def all_ops(g, src):
     """Every kind over every tensor: one native q8_1 per input width, the SwiGLU into the Q8_0 down, the IEEE rows on
-    their own, the hyper-connection write with the 2560-value input as its block output."""
+    their own, the hyper-connection write with the 2560-value input as its block output, the router top-10 on its own
+    logits."""
     widths = sorted({e[2] for e in GGUF.values()})
     xs = {n: g.input(f"x{n}", (T, n), F32) for n in widths}
     xq = {n: q8_1(g, f"xq{n}", [xs[n]]) for n in widths}
@@ -155,6 +166,7 @@ def all_ops(g, src):
     for name in BF16:
         gemv(g, "basalt_mmvf", f"y.{name}", xs[2560], weight(g, f"dense/{name}", src))
     gr_post(g, xs[2560])
+    top10(g)
 
 
 # ---- registration, and each dispatch against the builders ----------------------------------------------------------
@@ -173,7 +185,9 @@ def test_grid_builders_are_the_launchers():
     """The q8_1 and BF16 grid builders against the harness's own formulas (tests/kernels/basalt_gpu.py); the write's
     against basalt's ``blocks`` of 256 threads over T tokens' elements (native_gr_postops.cu:83, :111), and its record
     refused by each arm alone, ``check_shape``'s two (a dimension of 0, n_embd * hc past INT_MAX; :79-82) and the
-    port's 32-bit element bound (T * hc * n_embd at 2^32), and accepted at INT_MAX and at the last T below 2^32."""
+    port's 32-bit element bound (T * hc * n_embd at 2^32), and accepted at INT_MAX and at the last T below 2^32. The
+    top-10's: one 32-thread threadgroup per token, the multi launcher's ``dim3(n_tok)`` blocks, of which ``route``
+    keeps only the first 32-thread row (native_router.cu:52, :125)."""
     for n in (32, 256, 2560, 8 * 23040):
         assert kernels.basalt_q8_1_grid(n) == (-(-n // 256), 256)
     for n_in, n_out, t in ((2560, 128, 1), (2560, 1, 5), (640, 7, 8)):
@@ -186,10 +200,12 @@ def test_grid_builders_are_the_launchers():
             kernels.basalt_gr_post_params(n, hc, t)
     for n, hc, t in ((2 ** 31 - 1, 1, 1), (2 ** 20, 2 ** 10, 3)):
         assert kernels.basalt_gr_post_params(n, hc, t) == struct.pack("<IIII", n, hc, t, 0)
+    assert [kernels.basalt_router_grid(n) for n in (1, 8, 64)] == [(1, 32), (8, 32), (64, 32)]
 
 
 def expected(gop, src, t):
-    """(function, macros, source, params, grid, threadgroup) of ``gop``'s dispatch from the builders."""
+    """(function, macros, source, params, grid, threadgroup) of ``gop``'s dispatch from the builders (params None:
+    the kernel takes no record)."""
     if gop.kind == "basalt_q8_1":
         n = t * gop.inputs[0].shape[1]
         return (Q8_1_FUNCTIONS[gop.attrs["quantizer"]], {}, kernels.basalt_q8_1_source(), kernels.basalt_q8_1_params(n),
@@ -197,6 +213,8 @@ def expected(gop, src, t):
     if gop.kind == "basalt_gr_post":
         return ("basalt_gr_post", {}, kernels.basalt_gr_post_source(), kernels.basalt_gr_post_params(2560, 4, t),
                 *kernels.basalt_gr_post_grid(2560, 4, t))
+    if gop.kind == "basalt_router_top10":
+        return ("basalt_router_top10", {}, kernels.basalt_router_source(), None, t, 32)
     ws = [src.entries[w.name] for w in gop.inputs[1:]]
     tid, (n_out, n_in) = ws[0].type_id, ws[0].shape
     if gop.kind == "basalt_mmvq":
@@ -229,9 +247,10 @@ def slot_values(gop):
 @pytest.mark.parametrize("t", range(1, 9))
 def test_dispatches_are_the_builders(src, t):
     """Every op of ``all_ops`` at T = t: one dispatch whose kernel, macros, grid, threadgroup and params record are the
-    builders' (the q8_1 and BF16 grids as the harness writes them), binding each weight at the window and offset the
-    planner gives it and each activation at 0 of its own buffer, writing exactly its outputs' slots, the params at
-    the slot after them; no StepState and no threadgroup memory."""
+    builders' (the q8_1 and BF16 grids as the harness writes them, the top-10's as basalt's multi launcher does),
+    binding each weight at the window and offset the planner gives it and each activation at 0 of its own buffer,
+    writing exactly its outputs' slots, the params record, where the kernel takes one (the top-10 takes none), at the
+    slot after them; no StepState and no threadgroup memory."""
     g = Graph("step")
     all_ops(g, src)
     prog = emit(g, src, t)
@@ -245,9 +264,11 @@ def test_dispatches_are_the_builders(src, t):
         assert (k.function, k.macros, k.source) == (fn, macros, spliced(source)), gop
         assert (o.grid, o.threadgroup, o.threadgroup_memory) == ((grid, 1, 1), (tg, 1, 1), []), gop
         vals = slot_values(gop)
-        assert o.bindings[:-1] == [(i, *bound.get(v.name, (v.name, 0))) for i, v in enumerate(vals)], gop
-        slot, prm, off = o.bindings[-1]
-        assert (slot, off, prog.buffers[prm].role, prog.buffers[prm].init) == (len(vals), 0, "params", params), gop
+        assert o.bindings[:len(vals)] == [(i, *bound.get(v.name, (v.name, 0))) for i, v in enumerate(vals)], gop
+        assert len(o.bindings) == len(vals) + (params is not None), gop
+        if params is not None:
+            slot, prm, off = o.bindings[-1]
+            assert (slot, off, prog.buffers[prm].role, prog.buffers[prm].init) == (len(vals), 0, "params", params), gop
         assert o.meta["writes"] == list(range(len(gop.inputs), len(vals))), gop
 
 
@@ -296,6 +317,8 @@ def pack(directory, entries, slab=False):
 
 def one_op(kind, g, src):
     """A valid op of ``kind`` at T columns (with the quantizer feeding a q8_1 GEMV)."""
+    if kind == "basalt_router_top10":
+        return top10(g)
     x = g.input("x", (T, 2560), F32)
     if kind == "basalt_q8_1":
         return q8_1(g, "xq", [x])
@@ -416,6 +439,9 @@ def _aligned(kind, slot, offset):
         if kind == "basalt_q8_1":
             q8_1(g, "xq", [g.const("p", (2, 64), F32)])
             return {"packs": [pack(tmp, {"p": (at, 2 * 64 * 4)})]}
+        if kind == "basalt_router_top10":                                      # slot 0: the logits
+            top10(g, g.const("p", (2, 512), F32))
+            return {"packs": [pack(tmp, {"p": (at, 2 * 512 * 4)})]}
         if kind == "basalt_gr_post":                                           # slots 0-2: r, block_out, inject
             name, shape = (("r", (2, 10240)), ("block_out", (2, 2560)), ("inject", (2, 4)))[slot]
             gr_post(g, **{"block_out": x, name: g.const("p", shape, F32)})
@@ -462,6 +488,20 @@ def _gr_post_value(name, shape, dtype):
             gr_post(g, g.input("x", shape, dtype) if bad else g.input("x", (T, 2560), F32))
         else:
             gr_post(g, g.input("x", (T, 2560), F32), **({name: g.input(name, shape, dtype)} if bad else {}))
+        return {}
+    return build
+
+
+def _top10_value(name, width, dtype):
+    """The top-10 of ``one_op`` with its input ``logits`` or its output ``ids`` or ``weights`` of ``width`` values a
+    column and ``dtype`` instead."""
+    def build(g, src, bad, tmp):
+        if not bad:
+            top10(g)
+        elif name == "logits":
+            top10(g, g.input("logits", (T, width), dtype))
+        else:
+            top10(g, **{name: (width, dtype)})
         return {}
     return build
 
@@ -525,6 +565,19 @@ REFUSALS = [
     ("gr post residual off 4 bytes", _aligned("basalt_gr_post", 0, 2), "slot 0 needs 4-byte alignment"),
     ("gr post block output off 4 bytes", _aligned("basalt_gr_post", 1, 2), "slot 1 needs 4-byte alignment"),
     ("gr post injections off 4 bytes", _aligned("basalt_gr_post", 2, 2), "slot 2 needs 4-byte alignment"),
+    ("top-10 logits of another width", _top10_value("logits", 511, F32),
+     r"'logits' is f32 \[2, 511\], not f32 \[2, 512\] \(the 512 router logits of each column\)"),
+    ("top-10 logits not f32", _top10_value("logits", 512, DType.BF16),
+     r"'logits' is bf16 \[2, 512\], not f32 \[2, 512\] \(the 512 router logits of each column\)"),
+    ("top-10 ids not i32", _top10_value("ids", 10, F32),
+     r"'top10\.ids' is f32 \[2, 10\], not i32 \[2, 10\] \(the ten expert ids of each column\)"),
+    ("top-10 ids of another width", _top10_value("ids", 9, I32),
+     r"'top10\.ids' is i32 \[2, 9\], not i32 \[2, 10\] \(the ten expert ids of each column\)"),
+    ("top-10 weights of another width", _top10_value("weights", 11, F32),
+     r"'y\.top10\.w' is f32 \[2, 11\], not f32 \[2, 10\] \(the ten weights of each column\)"),
+    ("top-10 weights not f32", _top10_value("weights", 10, DType.BF16),
+     r"'y\.top10\.w' is bf16 \[2, 10\], not f32 \[2, 10\] \(the ten weights of each column\)"),
+    ("top-10 logits off 4 bytes", _aligned("basalt_router_top10", 0, 2), "slot 0 needs 4-byte alignment"),
 ]
 
 

@@ -6,8 +6,9 @@ q8_1 rows feed only the routed experts; outputs are contiguous columns); a stati
 
 # The launcher checks are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_mmvq.cu:1465-1475, :1490-1494,
 # :1549-1552 and :1563-1568, src/kernels/cuda/dense_tc.cu:1077-1082 and :1107-1113,
-# src/kernels/cuda/native_bf16.cu:139-171, src/kernels/cuda/iq_kernels.cu:2450-2455 and
-# src/kernels/cuda/native_gr_postops.cu:75-82 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+# src/kernels/cuda/native_bf16.cu:139-171, src/kernels/cuda/iq_kernels.cu:2450-2455,
+# src/kernels/cuda/native_gr_postops.cu:75-82 and src/kernels/cuda/native_router.cu:101-128 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 
 from __future__ import annotations
 
@@ -204,6 +205,20 @@ def _gr_post(ctx: _Ctx, op: Op) -> None:
             f"{op.kind}:{block_out.name}", writes=[3])
 
 
+def _router_top10(ctx: _Ctx, op: Op) -> None:
+    # no overlap check (the one-token launcher's, native_router.cu:114-115): a view keeps its base's dtype and
+    # trailing shape, so no graph makes two of the F32 [T, 512], I32 [T, 10] and F32 [T, 10] values share bytes
+    t = _columns(ctx, op)                                    # no other T bound: the multi launcher takes any count
+    (logits,), (ids, weights) = op.inputs, op.outputs
+    _expect(ctx, op, logits, (t, 512), DType.F32, "the 512 router logits of each column")
+    _expect(ctx, op, ids, (t, 10), DType.I32, "the ten expert ids of each column")
+    _expect(ctx, op, weights, (t, 10), DType.F32, "the ten weights of each column")
+    k = ctx.kernel("basalt_router", kernels.basalt_router_source(), "basalt_router_top10", {})
+    grid, threads = kernels.basalt_router_grid(t)
+    ctx.add(k, [_bind(ctx, op, 0, logits, 4), _bind(ctx, op, 1, ids, 4), _bind(ctx, op, 2, weights, 4)],
+            (grid, 1, 1), (threads, 1, 1), f"{op.kind}:{logits.name}", writes=[1, 2])
+
+
 BASALT_HANDLERS: Dict[str, object] = {"basalt_q8_1": _q8_1, "basalt_mmvq": _mmvq, "basalt_dense_tc": _dense_tc,
                                       "basalt_dense_tc_pair": _dense_tc_pair, "basalt_mmvf": _mmvf,
-                                      "basalt_gr_post": _gr_post}
+                                      "basalt_gr_post": _gr_post, "basalt_router_top10": _router_top10}
