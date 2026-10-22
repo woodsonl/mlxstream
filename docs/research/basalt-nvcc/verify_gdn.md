@@ -434,10 +434,14 @@ at the L2 scale, `:53`, and the sigmoid factor of y, `:441`, at point 2's logits
 from 2^-149 up, while `ex2n`'s squared result rounds up to 2^-149 from just above 2^-150, which gives (-103.97,
 -87.34). No rule changes.)
 
-For the contract (`flash-next.md`): its list of approximate operations names `:315` alone for `verify_kernels.cu`;
+For the contract (`flash-next.md`): its list of approximate operations named `:315` alone for `verify_kernels.cu`;
 the per-stage kernels' `__expf` (`:46`, `:76`, `:151`, `:154`, `:206`, `:209`, `:241`, `:407`, `:441`), `log1pf`
-(`:154`, `:209`) and run-time `rsqrtf` (`:53`, `:83`, `:439`) are approximate in the same way and belong on it, with
-`rsqrtf((float) S)` (`:431`) as the folded constant. Three helpers the rows above need do not exist on origin/main; the unmerged `origin/woodsonl/basalt-sampler` (read at
+(`:154`, `:209`) and run-time `rsqrtf` (`:53`, `:83`, `:439`) are approximate in the same way, with
+`rsqrtf((float) S)` (`:431`) as the folded constant. The port adds the `_multi` kernels' sites as their own entry:
+`__expf` at `:46`, `:151`, `:206`, `:407` and `:441`, the softplus with `log1pf` at `:153-155` and `:208-210`, and
+`rsqrtf` at `:53`, `:431` and `:439`. The segment kernel's `:76` and `:83` (`gdn_conv_l2_seg_kernel`, batch windows
+only) are off this port's path, and the step commit's `:241` (`gdn_step_commit_block`) waits for the commit's port.
+Three helpers the rows above need do not exist on origin/main; the unmerged `origin/woodsonl/basalt-sampler` (read at
 `2acc918`) has one of them:
 
 - `ieee_fma_any`: that branch has it as `ieee_fma_count` (`kernels/common/basalt_sampler.metal:77-86`), a correctly
