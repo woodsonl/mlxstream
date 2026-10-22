@@ -1120,3 +1120,27 @@ def nv_trig(x, add):
         v = fma32(k, t, p)
         v = np.where((q & 2) != 0, F32(0.0) - v, v)                     # sub.f32 from +0
     return np.where(np.isnan(v), _w2f(0x7FFFFFFF), v).astype(F32).reshape(shape)
+
+
+# ---- the prompt path's attention row kernels (kernels/common/basalt_prompt_qsa.metal) --------------------------------
+# src/prefill/kernels.cu:726-734 builds with nvcc's IEEE defaults: each product, quotient and sum is numpy's float32
+# operation and each FFMA fma32, in the order docs/research/basalt-nvcc/prefill_kernels.md section 4 records; the
+# reduction is hc_block_sum and the operation table hc_ops, as for the hyper-connection kernels above. fast::rsqrt has
+# no bit-exact host model: ``rsqrt`` evaluates the GPU's on a float32 array (basalt_prompt_gpu.hc_probe).
+
+def rms_rows_emu(x, w, eps, rsqrt, flush=False):
+    """prompt_rms_rows's stores, fp32 bits [rows, cols], for the rows ``x`` [rows, cols] and the weights ``w`` [cols]:
+    thread k sums x[c]^2 over c = k + 256 j < cols, j ascending, by fma32 from +0 (a thread with no column keeps +0);
+    hc_block_sum; s = rsqrt(fl(fl(S / cols) + eps)), the argument computed here in basalt's order; y =
+    cuda_nan(fl(fl(s x) w)). ``flush``: every operation's inputs and result flushed."""
+    fma, add, mul, div = hc_ops(flush)
+    x = np.asarray(x, F32)
+    rows, cols = x.shape
+    ss = np.zeros((rows, 256), F32)
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN rows
+        for c0 in range(0, cols, 256):
+            v = x[:, c0: c0 + 256]
+            ss[:, : v.shape[1]] = fma(v, v, ss[:, : v.shape[1]])
+        s = np.asarray(rsqrt(add(div(hc_block_sum(ss, flush), F32(cols)), F32(eps))), F32)
+        y = mul(mul(s[:, None], x), np.asarray(w, F32))
+    return hc_bits(y)
