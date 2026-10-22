@@ -9,6 +9,9 @@
 # b4c63b55754637f4c72ad53a0f791d425f71eb36, which adapt ggml-org/llama.cpp ggml/src/ggml-common.h (kvalues_iq4nl),
 # ggml/src/ggml-quants.c (get_scale_min_k4), ggml/src/ggml-cuda/quantize.cu and ggml/src/ggml-cuda/mmvf.cu @
 # 3cf03257f219afbe7334045ff7c6a06ac68c627d (MIT; third_party/NOTICE).
+# nv_expf_emu: transcribed from NVIDIA libdevice's __nv_expf as nvcc 13.0 (V13.0.48, -arch=sm_120 -lineinfo -O3
+# -DNDEBUG) inlined it into basalt's src/prefill/kernels.cu (route_kernel); PTX listing and transcription:
+# docs/research/basalt-nvcc/prefill_kernels.md section 3.
 """numpy emulation of basalt's float32 arithmetic as nvcc compiles it (docs/research/basalt-nvcc/matvec.md), for the
 bit-for-bit tests of the Metal port. Every float operation rounds once to float32, to nearest even on the float32
 grid, subnormals included (gradual underflow): numpy's float32 add, multiply and divide do; ``fma32`` does by rounding
@@ -1000,3 +1003,27 @@ def hc_write_norm(r, bo, inj, w_next, eps, rsqrt, exp_neg, flush=False):
     the same mapping and block_sum, so the same bits). ``flush``: every operation's inputs and result flushed."""
     rp = hc_write(r, bo, inj, exp_neg, flush)
     return (rp, *hc_norm(rp.view(F32), w_next, eps, rsqrt, flush))
+
+
+# ---- libdevice's expf in the prompt router (docs/research/basalt-nvcc/prefill_kernels.md section 3) ----------------
+# kernels.cu builds with nvcc's IEEE defaults: no flush, as numpy's float32 operations. ex2.approx.ftz has no bit-exact
+# host model: ``exp2`` evaluates the port's stand-in, the GPU's fast::exp2, on a float32 array
+# (basalt_prompt_gpu.hc_probe("exp2", .)).
+
+def nv_expf_emu(x, exp2):
+    """libdevice's __nv_expf as nvcc 13.0 inlines it into an IEEE-built kernel (src/prefill/kernels.cu:642, the prompt
+    router's library expf), the PTX's sequence on a float32 array: t = fma.rn(x, log2(e) / 252, 0.5) saturated
+    (cvt.sat, a NaN to +0); j = fma.rm(t, 252, 12582913) = 12582913 + k, k = floor of the exact t * 252 (float64 holds
+    it); n = j - 12583039 = k - 126 (add.f32); f = fma.rn(x, log2(e), -n), then fma.rn(x, log2(e)'s low part, f);
+    s = 2^(k - 126) from j << 23 (shl.b32); e = exp2(f) * s (mul.f32), a subnormal e kept.
+    kernels/common/basalt_libdevice.metal's nv_expf gives these bits (test_nv_expf_bits), a NaN aside: its NaN has the
+    hardware multiply's bits."""
+    x = np.asarray(x, F32)
+    c, cn, lo = np.array([0x3BBB989D, 0xCB40007F, 0x32A57060], np.uint32).view(F32)   # log2(e) / 252, -12583039, the
+    with np.errstate(over="ignore", invalid="ignore"):                                   # low part log2(e) - L2E
+        t = fma32(x, c, F32(0.5))
+        t = np.where(t > 0, np.minimum(t, F32(1)), F32(0))
+        j = (12582913 + np.floor(t.astype(np.float64) * 252)).astype(F32)
+        f = fma32(x, lo, fma32(x, L2E, -(j + cn)))
+        s = (j.view(np.uint32) << np.uint32(23)).view(F32)
+        return (np.asarray(exp2(f), F32) * s).astype(F32)

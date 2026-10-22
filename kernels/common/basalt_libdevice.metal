@@ -1,7 +1,8 @@
-// Transcribed from NVIDIA libdevice's __nv_exp and __nv_logf as nvcc 13.0 (V13.0.48, -arch=sm_120 -lineinfo -O3
-// -DNDEBUG) inlined them into basalt's sampler.cu (jesdga95/basalt src/kernels/cuda/sampler.cu
-// @ b4c63b55754637f4c72ad53a0f791d425f71eb36; third_party/NOTICE); PTX listing and transcription:
-// docs/research/basalt-nvcc/sampler.md sections 2.5-2.6.
+// Transcribed from NVIDIA libdevice's __nv_exp, __nv_logf and __nv_expf as nvcc 13.0 (V13.0.48, -arch=sm_120
+// -lineinfo -O3 -DNDEBUG) inlined them into basalt's sampler.cu (__nv_exp, __nv_logf) and prefill/kernels.cu
+// (__nv_expf) (jesdga95/basalt src/kernels/cuda/sampler.cu and src/prefill/kernels.cu
+// @ b4c63b55754637f4c72ad53a0f791d425f71eb36; third_party/NOTICE); PTX listings and transcriptions:
+// docs/research/basalt-nvcc/sampler.md sections 2.5-2.6 and docs/research/basalt-nvcc/prefill_kernels.md section 3.
 //
 // CUDA's binary64 exp and binary32 logf, which are not correctly rounded, so no Metal function gives their bits: the
 // sampled tail's exp((double) x - (double) max) and logf(min_p), operation for operation. Needs basalt_ieee.metal and
@@ -78,4 +79,23 @@ static inline float nv_logf(float x) {
     if (ib > 0x7F7FFFFFu) r = fma(xs, as_type<float>(0x7F800000u), as_type<float>(0x7F800000u));   // setp.gt.u32
     if ((ib & 0x7fffffffu) == 0u) r = as_type<float>(0xFF800000u);          // setp.eq.f32 xs, 0: xs is never subnormal
     return r;
+}
+
+// libdevice __nv_expf as nvcc 13.0 inlines it into an IEEE-built kernel (kernels.cu:642, :770).
+// expf(float) for src/prefill/kernels.cu:642, the prompt router's library expf; PTX listing and transcription:
+// docs/research/basalt-nvcc/prefill_kernels.md section 3. Every step but ex2.approx.ftz (fast::exp2, invariant 5) is
+// exact on this GPU: fl(t * 252) rounds up at most to the next integer, which the sign of the fma corrects to
+// fma.rm's floor; t and f are never subnormal for a normal x, and a subnormal x gives 1.0 on both machines; only the
+// scale multiply can write a subnormal (x in about (-104, -87.3]), so it is ieee_mul. expf(-inf) = +0. A NaN x gives
+// a NaN with the hardware multiply's bits [H: CUDA's mul.f32 gives 0x7fffffff].
+static inline float nv_expf(float x) {
+    const float t = saturate(fma(x, as_type<float>(0x3BBB989Du), 0.5f));   // fma.rn, cvt.sat: t in [0, 1]
+    float k = floor(t * 252.0f);                                              // fma.rm(t, 252, 12582913) - 12582913
+    if (fma(t, 252.0f, -k) < 0.0f) k -= 1.0f;                                 //   = floor(exact t * 252)
+    const float j = 12582913.0f + k;                                          // exact: integers below 2^24
+    const float n = j + as_type<float>(0xCB40007Fu);                          // add.f32 j - 12583039 = k - 126
+    float f = fma(x, as_type<float>(0x3FB8AA3Bu), -n);                        // x * log2(e) - n
+    f = fma(x, as_type<float>(0x32A57060u), f);                               // + x * (log2(e) - 0x3FB8AA3B)
+    const float s = as_type<float>(as_type<uint>(j) << 23);                   // 2^n, n in [-126, 126]
+    return ieee_mul(s, fast::exp2(f));                                        // ex2.approx.ftz -> fast::exp2
 }
