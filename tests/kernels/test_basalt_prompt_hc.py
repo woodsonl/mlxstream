@@ -17,10 +17,11 @@ none), each kind seeing the classes on its inputs:
   column 7 (a signalling NaN, planted and compared as bits only).
 - token 1: E3 a NaN and E4 +inf in r (stream 0 and stream 1, column 3), lo (columns 3 and 4) and inj (streams 0, 1).
 - token 2: E6, the tie row (stream 1): r[k] = 2^-70 s, r[k + 256] = (1 + 2^-12) s at k = 0, the rest 0, so thread
-  k's first square is subnormal and decides the rounding of its sum (s = ``E6_S`` = 1, for which the IEEE and
-  flushing twins' rs differ); inj 0 on stream 0 (E5: 2 sigmoid = 1, gr_parity.cpp:641's plain add) and -400 on
-  stream 1 (E5's zero sigmoid: sc = +0, so gr_write_norm_rs's R' row is E6's r, bit for bit, and its sum of squares
-  meets the tie).
+  k's first square is subnormal and decides the rounding of its sum (s = ``E6_S`` = 8, for which the IEEE and
+  flushing twins' rs differ when correctly rounded, each exact value at least 0.41 ulp from a rounding midpoint, so
+  any rsqrt within 0.9 ulp of exact keeps them apart; at s = 1 they round alike); inj 0 on stream 0 (E5: 2 sigmoid =
+  1, gr_parity.cpp:641's plain add) and -400 on stream 1 (E5's zero sigmoid: sc = +0, so gr_write_norm_rs's R' row is
+  E6's r, bit for bit, and its sum of squares meets the tie).
 - token 3: E1, an all-zero r row (stream 0: rs = fast::rsqrt(1e-6)), with E5's inj (-352, -400, 100, -100): -352 / 4
   = -88 has a subnormal sigmoid, -400 / 4 = -100 a zero one; gated -88 and -100 on all four streams of columns 0 and 1.
 - token 4: E9, r = copysign(0, -w) at column ``E9_D`` (100) of every stream, so x = fl(fl(r rs) w) is -0 on all four
@@ -79,7 +80,7 @@ from tests.kernels import basalt_prompt_gpu as gpu
 F32 = np.float32
 B, N, LR = 256, 2560, 320
 EPS = F32(1e-6)              # the handler's HC_EPS, 0x358637BD (prompt_hc's)
-E6_S = 1.0                   # E6's s: twins' rs 0x424a13f8 (IEEE) vs 0x424a13f9 (flush) on the M3 Max; 2^-4 ties them
+E6_S = 8.0                   # E6's s: twins' rs 0x40ca5513 (IEEE) vs 0x40ca5514 (flush), the correctly rounded values
 E8_NAN = 0x7FA00001
 E9_D = 100                   # E9's column (token 4): four -0 products, which pin gr_mix_r's +0 seed
 WORD = {4: np.uint32, 2: np.uint16}
