@@ -829,18 +829,24 @@ def basalt_mmq_macros(product: str, *, sm_count: int = DENSE_TC_SM_COUNT, rows_p
             "MMQ_RANGE": str(MMQ_RANGE)}
 
 
-def basalt_mmq_grids(rows_cap: int, product: str) -> Dict[str, Tuple[int, int]]:
-    """The threadgroup grids (x, y) of the kernels that run on an expert product's macros at the program's row bound
-    ``rows_cap`` (B, so 10 B slots), keyed by kernel name. ``gate_up``: the plan kernels, ceil(B / MMQ_RANGE) ranges
-    (count: MMQ_THREADS threads, fill: 10 MMQ_RANGE) and one scan threadgroup of 512; kernel 1, a slot by a 512-value
-    column block; kernel 2. ``down``: kernel 3 (a slot by a 512-value block of pad512(K)) and kernel 4. Kernels 1 to 4
-    hold MMQ_THREADS threads; 2 and 4 run NTY weight tiles by W_cap = ceil((10 B + 7 min(512, 10 B)) / 8) work items
-    (spec-kernels-mmq.md 9.4): at least the plan's wpre[n], the sum of ceil(cnt / 8) over at most min(512, 10 B)
-    experts whose counts total at most 10 B."""
+def basalt_mmq_grids(rows_cap: int, product: str, *, n: int = 0, k: int = 0,
+                     rows_per_t: int = 1) -> Dict[str, Tuple[int, int]]:
+    """The threadgroup grids (x, y) of the kernels that run on a product's macros (``n``, ``k`` and ``rows_per_t`` as
+    basalt_mmq_macros takes them) at the program's row bound ``rows_cap`` (B, so 10 B slots), keyed by kernel name.
+    ``gate_up``: the plan kernels, ceil(B / MMQ_RANGE) ranges (count: MMQ_THREADS threads, fill: 10 MMQ_RANGE) and one
+    scan threadgroup of 512; kernel 1, a slot by a 512-value column block; kernel 2. ``down``: kernel 3 (a slot by a
+    512-value block of pad512(K)) and kernel 4. Kernels 1 to 4 hold MMQ_THREADS threads; 2 and 4 run NTY weight tiles
+    by W_cap = ceil((10 B + 7 min(512, 10 B)) / 8) work items (spec-kernels-mmq.md 9.4): at least the plan's wpre[n],
+    the sum of ceil(cnt / 8) over at most min(512, 10 B) experts whose counts total at most 10 B. ``q8_0``: the dense
+    pair on B rows_per_t rows by position, kernel 1 a row by a 512-value block of pad512(K) and kernel 2 NTY weight
+    tiles by ceil(B rows_per_t / 8) work items, its one expert's wpre[1] at most."""
     if rows_cap < 1:
         raise ValueError(f"basalt_mmq: rows_cap must be positive, got {rows_cap}")
-    m = basalt_mmq_macros(product)
+    m = basalt_mmq_macros(product, n=n, k=k, rows_per_t=rows_per_t)
     slots, nr, blocks = 10 * rows_cap, -(-rows_cap // MMQ_RANGE), -(-int(m["K"]) // 512)
+    if product == "q8_0":
+        rows = rows_cap * rows_per_t
+        return {"basalt_mmq_quantize": (rows, blocks), "basalt_mmq": (int(m["NTY"]), -(-rows // 8))}
     mmq = (int(m["NTY"]), -(-(slots + 7 * min(512, slots)) // 8))
     if product == "down":
         return {"basalt_mmq_swiglu_quantize": (slots, blocks), "basalt_mmq": mmq}

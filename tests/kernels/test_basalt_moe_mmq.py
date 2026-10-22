@@ -63,9 +63,17 @@ exists), then the Metal port's (kernels/common/basalt_mmq.metal).
 - test_mmq_order_is_basalts_not_this_gpus (M4): MMQ_SM_COUNT is basalt's 170 unless asked, and it reaches the
   arithmetic: built at this Mac's 40 cores, kernel 2 gives other bits, the emulator's at 40.
 - test_mmq_nan_reaches_d: a NaN group, a +inf and a -inf activation make their slots' GU and D NaN, each stored as
-  sm_120's 0x7fffffff, and the chain's bytes equal the emulator's."""
+  sm_120's 0x7fffffff, and the chain's bytes equal the emulator's; on the Q8_0 instance their rows' y, equal to the
+  Q2_0 instance's.
+- test_mmq_q8_0_equals_q2_0_tiles: the Q8_0 instance (basalt_prompt_mmq's pair: kernel 1 on rows by position, kernel 2
+  with MMQ_TYPE 8 and one expert, draft_kv's proj, prefill.cpp:971-980) on a Q8_0 matrix holding a Q2_0 matrix's values
+  gives y bit-equal to the Q2_0 instance's (kernel 2 with the gate/up product's macros) on the same Xq rows, and its Xq
+  equals the emulator's (spec-engine.md 7.2).
+- test_mmq_q8_0_float64_reference: the Q8_0 instance at draft_kv's shapes meets G1, G2 and G3's plain bounds
+  (prefill_mmq_kq_test.cpp:269, :277-278, :375-377) against the float64 product with ggml's dequantized weights."""
 
 import functools
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -77,6 +85,7 @@ from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu
 from tests.kernels import basalt_moe_fixture as fx
 from tests.kernels import basalt_prompt_gpu as gpu
+from tests.kernels.basalt_cpu_emu import unpack64_q2_0
 
 F32 = np.float32
 NSM = kernels.DENSE_TC_SM_COUNT       # basalt's reference GPU, which the port pins (never this Mac's)
@@ -860,20 +869,34 @@ def test_mmq_order_is_basalts_not_this_gpus():
     assert np.array_equal(got[THIS_MAC], here), "the 40 build differs from the emulator at 40"
 
 
-@pytest.mark.parametrize("path", ["moe"])
+@pytest.mark.parametrize("path", ["moe", "q8_0"])
 def test_mmq_nan_reaches_d(path):
     """eng-review D25's stored-NaN row (no basalt test: basalt's tests feed no non-finite activation): every NaN the
-    chain stores in GU and D goes through cuda_nan (mmq.cuh:216's write-back; sm_120 stores 0x7fffffff, this GPU's
-    arithmetic NaN is 0x7fc00000). The share-plain configuration's x with three tokens poisoned, each alone: token 0 an
-    all-NaN 32-value group, whose d4 is cuda_nan(1 / NaN), so every step fma_ftz(NaN, .., sum) of each output; token 1
-    a +inf and token 2 a -inf element, whose group's amax +inf gives d_inv = 0, codes 0 and d4 = rcp_ftz(0) = +inf, so
-    fma_ftz(+inf, +-0, sum) (mmq_vec_dot.cuh:87) makes each output NaN. Through gpu.moe_mmq (the plan kernels and
-    kernels 1-4 at bound B = 256): Xq, GU, Hq and D equal emu.mmq_moe's bytes (with the GPU's expf_ftz), the poisoned
-    tokens' 30 slots hold 0x7fffffff in every GU and D element, and every other slot's elements are finite."""
+    chain stores in GU and D, and the Q8_0 instance in y, goes through cuda_nan (mmq.cuh:216's write-back; sm_120
+    stores 0x7fffffff, this GPU's arithmetic NaN is 0x7fc00000). The share-plain configuration's x with three tokens
+    poisoned, each alone: token 0 an all-NaN 32-value group, whose d4 is cuda_nan(1 / NaN), so every step fma_ftz(NaN,
+    .., sum) of each output; token 1 a +inf and token 2 a -inf element, whose group's amax +inf gives d_inv = 0, codes 0
+    and d4 = rcp_ftz(0) = +inf, so fma_ftz(+inf, +-0, sum) (mmq_vec_dot.cuh:87) makes each output NaN. ``moe``: through
+    gpu.moe_mmq (the plan kernels and kernels 1-4 at bound B = 256), Xq, GU, Hq and D equal emu.mmq_moe's bytes (with
+    the GPU's expf_ftz), the poisoned tokens' 30 slots hold 0x7fffffff in every GU and D element, and every other slot's
+    elements are finite. ``q8_0``: the same three rows poisoned among 192 (tile width 96, 8 or 9 pieces a tile) through
+    _q8_0_and_q2_0 (Xq equal to emu.mmq_quantize's), the poisoned rows hold 0x7fffffff in every y element, the other
+    rows are finite, and y equals the Q2_0 instance's bit for bit (test_mmq_q8_0_equals_q2_0_tiles's weights)."""
     cfg = fx.config("share-plain")
-    x = cfg.x.copy()
+    if path == "q8_0":
+        x = np.full((256, fx.N), np.nan, F32)
+        x[:192] = np.random.default_rng(9).standard_normal((192, fx.N), dtype=F32)
+    else:
+        x = cfg.x.copy()
     x[0, 224:256] = np.nan                                 # group 7, block 1
     x[1, 1000], x[2, 2047] = np.inf, -np.inf               # groups 31 and 63, the second and fourth 512-value blocks
+    if path == "q8_0":
+        _, y8, y2 = _q8_0_and_q2_0(x, 192, 1)
+        bad = np.argwhere(y8 != y2)
+        assert not len(bad), f"y: {len(bad)} words differ from the Q2_0 instance's, first {tuple(bad[0])}"
+        assert np.all(y8[:3] == 0x7FFFFFFF), "y: a poisoned row's element is not 0x7fffffff"
+        assert np.all(np.isfinite(y8[3:].view(F32))), "y: a non-finite element outside the poisoned rows"
+        return
     with np.errstate(invalid="ignore"):
         want = emu.mmq_moe(x, cfg.plan, cfg.buf, cfg.offsets, expf=basalt_gpu.expf_ftz, nsm=NSM)
     xb = np.full((256, fx.N), np.nan, F32)
@@ -890,3 +913,117 @@ def test_mmq_nan_reaches_d(path):
         a = getattr(got, e)[:local]
         assert np.all(a[poisoned] == 0x7FFFFFFF), f"{e}: a poisoned slot's element is not 0x7fffffff"
         assert np.all(np.isfinite(a[~poisoned].view(F32))), f"{e}: a non-finite element outside the poisoned slots"
+
+
+def _dense(x, w, R, m, B=256):
+    """gpu.mmq_dense, basalt_prompt_mmq's pair (draft_kv's proj, prefill.cpp:971-980: mmq::quantize without ids, then
+    mul_mat_q<Q8_0> with p.n = 1 and p.bounds = {0, rows}), of the float32 rows ``x`` [B m, K] with the Q8_0 matrix
+    ``w``, compiled at bound ``B`` and run with ``R`` rows of ``m``, so R m dense rows. Asserts that Xq's bytes equal
+    emu.mmq_quantize's (kernel 1's rows by position, quantize.cu:29 without ids) and that Xq and y keep their 0xFF fill
+    past R m; returns Xq's bytes [R m, pad512(K) / 128, 144] and y's bits [R m, N]."""
+    rows = R * m
+    xq, y = gpu.mmq_dense(x, w, B=B, rows=R, rows_per_t=m)
+    with np.errstate(invalid="ignore"):
+        bad = np.argwhere(xq[:rows] != emu.mmq_quantize(x[:rows]))
+    assert not len(bad), f"Xq: {len(bad)} bytes differ from emu.mmq_quantize, first {tuple(bad[0])}"
+    assert np.all(xq[rows:] == 0xFF) and np.all(y[rows:] == 0xFFFFFFFF), "a row past R m written"
+    return xq[:rows], y[:rows]
+
+
+@functools.lru_cache(maxsize=None)
+def _q2_0_as_q8_0():
+    """spec-engine.md 7.2's weights: a Q2_0 matrix at the one shape a Q2_0 instance shares with a dense matrix, the
+    gate/up product's [1280, 2560] (fx.fill_q2_0), followed by 64 bytes of 0xFF (a read past it is a validation report,
+    else an fp16 NaN scale); and the Q8_0 matrix [1280, 80 * 34] of the same values, each 64-value block as two Q8_0
+    blocks (ggml_common.h:163-167: fp16 d, then qs[32]) with its d's bits and the int8 codes q - 1 in {-1, 0, 1, 2}
+    (unpack64_q2_0's code q), so equal d on each pair of adjacent blocks. Cached and read-only."""
+    w2 = fx.fill_q2_0(np.random.default_rng(80), 2 * fx.FF, fx.N).reshape(-1, fx.QB)
+    w8 = np.empty((len(w2), 2, kernels.Q8_0_BLOCK_BYTES), np.uint8)
+    w8[..., :2] = w2[:, None, :2]
+    w8[..., 2:] = (unpack64_q2_0(w2[:, 2:]).astype(np.int8) - 1).reshape(-1, 2, 32).view(np.uint8)
+    out = np.append(w2, np.full(64, 0xFF, np.uint8)), w8.reshape(2 * fx.FF, -1)
+    for a in out:
+        a.flags.writeable = False
+    return out
+
+
+def _q8_0_and_q2_0(x, R, m, B=256):
+    """The Q8_0 instance and the Q2_0 one on the same rows (spec-engine.md 7.2), with _q2_0_as_q8_0's weights: _dense
+    of ``x`` [B m, 2560] with the Q8_0 matrix (R rows of m), then kernel 2 with the gate/up product's macros (MMQ_TYPE
+    42; gpu.mmq) on the same Xq rows with the Q2_0 matrix as expert 0's blob, through a plan of one launch slot holding
+    the R m rows, n 1, bounds {0, R m}, wpre {0, ceil(R m / 8)} (moe_plan's form of p.n = 1 and p.bounds = {0, rows};
+    kernel 2 reads no slot or src). Returns Xq's bytes and both y's bits [R m, 1280], the Q8_0 instance's first."""
+    w2, w8 = _q2_0_as_q8_0()
+    rows = R * m
+    xq, y8 = _dense(x, w8, R, m, B)
+    xq2 = np.full((10 * B,) + xq.shape[1:], 0xFF, np.uint8)
+    xq2[:rows] = xq
+    plan = SimpleNamespace(slot=np.zeros((R, 10), np.int32), n=1, rows_local=rows, order=[0], bounds=[0, rows],
+                           wpre=[0, -(-rows // 8)])
+    return xq, y8, gpu.mmq(xq2, plan, w2, [0], B=B)[:rows]
+
+
+def test_mmq_q8_0_equals_q2_0_tiles():
+    """spec-engine.md 7.2's bitwise check (no basalt test: basalt never sets its MMQ instances side by side): the Q8_0
+    tile load (mmq_load_tiles.cuh:77-124) leaves the x tile that load_tiles_q2_0 (:11-75) leaves for the same values,
+    and everything after it is one code, the integer dot and the fp32 epilogue (mmq_vec_dot.cuh:14-92), the stream-k
+    pieces and the fixup (mmq.cuh:390-864), whose piece starts are the same function of (tiles, grid) for Q8_0's 80
+    blocks of 8 an iteration as for Q2_0's 40 of 4 (scripts/draft_mmq_tiles.py). So _q2_0_as_q8_0's Q8_0 matrix, which
+    holds its Q2_0 matrix's values, gives y bit-equal to the Q2_0 instance's on the same Xq rows (_q8_0_and_q2_0): 768
+    rows (R 192 of 4, fc_hidden's ROWS_PER_T: tile width 128, six column tiles, split at 170 multiprocessors) and one
+    row (width 8, a one-column window, every k iteration its own piece); every y is finite."""
+    rng = np.random.default_rng(8)
+    for R, m in ((192, 4), (1, 1)):
+        x = np.full((256 * m, fx.N), np.nan, F32)
+        x[:R * m] = rng.standard_normal((R * m, fx.N), dtype=F32)
+        _, y8, y2 = _q8_0_and_q2_0(x, R, m)
+        bad = np.argwhere(y8 != y2)
+        assert not len(bad), f"R {R} m {m}: {len(bad)} of {y8.size} y elements differ from the Q2_0 instance's, " \
+                             f"first {tuple(bad[0])}"
+        assert np.all(np.isfinite(y8.view(F32))), f"R {R} m {m}: a non-finite y"
+
+
+# draft_kv's dense Q8_0 products (spec-engine.md 7.2; prefill.cpp:1008, :1012, :1021-1022), "N x K @ rows": (N, R, m,
+# B), R rows of m activation rows each at bound B: fc_embedding on nb rows, fc_hidden on nb rows of hc = 4 streams,
+# attn_k and attn_v on nb rows, at nb = 192 and the last batch's 64 of a 256-row chunk, and one row. fc_hidden runs at
+# draft_kv's own bound, B = 192 at m.T = 256 (spec-engine.md 4), so R = B and every row of its buffers is live; the
+# others at B = 256, so rows past R m stay to be checked.
+Q8_0_SHAPES = {"2560x2560@192": (2560, 192, 1, 256), "2560x2560@768": (2560, 192, 4, 192),
+               "512x2560@192": (512, 192, 1, 256), "512x2560@64": (512, 64, 1, 256), "512x2560@1": (512, 1, 1, 256)}
+
+
+@pytest.mark.parametrize("name", list(Q8_0_SHAPES))
+def test_mmq_q8_0_float64_reference(name):
+    """nearest bound; no basalt test launches this kernel: G3 is prefill_mmq_kq_test.cpp:375's ``const double lim_rms =
+    outliers ? 3e-2 : 2e-2, lim_worst = outliers ? 0.15 : 0.1;`` at its plain values, failing if ``em.rms > lim_rms ||
+    em.worst > lim_worst`` (:376-377; eng-review D20). basalt runs mul_mat_q<Q8_0> only as the grouped down product of
+    its K-quant pairs Q4_K / Q8_0 and Q5_K / Q8_0 at K = 640 (:525-527, :213-214), gated through the whole chain's D,
+    never this dense launch, draft_kv's proj (prefill.cpp:971-980). Here at draft_kv's shapes (Q8_0_SHAPES), each at
+    its bound B (@768 at R = B = 192, the others at B = 256 with fewer rows): the matrix [N, 2560] by fill_matrix at
+    Q8_0 (:74-95: every byte uniform, then each block's own d from U(0.0008, 0.0032), float32 rounded to fp16), N(0, 1)
+    activations with row 5 all zero where the rows reach it (make_x, :112-119) and the rows past R m NaN. Through
+    _dense (Xq's bytes equal emu.mmq_quantize's, Xq and y keep their 0xFF fill past R m), y meets G1 (no non-finite
+    output, counted; :269), G2 (the zero row exactly zero; :277-278) and G3 against the float64 product of the
+    activations with the matrix as ggml dequantizes it (gguf_reference), by fx.compare (basalt's compare, :259-282)."""
+    n, R, m, B = Q8_0_SHAPES[name]
+    rows, nb = R * m, n * fx.N // 32
+    rng = np.random.default_rng(n + rows)
+    w = rng.integers(0, 256, (nb, kernels.Q8_0_BLOCK_BYTES), dtype=np.uint8)
+    lo = F32(0.0008)
+    d = lo + (F32(4.0) * lo - lo) * rng.random(nb, dtype=np.float32)
+    w[:, :2] = d.astype("<f2").view(np.uint8).reshape(nb, 2)
+    w = w.reshape(n, -1)
+    x = np.full((B * m, fx.N), np.nan, F32)
+    x[:rows] = rng.standard_normal((rows, fx.N), dtype=F32)
+    zero = rows > 5
+    if zero:
+        x[5] = 0.0
+    y = _dense(x, w, R, m, B)[1].view(F32)
+    ref = (x[:rows].astype(np.float64) @ gguf_reference.dequantize(8, w).astype(np.float64).T).astype(F32)
+    bad = np.count_nonzero(~np.isfinite(y))
+    em = fx.compare(y, ref, np.arange(rows))
+    print(f"\n{name}: rel RMS {em.rms:.3e} (bound 2e-2)  worst row {em.worst:.3e} (bound 0.1)  max rel {em.rmax:.3e}  "
+          f"non-finite {bad}")
+    assert bad == 0, f"{name}: {bad} non-finite outputs"
+    assert not zero or not np.any(y[5] != 0), f"{name}: the zero row is not zero (worst = 1e30)"
+    assert not (em.rms > 2e-2 or em.worst > 0.1), (name, em.rms, em.worst)

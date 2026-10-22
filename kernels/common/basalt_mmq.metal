@@ -67,8 +67,9 @@ constant int MMQ_J[11] = {8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128};
 
 struct MmqLaunch { int ngx, maxr, J, ntx, ntiles, grid; };
 
-// group g of a product with nty = rows / 128 (prefill.cpp:2243-2263; switch_J mmq.cuh:866-946; launch :786-864)
-static inline MmqLaunch mmq_launch(device const int* bounds, int n, int g, int nty) {
+// group g of a product with nty = rows / 128 (prefill.cpp:2243-2263; switch_J mmq.cuh:866-946; launch :786-864);
+// bounds a device pointer (the plan's) or a thread array (MMQ_DENSE's)
+template <typename P> static inline MmqLaunch mmq_launch(P bounds, int n, int g, int nty) {
     MmqLaunch L;
     L.ngx = min(16, n - 16 * g);                                   // MMQ_GROUP = 16 (prefill.cpp:607)
     L.maxr = 0;
@@ -234,21 +235,32 @@ static inline void mmq_quantize_block(float4 xi, device uint* blk, uint iqs) {
 
 // Kernel 1 (quantize.cu:10-84 as quantize.cu:94-96 launches it from prefill.cpp:1990: the layer's activations through
 // src_dev; spec-kernels-mmq.md 9.7). x [B][K] floats, its binding 16-byte aligned (basalt's float4 loads,
-// quantize.cu:32, :39); src [10 B] the plan's slot-to-token rows; Xq [10 B][K / 128] blocks of 144 bytes, a slot's
-// row contiguous (basalt's are k-block-major with the row count as stride: an address change, 9.1); plan its words.
-// Threadgroup (p, by) of MMQ_THREADS quantizes values 512 by .. 512 by + 511 of x's row src[p] into blocks 4 by ..
-// 4 by + 3 of Xq's row p, four values a thread (quantize.cu:18, :35-36). Slots p >= bounds[n] return (bounds[n] is
-// the plan's rows_local, prefill.cpp:1996: below 10 R only when the CPU holds experts, whose last block of rows basalt
-// quantizes too and no GPU kernel reads). Grid (10 B, K / 512).
-kernel void basalt_mmq_quantize(device const float* x [[buffer(0)]], device const int* src [[buffer(1)]],
-                                device uint* xq [[buffer(2)]], device const int* plan [[buffer(3)]],
-                                device const StepState* st [[buffer(15)]],
+// quantize.cu:32, :39); src [10 B] the plan's slot-to-token rows; Xq [10 B][pad512(K) / 128] blocks of 144 bytes, a
+// slot's row contiguous (basalt's are k-block-major with the row count as stride: an address change, 9.1); plan its
+// words. Threadgroup (p, by) of MMQ_THREADS quantizes values 512 by .. 512 by + 511 of x's row src[p] (those past K
+// quantize.cu:39's zero, moe_mmq.cu:154-159's pad512) into blocks 4 by .. 4 by + 3 of Xq's row p, four values a
+// thread (quantize.cu:18, :35-36). Slots p >= bounds[n] return (bounds[n] is the plan's rows_local, prefill.cpp:1996:
+// below 10 R only when the CPU holds experts, whose last block of rows basalt quantizes too and no GPU kernel reads).
+// Grid (10 B, pad512(K) / 512). With MMQ_DENSE (draft_kv's mmq::quantize(x, nullptr, ...), prefill.cpp:974; ids
+// nullptr, so row p is x's row p): x [B ROWS_PER_T][K], no src or plan, rows p >= R ROWS_PER_T return, grid
+// (B ROWS_PER_T, pad512(K) / 512).
+kernel void basalt_mmq_quantize(device const float* x [[buffer(0)]],
+#if !MMQ_DENSE
+                                device const int* src [[buffer(1)]], device const int* plan [[buffer(3)]],
+#endif
+                                device uint* xq [[buffer(2)]], device const StepState* st [[buffer(15)]],
                                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     if (st->done) return;                                                    // uniform: before any load
+#if MMQ_DENSE
+    if (tg.x >= prompt_rows(st) * ROWS_PER_T) return;                        // uniform per threadgroup
+    const ulong row = tg.x;                                                  // quantize.cu:29 without ids
+#else
     if (int(tg.x) >= plan[MMQ_BOUNDS + plan[0]]) return;                     // uniform per threadgroup
+    const ulong row = ulong(src[tg.x]);                                      // :29
+#endif
     const uint i0 = 512u * tg.y + 4u * tid;
-    const float4 xi = *(device const float4*) (x + ulong(src[tg.x]) * K + i0);                     // :29-39
-    mmq_quantize_block(xi, xq + (ulong(tg.x) * (K / 128) + i0 / 128u) * 36u, i0 % 128u);          // :70-71
+    const float4 xi = i0 < uint(K) ? *(device const float4*) (x + row * K + i0) : float4(0.0f);         // :29-39
+    mmq_quantize_block(xi, xq + (ulong(tg.x) * ((K + 511) / 512 * 4) + i0 / 128u) * 36u, i0 % 128u);    // :70-71
 }
 
 // The down product's padded sub-blocks (spec-kernels-mmq.md 4.3, 9.6). Its rows of BPNE = 10 blocks are not a multiple
@@ -266,6 +278,28 @@ static inline float mmq_dA(device const GrpPtr* tab, device const int* order, in
         i = 0; ++j;                               // the next slot's row 0
     }
     return h2f(tab[order[j]].p[MAT_OFF + (ulong(i) * BPNE + ulong(b)) * 9]);
+}
+
+// The tile load, the one step MMQ_TYPE selects (spec-kernels-mmq.md 9.5, spec-engine.md 7.2): 32-value sub-block s of
+// a weight row of BPNE blocks of MMQ_BLK ushorts, read in place, as the code words the dot takes in K order (qx[k],
+// qy[k]: values 8k .. 8k + 3, 8k + 4 .. 8k + 7) and dA in d2. Q2_0: half s % 2 of block s / 2, dA its block's d
+// (mmq_load_tiles.cuh:42-58, :73). Q8_0 (mmq_load_tiles.cuh:77-124; ggml_common.h:163-167's block_q8_0, fp16 d then
+// qs[32], only 2-byte aligned): block s, its int8 codes' words through get_int_b2 (:104-105, two 16-bit loads), dA its
+// own d (:122; mmq_vec_dot.cuh:55 reads x_df per 32 values): the x tile load_tiles_q2_0 leaves for the same values.
+constant int MMQ_BLK = MMQ_TYPE == 8 ? 17 : 9;          // a weight block's ushorts: Q8_0 34 bytes, Q2_0 18
+static inline Q20W mmq_load(device const ushort* row, int s) {
+#if MMQ_TYPE == 8
+    device const ushort* blk = row + MMQ_BLK * s;
+    Q20W r;
+    r.d2 = h2f(blk[0]);
+    for (int k = 0; k < 4; ++k) {
+        r.qx[k] = load_int_b2(blk + 1, 2 * k);
+        r.qy[k] = load_int_b2(blk + 1, 2 * k + 1);
+    }
+    return r;
+#else
+    return q2_0_load(row + MMQ_BLK * (s / 2), s % 2);
+#endif
 }
 
 // Kernels 2 and 4 (spec-kernels-mmq.md 9.2-9.6): mul_mat_q<Q2_0> (mmq.cuh:390-864) of every launch of the plan, the
@@ -288,21 +322,35 @@ static inline float mmq_dA(device const GrpPtr* tab, device const int* order, in
 // piece is stored as it is (:216); else P_{m-1} .. P_0 are added from +0, nearest first (the fixup, :646, :689), and
 // that sum onto P_m (:765), add_ftz each. Stores through cuda_nan (sm_120's NaN). The down product's last iteration's
 // sub-blocks past row i run the same step with c = 0 and mmq_dA's dA, their weight codes never loaded.
-kernel void basalt_mmq(device const uint* xq [[buffer(0)]], device const GrpPtr* tab [[buffer(1)]],
-                       device const int* plan [[buffer(2)]], device float* y [[buffer(3)]],
-                       device const StepState* st [[buffer(15)]],
+// With MMQ_DENSE (MMQ_TYPE 8) it is draft_kv's proj (prefill.cpp:971-980; spec-engine.md 7.2): mul_mat_q<Q8_0> with one
+// "expert", p.n = 1, the matrix wm [NTY 128][BPNE] blocks bound directly, the rows by position (p.ids the identity)
+// with p.bounds the batch's {0, rows} (:977, :984), here R ROWS_PER_T rows, and the work map wpre = {0, ceil(rows /
+// 8)}, both derived from StepState: no plan. xq [B ROWS_PER_T][pad512(K) / 128] blocks, kernel 1's dense rows; y
+// [B ROWS_PER_T][LD].
+kernel void basalt_mmq(device const uint* xq [[buffer(0)]],
+#if MMQ_DENSE
+                       device const ushort* wm [[buffer(1)]],
+#else
+                       device const GrpPtr* tab [[buffer(1)]], device const int* plan [[buffer(2)]],
+#endif
+                       device float* y [[buffer(3)]], device const StepState* st [[buffer(15)]],
                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     if (st->done) return;                                                    // uniform: before any load
-    const int n = plan[0], w = int(tg.y);
+    const int w = int(tg.y);
+#if MMQ_DENSE
+    const int n = 1, rows = int(prompt_rows(st)) * ROWS_PER_T;
+    const int bounds[2] = {0, rows}, wpre[2] = {0, (rows + 7) / 8};
+#else
+    const int n = plan[0];
     device const int* bounds = plan + MMQ_BOUNDS;
     device const int* wpre = plan + MMQ_WPRE;
+#endif
     if (w >= wpre[n]) return;                                                // uniform per threadgroup
     int j = 0;                                                               // the last slot with wpre[j] <= w: wpre
     for (int h = 256; h > 0; h >>= 1)                                        // rises (cnt >= 1), n <= 512
         if (j + h < n && wpre[j + h] <= w) j += h;
     const int u = w - wpre[j];
     const MmqLaunch L = mmq_launch(bounds, n, j / 16, NTY);
-    const int jl = 16 * (j / 16) + L.ngx - 1;                                // the group's last launch slot
     const uint mask = mmq_piece_mask((int(tg.x) * L.ngx + j % 16) * L.ntx + 8 * u / L.J, L.ntiles, BPNE, BPI, L.grid);
     int b[NITER + 1], m = 0;                                                 // the pieces' first k iterations
     b[0] = 0;
@@ -314,7 +362,12 @@ kernel void basalt_mmq(device const uint* xq [[buffer(0)]], device const GrpPtr*
     // change only wpre and no bit (spec-kernels-mmq.md 9.5).
     const int p0 = bounds[j] + 8 * u, ncol = min(8, bounds[j + 1] - p0);
     const int i = 128 * int(tg.x) + int(tid);
-    device const ushort* wr = tab[plan[2 + j]].p + MAT_OFF + ulong(i) * (9 * BPNE);
+#if MMQ_DENSE
+    device const ushort* wr = wm + ulong(i) * (MMQ_BLK * BPNE);
+#else
+    device const ushort* wr = tab[plan[2 + j]].p + MAT_OFF + ulong(i) * (MMQ_BLK * BPNE);
+    const int jl = 16 * (j / 16) + L.ngx - 1;                                // the group's last launch slot
+#endif
     float S[8];
     for (int c = 0; c < 8; ++c) S[c] = 0.0f;
     for (int pp = m - 1; pp >= -1; --pp) {                                   // P_{m-1} .. P_0 into S, then P_m
@@ -324,8 +377,12 @@ kernel void basalt_mmq(device const uint* xq [[buffer(0)]], device const GrpPtr*
         for (int q = b[pc]; q < b[pc + 1]; ++q)
             for (int s = 8 * q; s < 8 * q + 8; ++s) {
                 const bool pad = MMQ_DOWN && s >= 2 * BPNE;                     // past row i: c = 0, mmq_dA's dA
-                const Q20W wq = pad ? Q20W{} : q2_0_load(wr + 9 * (s / 2), s % 2);  // mmq_load_tiles.cuh:42-58, :73
+                const Q20W wq = pad ? Q20W{} : mmq_load(wr, s);                  // the tile load
+#if MMQ_DENSE
+                const float dA = wq.d2;
+#else
                 const float dA = pad ? mmq_dA(tab, plan + 2, j, jl, i, s) : wq.d2;
+#endif
                 for (int c = 0; c < 8 && c < ncol; ++c) {
                     device const uint* yb = xq + (ulong(p0 + c) * ((K + 511) / 512 * 4) + ulong(s / 4)) * 36u;
                     const float dB = as_type<float>(yb[s % 4]);                         // mmq_vec_dot.cuh:74

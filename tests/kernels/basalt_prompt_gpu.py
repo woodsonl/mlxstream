@@ -138,6 +138,39 @@ def mmq(xq, plan, buf, offsets, *, B, product="gate_up", sm_count=kernels.DENSE_
     return np.frombuffer(bufs[3].read(0, bufs[3].nbytes), np.uint32).reshape(slots, ld)
 
 
+def mmq_dense(x, w, *, B, rows=None, rows_per_t=1, sm_count=kernels.DENSE_TC_SM_COUNT):
+    """The dense pair of basalt_prompt_mmq, draft_kv's proj on a Q8_0 matrix (prefill.cpp:971-980: mmq::quantize
+    without ids, then mul_mat_q<Q8_0> with one expert whose rows are the batch's by position), in one command buffer on
+    one StepState: basalt_mmq_quantize and basalt_mmq with the q8_0 product's macros (MMQ_DENSE, ROWS_PER_T
+    ``rows_per_t``, MMQ_SM_COUNT ``sm_count``), compiled at bound ``B`` and run with ``rows`` (default B) in StepState
+    on kernels.basalt_mmq_grids' grids. ``x`` the float32 rows [B rows_per_t, K]; ``w`` the matrix's GGUF Q8_0 bytes
+    [N, K / 32 * 34]. Returns Xq's bytes, uint8 [B rows_per_t, pad512(K) / 128, 144], and y's bits, uint32
+    [B rows_per_t, N], whose bytes start as 0xFF."""
+    x, w = np.ascontiguousarray(x, np.float32), np.ascontiguousarray(w, np.uint8)
+    (nx, k), n = x.shape, len(w)
+    assert nx == B * rows_per_t and w.shape == (n, k // 32 * kernels.Q8_0_BLOCK_BYTES), f"x {x.shape}, w {w.shape}"
+    macros = kernels.basalt_mmq_macros("q8_0", n=n, k=k, rows_per_t=rows_per_t, sm_count=sm_count)
+    grids = kernels.basalt_mmq_grids(B, "q8_0", n=n, k=k, rows_per_t=rows_per_t)
+    dev = device()
+    b_x, b_w = nt.Buffer(dev, x.tobytes()), nt.Buffer(dev, w.tobytes())
+    b_xq = nt.Buffer(dev, nx * -(-k // 512) * 4 * kernels.MMQ_BLOCK_BYTES)
+    b_y = nt.Buffer(dev, 4 * nx * n)
+    for b in (b_xq, b_y):
+        b.fill(0xFF)
+    b_st = nt.Buffer(dev, StepStateLayout().pack({"t_this_step": B if rows is None else rows}))
+    ds = []
+    for name, binds in (("basalt_mmq_quantize", [(0, b_x), (2, b_xq)]),
+                        ("basalt_mmq", [(0, b_xq), (1, b_w), (3, b_y)])):
+        d = nt.Dispatch().pipeline(prompt_pipeline(kernels.basalt_mmq_source(), name, B, macros))
+        for s, b in binds:
+            d = d.buffer(s, b)
+        ds.append(d.buffer(15, b_st).grid(*grids[name], 1).threadgroup(kernels.MMQ_THREADS, 1, 1))
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+    return (np.frombuffer(b_xq.read(0, b_xq.nbytes), np.uint8).reshape(nx, -1, kernels.MMQ_BLOCK_BYTES),
+            np.frombuffer(b_y.read(0, b_y.nbytes), np.uint32).reshape(nx, n))
+
+
 def mmq_swiglu_quantize(gu, plan, *, B):
     """basalt_mmq_swiglu_quantize (kernel 3, mmq::swiglu fused with quantize_mmq_q8_1<D4> on H) of the float32 GU rows
     ``gu`` [10 B, 1280] (slot p's gate outputs, then its up outputs) through ``plan`` (basalt_emu.moe_plan's for its R
