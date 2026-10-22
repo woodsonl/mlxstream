@@ -2,15 +2,16 @@
 T = 1 .. 8 (basalt captures one graph per width), each running every kind over a synthetic .basalt file
 (tests/contract/test_basalt_ops.py ``all_ops``): a native q8_1 per input width into every native_mmvq type and every
 dense_tc type in every summation order, the pairs and the BF16 GEMVs on dense rows, the SwiGLU quantizer into a Q8_0
-down, the IEEE quantizer on its own, the hyper-connection write on the 2560-value input. The file is bound through its
-windows, and again through exact per-tensor copies (``BasaltSource(copy=True)``), so that shader validation bounds
-every read by its own tensor, not by a window that holds its neighbours.
+down, the IEEE quantizer on its own, the hyper-connection write on the 2560-value input, the router top-10 on its own
+logits. The file is bound through its windows, and again through exact per-tensor copies (``BasaltSource(copy=True)``),
+so that shader validation bounds every read by its own tensor, not by a window that holds its neighbours.
 
 - Each output bitwise equal to the merged single-kernel harness (tests/kernels/basalt_gpu.py) on the same bytes: the
   q8_1 rows against the harness's quantizer on the same activations, each GEMV against the harness's launch on the
   program's own q8_1 rows (or activations) and the file's weights, the write against the harness's launch into a
-  separate output on the same residual, block output and injections. The program's outputs start as 0xff bytes, the
-  harness's as 0xfe, so a value neither writes cannot match.
+  separate output on the same residual, block output and injections, the top-10 against the harness's launch on the
+  same logits. The program's outputs start as 0xff bytes, the harness's as 0xfe, so a value neither writes cannot
+  match.
 - Window invariance at program level (docs/design/flash-next.md invariant 1, ``CONTRIBUTING.md:14`` of basalt): column
   j of the T-wide program bitwise equal to the 1-wide program run on column j alone, every output finite.
 - The eight programs share their weight windows: the same buffer names, and one buffer per name across the engines.
@@ -156,6 +157,16 @@ def test_gr_post_is_the_harness(runs):
         want = gpu.gr_post(x["r"][:t], x["x2560"][:t], x["inject"][:t], t, 2560, 4, in_place=False, fill=0xFE)[0]
         assert np.array_equal(bits(got), bits(want[:t].ravel())), t
         assert np.all(np.isfinite(got)), t
+
+
+def test_router_top10_is_the_harness(runs):
+    """The router top-10's ``top10.ids`` and ``y.top10.w`` at every width, bit for bit the harness's launch on the
+    program's own ``logits`` rows (the weights' finiteness is ``test_window_invariance``'s, a ``y.`` output)."""
+    for t in WIDTHS:
+        ids, w = gpu.top10(runs["inputs"]["logits"][:t], t, fill=0xFE)
+        got = runs["wide"][t]
+        assert np.array_equal(np.frombuffer(got["top10.ids"], np.int32).reshape(t, 10), ids), t
+        assert np.array_equal(bits(np.frombuffer(got["y.top10.w"], F32).reshape(t, 10)), bits(w)), t
 
 
 def test_window_invariance(runs):
