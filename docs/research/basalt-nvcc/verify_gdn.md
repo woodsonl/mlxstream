@@ -26,8 +26,8 @@ literal `0x3DB504F3`; `1.0f / (1.0f + e)` and the SiLU's quotient are `ieee_div`
 other `FFMA` is `fma_ieee` (`kernels/common/basalt_ieee_f64.metal`; `ieee_fma_any` here, a helper of its own rather than
 the sampler's `ieee_fma_count`), the three contractions (`:45`, `:414`, `:439`) and the chains SASS starts from `RZ` (on
 `0.0f`) included, and every other unflagged `FMUL`, `FADD` and butterfly is `ieee_mul`, `ieee_add` and `warp_sum_ieee`,
-`a + dt[r]` included. The stored h, gate, beta and y go through `cuda_nan` (`nan.md`). The commit kernels' sections (4
-and 7) keep their proposals until the commit is ported.
+`a + dt[r]` included. The stored h, gate, beta and y go through `cuda_nan` (`nan.md`). Sections 4 and 7 give the
+commit port's form in their Metal columns.
 
 ## 1. Build, compiler and method
 
