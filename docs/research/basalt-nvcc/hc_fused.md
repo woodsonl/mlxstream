@@ -461,7 +461,7 @@ of 1,501 rows), its softmax and weights are the instructions `hc_top10` writes b
 rows 33-118), then the warp sum, `MUFU.RCP`, the products, the selected sum, the floor and the second `MUFU.RCP`:
 `FMNMX.FTZ` 22, `FADD.FTZ` 52, `FMUL.FTZ` 33, `MUFU.EX2` 16 and `MUFU.RCP` 2, the counts of `hc_top10`'s main path and
 tail (section 9). Only the operands of the subtraction (`FADD.FTZ v, -m` against `-m, v`) and of the weight's product
-stand in the other order, inside commutative operations. Its selection is ten argmax passes (`:74-92`) with `.FTZ`
+stand in the other order, inside commutative operations. Its selection is ten argmax passes (`:74-96`) with `.FTZ`
 compares (`FSETP.GT.FTZ` 150, `FSETP.GEU.FTZ` and `FSETP.NEU.FTZ` 50 each) where `hc_top10` ranks candidates with
 plain ones: on probabilities that are +0, positive normal or −FLT_MAX the flags agree, and both take the first ten
 (p, e) pairs under `before`'s strict total order (basalt's comment, `hc_fused.cu:811-815`), so the port's top-10 serves
