@@ -26,31 +26,6 @@
 #define STEP_STATE 0
 #endif
 
-// ---- Keys and compares on the bits ----------------------------------------------------------------------------------
-//
-// CUDA's setp and max.f32 without .ftz order subnormals exactly and compare -0 equal to +0; this GPU's <, > and ==
-// read a subnormal as zero (tests/kernels/test_basalt_platform.py), so every compare that orders or selects a float
-// here runs on its bits (tests/kernels/test_basalt_sampler_helpers.py, H.6).
-
-// The order-preserving key of a non-NaN float's bits: a < b exactly when okey(a) < okey(b), and a == b exactly when
-// the keys are equal (-0 and +0 share one key).
-static inline uint okey(uint b) {
-    b = (b == 0x80000000u) ? 0u : b;
-    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
-}
-static inline bool fnan(uint b) { return (b & 0x7fffffffu) > 0x7f800000u; }
-// CUDA's ordered > and < (false when either operand is NaN)
-static inline bool f_gt(uint a, uint b) { return !fnan(a) && !fnan(b) && okey(a) > okey(b); }
-static inline bool f_lt(uint a, uint b) { return !fnan(a) && !fnan(b) && okey(a) < okey(b); }
-
-// CUDA's fmaxf (max.f32 without .ftz): the other operand when one is NaN, 0x7fffffff (NVIDIA's canonical NaN) when
-// both are, else the larger by okey; on -0 against +0 the first operand (no output depends on that zero's sign).
-static inline uint fmaxf_bits(uint a, uint b) {
-    if (fnan(a)) return fnan(b) ? 0x7fffffffu : b;
-    if (fnan(b)) return a;
-    return okey(b) > okey(a) ? b : a;
-}
-
 // ---- IEEE division and fma where a subnormal can occur -------------------------------------------------------------
 //
 // CUDA's div.rn.f32 and fma.rn.f32 in an IEEE-built kernel keep subnormal operands and results; this GPU flushes them,
