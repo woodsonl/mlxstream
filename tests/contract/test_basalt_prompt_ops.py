@@ -1,7 +1,7 @@
 """basalt's prompt-path op kinds (monolith/ops/basalt_prompt.py) as compiler/emit_basalt_prompt.py emits them over the
-synthetic .basalt file of tests/contract/test_basalt_ops.py: both kinds registered and covered; every dispatch equal to
-monolith/kernels.py's builders (function, macros, source, grid, threadgroup, params, written slot), with StepState bound
-at slot 15 and the row macros of the program's form (prompt_rows); no per-step value in a params record (invariant 4);
+synthetic .basalt file of test_basalt_ops.py: both kinds registered and covered; every dispatch equal to kernels.py's
+builders and the handlers' rules (function, macros, source, grid, threadgroup, params, written slot), with StepState at
+slot 15 and the row macros of the program's form (prompt_rows); no per-step value in a params record (invariant 4);
 the GEMM's static slices tiling every product once; Gemm::native's dequantization into the program's one FP16 scratch
 ordered ahead of its products and behind the previous op's; Gemm::bf16_w's BF16 image of an int8 copy (its pack rows
 hc8/<name>/q and /s) the same way, into the same scratch; and each refusal, a valid input with exactly one defect
@@ -41,10 +41,12 @@ PRODUCTS = ((320, 10240), (10240, 320), (4, 10240), (10240, 2560), (6144, 2560),
 
 
 def prompt_graph(g, src, rows=T):
-    """Both kinds at ``rows`` rows: to_f16 of x [rows, 2560] F32, and Gemm::bf16 of xb [rows, 2560] BF16 by the file's
-    two BF16 matrices (128 outputs: two column tiles; 1 output: one partial tile)."""
+    """Both kinds at ``rows`` rows: to_f16 and to_bf16 of x [rows, 2560] F32 (the PLE's key and value operands of one
+    row, prefill.cpp:1534, :1536), and Gemm::bf16 of xb [rows, 2560] BF16 by the file's two BF16 matrices (128 outputs:
+    two column tiles; 1 output: one partial tile)."""
     x = g.input("x", (rows, 2560), F32)
     op(g, "basalt_prompt_convert", [x], [g.value("x16", (rows, 2560), F16)])
+    op(g, "basalt_prompt_convert", [x], [g.value("xbf16", (rows, 2560), BF16)])
     xb = g.input("xb", (rows, 2560), BF16)
     for name in ("mmvf.q", "mmvf.gate"):
         w = weight(g, f"dense/{name}", src)
@@ -83,10 +85,11 @@ FORMS = [(True, T, 128), (True, 17, 128), (False, T, 17), (False, 5, 17)]
 
 @pytest.mark.parametrize("dynamic, rows, t", FORMS, ids=["dynamic", "dynamic-static-rows", "static", "static-rows"])
 def test_dispatches_bind_step_state(src, monkeypatch, dynamic, rows, t):
-    """Every dispatch of both kinds is the builders' and binds (15, step_state, 0) once, with STEP_STATE 1, ROWS_MAX
-    the compiled rows B and T_SRC 0 (dynamic-T, T rows) or T_SRC 2 with T_STATIC_ROWS B. Under a budget of one tile
-    the products split into static slices, one dispatch each in basalt_prompt_gemm_slices' order, each with its own
-    record (row0, col0) and the grid of its block; the conversion is one dispatch over the bound's elements."""
+    """Every dispatch of both kinds is the builders' (source, params, slices) and the handler's (grid, threadgroup,
+    macros) and binds (15, step_state, 0) once, with STEP_STATE 1, ROWS_MAX the compiled rows B and T_SRC 0 (dynamic-T,
+    T rows) or T_SRC 2 with T_STATIC_ROWS B. Under a budget of one tile the products split into static slices, one
+    dispatch each in basalt_prompt_gemm_slices' order, each with its own record (row0, col0) and the grid of its block;
+    each conversion is one dispatch over the bound's elements, its output's dtype choosing CV_BF16."""
     monkeypatch.setattr(kernels, "PROMPT_GEMM_MACS", TILE_K2560)
     g = Graph("step")
     prompt_graph(g, src, rows)
@@ -96,8 +99,9 @@ def test_dispatches_bind_step_state(src, monkeypatch, dynamic, rows, t):
     macros = row_macros(b, not dynamic or rows is not T)
     source = kernels.basalt_prompt_gemm_source().replace(kernels.PRELUDE, kernels.PRELUDE + LAYOUT.to_msl() + "\n", 1)
     # per dispatch: (function, its macro, the value slots, params, grid, label, written slots)
-    want = [("basalt_prompt_convert", {"CV_BF16": "0"}, [(0, "x", 0), (1, "x16", 0)],
-             kernels.basalt_prompt_convert_params(2560), (-(-b * 2560 // 256), 1, 1), "basalt_prompt_convert:to_f16:x", [1])]
+    want = [("basalt_prompt_convert", {"CV_BF16": cv}, [(0, "x", 0), (1, y, 0)],
+             kernels.basalt_prompt_convert_params(2560), (-(-b * 2560 // 256), 1, 1), f"basalt_prompt_convert:{name}:x", [1])
+            for cv, y, name in (("0", "x16", "to_f16"), ("1", "xbf16", "to_bf16"))]
     for name in ("mmvf.q", "mmvf.gate"):
         n = src.entries[f"dense/{name}"].shape[0]
         values = [(0, "xb", 0), (1, *bound[f"dense/{name}"]), (2, f"y.{name}", 0)]
@@ -120,12 +124,12 @@ def test_dispatches_bind_step_state(src, monkeypatch, dynamic, rows, t):
 def test_native_orders_its_stages(src, monkeypatch, dynamic, rows, t):
     """Gemm::native (gemm.cu:169-185): dequant_f16 of the whole matrix into the scratch, then Gemm::f16's product on
     it. Two native ops in a row, the smaller image first (Q6_K 35 x 2560, then Q4_K 70 x 2560), each product sliced
-    under a budget of one tile: every dispatch is the builders' and binds (15, step_state, 0); each op's
-    dequantization (dequant's builders, DQ_OUT 1) comes first and writes the scratch at slot 1, and its slices
-    (GEMM_BF16 0) read the scratch at slot 1; both ops bind the program's one ws.T{t}.prompt_gemm_f16.shared, sized
-    to the larger image. The barrier pass (compiler/barriers.py's conflict rule) puts each op's products behind its
-    dequantization (read after write) and the second dequantization behind the first op's products (write after
-    read), so no product reads another op's image."""
+    under a budget of one tile: every dispatch is the builders' and the handler's and binds (15, step_state, 0); each
+    op's dequantization (dequant's builders, DQ_OUT 1) comes first and writes the scratch at slot 1, and its slices
+    (GEMM_BF16 0) read the scratch at slot 1; both ops bind the program's one ws.T{t}.prompt_gemm_f16.shared, sized to
+    the larger image. The barrier pass (compiler/barriers.py's conflict rule) puts each op's products behind its
+    dequantization (read after write) and the second dequantization behind the first op's products (write after read),
+    so no product reads another op's image."""
     monkeypatch.setattr(kernels, "PROMPT_GEMM_MACS", TILE_K2560)
     names = ("gguf/pair.14.23.0", "gguf/mmvq.12")
     g = Graph("step")
@@ -245,17 +249,17 @@ def test_slices_cover_the_product(monkeypatch, rows, budget):
 
 # ---- refusals: each case's valid input emits, and the same input with its one defect is refused by its own check ---
 
-def gemm(g, src, entry="bf16", w="dense/mmvf.q", x_dtype=BF16, y_dtype=F32, y_extra=0, rows=T):
-    """``basalt_prompt_gemm`` of x [rows, K] by ``w`` into y [rows, N + y_extra]."""
+def gemm(g, src, entry="bf16", w="dense/mmvf.q", x_dtype=BF16, y_dtype=F32, y_extra=0, rows=T, x_rows=None):
+    """``basalt_prompt_gemm`` of x [x_rows (default rows), K] by ``w`` into y [rows, N + y_extra]."""
     wv = weight(g, w, src)
-    x = g.input("x", (rows, wv.shape[1]), x_dtype)
+    x = g.input("x", (rows if x_rows is None else x_rows, wv.shape[1]), x_dtype)
     op(g, "basalt_prompt_gemm", [x, wv], [g.value("y", (rows, wv.shape[0] + y_extra), y_dtype)], entry=entry)
 
 
-def convert(g, x_dtype=F32, y_dtype=F16, y_extra=0):
-    """``basalt_prompt_convert`` of x [T, 64] into y [T, 64 + y_extra]."""
+def convert(g, x_dtype=F32, y_dtype=F16, y_extra=0, y_rows=T):
+    """``basalt_prompt_convert`` of x [T, 64] into y [y_rows, 64 + y_extra]."""
     x = g.input("x", (T, 64), x_dtype)
-    op(g, "basalt_prompt_convert", [x], [g.value("y", (T, 64 + y_extra), y_dtype)])
+    op(g, "basalt_prompt_convert", [x], [g.value("y", (y_rows, 64 + y_extra), y_dtype)])
 
 
 def _gemm(**defect):
@@ -297,16 +301,16 @@ def _f16_blocks(g, src, bad, tmp):
 
 
 def copy_op(g, name, n, k, rows=T, entry="bf16_w", x_dtype=BF16, q_dtype=DType.U8, s_dtype=F16, s_width=None,
-            copy_rows=None, q_format=None):
-    """``basalt_prompt_gemm`` entry ``bf16_w`` (Gemm::bf16_w) of x.<name> [rows, k] BF16 by the int8 copy ``name``,
-    its codes ``hc8/<name>/q`` U8 [n, k] and scales ``hc8/<name>/s`` F16 [n, (k / 32 + 7) & ~7] (the hc lane's pack
-    rows, packs/basalt_hc8.py), into y.<name> [rows, n] F32; the other arguments replace one valid part (``q_format``:
-    the codes a weight of that format, U8 as every weight is). Returns the codes and the scales."""
+            copy_rows=None, q_format=None, x_rows=None):
+    """``basalt_prompt_gemm`` entry ``bf16_w`` (Gemm::bf16_w) of x.<name> [x_rows (default rows), k] BF16 by the int8
+    copy ``name``, its codes ``hc8/<name>/q`` U8 [n, k] and scales ``hc8/<name>/s`` F16 [n, (k / 32 + 7) & ~7] (the hc
+    lane's pack rows, packs/basalt_hc8.py), into y.<name> [rows, n] F32; the other arguments replace one valid part
+    (``q_format``: the codes a weight of that format, U8 as every weight is). Returns the codes and the scales."""
     copy_rows = n if copy_rows is None else copy_rows
     q = (g.weight(f"hc8/{name}/q", (copy_rows, k), q_format) if q_format else
          g.const(f"hc8/{name}/q", (copy_rows, k), q_dtype))
     s = g.const(f"hc8/{name}/s", (copy_rows, (k // 32 + 7) & ~7 if s_width is None else s_width), s_dtype)
-    op(g, "basalt_prompt_gemm", [g.input(f"x.{name}", (rows, k), x_dtype), q, s],
+    op(g, "basalt_prompt_gemm", [g.input(f"x.{name}", (rows if x_rows is None else x_rows, k), x_dtype), q, s],
        [g.value(f"y.{name}", (rows, n), F32)], entry=entry)
     return q, s
 
@@ -344,6 +348,7 @@ REFUSALS = [
     ("product output wider than the weight's rows", _gemm(y_extra=1), r"'y' is f32 \[2, 129\], not f32 \[2, 128\]"),
     ("K not a multiple of 16", _k16, "k must be a positive multiple of 16, got 40"),
     ("rows from n_inject", _gemm(rows=N_INJ), r"'y' has the rows n_inject \(T_SRC 1\)"),
+    ("product rows from two sources", _gemm(rows=2, x_rows=T), r"'x' has the rows T and 'y' 2; a prompt kernel reads"),
     # Gemm::bf16_w: the entry agrees with its inputs; a BF16 matrix without a copy is entry "bf16" (gemm.cu:155)
     ("bf16_w entry on a BF16 matrix", _gemm(entry="bf16_w"), r"entry 'bf16_w' takes 3 inputs, \(x, wq, ws\), got 2"),
     ("bf16 entry on a copy", _copy(entry="bf16"), r"entry 'bf16' takes 2 inputs, \(x, w\), got 3"),
@@ -353,16 +358,16 @@ REFUSALS = [
     ("copy scale rows not srow wide", _copy(s_width=2), r"'hc8/c/s' is f16 \[4, 2\], not f16 \[4, 8\]"),
     ("copy not the product's N x K", _copy(copy_rows=5),
      "prefill gemm: an 8-bit copy is 5 x 64, the product wants 4 x 64"),
+    ("copy rows from two sources", _copy(rows=2, x_rows=T), r"'x.c' has the rows T and 'y.c' 2; a prompt kernel reads"),
     # a copy's rows are pack constants of exactly their bytes: the image reads all of them (hc_fused.cu:1212-1217)
     ("copy codes a weight", _copy(q_format="q8_0"), r"'hc8/c/q' is not a constant; a copy's codes and scales are"),
     ("copy scales a pack slab", _copy(s_slab=True), r"'hc8/c/s' is a pack slab; a copy's codes and scales are"),
     ("copy codes' pack row longer than the codes", _copy(q_extra=256),
      r"the copy's 'hc8/c/q' is 256 bytes of u8 \[4, 64\], but its pack entry holds 512"),
     ("convert to F32", _convert(y_dtype=F32), r"'y' is f32; the output is F16 \(to_f16\) or BF16 \(to_bf16\)"),
-    # the valid to_bf16 op until dequant's bf16_rne_nonan merges into this branch
-    ("convert to BF16 before dequant", _convert(y_dtype=BF16), "bf16_rne_nonan, which this branch does not have yet"),
     ("convert of F16 rows", _convert(x_dtype=F16), r"'x' is f16 \[2, 64\], not f32 \[2, 64\]"),
     ("convert output of another width", _convert(y_extra=1), r"'y' is f16 \[2, 65\], not f16 \[2, 64\]"),
+    ("convert rows from two sources", _convert(y_rows=2), r"'x' has the rows T and 'y' 2; a prompt kernel reads"),
 ]
 
 

@@ -1,7 +1,7 @@
 """basalt's prompt path (docs/design/flash-next.md): one op kind per distinct signature of the kernels a prompt chunk
 runs, ``basalt_prompt_<name>``, each lowered by ``compiler/emit_basalt_prompt.py`` to the dispatches of
-``kernels/common/basalt_prompt_*.metal`` with the macros, grids, threadgroups and params of ``monolith/kernels.py``'s
-builders. Each prompt PR appends its kinds here, with a bullet below.
+``kernels/common/basalt_*.metal``, with the sources and params records of ``monolith/kernels.py``'s builders.
+Each prompt PR appends its kinds here, with a bullet below.
 
 Values. Activations are row-major ``[T, n]``, a token's row after the one before. A weight is the tensor as shipped,
 ``[N, K]`` (N outputs over K inputs): a weight value whose format is the ggml type's name, or, for BF16 rows, a
@@ -11,7 +11,10 @@ slab (as ``ops/basalt.py`` says).
 Rows. T, the first output's rows, is the chunk's row count: ``StepState.t_this_step`` clamped to the compiled bound B
 in the dynamic-T prompt program (``kernels.PROMPT_ROWS``; every grid is encoded at B and a threadgroup past the chunk's
 rows returns before its first barrier), the compiled count in a static one. Rows never come from an attr or a params
-record (invariant 4). Outputs are exactly ``[T, N]``: no ``ldy`` and no ``beta`` (no prompt-path call passes another).
+record (invariant 4). Outputs are exactly ``[T, N]``: no ``ldy`` and no ``beta``. No prompt-path call passes a nonzero
+``beta``. The only ``ldy`` other than N, 96, is passed by the GDN layer's ``ssm_alpha`` and ``ssm_beta`` products of
+48 outputs into one ``ab`` buffer (``src/prefill/prefill.cpp:1587``-``:1588``); the port gives them two ops with
+``[T, 48]`` outputs.
 
 Programs. The dynamic-T prompt program at bound B (one per session; every chunk, the short last one included, runs
 through it) and static programs (the tests') are both accepted; every dispatch binds StepState at slot 15 in both.
@@ -34,8 +37,7 @@ through it) and static programs (the tests') are both accepted; every dispatch b
   of these).
 * ``basalt_prompt_convert`` (``to_f16`` / ``to_bf16``, ``src/prefill/kernels.cu:818-833``): ``(x [T, n] F32)`` →
   ``y [T, n]`` F16 (``to_f16``) or BF16 (``to_bf16``); the output dtype picks the kernel. Element-local, so a row's
-  bits never depend on the chunk. Until dequant's ``bf16_rne_nonan`` merges into this branch, a BF16 output is
-  refused.
+  bits never depend on the chunk.
 
 Alignment, checked at every binding: 2 bytes for 16-bit values, 4 for F32 ones.
 """

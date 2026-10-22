@@ -19,13 +19,14 @@ fix no summation order; the port computes each output as one fp32 fma chain from
 - GM-REF: the product (the handler's slices) against float64 on the same operand bits, ``emu.rel_norm``
   (hc8_parity.cpp:57-61's Err) over every output under hc8_parity.cpp:269's 5e-3, and no output non-finite, at the
   pack's BF16 shapes (Gemm::bf16's own gate, which hc8_parity applies at hc8's shapes) and FP16 ones (Gemm::native's
-  second stage: the nearest bound, as no basalt test launches it), 1, 17 and 512 rows (attn_q's 12288 outputs at 1
-  and 17), activations N(0, 1) and weights 0.02 N(0, 1); and Gemm::native end to end (``gpu.native``: the fp16
-  image, then its product) at 37 rows, Q2_0 (512, 2560), Q4_K (640, 2560) and the ten GGUF types at (64, 2560),
-  against float64 on the exact dequantized weights (gguf_reference.dequantize), so the image's rounding counts; and
-  Gemm::bf16_w (``gpu.prompt_gemm_copy``: the copy's BF16 image, then its product) on hc8_parity's down and up copies,
-  (320, 10240) and (10240, 320), at 1, 37 and 512 rows, against float64 on the image's values (:269 on this entry's
-  product; GM-X holds it against the copy's exact values).
+  second stage: the nearest bound, as no basalt test gates Gemm::f16's product against a reference;
+  prefill_mmq_kq_test.cpp:241, :244 run it off this pack, its error printed, not gated), 1, 17 and 512 rows
+  (attn_q's 12288 outputs at 1 and 17), activations N(0, 1) and weights 0.02 N(0, 1); and Gemm::native end to end
+  (``gpu.native``: the fp16 image, then its product) at 37 rows, Q2_0 (512, 2560), Q4_K (640, 2560) and the ten GGUF
+  types at (64, 2560), against float64 on the exact dequantized weights (gguf_reference.dequantize), so the image's
+  rounding counts; and Gemm::bf16_w (``gpu.prompt_gemm_copy``: the copy's BF16 image, then its product) on
+  hc8_parity's down and up copies, (320, 10240) and (10240, 320), at 1, 37 and 512 rows, against float64 on the
+  image's values (hc8_parity.cpp:269 on this entry's product; GM-X holds it against the copy's exact values).
 
 basalt promises no invariance (cuBLAS picks the kernel per product, hc8_parity.cpp:263); the chain gives each by
 construction, and these gates keep it bit for bit against one whole-product dispatch (``whole``; on a copy, behind
@@ -59,6 +60,13 @@ the fp32 value, is bitwise, and so is this one:
 - G9-F16: n 100 a row at 37 rows of a 64-row bound, ``F16_SPECIALS`` (+-0, fp32 subnormals, 65504, the overflow tie
   65520 and the float below it, +-inf, three NaNs, the fp16-subnormal ties) among fp32 normals from 2^-30 to 2^20,
   bit for bit against emu.cuda_half_bits; the elements past 37 * n keep the 0xFF fill.
+
+The conversion to_bf16 without ylo (src/prefill/kernels.cu:826-833, bf :31-35), the PLE value's operand
+(prefill.cpp:1536), has no basalt test either; bf16_bits_test checks bf16_from_f32 against previous_bf16, whose
+arithmetic is bf's, on the non-NaN inputs only (bf16_bits_test.cpp:30, :57). This one is bitwise on NaNs too:
+- G9-BF16: G9-F16's elements with ``BF16_SPECIALS`` (G9-F16's specials, the low half's carry, the largest float to
+  inf, the fp32 subnormal 0x00018000 kept as 0x0002, a tie that stays even, the NaNs 0x7fffffff and 0xffffffff that
+  wrap to zeros), bit for bit against emu.bf16_bits; the elements past 37 * n keep the 0xFF fill.
 
 Gemm::bf16_w on an int8 hyper-connection copy (src/prefill/gemm.cu:134-156) first writes the copy's BF16 image
 (hc8_dequant_bf16, src/kernels/cuda/hc_fused.cu:1229-1244; kernels/common/basalt_prompt_hc8.metal) into the GEMM
@@ -225,8 +233,8 @@ REF_ROWS += [("copy", None, n, k, b) for n, k in REF_COPY for b in (1, 37, 512)]
 REF_GATE = {   # the bound's standing per entry (ER-D5's label) with hc8_parity.cpp:269's criterion
     True: "hc8_parity.cpp:269, Gemm::bf16's gate at this pack's plain-BF16 shapes: "
           'expect(ex.rel() < 5e-3, "the product against the copy in double");',
-    False: "nearest bound; no basalt test launches Gemm::native or Gemm::f16: hc8_parity.cpp:269 "
-           'expect(ex.rel() < 5e-3, "the product against the copy in double");',
+    False: "nearest bound; no basalt test gates Gemm::native's or Gemm::f16's product against a reference: "
+           'hc8_parity.cpp:269 expect(ex.rel() < 5e-3, "the product against the copy in double");',
     "copy": "hc8_parity.cpp:269, Gemm::bf16_w's own gate, here against its BF16 image's values (GM-X holds it against "
             'the copy\'s exact values): expect(ex.rel() < 5e-3, "the product against the copy in double");',
 }
@@ -540,6 +548,43 @@ def test_to_f16_is_the_conversion():
         "0x7fff); elements past R*n keep 0xFFFF. The nearest basalt check (dequant_f16_parity.cpp:73, the store "
         f"against the rounded fp32 value) is bitwise too (R {R} of B {B}, n {n}): {len(miss)} elements differ, as "
         f"(x, y, want) {[(hex(bits[i * n + j]), hex(y[i, j]), hex(want[i, j])) for i, j in miss[:4]]}; "
+        f"{np.count_nonzero(y[R:] != 0xFFFF)} past R*n written")
+
+
+# G9-BF16's specials, float32 bits: to_bf16's bf16 bits (bf, kernels.cu:31-35: u += 0x7fff + ((u >> 16) & 1) in 32
+# bits, then the high half; no NaN case). G9-F16's (F16_SPECIALS), where 0x807fffff rounds by its bits to -2^-126
+# (0x8080) and 65504 up to 65536; then 0x3f80ffff (the low half's carry), 0x7f7fffff (the largest float, to inf), the
+# fp32 subnormal 0x00018000 (kept: a load keeps its bits; the tie with bit 16 set, to the even 0x0002), the tie
+# 0x3f808000 with bit 16 clear (stays 0x3f80: to even, not away from zero), and the NaNs: sm_120's 0x7fffffff wraps
+# to 0x8000 (-0), 0xffffffff to 0x0000 (+0), the signaling 0x7f800001 to +inf (0x7f80); 0x7fc00000 stays 0x7fc0.
+BF16_SPECIALS = {
+    0x00000000: 0x0000, 0x80000000: 0x8000, 0x00000001: 0x0000, 0x807FFFFF: 0x8080, 0x477FE000: 0x4780,
+    0x477FEFFF: 0x4780, 0x477FF000: 0x4780, 0x7F800000: 0x7F80, 0xFF800000: 0xFF80, 0x7FC00000: 0x7FC0,
+    0xFFFFFFFF: 0x0000, 0x7F800001: 0x7F80, 0x33000000: 0x3300, 0x33C00000: 0x33C0,
+    0x3F80FFFF: 0x3F81, 0x7F7FFFFF: 0x7F80, 0x00018000: 0x0002, 0x3F808000: 0x3F80, 0x7FFFFFFF: 0x8000,
+}
+
+
+def test_to_bf16_is_the_rounding():
+    """G9-BF16: to_bf16 of n 100 floats a row at 37 rows of a 64-row bound, into a y prefilled 0xFF: G9-F16's
+    elements (its seed and normals, the specials at its three places) with BF16_SPECIALS for F16_SPECIALS."""
+    B, R, n = 64, 37, 100
+    rng = np.random.default_rng(73)
+    x = (np.exp2(rng.uniform(-30.0, 20.0, (B, n))) * rng.choice([-1.0, 1.0], (B, n))).astype(F32)
+    bits, sp = x.reshape(-1).view(np.uint32), np.array(list(BF16_SPECIALS), np.uint32)
+    for at in (0, R * n - len(sp), R * n):
+        bits[at:at + len(sp)] = sp
+    want, twin = emu.bf16_bits(x), emu.bf16_bits(sp.view(F32))
+    assert set(F16_SPECIALS) < set(BF16_SPECIALS) and np.array_equal(twin, list(BF16_SPECIALS.values())) \
+        and np.isin(sp, bits[:R * n]).all(), \
+        "G9-F16's specials are not all here, a special is not among the converted elements, or the twin misses its bits"
+    y = gpu.convert(x, bf16=True, B=B, rows=R)
+    miss = np.argwhere(y[:R] != want[:R])
+    assert np.array_equal(y[:R], want[:R]) and (y[R:] == 0xFFFF).all(), (
+        "port: bitwise equal to emu.bf16_bits (bf's integer round to nearest even with no NaN case: its uint64 sum cut "
+        "to 16 bits is bf's 32-bit wrap, so 0x7fffffff -> 0x8000, 0xffffffff -> 0x0000); elements past R*n keep "
+        f"0xFFFF (R {R} of B {B}, n {n}): {len(miss)} elements differ, as (x, y, want) "
+        f"{[(hex(bits[i * n + j]), hex(y[i, j]), hex(want[i, j])) for i, j in miss[:4]]}; "
         f"{np.count_nonzero(y[R:] != 0xFFFF)} past R*n written")
 
 

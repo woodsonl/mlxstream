@@ -12,9 +12,10 @@
 //
 // on the operands widened exactly (h2f; a BF16 field as the high half of a float). Metal's fma reads a subnormal BF16
 // operand as the zero of its sign and flushes a partial sum whose exact value is below 2^-126 (a lone product
-// included): the order is the port's, not basalt code. FP16 operands, products and partial sums are never subnormal
-// (multiples of 2^-24 and 2^-48). A NaN is stored as sm_120's 0x7fffffff (cuda_nan). Each output's bits depend only on
-// its x row, its w row and K: not on the chunk's rows, the tile or the slice that computes it.
+// included): the order is the port's, not basalt code. Widened FP16 operands, their fp32 products and the partial sums
+// are never subnormal in fp32 (nonzero ones are multiples of 2^-24 and 2^-48). A NaN is stored as sm_120's 0x7fffffff
+// (cuda_nan). Each output's bits depend only on its x row, its w row and K: not on the chunk's rows, the tile or the
+// slice that computes it.
 //
 // basalt_prompt_gemm: x [B][K] (bf16 or fp16 bits), w [N][K] (the same type; a BF16 tensor in place or the FP16
 // image), y [B][N] floats. Rows come from StepState through prompt_rows (monolith/kernels.py's PROMPT_ROWS, ahead of
@@ -28,16 +29,21 @@
 // every barrier; stores need t < R and n < N. Grid: (ceil(ncols / 64), nrows / 64) threadgroups of 256 per slice.
 // K % 16 == 0.
 //
-// basalt_prompt_convert: to_f16 (kernels.cu:818-821, hf :40) at CV_BF16 0, x [B][n] floats to y [B][n] fp16 bits.
-// One thread per element of the chunk's rows, i < prompt_rows(st) * n (basalt's launcher, :846-850, runs a grid-stride
-// loop of min(ceil(count / 256), 4096) blocks of 256 over the element count; every element is independent, so the
-// geometry changes no bit).
+// basalt_prompt_convert: to_f16 (kernels.cu:818-821, hf :40) at CV_BF16 0 and to_bf16 without ylo (:826-833, bf
+// :31-35) at CV_BF16 1, x [B][n] floats to y [B][n] fp16 or bf16 bits. One thread per element of the chunk's rows,
+// i < prompt_rows(st) * n (basalt's launchers, :846-850 and :856-860, run a grid-stride loop of
+// min(ceil(count / 256), 4096) blocks of 256 over the element count; every element is independent, so the geometry
+// changes no bit).
 // hf is __float2half_rn: round to nearest even, a finite overflow to inf, fp16 subnormals kept, an fp32 subnormal to
-// the zero of its sign, every NaN to sm_120's 0x7fff (f16_bits, then cuda_nan_f16). Grid: ceil(B * n / 256)
-// threadgroups of 256.
+// the zero of its sign, every NaN to sm_120's 0x7fff (f16_bits, then cuda_nan_f16). bf is integer arithmetic on the
+// loaded bits (bf16_rne_nonan): round to nearest even, a finite value from 0x7f7f8000 in magnitude to inf, an fp32
+// subnormal rounded by its bits (a load and as_type keep them), and no NaN case, so a NaN's bits round like any
+// others, with 32-bit wrap-around: sm_120's 0x7fffffff gives 0x8000 (-0), 0xffffffff 0x0000, 0x7fc00000 0x7fc0. x
+// is only loaded, so it keeps its producer's NaN (a ported kernel stores cuda_nan's) and takes no cuda_nan here.
+// Grid: ceil(B * n / 256) threadgroups of 256.
 //
-// Macros: GEMM_BF16 (1: BF16 operands, 0: FP16), CV_BF16 (0: to_f16), and PROMPT_ROWS' T_SRC, ROWS_MAX and
-// T_STATIC_ROWS.
+// Macros: GEMM_BF16 (1: BF16 operands, 0: FP16), CV_BF16 (0: to_f16, 1: to_bf16), and PROMPT_ROWS' T_SRC, ROWS_MAX
+// and T_STATIC_ROWS.
 #pragma STDC FP_CONTRACT OFF
 
 #ifndef GEMM_BF16
@@ -122,7 +128,7 @@ kernel void basalt_prompt_convert(device const float* x [[buffer(0)]], device us
                                   device const StepState* st [[buffer(15)]], uint i [[thread_position_in_grid]]) {
     if (st->done || i >= prompt_rows(st) * p.n) return;
 #if CV_BF16
-#error "basalt_prompt_convert: only to_f16 (CV_BF16 0) is built"
+    y[i] = bf16_rne_nonan(x[i]);
 #else
     y[i] = cuda_nan_f16(f16_bits(x[i]));
 #endif
