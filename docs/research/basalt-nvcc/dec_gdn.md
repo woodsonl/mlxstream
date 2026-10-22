@@ -57,7 +57,8 @@
   __cuda_sm3x_div_rn_noftz_f32_slowpath`. Result: the correctly rounded IEEE quotient, subnormals kept.
 - Metal names: `kernels/common/basalt_fp.metal` and `kernels/common/basalt_q8_1.metal` on origin/main (`ieee_add`
   `:95`, `ieee_mul` `:108`, `ieee_rcp` `:153`, `ieee_fma` `:167`, `ieee_div` `:181`, `warp_sum_ieee` `:206`,
-  `q8_1_store_native` `:52`); on `origin/woodsonl/basalt-sampler` the `ieee_*` helpers move to `basalt_ieee.metal`.
+  `q8_1_store_native` `:52`); on `origin/woodsonl/basalt-sampler` `ieee_add` and `ieee_mul` move to
+  `basalt_ieee.metal`; `ieee_rcp`, `ieee_fma`, `ieee_div` and `warp_sum_ieee` stay in `basalt_q8_1.metal`.
   Helpers this record calls for that do not exist yet are named in section 6.
 - **Subnormal reachable**: whether an fp32 subnormal can be an operand or the result at that site for some input the
   kernel accepts, with the reason; "immaterial" marks a site where a subnormal can occur but cannot change any output
