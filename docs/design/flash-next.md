@@ -91,8 +91,8 @@ ones this pack runs.
   (`kernels/common/basalt_prompt_gemm.metal`), which, as Metal's `fma` does, reads subnormal BF16 operands as zero and
   flushes every partial sum whose exact value is below 2^-126 (a lone product included): that order is the port's,
   not basalt code, so invariant 5's subnormal emulation does not apply (decided 2026-10-19 for the partial sums; for
-  the operands, 2026-10-20). FP16 operands, products and partial sums are never subnormal (multiples of 2^-24 and
-  2^-48).
+  the operands, 2026-10-20). Widened FP16 operands, their fp32 products and the partial sums are never subnormal in
+  fp32: nonzero operands are multiples of 2^-24, nonzero products and partial sums multiples of 2^-48.
 
 ### Exactness invariants
 

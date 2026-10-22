@@ -12,9 +12,10 @@
 //
 // on the operands widened exactly (h2f; a BF16 field as the high half of a float). Metal's fma reads a subnormal BF16
 // operand as the zero of its sign and flushes a partial sum whose exact value is below 2^-126 (a lone product
-// included): the order is the port's, not basalt code. FP16 operands, products and partial sums are never subnormal
-// (multiples of 2^-24 and 2^-48). A NaN is stored as sm_120's 0x7fffffff (cuda_nan). Each output's bits depend only on
-// its x row, its w row and K: not on the chunk's rows, the tile or the slice that computes it.
+// included): the order is the port's, not basalt code. Widened FP16 operands, their fp32 products and the partial sums
+// are never subnormal in fp32 (nonzero ones are multiples of 2^-24 and 2^-48). A NaN is stored as sm_120's 0x7fffffff
+// (cuda_nan). Each output's bits depend only on its x row, its w row and K: not on the chunk's rows, the tile or the
+// slice that computes it.
 //
 // basalt_prompt_gemm: x [B][K] (bf16 or fp16 bits), w [N][K] (the same type; a BF16 tensor in place or the FP16
 // image), y [B][N] floats. Rows come from StepState through prompt_rows (monolith/kernels.py's PROMPT_ROWS, ahead of

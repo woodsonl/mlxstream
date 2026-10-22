@@ -248,17 +248,17 @@ def test_slices_cover_the_product(monkeypatch, rows, budget):
 
 # ---- refusals: each case's valid input emits, and the same input with its one defect is refused by its own check ---
 
-def gemm(g, src, entry="bf16", w="dense/mmvf.q", x_dtype=BF16, y_dtype=F32, y_extra=0, rows=T):
-    """``basalt_prompt_gemm`` of x [rows, K] by ``w`` into y [rows, N + y_extra]."""
+def gemm(g, src, entry="bf16", w="dense/mmvf.q", x_dtype=BF16, y_dtype=F32, y_extra=0, rows=T, x_rows=None):
+    """``basalt_prompt_gemm`` of x [x_rows (default rows), K] by ``w`` into y [rows, N + y_extra]."""
     wv = weight(g, w, src)
-    x = g.input("x", (rows, wv.shape[1]), x_dtype)
+    x = g.input("x", (rows if x_rows is None else x_rows, wv.shape[1]), x_dtype)
     op(g, "basalt_prompt_gemm", [x, wv], [g.value("y", (rows, wv.shape[0] + y_extra), y_dtype)], entry=entry)
 
 
-def convert(g, x_dtype=F32, y_dtype=F16, y_extra=0):
-    """``basalt_prompt_convert`` of x [T, 64] into y [T, 64 + y_extra]."""
+def convert(g, x_dtype=F32, y_dtype=F16, y_extra=0, y_rows=T):
+    """``basalt_prompt_convert`` of x [T, 64] into y [y_rows, 64 + y_extra]."""
     x = g.input("x", (T, 64), x_dtype)
-    op(g, "basalt_prompt_convert", [x], [g.value("y", (T, 64 + y_extra), y_dtype)])
+    op(g, "basalt_prompt_convert", [x], [g.value("y", (y_rows, 64 + y_extra), y_dtype)])
 
 
 def _gemm(**defect):
@@ -311,9 +311,11 @@ REFUSALS = [
     ("product output wider than the weight's rows", _gemm(y_extra=1), r"'y' is f32 \[2, 129\], not f32 \[2, 128\]"),
     ("K not a multiple of 16", _k16, "k must be a positive multiple of 16, got 40"),
     ("rows from n_inject", _gemm(rows=N_INJ), r"'y' has the rows n_inject \(T_SRC 1\)"),
+    ("product rows from two sources", _gemm(rows=2, x_rows=T), r"'x' has the rows T and 'y' 2; a prompt kernel reads"),
     ("convert to F32", _convert(y_dtype=F32), r"'y' is f32; the output is F16 \(to_f16\) or BF16 \(to_bf16\)"),
     ("convert of F16 rows", _convert(x_dtype=F16), r"'x' is f16 \[2, 64\], not f32 \[2, 64\]"),
     ("convert output of another width", _convert(y_extra=1), r"'y' is f16 \[2, 65\], not f16 \[2, 64\]"),
+    ("convert rows from two sources", _convert(y_rows=2), r"'x' has the rows T and 'y' 2; a prompt kernel reads"),
 ]
 
 

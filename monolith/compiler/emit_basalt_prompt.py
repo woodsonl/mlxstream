@@ -14,7 +14,7 @@ record holds geometry, never a row count, a position or a pointer (invariant 4).
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple
 
 from .. import kernels
 from ..core.dtypes import DType
@@ -28,19 +28,25 @@ if TYPE_CHECKING:
 GEMM_ENTRIES = ("bf16", "native")      # hc8 adds "bf16_w"
 
 
-def prompt_rows(ctx: _Ctx, op: Op, rows_from: Optional[Value] = None) -> Tuple[int, Dict[str, str]]:
+def prompt_rows(ctx: _Ctx, op: Op, rows_from: Optional[Value] = None,
+                same_rows: Sequence[Value] = ()) -> Tuple[int, Dict[str, str]]:
     """``(B, macros)`` of a prompt dispatch: B, the compiled rows of ``op``'s first output (of ``rows_from`` instead, for
     an op whose only output is a placeholder), by ``ctx.rows_of``'s rule, and the macros ``prompt_rows(st)`` reads:
     STEP_STATE 1, ROWS_MAX B, and T_SRC 0 for T rows in a dynamic-T program, T_SRC 2 with T_STATIC_ROWS B for a static
     row count and in a static program (``rows_of`` reports T rows as source 0 there too, but its advance resets
-    t_this_step to 1). Rows from any other StepState field are refused. Every prompt dispatch lists
-    ``(15, ctx.program.step_state, 0)`` itself: ``ctx.add`` appends it in a dynamic-T program only."""
+    t_this_step to 1). Rows from any other StepState field are refused, as is a value of ``same_rows`` (an input the
+    kernel reads row for row) whose rows are not the output's, the same count from the same source. Every prompt
+    dispatch lists ``(15, ctx.program.step_state, 0)`` itself: ``ctx.add`` appends it in a dynamic-T program only."""
     from .emit import ROW_SOURCE, STATIC_ROWS              # emit imports this module: resolved at call time
     v = op.outputs[0] if rows_from is None else rows_from
     rows, src = ctx.rows_of(replace(op, outputs=[v]))
     if src not in (ROW_SOURCE[T], STATIC_ROWS):
         raise ValueError(f"{op.kind}: {v.name!r} has the rows {v.shape[0]} (T_SRC {src}); a prompt kernel's rows are "
                          "the chunk's (T, t_this_step) or a static count")
+    for u in same_rows:
+        if ctx.rows_of(replace(op, outputs=[u])) != (rows, src):
+            raise ValueError(f"{op.kind}: {u.name!r} has the rows {u.shape[0]} and {v.name!r} {v.shape[0]}; a prompt "
+                             "kernel reads and writes the same rows, from one source")
     src = src if ctx.dynamic_t else STATIC_ROWS
     macros = {"STEP_STATE": "1", "T_SRC": str(src), "ROWS_MAX": f"{rows}u"}
     if src == STATIC_ROWS:
@@ -59,7 +65,7 @@ def _gemm(ctx: _Ctx, op: Op) -> None:
     if entry not in GEMM_ENTRIES:
         raise ValueError(f"basalt_prompt_gemm: attr entry must be one of {GEMM_ENTRIES}, got {entry!r}")
     (x, w), (y,) = op.inputs, op.outputs
-    rows, macros = prompt_rows(ctx, op)
+    rows, macros = prompt_rows(ctx, op, same_rows=(x,))
     native = entry == "native"
     tid, n, k = _weight(ctx, op, w, kernels.DEQUANT16_TYPES if native else (GGML_IDS["bf16"],))
     _expect(ctx, op, x, (rows, k), DType.F16 if native else DType.BF16,
@@ -100,7 +106,7 @@ def _convert(ctx: _Ctx, op: Op) -> None:
     """``to_f16`` (``kernels.cu:818-821``) or ``to_bf16`` without ``ylo`` (``:826-833``), as the output's dtype
     says: one thread per element of the bound's rows."""
     (x,), (y,) = op.inputs, op.outputs
-    rows, macros = prompt_rows(ctx, op)
+    rows, macros = prompt_rows(ctx, op, same_rows=(x,))
     n = ctx.shape(x)[-1]
     _expect(ctx, op, x, (rows, n), DType.F32, "the converted rows")
     if y.dtype not in (DType.F16, DType.BF16):
