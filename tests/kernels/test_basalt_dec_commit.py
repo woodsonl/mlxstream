@@ -33,7 +33,9 @@
   the kept rows; its history equals the word copy bit for bit, and at n_keep 0 the layer keeps state0's bits.
   ``[seg-<trial>-<nseg>]``, S11, the bound on the inputs it grades in basalt (:504-551): ``seg_cases``' commits of
   parity_seg's 12 configurations, one segment at a time (D12: no _seg kernel), each segment's 2 layers committed with
-  keep[k] of its T[k] rows, its 8 window rows NaN past T[k]; the same checks per layer.
+  keep[k] of its T[k] rows, its 8 window rows NaN past T[k]; the same checks per layer. Each segment is committed
+  again as basalt dispatches it (:519-523: every recorded array from row0[k]'s row, h_stride R C, gb_stride R HV,
+  mt T[k]), which must equal the dense run bit for bit, as basalt ties that commit to the one es grades (:535).
 - DCM.5, the keep count's edges (none in basalt): ``commit[0]`` of -1, 0 and -2^31 stores nothing but ``used`` = 0,
   and 8 and 100 give the bits of 7, the window's rows, with ``used`` = 7 (basalt clamps to kVerifyMaxT = 8 and would
   read row 7 past this window). The 7-row commit must store: every thread's rows of the state change and every
@@ -181,10 +183,12 @@ def seg_cases(trial, nseg):
     """The commits of parity_seg's configuration (trial, nseg) (dec_gdn_parity.cpp:504-531), one per segment (D12):
     tests/basalt_gdn_ref.py's ``segments`` on its default stream gives the T[k], keep[k] and st0[k] that S8 and S9
     grade; the same stream then draws the recorded inputs in :505-507's order, hL N(0, 0.1), qL N(0, 1), gL and bL
-    N(0, 0.3), CNL layer-major blocks of R = sum(T) rows. Yields per segment k: keep[k], st0[k]'s CNL layers (flat)
-    and its window, h and qkv (CNL, SEG_MT, C), gate and beta (CNL, SEG_MT, HV): each layer's rows row0[k] ..
-    row0[k] + T[k] - 1, then NaN. basalt offsets its pointers by row0[k] with h_stride R * C; the harness binds at
-    offset 0, so the window is repacked to the dense strides at mt 8 (h_stride 8 C, gb_stride 8 HV)."""
+    N(0, 0.3), CNL layer-major blocks of R = sum(T) rows. Yields per segment k: keep[k], st0[k]'s CNL layers (flat),
+    its window repacked to the dense strides at mt 8, h and qkv (CNL, SEG_MT, C), gate and beta (CNL, SEG_MT, HV):
+    each layer's rows row0[k] .. row0[k] + T[k] - 1, then NaN, so a read past them shows; and basalt's own layout
+    (:519-521) as (rows, T[k], R): ``rows`` the four recorded arrays flat from row0[k]'s row, so layer l's rows start
+    l * R rows on, which basalt's commit reads with h_stride R * C and gb_stride R * HV (past a segment's rows lie
+    the next segment's, not NaN)."""
     rng = np.random.default_rng((SEG_SEED, trial, nseg))
     seg = segments(trial, nseg, rng)
     R = sum(seg.T)
@@ -193,7 +197,7 @@ def seg_cases(trial, nseg):
         win = [np.full((CNL, SEG_MT, a.shape[2]), np.nan, np.float32) for a in rec]
         for w, a in zip(win, rec):
             w[:, :t] = a[:, r0:r0 + t]
-        yield seg.keep[k], seg.st0[k].reshape(-1), win
+        yield seg.keep[k], seg.st0[k].reshape(-1), win, ([a.reshape(-1)[r0 * a.shape[2]:] for a in rec], t, R)
 
 
 PROBE = """
@@ -280,17 +284,18 @@ def test_gdn_commit_of_n_rows_equals_n_one_row_commits(gdn):
 
 @pytest.mark.parametrize("case", ["dcp", *SEG_CASES], ids=["dcp", *(f"seg-{t}-{n}" for t, n in SEG_CASES)])
 def test_gdn_commit_state_meets_the_double_reference_and_copies_the_history(case, gdn):
-    # each commit: (what, n_keep, its layers' state0, its window (layers, rows, width) x 4, mt, each layer's reference)
+    # each commit: (what, n_keep, its layers' state0, its window (layers, rows, width) x 4, mt, each layer's reference,
+    # seg_cases' basalt layout or None)
     if case == "dcp":
         win = [a.reshape(NL, MT, -1) for a in (gdn.h, gdn.qkv, gdn.gate, gdn.beta)]     # per layer, MT rows
         refs = [cpu_commit(layer(gdn.state0, l), *(w[l] for w in win), MT) for l in range(NL)]
-        commits = [(f"dcp, n_keep {n}", n, gdn.state0, win, MT, [r[n] for r in refs]) for n in range(MT + 1)]
+        commits = [(f"dcp, n_keep {n}", n, gdn.state0, win, MT, [r[n] for r in refs], None) for n in range(MT + 1)]
     else:
         trial, nseg = case
         commits = ((f"seg-{trial}-{nseg}, segment {k}, keep {n}", n, st0, win, SEG_MT,
-                    [cpu_commit(layer(st0, l), *(w[l] for w in win), n)[n] for l in range(CNL)])
-                   for k, (n, st0, win) in enumerate(seg_cases(trial, nseg)))
-    for what, n, st0, win, mt, refs in commits:
+                    [cpu_commit(layer(st0, l), *(w[l] for w in win), n)[n] for l in range(CNL)], bas)
+                   for k, (n, st0, win, bas) in enumerate(seg_cases(trial, nseg)))
+    for what, n, st0, win, mt, refs, bas in commits:
         st, _ = gdn_gpu.gdn_commit(st0, *win, commit_record(n, 0, mt), c=C, h_v=HV, mt=mt, n_layers=len(refs))
         for l, ref in enumerate(refs):
             got, at = layer(st, l), f"{what}, layer {l}"
@@ -300,6 +305,13 @@ def test_gdn_commit_state_meets_the_double_reference_and_copies_the_history(case
             assert_bits(f"{at}: the history", got[REC:], ref[REC:], CRIT4)
             if n == 0:
                 assert_bits(f"{at}: the state and history", got, layer(st0, l), CRIT4)
+        if bas is not None:      # the segment's commit as basalt dispatches it (:519-523), mt T[k] (keep[k] <= T[k])
+            rows, t, r = bas
+            strided, _ = gdn_gpu.gdn_commit(st0, *rows, commit_record(n, 0, t), c=C, h_v=HV, mt=t, n_layers=CNL,
+                                            strides={"h_stride": r * C, "gb_stride": r * HV})
+            assert_bits(f"{what}: basalt's layout (from row0[k], h_stride R C, gb_stride R HV, R {r}) against the "
+                        "dense one", strided, st, "basalt ties its per-segment commit to the one es grades bitwise, "
+                        ":535")
 
 
 # ---- DCM.5: the keep count's edges ----------------------------------------------------------------------------------
