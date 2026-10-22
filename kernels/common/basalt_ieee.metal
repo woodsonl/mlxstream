@@ -79,7 +79,7 @@ static inline float ieee_mul(float a, float b) {
 // multiply by log2(e) (0x3FB8AA3B), then MUFU.EX2 with an argument below -126 halved and the result squared by an IEEE
 // multiply, so that subnormal results survive; rsqrtf(x) is MUFU.RSQ with a zero or subnormal argument scaled by 2^24
 // and the result by 2^12. fast::exp2 and fast::rsqrt stand in for MUFU.EX2 and MUFU.RSQ; the product, the square and
-// the prescale go through ieee_mul.
+// the 2^24 and 2^12 scalings go through ieee_mul (the halving is exact).
 
 // -x by its bits: the sign flipped, every other bit kept (unary minus on a subnormal is not measured on this GPU)
 static inline float sign_flip(float x) { return as_type<float>(as_type<uint>(x) ^ 0x80000000u); }
@@ -97,9 +97,9 @@ static inline float expf_ieee(float x) {
 }
 
 // rsqrtf(x). small is FSETP.GEU's complement, |x| < 2^-126 ordered: a zero or a subnormal, read from the bits. A
-// scaled result is at least 2^51 in magnitude, infinite or NaN, so the plain postscale is exact.
+// scaled result is at least 2^51 in magnitude, infinite or NaN, so the postscale's ieee_mul is the hardware product.
 static inline float rsqrt_ieee(float x) {
     const bool small = (as_type<uint>(x) & 0x7fffffffu) < 0x00800000u;
     const float r = fast::rsqrt(small ? ieee_mul(x, 0x1p24f) : x);
-    return small ? r * 4096.0f : r;
+    return small ? ieee_mul(r, 4096.0f) : r;
 }
