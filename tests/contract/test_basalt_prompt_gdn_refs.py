@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
-# adapted from basalt (jesdga95/basalt) src/prefill/gdn_rec_parity.cu, src/kernels/dec_gdn_parity.cpp and
-# src/kernels/elementwise_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): the
-# arithmetic of cpu_seg's recurrence and gated norm (dec_gdn_parity.cpp:339-366), elementwise_parity's double softplus
-# (:78-80) and its fixture checks (:82-99), and gdn_rec_parity's hash (mix :373-376), close_to (:559-573) and word
-# count (count_diff :404-409), checked here; W's pass criterion (gdn_rec_parity.cu:585-586) and dec_gdn_parity's
-# ey < 1e-3 (:551) on the fp32 emulation.
+# adapted from basalt (jesdga95/basalt) src/prefill/gdn_rec_parity.cu, src/prefill/kernels.cu,
+# src/kernels/dec_gdn_parity.cpp and src/kernels/elementwise_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
+# (MIT; third_party/NOTICE): the arithmetic of cpu_seg's recurrence and gated norm (dec_gdn_parity.cpp:339-366),
+# elementwise_parity's double softplus (:78-80) and its fixture checks (:82-99), and gdn_rec_parity's hash (mix
+# :373-376), close_to (:559-573) and word count (count_diff :404-409), checked here; W's pass criterion
+# (gdn_rec_parity.cu:585-586), dec_gdn_parity's ey < 1e-3 and ec < 1e-4 (:551) and elementwise_parity's rel <= 1e-6
+# (:116) on the fp32 emulation; gdn_conv_tiled_kernel's taps (kernels.cu:243-249) written out.
 """Host-only checks of the prompt GDN references and fixtures (tests/basalt_prompt_gdn_ref.py); no GPU.
 
 - float64: ``gdn_prompt_ref`` on one token from a zero state is spec T§4.3's closed form, computed head by head: kv =
@@ -21,7 +22,11 @@
   rests on its last bits) and the float64 reference for the recurrence.
 - The fp32 emulation (spec T§4.4): ``rec_emu`` and ``out_norm_emu``, numpy's exp2 and 1/sqrt standing in for the
   GPU's probes, at T = 1, 2, 17, 257 on W's seeds against the float64 reference: W's gate on oc and the state
-  (gdn_rec_parity.cu:585-586) and D-y16's ey < 1e-3 (dec_gdn_parity.cpp:551) on the y16 of the emulated oc.
+  (gdn_rec_parity.cu:585-586) and D-y16's ey < 1e-3 (dec_gdn_parity.cpp:551) on the y16 of the emulated oc. Likewise
+  ``gates_emu``, ``conv_emu`` and ``l2_emu`` against ``gates64`` and ``conv_l2_64``: D-gates' rel <= 1e-6
+  (elementwise_parity.cpp:116) and D-conv's ec < 1e-4 (dec_gdn_parity.cpp:551); the conv split at the history
+  ``conv_tail`` carries, bit for bit; and the conv's taps bit for bit against kernels.cu:243-249 written out in the
+  PTX's order, which a swapped rounded product fails.
 """
 
 import math
@@ -30,10 +35,11 @@ import numpy as np
 import pytest
 
 from tests.basalt_gdn_ref import C, EPS, F32, F64, HK, HV, REC, S, conv_tail, max_err, n_bad
-from tests.basalt_prompt_gdn_ref import (M64, SEED_B, SEED_W, TS, U32, close_to, conv_inputs, diff_words, edge_conv,
-                                         edge_gates, edge_rec, gates64, gates_inputs, gdn_prompt_ref, inputs, mix,
-                                         out_norm_emu, rec_emu)
-from tests.kernels.basalt_emu import L2E, ex2n, expf_ieee, gdn_beta, gdn_conv, gdn_gate, gdn_silu, h2f
+from tests.basalt_prompt_gdn_ref import (M64, SEED_B, SEED_W, TS, U32, close_to, conv_emu, conv_inputs, conv_l2_64,
+                                         cuda_nan, diff_words, edge_conv, edge_gates, edge_rec, gates64, gates_emu,
+                                         gates_inputs, gdn_prompt_ref, inputs, l2_emu, mix, out_norm_emu, rec_emu,
+                                         rel_l1)
+from tests.kernels.basalt_emu import L2E, ex2n, expf_ieee, fma32, gdn_beta, gdn_conv, gdn_gate, gdn_silu, h2f
 
 TINY = 2.0 ** -126
 
@@ -338,3 +344,50 @@ def test_emulation_rec_and_out_norm_against_float64(T):
                                    f"{co_rms:.3g} {co_worst:.3g}, cs {cs_rms:.3g} {cs_worst:.3g}")
     ey = max_err(y, y_ref)
     assert ey < 1e-3, f"`ey < 1e-3` (dec_gdn_parity.cpp:551): ey {ey:.3g}"
+
+
+@pytest.mark.parametrize("T", (1, 2, 17, 257))
+def test_emulation_gates_conv_l2_against_float64(T):
+    """gates_emu, conv_emu and l2_emu with numpy's exp2 and 1/sqrt standing in for the GPU's probes, on D-gates' and
+    D-conv's fixtures (gates_inputs, conv_inputs at seed 27 + i for basalt's width i), against gates64 and conv_l2_64:
+    rel_l1 <= 1e-6 on gate and on beta (elementwise_parity.cpp:116) and ec < 1e-4 on h after the L2
+    (dec_gdn_parity.cpp:551, max_err :403-407); no value is non-finite. And the conv's rows split at r = 1, 2 and
+    T // 2, the second part read from the history conv_tail leaves (gdn_conv_hist_kernel's word copy,
+    kernels.cu:254-263), give the words of one call. The float64 bounds hold for any order of the taps and sums: the
+    next test pins the tap order, the kernel tests every bit."""
+    seed = SEED_W + TS.index(T)
+    alpha, logit, dt, ssm_a = gates_inputs(T, seed)
+    gate, beta = gates_emu(alpha, logit, dt, ssm_a, np.exp2)
+    rg, rb = (rel_l1(want, got) for want, got in zip(gates64(alpha, logit, dt, ssm_a), (gate, beta)))
+    assert rg <= 1e-6 and rb <= 1e-6, ("`if (!(rel <= 1e-6)) ... ++bad;` (elementwise_parity.cpp:116): gate "
+                                       f"{rg:.3g}, beta {rb:.3g}")
+    qkv, conv_w, state = conv_inputs(T, seed)
+    hc = conv_emu(state, qkv, conv_w, np.exp2)
+    h = l2_emu(hc, lambda x: F32(1) / np.sqrt(x))
+    assert [n_bad(a) for a in (gate, beta, h)] == [0, 0, 0], "a non-finite gate, beta or h value"
+    ec = max_err(h, conv_l2_64(state, qkv, conv_w))
+    assert ec < 1e-4, f"`ec < 1e-4` (dec_gdn_parity.cpp:551): ec {ec:.3g}"
+    for r in sorted({1, 2, T // 2} & set(range(1, T))):
+        st = state.copy()
+        st[REC:] = conv_tail(state[REC:], qkv[:r])
+        parts = np.concatenate([conv_emu(state, qkv[:r], conv_w, np.exp2), conv_emu(st, qkv[r:], conv_w, np.exp2)])
+        assert diff_words(parts, hc) == 0, f"split at {r}: the rows after the history conv_tail carries differ"
+
+
+def test_emulation_conv_takes_basalts_taps_in_the_ptx_order():
+    """conv_emu bit for bit against kernels.cu:243-249 written out tap by tap, at row 0 (v0, v1, v2 in the old history)
+    and row 3 (in qkv alone): v0, v1, v2 = input(t - 3), input(t - 2), input(t - 1) with input(u) = u >= 0 ?
+    qkv[u * C + c] : hist[c * 3 + (u + 3)], x = qkv[t * C + c], w0..w3 = w[c * 4 + 0..3], and the PTX's FMUL p, w1,
+    v1; FFMA s, w0, v0, p; FFMA s, w2, v2, s; FFMA s, w3, x, s (prefill_kernels.md section 2), then the SiLU. Tap 0's
+    product rounded alone instead gives other words on both rows, so the check sees the order, which max_err cannot."""
+    qkv, w, state = conv_inputs(4, SEED_W)
+    hist, q, wf, c = state[REC:], qkv.reshape(-1), w.reshape(-1), np.arange(C)
+    h = conv_emu(state, qkv, w, np.exp2)
+    w0, w1, w2, w3 = (wf[c * 4 + k] for k in range(4))
+    for t in (0, 3):
+        v0, v1, v2 = (q[u * C + c] if u >= 0 else hist[c * 3 + (u + 3)] for u in (t - 3, t - 2, t - 1))
+        x = q[t * C + c]
+        want = cuda_nan(gdn_silu(fma32(w3, x, fma32(w2, v2, fma32(w0, v0, w1 * v1))), np.exp2))
+        swap = cuda_nan(gdn_silu(fma32(w3, x, fma32(w2, v2, fma32(w1, v1, w0 * v0))), np.exp2))
+        assert diff_words(h[t], want) == 0, f"row {t}: conv_emu is not basalt's taps in the PTX order"
+        assert diff_words(swap, want) > 0, f"row {t}: the fixture cannot tell tap 0's rounded product from tap 1's"

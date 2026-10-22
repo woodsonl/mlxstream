@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
-# adapted from basalt (jesdga95/basalt) src/prefill/gdn_rec_parity.cu, src/kernels/dec_gdn_parity.cpp and
-# src/kernels/elementwise_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE):
-# gdn_rec_parity's fixture (mix, uni, gauss, fill_gauss, l2_rows, fill_gates :372-403, Inputs :484-505, the widths and
-# seeds :1038-1041), its word count (count_diff :404-409, diff_words :475-482), close_to (:556-573) and the fp32
-# arithmetic of its copies of gdn_rec_wl_kernel and gdn_out_norm_kernel (:236-352, with warp_sum, sigm and hf :44-50);
-# cpu_seg's recurrence and gated norm (dec_gdn_parity.cpp:339-366), make_layer's and parity_seg's conv distributions
-# (:130, :434, :437); elementwise_parity's gate fixture (:59-99) and double softplus gate (:78-80).
+# adapted from basalt (jesdga95/basalt) src/prefill/gdn_rec_parity.cu, src/prefill/kernels.cu,
+# src/kernels/dec_gdn_parity.cpp and src/kernels/elementwise_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
+# (MIT; third_party/NOTICE): gdn_rec_parity's fixture (mix, uni, gauss, fill_gauss, l2_rows, fill_gates :372-403,
+# Inputs :484-505, the widths and seeds :1038-1041), its word count (count_diff :404-409, diff_words :475-482),
+# close_to (:556-573) and the fp32 arithmetic of its copies of gdn_rec_wl_kernel and gdn_out_norm_kernel (:236-352,
+# with warp_sum, sigm and hf :44-50); the fp32 arithmetic of gdn_gates_kernel, gdn_conv_tiled_kernel,
+# gdn_conv_hist_kernel and gdn_l2_kernel (kernels.cu:207-276, with warp_sum :21-25 and sigm :39); cpu_seg's recurrence
+# and gated norm (dec_gdn_parity.cpp:339-366), make_layer's and parity_seg's conv distributions (:130, :434, :437);
+# elementwise_parity's rel_l1 (:38-45), gate fixture (:59-99) and double softplus gate (:78-80).
 """The prompt GDN kernels' host references and fixtures, numpy only (no Metal import), imported as ``from
 tests.basalt_prompt_gdn_ref import ...``. The geometry, ``randn``, ``cpu_seg``, ``max_err``, ``n_bad`` and ``conv_tail``
 are the gdn lane's (tests/basalt_gdn_ref.py) and are used from there, never copied: one float64 module of the GDN
@@ -21,7 +23,7 @@ arithmetic, each lane its own driver; so are the fp32 steps the emulation compos
 - ``gates64``: gdn_gates_kernel's gate and beta (kernels.cu:207-216) in float64, elementwise_parity's reference.
 - ``conv_l2_64``: D-conv's float64 h, ``cpu_seg``'s conv, SiLU and q/k L2 (dec_gdn_parity.cpp:320-338).
 - ``close_to``: W's metric (gdn_rec_parity.cu:556-573); ``diff_words``: B-rec's and B-norm's count of differing raw
-  32-bit words (:404-409, :475-482). Spec T§4.1-4.2.
+  32-bit words (:404-409, :475-482). Spec T§4.1-4.2. ``rel_l1``: D-gates' metric (elementwise_parity.cpp:38-45).
 - The fixtures. ``inputs(T, seed)``: gdn_rec_parity's ``Inputs`` (:484-505) in numpy (spec T§5.2), the hash generator
   ``mix``, ``uni``, ``gauss`` (:373-381) keyed by ``keys``, ``fill_gauss`` (:382-385), the L2 of ``l2_rows`` in float64,
   ``fill_gates`` (:397-403); basalt's widths ``TS`` with seeds ``SEED_B + i`` (B-rec, B-norm) and ``SEED_W + i`` (W).
@@ -31,8 +33,10 @@ arithmetic, each lane its own driver; so are the fp32 steps the emulation compos
 - The fp32 emulation (spec T§4.4), the bit-for-bit tests' reference, on the gdn lane's ``basalt_emu`` steps with
   ``exp2`` and ``rsqrt`` injected (the GPU's fast::exp2 and fast::rsqrt in the kernel tests): ``rec_emu``,
   gdn_rec_wl_kernel's oc and state (kernels.cu:486-585), each column's row sums as wl's 8 lanes of 16-row chains
-  (``LANE_ROWS``) and their ``octet`` butterfly; ``out_norm_emu``, gdn_out_norm_kernel's y16 bits (:609-623). NaNs as
-  sm_120 stores them (``cuda_nan``; 0x7fff).
+  (``LANE_ROWS``) and their ``octet`` butterfly; ``out_norm_emu``, gdn_out_norm_kernel's y16 bits (:609-623);
+  ``gates_emu``, gdn_gates_kernel's gate and beta (:207-216); ``conv_emu``, gdn_conv_tiled_kernel's h (:236-252) in
+  the PTX's tap order; ``l2_emu``, gdn_l2_kernel's (:264-276); gdn_conv_hist_kernel's history (:254-263) is the gdn
+  lane's ``conv_tail``. NaNs as sm_120 stores them (``cuda_nan``; 0x7fff).
 """
 
 import math
@@ -40,8 +44,8 @@ import math
 import numpy as np
 
 from tests.basalt_gdn_ref import C, EPS, F32, F64, HK, HV, REC, S, SF, ZV, cpu_seg, randn
-from tests.kernels.basalt_emu import (RSQRT128, cuda_half_bits, expf_ieee, gdn_delta, gdn_kv, gdn_out, gdn_sq32,
-                                      gdn_sum4, gdn_update)
+from tests.kernels.basalt_emu import (RSQRT128, cuda_half_bits, expf_ieee, gdn_beta, gdn_conv, gdn_delta, gdn_gate,
+                                      gdn_kv, gdn_l2_scale, gdn_out, gdn_silu, gdn_sq32, gdn_sum4, gdn_update)
 
 QH = np.arange(HV) % HK                  # value head hd reads q/k head hd % HK (`const int qh = hd % HK;`)
 U64, U32 = np.uint64, np.uint32
@@ -127,6 +131,16 @@ def diff_words(a, b):
     a, b = (np.ascontiguousarray(v).reshape(-1).view(U32) for v in (a, b))
     assert a.shape == b.shape, f"{a.size} words against {b.size}"
     return int(np.count_nonzero(a != b))
+
+
+def rel_l1(a, b):
+    """rel_l1 (elementwise_parity.cpp:38-45), D-gates' metric: sum |a - b| / sum |a| in float64, the denominator floored
+    at 1e-30, with a the reference and b the result (basalt calls rel_l1(want, got)), both read as float32 as basalt's
+    vectors hold them (want cast to float once, :80). A non-finite value on either side makes it NaN or inf, which
+    `!(rel <= 1e-6)` fails (:116); the sums run in numpy's pairwise order, which moves it by about n 2^-53 relative."""
+    a, b = (np.asarray(v, F32).astype(F64).ravel() for v in (a, b))
+    m = float(np.abs(a).sum())
+    return float(np.abs(a - b).sum()) / (m if m > 1e-30 else 1e-30)
 
 
 def mix(x):                                      # gdn_rec_parity.cu:373-376, x a uint64 array (wraps mod 2^64 as C)
@@ -348,3 +362,37 @@ def out_norm_emu(oc, z, gamma, exp2, rsqrt):
     oc = np.asarray(oc, F32).reshape(-1, HV, S)
     ss = gdn_sum4(*gdn_sq32(oc.reshape(-1, 32)).reshape(-1, 4).T).reshape(-1, HV, 1)
     return cuda_half_bits(gdn_out(oc, ss, EPS, gamma, np.asarray(z, F32).reshape(oc.shape), exp2, rsqrt))
+
+
+def gates_emu(alpha, beta_logit, dt, ssm_a, exp2):
+    """gdn_gates_kernel's gate and beta, float32 (T, HV) each (kernels.cu:207-216, prefill_kernels.md section 2): the
+    gdn lane's gdn_gate, FADD u = alpha + dt, u itself above 20, else log1pf_nv of expf_ieee(u), then FMUL by ssm_a;
+    and gdn_beta, sigm's FMUL by -log2(e), ex2n, FADD 1 and the correctly rounded reciprocal. Inputs as gates64's;
+    every NaN 0x7fffffff."""
+    return cuda_nan(gdn_gate(alpha, dt, ssm_a, exp2)), cuda_nan(gdn_beta(beta_logit, exp2))
+
+
+def conv_emu(state, qkv, conv_w, exp2):
+    """gdn_conv_tiled_kernel's h before the L2, float32 (R, C) (kernels.cu:236-252, prefill_kernels.md section 2;
+    gdn_conv_kernel's :218-231 are the same bits): row t of channel c is gdn_conv of the taps v0, v1, v2 = input(t - 3),
+    input(t - 2), input(t - 1) and x = qkv[t, c] against conv_w[c, 0..3], with input(u) = qkv[u, c] for u >= 0, else
+    the old history hist[c][u + 3], oldest first; in the PTX's order, FMUL p, w1, v1, then FFMA w0 v0, w2 v2 and w3 x;
+    then gdn_silu. A tile's window holds the same values. state (SF floats, the history [C][3] at REC), qkv (R, C),
+    conv_w (C, 4); every NaN 0x7fffffff. The history after the rows (gdn_conv_hist_kernel, :254-263, a word copy) is
+    the gdn lane's conv_tail(state[REC:], qkv)."""
+    hist = np.asarray(state, F32)[REC:].reshape(C, 3)
+    win = np.concatenate([hist.T, np.asarray(qkv, F32).reshape(-1, C)])      # win[t + k] = input(t - 3 + k)
+    w = np.asarray(conv_w, F32).reshape(C, 4).T
+    return cuda_nan(gdn_silu(gdn_conv(win[:-3], win[1:-2], win[2:-1], win[3:], *w), exp2))
+
+
+def l2_emu(h, rsqrt):
+    """gdn_l2_kernel on a copy of the conv's h (R, C) (kernels.cu:264-276, prefill_kernels.md section 2): each q and k
+    head of a row (channels [0, 2 HK S)) times rsqrt_ieee(ss + eps) (gdn_l2_scale), ss its 128 squares as SIMD-group
+    w's butterfly over channels 32 w .. 32 w + 31 (gdn_sq32, warp_sum :21-25), the four sums left to right (gdn_sum4);
+    the v heads keep their words. Returns the copy, every NaN of a q or k head 0x7fffffff."""
+    h = np.array(h, F32).reshape(-1, C)
+    qk = h[:, :2 * HK * S].reshape(-1, S)                                    # one (row, head) per line
+    ss = gdn_sum4(*gdn_sq32(qk.reshape(-1, 32)).reshape(-1, 4).T)[:, None]
+    h[:, :2 * HK * S] = cuda_nan(gdn_l2_scale(qk, ss, EPS, rsqrt)).reshape(len(h), -1)
+    return h
