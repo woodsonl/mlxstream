@@ -943,6 +943,18 @@ def basalt_prompt_convert_params(n: int) -> bytes:
     return struct.pack("<I", n)
 
 
+# ---- basalt's prompt path: GDN (kernels/common/basalt_prompt_gdn.metal; docs/research/basalt-nvcc/prefill_kernels.md) ----
+
+def basalt_prompt_gdn_source() -> str:
+    """basalt's prompt-path GDN kernels (``gdn_gates_kernel``) on the gdn lane's shared GDN steps: the helpers and the
+    steps file ``basalt_gdn_source()`` templates, without that lane's own kernels (``basalt_gdn.metal``), then
+    ``PROMPT_ROWS`` and ``basalt_prompt_gdn.metal``. The model's constants are macros its handlers set: ``GDN_C``,
+    ``GDN_HK``, ``GDN_HV`` and ``GDN_EPS_BITS``."""
+    return (PRELUDE + template("basalt_fp.metal") + template("basalt_ieee.metal") + template("basalt_f64.metal")
+            + template("basalt_ieee_f64.metal") + template("basalt_q8_1.metal") + template("basalt_libdevice.metal")
+            + template("basalt_gdn_steps.metal") + PROMPT_ROWS + template("basalt_prompt_gdn.metal"))
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
