@@ -1123,10 +1123,11 @@ def nv_trig(x, add):
 
 
 # ---- the prompt path's attention row kernels (kernels/common/basalt_prompt_qsa.metal) --------------------------------
-# src/prefill/kernels.cu:726-734 builds with nvcc's IEEE defaults: each product, quotient and sum is numpy's float32
+# src/prefill/kernels.cu:726-758 builds with nvcc's IEEE defaults: each product, quotient and sum is numpy's float32
 # operation and each FFMA fma32, in the order docs/research/basalt-nvcc/prefill_kernels.md section 4 records; the
 # reduction is hc_block_sum and the operation table hc_ops, as for the hyper-connection kernels above. fast::rsqrt has
-# no bit-exact host model: ``rsqrt`` evaluates the GPU's on a float32 array (basalt_prompt_gpu.hc_probe).
+# no bit-exact host model: ``rsqrt`` evaluates the GPU's on a float32 array (basalt_prompt_gpu.hc_probe). The
+# rotation's angle is nv_powf's and nv_trig's above.
 
 def rms_rows_emu(x, w, eps, rsqrt, flush=False):
     """prompt_rms_rows's stores, fp32 bits [rows, cols], for the rows ``x`` [rows, cols] and the weights ``w`` [cols]:
@@ -1144,3 +1145,19 @@ def rms_rows_emu(x, w, eps, rsqrt, flush=False):
         s = np.asarray(rsqrt(add(div(hc_block_sum(ss, flush), F32(cols)), F32(eps))), F32)
         y = mul(mul(s[:, None], x), np.asarray(w, F32))
     return hc_bits(y)
+
+
+def rope_emu(x, c, s, flush=False):
+    """prompt_rope's stores, fp32 bits of ``x``'s shape, for the head rows ``x`` [..., dim] and the angle's cosine and
+    sine ``c``, ``s`` [..., 32], one per pair (broadcast against x's leading axes: one token's for all its heads): with
+    a = x[pair] and b = x[pair + 32], y[pair] = cuda_nan(fma32(c, a, -fl(b s))) and y[pair + 32] = cuda_nan(fma32(c, b,
+    fl(a s))) (kernels.cu:756-757 as the SASS has them: FMUL, then FFMA with the product as its addend), every other
+    dim x's bits. ``flush``: every operation's inputs and result flushed."""
+    fma, _, mul, _ = hc_ops(flush)
+    x = np.asarray(x, F32)
+    a, b = x[..., :32], x[..., 32:64]
+    y = x.view(np.uint32).copy()
+    with np.errstate(over="ignore", invalid="ignore"):         # the inf and NaN entries
+        y[..., :32] = hc_bits(fma(c, a, -mul(b, s)))
+        y[..., 32:64] = hc_bits(fma(c, b, mul(a, s)))
+    return y

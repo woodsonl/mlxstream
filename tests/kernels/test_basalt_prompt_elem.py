@@ -18,6 +18,14 @@ non-finite input) and the inputs must keep their bytes (TA 3.0).
   word equal to the host twin basalt_emu.rms_rows_emu with this GPU's fast::rsqrt, on random rows, TA 3.1's IEEE rows
   (a)-(d) and hc's tie row, each of which a flushing kernel fails (RMS-4); the stored words of rows with an infinite
   or NaN element (RMS-5).
+- RO-1 to RO-4, ``prompt_rope`` (kernels.cu:738-758, rope_kernel<false> at scaling None) at basalt's call shapes
+  (prefill.cpp:1611, :1643, :1646; draft_kv's :1024): against float64 at rope_parity's bound to position 16383, the
+  worst at 32512..32767 printed, not gated (RO-1); every word of every head equal to the host twin
+  basalt_emu.rope_emu with the (c, s) the kernel writes on a probe head (a = 1, b = 0), on random rows, subnormal
+  and tiny rows whose products or results fall into the subnormals, and NaN and infinite entries (RO-2); those (c, s)
+  bitwise equal to the host twins of nv_cosf and nv_sinf of fl32(float(pos) nv_powf(0x3F1AB32B, pair)) at positions
+  0..16383 and KE 8.2's three Payne-Hanek chunks (RO-3, the kernel's own angle); one token alone equal to its rows in
+  a 256-token run, two runs equal and a StepState.done run storing nothing (RO-4).
 
 - RO-5: ``nv_powf(0x3F1AB32B, pair)``, pairs 0..31 (this pack's theta_scale, ``powf(1e7f, -2.0f / 64.0f)``), from a
   probe kernel and from the host twin (basalt_emu.nv_powf), bitwise equal to the 32 words
@@ -380,3 +388,64 @@ def test_rms_rows_nonfinite():
     keep = np.ones(len(got), bool)
     keep[[3, 4]] = False
     assert np.array_equal(got[keep], clean[keep]), "a row without a non-finite element changed"
+
+
+# ---- RO-1 to RO-4: prompt_rope ---------------------------------------------------------------------------------------
+
+# basalt's calls, all with ld = heads * dim (prefill.cpp:1611, :1643, :1646; draft_kv's :1024): name -> (heads, dim,
+# row counts R); a draft_kv batch of nb tokens is R = nb
+ROPE_SHAPES = {"A2": (2, 256, (1, 7, B)), "A6": (24, 256, (1, 7, B)), "A8": (4, 128, (1, 7, B)),
+               "D16": (2, 256, (1, 192))}
+ROPE_GATE = "nearest bound; no basalt test launches this kernel: rope_parity.cpp:400 if (!(rel <= 3e-3)) ++agree_bad;"
+
+
+def rope_fixture(heads, dim, n=B):
+    """TA 3.2's inputs from default_rng(400): x [n, heads * dim] ~ N(0, 1) (rope_parity.cpp:353-367's rows), float32."""
+    return np.random.default_rng(400).standard_normal((n, heads * dim)).astype(F32)
+
+
+def rope(x, heads, dim, R, p0, done=0, finite=True):
+    """prompt_rope on x [B, heads * dim] (HEADS, DIM, THETA_SCALE_BITS 0x3F1AB32B) at bound B with R tokens from
+    position p0 in StepState (and ``done``), B * heads threadgroups of 32, into y of B + 1 token rows of 0xFF bytes.
+    Asserts that x kept its bytes, that every row from token R on (every row, with ``done``) kept the fill and, with
+    ``finite``, that no live word is non-finite. Returns the live rows' words, uint32 [R, heads, dim]."""
+    pso = pgpu.prompt_pipeline(kernels.basalt_prompt_qsa_source(), "prompt_rope", B,
+                               {"HEADS": str(heads), "DIM": str(dim), "THETA_SCALE_BITS": f"{THETA_SCALE:#x}u"})
+    xb = np.ascontiguousarray(x, F32).tobytes()
+    out = pgpu.run_rows(pso, [xb, 4 * (B + 1) * heads * dim], None, 0, (B * heads, 1, 1), (32, 1, 1), R, p0,
+                        fill=0xFF, done=done)
+    assert out[0] == xb, f"{heads} x {dim}: x's bytes changed"
+    y = np.frombuffer(out[1], U32).reshape(B + 1, heads, dim)
+    n = 0 if done else R
+    assert (y[n:] == 0xFFFFFFFF).all(), f"{heads} x {dim} at {R} rows from {p0} (done {done}): token {n} on stored"
+    bad = np.count_nonzero(~np.isfinite(y[:n].view(F32)))
+    assert not (finite and bad), f"{heads} x {dim} at {R} rows from {p0}: {bad} live words not finite"
+    return y[:n]
+
+
+def test_rope_kernel_angle_bit_for_bit():
+    """RO-3 (TA 3.2, KE 8.2), the kernel's own angle: at A2's shape head 0 of every token is a probe row (a = 1, b = 0
+    in all 32 pairs), on which prompt_rope stores y[pair] = fma(c, 1, -(0 s)) = c and y[pair + 32] = fma(c, 0, 1 s) =
+    s exactly; both equal, bitwise, the host twins nv_cosf(th) and nv_sinf(th) of th = fl32(float(pos)
+    nv_powf(0x3F1AB32B, pair)) (basalt_emu.nv_trig and basalt_emu.nv_powf), every pair, at positions 0..16383 (64 runs
+    of 256 tokens at p0 = 256 k) and KE 8.2's three Payne-Hanek chunks (p0 = 105600, 174720 and 261888, the last 256
+    positions of the trained context of 262,144, rope_scaling.hpp:72), whose 1,211 angles of at least 105615 take
+    nv_trig_slow. So it holds what only the kernel decides (p0 + t read from StepState, float() of the position,
+    nv_powf's arguments, nv_cosf and nv_sinf rather than another cosine), which RO-1's 3e-3 would not see;
+    test_rope_angle_bit_for_bit (RO-3h) holds the helpers alone. Every word of both heads equals basalt_emu.rope_emu
+    with the twins' (c, s): the random head 1 is the rotation's check at the Payne-Hanek positions."""
+    heads, dim = ROPE_SHAPES["A2"][:2]
+    x = rope_fixture(heads, dim).reshape(B, heads, dim)
+    x[:, 0, :32], x[:, 0, 32:64] = 1, 0                                     # the probe head
+    p0s = [256 * k for k in range(64)] + list(SLOW_CHUNKS)
+    pos = np.array(p0s)[:, None] + np.arange(B)                             # (run, token)
+    th = pos.astype(F32)[..., None] * emu.nv_powf(U32(THETA_SCALE).view(F32), np.arange(32, dtype=F32))
+    assert int((th.view(U32) >= SLOW_MIN).sum()) == 1211
+    c, s = emu.nv_trig(th, 1), emu.nv_trig(th, 0)
+    for k, p0 in enumerate(p0s):
+        got = rope(x.reshape(B, -1), heads, dim, B, p0)
+        bad = np.argwhere(got[:, 0, :64] != np.concatenate([c[k], s[k]], axis=-1).view(U32))
+        assert not len(bad), (f"p0 {p0}: {len(bad)} probe words differ from the twins' (c, s); the first at token "
+                              f"{bad[0][0]}, {'s' if bad[0][1] >= 32 else 'c'} of pair {bad[0][1] % 32}")
+        bad = np.argwhere(got != emu.rope_emu(x, c[k][:, None], s[k][:, None]))
+        assert not len(bad), f"p0 {p0}: {len(bad)} words differ from the twin, the first at {bad[0]}"
