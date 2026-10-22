@@ -3,13 +3,14 @@
 # adapted from basalt (jesdga95/basalt) src/prefill/gdn_rec_parity.cu, src/kernels/dec_gdn_parity.cpp and
 # src/kernels/elementwise_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE):
 # gdn_rec_parity's fixture (mix, uni, gauss, fill_gauss, l2_rows, fill_gates :372-403, Inputs :484-505, the widths and
-# seeds :1038-1041), its word count (count_diff :404-409, diff_words :475-482) and close_to (:556-573); cpu_seg's
-# recurrence and gated norm (dec_gdn_parity.cpp:339-366), make_layer's and parity_seg's conv distributions (:130, :434,
-# :437); elementwise_parity's gate fixture (:59-99) and double softplus gate (:78-80).
+# seeds :1038-1041), its word count (count_diff :404-409, diff_words :475-482), close_to (:556-573) and the fp32
+# arithmetic of its copies of gdn_rec_wl_kernel and gdn_out_norm_kernel (:236-352, with warp_sum, sigm and hf :44-50);
+# cpu_seg's recurrence and gated norm (dec_gdn_parity.cpp:339-366), make_layer's and parity_seg's conv distributions
+# (:130, :434, :437); elementwise_parity's gate fixture (:59-99) and double softplus gate (:78-80).
 """The prompt GDN kernels' host references and fixtures, numpy only (no Metal import), imported as ``from
 tests.basalt_prompt_gdn_ref import ...``. The geometry, ``randn``, ``cpu_seg``, ``max_err``, ``n_bad`` and ``conv_tail``
 are the gdn lane's (tests/basalt_gdn_ref.py) and are used from there, never copied: one float64 module of the GDN
-arithmetic, each lane its own driver.
+arithmetic, each lane its own driver; so are the fp32 steps the emulation composes (tests/kernels/basalt_emu.py).
 
 - ``gdn_prompt_ref``: the float64 recurrence and gated norm of dec_gdn_parity's ``cpu_seg`` (:339-366) on the prompt
   layout (spec T§4.3), from an h whose q and k heads are already L2-normed. Per token and value head hd, of q/k head
@@ -27,6 +28,11 @@ arithmetic, each lane its own driver.
   ``gates_inputs(T, seed)``: D-gates' (elementwise_parity.cpp:59-99 on T rows) and ``conv_inputs(T, seed)``: D-conv's
   (dec_gdn_parity's distributions), each on ``default_rng(seed)`` (spec K§9.2). P-edge's: ``edge_rec()`` (spec T§5.3,
   E1-E6), ``edge_gates()`` and ``edge_conv()`` (spec K§9.2's gate, beta, conv, L2 and history classes).
+- The fp32 emulation (spec T§4.4), the bit-for-bit tests' reference, on the gdn lane's ``basalt_emu`` steps with
+  ``exp2`` and ``rsqrt`` injected (the GPU's fast::exp2 and fast::rsqrt in the kernel tests): ``rec_emu``,
+  gdn_rec_wl_kernel's oc and state (kernels.cu:486-585), each column's row sums as wl's 8 lanes of 16-row chains
+  (``LANE_ROWS``) and their ``octet`` butterfly; ``out_norm_emu``, gdn_out_norm_kernel's y16 bits (:609-623). NaNs as
+  sm_120 stores them (``cuda_nan``; 0x7fff).
 """
 
 import math
@@ -34,6 +40,8 @@ import math
 import numpy as np
 
 from tests.basalt_gdn_ref import C, EPS, F32, F64, HK, HV, REC, S, SF, ZV, cpu_seg, randn
+from tests.kernels.basalt_emu import (RSQRT128, cuda_half_bits, expf_ieee, gdn_delta, gdn_kv, gdn_out, gdn_sq32,
+                                      gdn_sum4, gdn_update)
 
 QH = np.arange(HV) % HK                  # value head hd reads q/k head hd % HK (`const int qh = hd % HK;`)
 U64, U32 = np.uint64, np.uint32
@@ -279,3 +287,64 @@ def edge_conv():
         words[R - 3 + k, v3[2 * k]] = (0x00000001, 0x80000005, 0x007FFFFF)[k]
         words[R - 3 + k, v3[2 * k + 1]] = 0x7FA00001
     return qkv, w, state
+
+
+# ---- the fp32 emulation (spec T§4.4), the bit-for-bit tests' reference ----------------------------------------------
+# The gdn lane's basalt_emu steps, numpy's IEEE float32 arithmetic with subnormals kept as the IEEE-built kernels.cu,
+# and the injected exp2 and rsqrt: the GPU's fast::exp2 and fast::rsqrt values, or numpy stand-ins on the host.
+
+LANE_ROWS = np.array([[4 * rg + 32 * m + e for m in range(4) for e in range(4)] for rg in range(8)])
+# wl's lane rg of a column's octet: its 16 state rows in chain order, r = 4 m + e (`s[j][4 * m + e]`, kernels.cu:506)
+
+
+def cuda_nan(x):
+    """x with every NaN as sm_120's arithmetic stores it, 0x7fffffff (the kernels' cuda_nan stores; nan.md)."""
+    x = np.asarray(x, F32)
+    return np.where(np.isnan(x), U32(0x7FFFFFFF), x.view(U32)).view(F32)
+
+
+def octet(p):
+    """wl's butterfly over a column's 8 row-group lanes p (8, ...) (kernels.cu:557-559, :570-572): for x = 1, 2, 4 every
+    lane adds its partner's value, FADD own, partner; lane 0's result ((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7))
+    is every lane's (each add commutes)."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        for x in (1, 2, 4):
+            p = p + p[np.arange(8) ^ x]
+    return p[0]
+
+
+def rec_emu(h, gate, beta, state0, exp2):
+    """gdn_rec_wl_kernel's output oc (the un-normed y) and final state in float32 (kernels.cu:486-585; the SASS rows of
+    docs/research/basalt-nvcc/prefill_kernels.md section 2), every value head and column at once, the state held
+    lane-major as st[rg, hd, j, r] = state[LANE_ROWS[rg, r], hd, j]. Per token: g = __expf(gate) (expf_ieee); kv =
+    lane rg's 16-row FFMA chain from +0 (gdn_kv), then the octet butterfly; delta = fma(-g, kv, v) * beta
+    (gdn_delta); s = fma(g, s, k * delta) and o = the lane chain over the updated rows (gdn_update), then the octet
+    butterfly, times 0x3DB504F3. Inputs as gdn_prompt_ref's; returns oc (T, HV, S) and the state (S, HV, S), every NaN
+    0x7fffffff."""
+    h = np.asarray(h, F32).reshape(-1, C)
+    T = h.shape[0]
+    gate, beta = (np.asarray(a, F32).reshape(T, HV) for a in (gate, beta))
+    lanes = lambda x: np.moveaxis(x.reshape(HK, S)[QH][:, LANE_ROWS], 1, 0)[:, :, None]    # (8, HV, 1, 16)
+    st = np.moveaxis(np.asarray(state0, F32).reshape(S, HV, S)[LANE_ROWS], 1, -1)        # (8, HV, S, 16)
+    oc = np.empty((T, HV, S), F32)
+    for t in range(T):
+        q, k = lanes(h[t, :HK * S]), lanes(h[t, HK * S:2 * HK * S])
+        g = expf_ieee(gate[t], exp2)[:, None]
+        delta = gdn_delta(g, octet(gdn_kv(st, k)), h[t, 2 * HK * S:].reshape(HV, S), beta[t][:, None])
+        st, o = gdn_update(st, k, q, g, delta)
+        with np.errstate(over="ignore", invalid="ignore"):
+            oc[t] = octet(o) * RSQRT128
+    out = np.empty((S, HV, S), F32)
+    out[LANE_ROWS] = np.moveaxis(st, -1, 1)
+    return cuda_nan(oc), cuda_nan(out)
+
+
+def out_norm_emu(oc, z, gamma, exp2, rsqrt):
+    """gdn_out_norm_kernel's y16 bits, uint16 (T, HV, S) (kernels.cu:609-623, prefill_kernels.md section 2), every
+    (token, value head) row at once, from oc (T, HV, S) float32: each warp's 32 squares summed by warp_sum's xor 16 .. 1
+    butterfly (gdn_sq32), the four warp sums left to right (gdn_sum4), then gdn_out's gated norm (fma(ss, 2^-7, eps),
+    rsqrt_ieee, the products by gamma and sigm(z) left to right), rounded to FP16 with a NaN as 0x7fff
+    (cuda_half_bits). z as gdn_prompt_ref's."""
+    oc = np.asarray(oc, F32).reshape(-1, HV, S)
+    ss = gdn_sum4(*gdn_sq32(oc.reshape(-1, 32)).reshape(-1, 4).T).reshape(-1, HV, 1)
+    return cuda_half_bits(gdn_out(oc, ss, EPS, gamma, np.asarray(z, F32).reshape(oc.shape), exp2, rsqrt))

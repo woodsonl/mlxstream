@@ -4,7 +4,8 @@
 # src/kernels/elementwise_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): the
 # arithmetic of cpu_seg's recurrence and gated norm (dec_gdn_parity.cpp:339-366), elementwise_parity's double softplus
 # (:78-80) and its fixture checks (:82-99), and gdn_rec_parity's hash (mix :373-376), close_to (:559-573) and word
-# count (count_diff :404-409), checked here.
+# count (count_diff :404-409), checked here; W's pass criterion (gdn_rec_parity.cu:585-586) and dec_gdn_parity's
+# ey < 1e-3 (:551) on the fp32 emulation.
 """Host-only checks of the prompt GDN references and fixtures (tests/basalt_prompt_gdn_ref.py); no GPU.
 
 - float64: ``gdn_prompt_ref`` on one token from a zero state is spec T§4.3's closed form, computed head by head: kv =
@@ -18,6 +19,9 @@
   asserts its own; D-conv's non-zero history; P-edge's three reaching every class of spec T§5.3 and K§2-§4, measured
   on the kernels' first float operations or GR's basalt_emu steps, numpy's exp2 standing in for MUFU.EX2 (no class
   rests on its last bits) and the float64 reference for the recurrence.
+- The fp32 emulation (spec T§4.4): ``rec_emu`` and ``out_norm_emu``, numpy's exp2 and 1/sqrt standing in for the
+  GPU's probes, at T = 1, 2, 17, 257 on W's seeds against the float64 reference: W's gate on oc and the state
+  (gdn_rec_parity.cu:585-586) and D-y16's ey < 1e-3 (dec_gdn_parity.cpp:551) on the y16 of the emulated oc.
 """
 
 import math
@@ -25,10 +29,11 @@ import math
 import numpy as np
 import pytest
 
-from tests.basalt_gdn_ref import C, EPS, F32, F64, HK, HV, REC, S, conv_tail
+from tests.basalt_gdn_ref import C, EPS, F32, F64, HK, HV, REC, S, conv_tail, max_err, n_bad
 from tests.basalt_prompt_gdn_ref import (M64, SEED_B, SEED_W, TS, U32, close_to, conv_inputs, diff_words, edge_conv,
-                                         edge_gates, edge_rec, gates64, gates_inputs, gdn_prompt_ref, inputs, mix)
-from tests.kernels.basalt_emu import L2E, ex2n, expf_ieee, gdn_beta, gdn_conv, gdn_gate, gdn_silu
+                                         edge_gates, edge_rec, gates64, gates_inputs, gdn_prompt_ref, inputs, mix,
+                                         out_norm_emu, rec_emu)
+from tests.kernels.basalt_emu import L2E, ex2n, expf_ieee, gdn_beta, gdn_conv, gdn_gate, gdn_silu, h2f
 
 TINY = 2.0 ** -126
 
@@ -310,3 +315,26 @@ def test_fixture_edge_conv_reaches_every_class():
     }
     missing = [name for name, hit in classes.items() if not hit]
     assert not missing, f"not reached: {missing}"
+
+
+# ---- the fp32 emulation (spec T§4.4) -------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("T", (1, 2, 17, 257))
+def test_emulation_rec_and_out_norm_against_float64(T):
+    """rec_emu and out_norm_emu with numpy's exp2 and 1/sqrt standing in for the GPU's fast::exp2 and fast::rsqrt, on
+    inputs(T, 27 + i) (W's seed for basalt's width i), against gdn_prompt_ref: oc and the state meet W's gate through
+    close_to (gdn_rec_parity.cu:585-586), and the y16 of the emulation's own oc, widened to float, meets D-y16's bound
+    (dec_gdn_parity.cpp:551, max_err :403-407); no value is non-finite. These bounds hold for any order of the row
+    sums: the kernel tests pin the bits."""
+    h, gate, beta, z, gamma, state0 = fx = inputs(T, SEED_W + TS.index(T))
+    oc_ref, y_ref, st_ref = gdn_prompt_ref(*fx)
+    oc, st = rec_emu(h, gate, beta, state0, np.exp2)
+    y = h2f(out_norm_emu(oc, z, gamma, np.exp2, lambda x: F32(1) / np.sqrt(x)))
+    assert [n_bad(a) for a in (oc, st, y)] == [0, 0, 0], "a non-finite oc, state or y16 value"
+    (co_rms, co_worst), (cs_rms, cs_worst) = close_to(oc, oc_ref), close_to(st, st_ref)
+    assert (math.isfinite(co_rms) and math.isfinite(cs_rms) and co_rms < 1e-5 and co_worst < 1e-4 and cs_rms < 1e-5
+            and cs_worst < 1e-4), ("`std::isfinite(co.rms) && std::isfinite(cs.rms) && co.rms < 1e-5 && co.worst < "
+                                   "1e-4 && cs.rms < 1e-5 && cs.worst < 1e-4` (gdn_rec_parity.cu:585-586): co "
+                                   f"{co_rms:.3g} {co_worst:.3g}, cs {cs_rms:.3g} {cs_worst:.3g}")
+    ey = max_err(y, y_ref)
+    assert ey < 1e-3, f"`ey < 1e-3` (dec_gdn_parity.cpp:551): ey {ey:.3g}"
