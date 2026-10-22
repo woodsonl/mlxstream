@@ -5,9 +5,12 @@
 """The emitter's handlers for basalt's prompt path (``monolith/ops/basalt_prompt.py``), merged into ``emit.HANDLERS``.
 Every dispatch binds StepState at slot 15 and reads the chunk's rows only through ``prompt_rows(st)``
 (``kernels.PROMPT_ROWS``; ``Gemm::native``'s dequantization reads none), in the dynamic-T prompt program and in a
-static one; its macros, grid, threadgroup and params come from ``monolith/kernels.py``'s builders only, and a params
-record holds geometry, never a row count, a position or a pointer (invariant 4). The weight checks are
-``native_proj``'s and ``bf16_proj``'s (``prefill.cpp:1188-1199``): the entry must agree with the weight."""
+static one. Its sources, params and the GEMM's and the hyper-connection kinds' slices come from
+``monolith/kernels.py``'s builders, as do the dequantization's ``DQ_TYPE``, ``DQ_OUT``, grid and threadgroup; the row
+macros come from ``prompt_rows``, and ``GEMM_BF16``, ``CV_BF16``, the hyper-connection kinds' ``HC_N``, ``HC_LR``,
+``HC_EPS`` and ``MIX_BF``, and the products', conversions' and hyper-connection kinds' grids and threadgroups from the
+handlers. A params record holds geometry, never a row count, a position or a pointer (invariant 4). The weight checks
+are ``native_proj``'s and ``bf16_proj``'s (``prefill.cpp:1188-1199``): the entry must agree with the weight."""
 
 from __future__ import annotations
 
