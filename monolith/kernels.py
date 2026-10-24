@@ -706,8 +706,8 @@ def basalt_q5k_proxy_params(n_cap: int, *, row0: int = 0, n: int = 0, n_rows: Op
 
 # ---- basalt's sampler (kernels/common/basalt_sampler.metal; docs/research/basalt-nvcc/sampler.md) ---------------
 # The launch rules and records below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/sampler.cu:172, :335,
-# :528-530, :981-1007 and :1057-1060 and include/basalt/kernels/sampler.hpp:15-29 @
-# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+# :528-530, :981-1007 and :1057-1060, include/basalt/kernels/sampler.hpp:15-29 and src/core/verify.cpp:2496-2498 and
+# :2659 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 
 def basalt_sampler_source() -> str:
     """basalt's sampler family: the shared helpers, the software binary64 (``basalt_f64.metal``), libdevice's ``exp``
@@ -724,12 +724,18 @@ BS_AM_CTAS = 8                # bs_greedy_partial's threadgroups per row (basalt
 
 
 def basalt_sampler_mode(greedy: bool, temperature: float, penalty_last_n: int, bias: bool) -> int:
-    """The ``mode`` word of a request (sampler.cu:988-1011): 0 greedy, the cluster argmax alone; 1 greedy with a
-    penalty window or a logit bias, the one-block greedy kernel after it; 2 sampled. Greedy is basalt's
-    ``p.greedy || p.temperature <= 0.0f`` on the float32 the record holds, so a NaN temperature samples."""
-    if greedy or struct.unpack("<f", struct.pack("<f", temperature))[0] <= 0.0:
-        return 1 if penalty_last_n > 0 or bias else 0
-    return 2
+    """The ``mode`` word of a request, as basalt's verify window picks its tokens: 0, the captured greedy pick alone
+    (the cluster argmax); 1, the one-block greedy kernel after it; 2, the sampled path after it. The window samples
+    again only a sampled request (``!greedy && temperature > 0.0f``), a penalty window or a logit bias
+    (src/core/verify.cpp:2496-2498, :2659), through sample_tokens_probe's branch, greedy on ``p.greedy ||
+    p.temperature <= 0.0f`` (sampler.cu:991); both compares on the float32 the record holds. So a NaN temperature,
+    neither above 0 nor at or below it, keeps the greedy pick without a window or a bias and samples with either
+    (inv_t 0, sampler.cu:374); basalt's probe needs a sampled request (verify.cpp:2500), so such a request sets no
+    PROBE."""
+    t = struct.unpack("<f", struct.pack("<f", temperature))[0]
+    if not ((not greedy and t > 0.0) or penalty_last_n > 0 or bias):
+        return 0
+    return 1 if greedy or t <= 0.0 else 2
 
 
 def basalt_sampler_params(vocab: int, t_rows: int, n_blocks: int, hist_len: int, *, mode: int = 0, bias: bool = False,

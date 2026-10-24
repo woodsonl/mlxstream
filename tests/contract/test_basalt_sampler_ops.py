@@ -170,12 +170,16 @@ def test_basalt_sampler_params_refusals_and_min_p():
 
 
 def test_basalt_sampler_mode_table():
+    """The mode rule against basalt's verify window (verify.cpp:2496-2498, :2659; sampler.cu:991)."""
     nan, inf = float("nan"), math.inf
     table = [((True, 1.0, 0, False), 0), ((False, 0.0, 0, False), 0), ((False, -0.0, 0, False), 0),
              ((False, -1.0, 0, False), 0), ((False, -inf, 0, False), 0),
              ((False, 1e-50, 0, False), 0),            # the record's float32 is +0
              ((False, 1e-40, 0, False), 2),            # a float32 subnormal: above 0 on basalt's host
-             ((False, nan, 0, False), 2),              # a NaN temperature samples (the compare is false)
+             ((False, nan, 0, False), 0),              # a NaN temperature is not sampled: the captured greedy pick
+             ((False, nan, H, False), 2),              # with a window the probe's branch runs, and samples it
+             ((False, nan, 0, True), 2),               # (not greedy, and NaN <= 0 is false); with a bias too
+             ((True, nan, H, False), 1),               # greedy with a window: the one-block greedy kernel
              ((True, nan, 0, False), 0), ((False, 1.0, 0, False), 2), ((False, inf, 0, False), 2),
              ((True, 1.0, H, False), 1), ((True, 1.0, 0, True), 1), ((False, 0.0, H, True), 1),
              ((False, 0.0, -5, False), 0),             # penalty_last_n <= 0: no window

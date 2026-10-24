@@ -236,11 +236,12 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   of 1,024 threads a row for the cluster argmax, 1,024 threads for the one-block kernels, 128 for the split part and 32
   for its merge). License: `third_party/BASALT-LICENSE`.
 - `monolith/kernels.py` — adapted from `src/kernels/cuda/sampler.cu:172`, `:335`, `:528-530`, `:981-1007` and
-  `:1057-1060` and `include/basalt/kernels/sampler.hpp:15-29` (MIT): the sampler's sizes (`BS_AM_CTAS`, `BS_SEL_MAX`,
-  `BS_BLOCK`, `BS_SPLIT_MAX_BLOCKS`, `BS_SPLIT_MAX_ROWS`), `sample_tokens_probe`'s greedy branch
-  (`basalt_sampler_mode`), its guards (`basalt_sampler_params`' refusals) and its split rule (`basalt_sampler_path`),
-  `coupled_draft_sample`'s guard (`basalt_coupled_node`) and `SamplerParams`' 72-byte image (`basalt_coupled_params`).
-  License: `third_party/BASALT-LICENSE`.
+  `:1057-1060`, `include/basalt/kernels/sampler.hpp:15-29` and `src/core/verify.cpp:2496-2498` and `:2659` (MIT): the
+  sampler's sizes (`BS_AM_CTAS`, `BS_SEL_MAX`, `BS_BLOCK`, `BS_SPLIT_MAX_BLOCKS`, `BS_SPLIT_MAX_ROWS`), the verify
+  window's resampling gate and `sample_tokens_probe`'s greedy branch (`basalt_sampler_mode`), its guards
+  (`basalt_sampler_params`' refusals) and its split rule (`basalt_sampler_path`), `coupled_draft_sample`'s guard
+  (`basalt_coupled_node`) and `SamplerParams`' 72-byte image (`basalt_coupled_params`). License:
+  `third_party/BASALT-LICENSE`.
 - `kernels/common/basalt_gr_norm.metal` — adapted from `src/kernels/cuda/native_gr_norm.cu:37-100` (MIT):
   `norm_warp_sum`, `weighted_rms_norm` and `native_gr_rms_norm_weighted`'s block choice, written in the rounding
   sequence nvcc compiles for them (`docs/research/basalt-nvcc/ple.md`). License: `third_party/BASALT-LICENSE`.

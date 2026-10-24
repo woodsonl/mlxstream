@@ -29,16 +29,17 @@ its Philox draw, bit for bit basalt's.
   3. ``bs_split_part`` then ``bs_split_merge``, which run only in mode 2. When the build chose the one-block path
      (``kernels.basalt_sampler_path``: more than 64 rows, or more than 64 blocks of 4,096 logits),
      ``bs_sample_one_block`` replaces them.
-* The ``mode`` word (``kernels.basalt_sampler_mode``, basalt's host branch):
+* The ``mode`` word (``kernels.basalt_sampler_mode``, the branch basalt's verify window takes):
 
   ====  ====================================================================  ======================================
   mode  request                                                               dispatches that run
   ====  ====================================================================  ======================================
-  0     greedy, or temperature <= 0 (a NaN temperature samples), no penalty    the cluster pair
-        window, no bias
-  1     greedy with a penalty window (``penalty_last_n > 0``: needs           the cluster pair, then the one-block
-        ``history``) or a bias                                                greedy kernel
-  2     sampled                                                               the cluster pair, then the sampled path
+  0     not sampled (greedy, or temperature not above 0, NaN included), no    the cluster pair
+        penalty window, no bias
+  1     greedy, or temperature <= 0, with a penalty window                    the cluster pair, then the one-block
+        (``penalty_last_n > 0``: needs ``history``) or a bias                 greedy kernel
+  2     sampled (not greedy, temperature > 0), or not greedy with a NaN       the cluster pair, then the sampled path
+        temperature and a penalty window or a bias
   ====  ====================================================================  ======================================
 
   The other dispatches return at their first instruction (``greedy_only`` programs do not emit them).

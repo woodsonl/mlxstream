@@ -541,7 +541,10 @@ Unit `g6_coupled_merge`. One warp; `p` is a register copy of `*dp`, so the tail'
 - **A NaN temperature.** `:805` sends it to the tail, where `:374`'s ordered `FSETP.GT` gives `inv_t = 0`: every
   scaled logit is ±0 or NaN, so the draw is uniform over the kept list, or lands nowhere when a kept entry is
   infinite, a -inf sentinel included (inf · 0 is NaN; section 2.4). The Metal gate must be the unordered form to
-  match. `sample_tokens_probe` makes the same test on the host (`:991`), where the comparison is IEEE as well.
+  match. `sample_tokens_probe` makes the same test on the host (`:991`), where the comparison is IEEE as well. The
+  verify window calls it again only for a sampled request (`temperature > 0.0f`, false for a NaN), a penalty window
+  or a logit bias (`src/core/verify.cpp:2496-2498`, `:2659`), so the target's window samples a NaN temperature only
+  with a window or a bias (`basalt_sampler_mode`).
 - **`:429` reaches subnormals.** `*out_prob` is `f32_of_d(ex[pi])`, a subnormal for a kept entry below 2^-126
   (section 2.4).
 

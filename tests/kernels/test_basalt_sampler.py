@@ -29,8 +29,9 @@ probe on (+Q, sample_tokens_probe: each queried row also writes its query's prob
 - M4.2-3, fixture 4, with A1: the repeat penalty multiplies a negative logit, and the presence penalty is a boolean
   (A1's rows are the ones on which that rule decides the pick, on G-1B and the sampled paths).
 - M5.1-3, fixture 5: temperature 0 (or -1) routes to the argmax whatever ``greedy`` says, and so does greedy at
-  temperature 1 (the mode rule, ``basalt_sampler_mode``, chooses greedy; a NaN temperature samples); the pick is the
-  argmax, never id 0, the row's worst.
+  temperature 1 (the mode rule, ``basalt_sampler_mode``, chooses greedy; so does a NaN temperature without a penalty
+  window or a bias, which basalt's verify window does not sample); the pick is the argmax, never id 0, the row's
+  worst.
 - M6.2, fixture 6: the penalties in the sampled chain turn its picks from [0, 0] to sampled_reference's [3, 2].
 - M7.2-4, fixture 7: min_p 0, 0.5 and 0.9 through the sampled chain pick sampled_reference's token.
 - M8.2, fixture 8: the penalty window is the tail of the history row.
@@ -351,8 +352,9 @@ TEMPERATURE_ZERO = [                     # (greedy, temperature, gate): fixture 
 def test_basalt_sampler_temperature_zero_is_argmax(path, greedy, temperature, gate):
     """M5.1-3 (:957-984), plus temperature -1: rows of -5 with 3.0 at 100 + t and -9.0 at id 0, the worst; the mode
     rule must choose greedy (mode 0), as basalt's ``p.greedy || p.temperature <= 0.0f`` does, and the pick is
-    100 + t. A NaN temperature is not greedy (the host compare is false), so it samples (mode 2)."""
-    assert kernels.basalt_sampler_mode(False, float("nan"), 0, False) == 2
+    100 + t. A NaN temperature is not sampled either (verify.cpp:2496: ``temperature > 0.0f`` is false), so without a
+    window or a bias the window keeps its greedy pick (mode 0)."""
+    assert kernels.basalt_sampler_mode(False, float("nan"), 0, False) == 0
     p = SamplerParams(top_k=0, top_p=1.0, temperature=temperature, greedy=greedy)
     assert kernels.basalt_sampler_mode(p.greedy, p.temperature, p.penalty_last_n, False) == 0, gate
     l = np.full((4, 512), -5, np.float32)
