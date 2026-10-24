@@ -385,6 +385,15 @@ def _routed_blobs_value(g, src, bad, tmp):
     return {}
 
 
+def _routed_blobs_field(g, src, bad, tmp):
+    """The routed experts on blobs in an input of one blob, or in one named after StepState's anchor field, which binds
+    the field (4 of StepState's 176 bytes), not a buffer of its own."""
+    name = "anchor" if bad else "moe.cache"
+    g.input(name, (BLOB,), U8)
+    routed(g, 2, blobs=[name])
+    return {}
+
+
 def gguf_file(directory, shape, type_id=42):
     """A .basalt file whose gguf section holds one tensor ``w`` of ggml type ``type_id`` (Q2_0 unless given) and
     ``shape`` (row-major) as zeros, and a section after it, so that the tensor's window ends on a page inside the
@@ -557,6 +566,16 @@ REFUSALS = [
      rf"blobs 'gguf/w' is q2_0 \[1919, 2560\], {BLOB - 720} bytes; .* at least one blob \({BLOB} bytes\)"),
     ("routed blobs in a weight of no ggml type", _routed_blobs_format,
      r"the weight 'p.w' \(nvfp4 \[1920, 2560\]\) is not a weight or constant \[n_out, n_in\] of ggml type"),
+    ("routed blobs in an input named after a StepState field", _routed_blobs_field,
+     r"blobs 'anchor' binds the program's StepState \(an input named after a StepState field binds the field\)"),
+    *[(f"routed blobs named after the program's {own}", case(r2, {"blobs": ["cache.0"]}, {"blobs": [name]}),
+       rf"the basalt_experts blobs buffer '{name}' is named after the program's {own}; a blobs name that is no graph "
+       "value binds the session's buffer")
+      for name, own in (("step_state", "StepState"), ("ring", "token ring"))],
+    ("routed blobs named after its gate scratch", case(r2, {"blobs": ["cache.0"]},
+                                                       {"blobs": ["ws.T2.basalt_experts.gate.1"]}),
+     r"the program's scratch arena took the name of the basalt_experts blobs buffer 'ws\.T2\.basalt_experts\.gate\.1'; "
+     "a blobs name that is no graph value binds the session's buffer"),
     ("routed out a row short", case(r2, {}, {"out_rows": 19}),
      r"'moe.out' is f32 \[19, 2560\]; .* so out is f32 \[>= T x k_per_tok \(20\), n_embd\]"),
     ("routed out i32", case(r2, {}, {"out_dtype": I32}), r"'moe.out' is i32 \[20, 2560\]; an entry writes the row"),

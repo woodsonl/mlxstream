@@ -29,7 +29,6 @@ from ..core.dtypes import DType
 from ..core.ir import Op, Value
 from ..formats.gguf import GGML_TYPES, ggml_row_bytes
 from ..packs.basalt import BasaltSource
-from ..runtime.program import BufferSpec
 
 if TYPE_CHECKING:
     from .emit import _Ctx
@@ -519,9 +518,10 @@ def _blob_buffers(ctx: _Ctx, op: Op, names: Sequence[str], blob: int) -> List[st
     """The buffers the plan's addresses point into: a graph value's buffer (a ``.basalt`` section's window), the value
     itself holding at least a blob (its own bytes: a window reaches to page boundaries and may hold its neighbours; a
     weight's dtype is its storage byte and its shape counts values, so a weight holds its ggml type's rows, as
-    ``_weight`` takes them and its entry holds them, unless it declares a section's bytes, u8), else a buffer the
-    session allocates (the expert cache), which the program declares with role "host", holding at least a blob, so
-    that Engine requires the session to pass it."""
+    ``_weight`` takes them and its entry holds them, unless it declares a section's bytes, u8) and not StepState (an
+    input named after a StepState field binds the field), else a buffer the session allocates (the expert cache),
+    which the program declares with role "host", holding at least a blob, so that Engine requires the session to pass
+    it; ``_Ctx.host_buffer`` refuses its name when it is, or becomes, one of the program's own buffers'."""
     bufs = []
     for name in names:
         buf = name
@@ -538,9 +538,12 @@ def _blob_buffers(ctx: _Ctx, op: Op, names: Sequence[str], blob: int) -> List[st
                                  f"each address the plan puts in it reaches a whole blob, so it holds at least one "
                                  f"blob ({blob} bytes)")
             buf = ctx.buf(v)[0]
-        spec = ctx.program.buffers.setdefault(buf, BufferSpec(blob, None, "host"))
-        if spec.role == "host":
-            spec.nbytes = max(spec.nbytes, blob)
+            if buf == ctx.program.step_state:
+                raise ValueError(f"basalt_experts: blobs {name!r} binds the program's StepState (an input named after a "
+                                 "StepState field binds the field), not a buffer of its own")
+        else:
+            ctx.host_buffer(name, blob, f"{op.kind} blobs buffer",
+                            "a blobs name that is no graph value binds the session's buffer of that name")
         bufs.append(buf)
     return list(dict.fromkeys(bufs))
 
