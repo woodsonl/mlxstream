@@ -320,18 +320,20 @@ def nbytes(v):
     return int(np.prod(v.shape)) * v.dtype.itemsize
 
 
-def _copy(q_extra=0, s_slab=False, **defect):
+def _copy(q_extra=0, s_pack=None, **defect):
     """A valid Gemm::bf16_w on the 4 x 64 copy c (srow 8), and the same with ``defect``. The pack holds exactly the
     graph's bytes of each constant, laid out as write_pack lays a copy (the codes at byte 256, the scales right after),
     so emit_program's size check passes every case and the handler's own check meets the defect. Or the rows are held
     wrongly, which that check (a constant's aux row too short) does not see: the codes' row ``q_extra`` bytes longer
-    (a wider copy's), or the scales a block-lane-major slab of a second pack (``s_slab``)."""
+    (a wider copy's), or the scales in a second pack (``s_pack``): a block-lane-major slab ("slab") or an aux row
+    ("aux")."""
     def build(g, src, bad, tmp):
         q, s = copy_op(g, "c", 4, 64, **(defect if bad else {}))
         nq = nbytes(q) + (q_extra if bad else 0)
-        if bad and s_slab:
+        if bad and s_pack:
             return {"packs": [pack(tmp, {q.name: (256, nq)}),
-                              pack(tmp.parent / f"{tmp.name}.slab", {s.name: (256, nbytes(s))}, slab=True)]}
+                              pack(tmp.parent / f"{tmp.name}.{s_pack}", {s.name: (256, nbytes(s))},
+                                   slab=s_pack == "slab")]}
         return {"packs": [pack(tmp, {q.name: (256, nq), s.name: (256 + nq, nbytes(s))})]}
     return build
 
@@ -362,7 +364,9 @@ REFUSALS = [
     ("copy rows from two sources", _copy(rows=2, x_rows=T), r"'x.c' has the rows T and 'y.c' 2; a prompt kernel reads"),
     # a copy's rows are pack constants of exactly their bytes: the image reads all of them (hc_fused.cu:1212-1217)
     ("copy codes a weight", _copy(q_format="q8_0"), r"'hc8/c/q' is not a constant; a copy's codes and scales are"),
-    ("copy scales a pack slab", _copy(s_slab=True), r"'hc8/c/s' is a pack slab; a copy's codes and scales are"),
+    ("copy scales a pack slab", _copy(s_pack="slab"), r"'hc8/c/s' is a pack slab; a copy's codes and scales are"),
+    ("copy codes and scales in two packs", _copy(s_pack="aux"),
+     r"the codes 'hc8/c/q' and the scales 'hc8/c/s' are in two packs; a copy's codes and scales are one pack's rows"),
     ("copy codes and scales of two copies", _copy(s_name="hc8/d/s"),
      r"the codes 'hc8/c/q' and the scales 'hc8/d/s' are not one copy's hc8/<name>/q and hc8/<name>/s"),
     ("copy codes' pack row longer than the codes", _copy(q_extra=256),

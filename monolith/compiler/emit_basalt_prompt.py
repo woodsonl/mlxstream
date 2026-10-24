@@ -107,8 +107,8 @@ def _gemm_copy(ctx: _Ctx, op: Op) -> None:
     exits). The image reads every byte of the codes and the scales, so each must be a constant held as rows (not a
     weight, not a pack slab) whose pack row, if a pack holds it, is exactly its bytes, as ``_weight`` requires of a
     weight's rows; basalt's reads stay inside the copy it allocated at its size (``hc_fused.cu:1212-1217``). The codes
-    and the scales must be one copy's, ``hc8/<name>/q`` and ``hc8/<name>/s``, as basalt's are: it finds the copy by
-    the matrix's pointer (``hc8_view``, ``gemm.cu:136``) and reads both from it."""
+    and the scales must be one copy's, ``hc8/<name>/q`` and ``hc8/<name>/s`` of one pack, as basalt's are: it finds
+    the copy by the matrix's pointer (``hc8_view``, ``gemm.cu:136``) and reads both from it."""
     (x, wq, ws), (y,) = op.inputs, op.outputs
     rows, macros = prompt_rows(ctx, op, same_rows=(x,))
     n, k = ctx.shape(y)[-1], ctx.shape(x)[-1]
@@ -130,6 +130,10 @@ def _gemm_copy(ctx: _Ctx, op: Op) -> None:
         if aux is not None and int(aux["nbytes"]) != (need := math.prod(ctx.shape(v)) * v.dtype.itemsize):
             raise ValueError(f"{op.kind}: the copy's {v.name!r} is {need} bytes of {v.dtype.short} "
                              f"{list(ctx.shape(v))}, but its pack entry holds {aux['nbytes']}")
+    homes = [next((i for i, pk in enumerate(ctx.packs) if v.name in pk.aux), None) for v in (wq, ws)]
+    if homes[0] != homes[1]:
+        raise ValueError(f"{op.kind}: the codes {wq.name!r} and the scales {ws.name!r} are in two packs; a copy's "
+                         "codes and scales are one pack's rows")
     img = ctx.scratch("prompt_gemm_f16", 2 * n * k, shared=True)
     kern = ctx.kernel("basalt_hc8_dequant_bf16", kernels.basalt_prompt_hc8_source(), "basalt_hc8_dequant_bf16", {})
     prm = ctx.params("hc8_image", kernels.basalt_hc8_image_params(n, k))
