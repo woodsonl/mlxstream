@@ -321,6 +321,9 @@ def basalt_mmvq_params(n_in: int, n_out: int) -> bytes:
 
 
 # ---- basalt's routed experts for Q2_0 / Q2_0 (kernels/common/basalt_experts.metal; docs/research/basalt-nvcc/experts.md)
+# The layout, the kernel choice, the grids and the scratch are adapted from basalt (jesdga95/basalt)
+# src/kernels/cuda/iq_kernels.cu:2376-2382, :2511-2529 and :2553-2603 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT;
+# third_party/NOTICE).
 
 EXPERT_THREADS = 256        # every expert dispatch: 256-thread threadgroups
 EXPERT_GROUP_ROWS = 24      # basalt's g_dec_gy: the most threadgroup rows a call takes when its caller leaves gy at 0
@@ -382,9 +385,17 @@ def basalt_expert_params(n_embd: int, n_ff: int) -> bytes:
     return struct.pack("<8I", n_embd, n_ff, lay["gu_row"], lay["d_row"], lay["up_off"], lay["down_off"], 0, 0)
 
 
+def basalt_expert_scratch(cap_entries: int, n_ff: int) -> Tuple[int, int, int]:
+    """Bytes of the gate, up and hq scratch for ``cap_entries`` entries: n_ff floats an entry for gate and for up, n_ff
+    / 32 q8_1 blocks for hq (basalt carves them from one scratch at 256-byte boundaries, iq_kernels.cu:2560-2564; the
+    kernels take each as a pointer of its own)."""
+    f = 4 * cap_entries * n_ff
+    return f, f, cap_entries * n_ff // 32 * Q8_1_BLOCK_BYTES
+
+
 # ---- basalt's drafter experts (kernels/common/basalt_s2_experts.metal; docs/research/basalt-nvcc/s2_experts.md) ----
 # The constants and the scratch layout are adapted from basalt (jesdga95/basalt) src/kernels/cuda/s2_expert_grouped.cu
-# :34-46, :554-562, :1085-1122 and src/kernels/cuda/quantize_act.cu:219-238 @ b4c63b55754637f4c72ad53a0f791d425f71eb36
+# :34-46, :554-562, :1076-1122 and src/kernels/cuda/quantize_act.cu:219-238 @ b4c63b55754637f4c72ad53a0f791d425f71eb36
 # (MIT; third_party/NOTICE).
 
 Q8_0_BLOCK_BYTES = 34       # fp16 d, 32 int8 codes
@@ -455,6 +466,9 @@ def basalt_s2_grids(cap_groups: int, cap_entries: int) -> Dict[str, object]:
     basalt_s2_scratch(cap_entries)
     grid = basalt_q8_0_scaled_grid(cap_entries * S2_FF)              # the SwiGLU's too: a thread a value
     return {"gu": (2 * S2_FF // 32, cap_groups), "swiglu": grid, "quant": grid, "down": (S2_H // 64, cap_groups)}
+
+
+S2_RESIDENT_THREADS = 128   # moe_group_resident: one threadgroup of 128 threads, a routed id each (:1080)
 
 
 def basalt_s2_resident_params(n: int, k_per_tok: int, blob: int = S2_BLOB_BYTES) -> bytes:

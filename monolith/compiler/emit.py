@@ -1515,8 +1515,9 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
         raise ValueError(f"emit_program: unknown tail {tail!r}")
     # an arena value no dispatch binds is not allocated: the graph allots the attention's partial workspaces for the
     # two-dispatch kernels, and with v3 (core and merge in one) nothing reads or writes them — the 8B's part_o alone
-    # is 8 MiB per layer at a 32K context
-    bound = {name for op in program.ops for _, name, _ in op.bindings}
+    # is 8 MiB per layer at a 32K context. A value a dispatch reaches only through GPU addresses (its indirect reads
+    # and writes: basalt's expert blobs) is used.
+    bound = {name for op in program.ops for names in op.access() for name in names}
     for name in [n for n, spec in program.buffers.items() if spec.role == "arena" and n not in bound]:
         del program.buffers[name]
     place_barriers(program, barriers)
