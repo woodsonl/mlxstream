@@ -6,6 +6,9 @@ decode op kinds the layer library lowers to (``embed``, ``rmsnorm_stat``, ``norm
 basalt's sampler (``basalt_sample``); kernels bind to them per profile."""
 
 from .registry import OPS, CostModel, KernelBinding, OpDef, register_op
-from . import attention, basalt, basalt_sample, draft, embed, gdn, gemv, moe, norm, sample  # noqa: F401  (registration)
+from . import attention, basalt, basalt_ple, draft, embed, gdn, gemv, moe, norm, sample  # noqa: F401  (registration)
+
+from . import basalt_prompt  # noqa: F401  (registration: basalt's prompt path, ops/basalt_prompt.py)
+from . import basalt_sample  # noqa: F401  (registration: basalt's sampler, ops/basalt_sample.py)
 
 __all__ = ["OPS", "CostModel", "KernelBinding", "OpDef", "register_op"]
