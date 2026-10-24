@@ -15,13 +15,13 @@ same bits. Basalt's router_top10_parity runs its generic ``router_top10``; the c
   ``expf_ftz``) on the four fixtures, the planted tokens (``planted_rows``, one dispatch) and 12 random windows of 8
   tokens; the planted tokens' literal outputs, and every regular token's selected sum at least 2^-9 (so the 2^-14
   floor fires only on the degenerate tokens, whose weights show it: 0xff800000, not +0).
-- HR-WIN: invariant 1 on the kernel alone, bitwise against its own one-token calls (docs/design/flash-next.md:86-91,
-  :185-186): every token of "random normal" with the planted tokens in rows 1, 5, ..., 49, in the windows of tokens
-  0..n-1 (n = 1..8 and 64), of widths 2..8 at row 56 and reversed, hc_fused_parity's window rule
-  (hc_fused_parity.cpp:328, its message :333).
+- HR-WIN: invariant 1 on the kernel alone, bitwise against its own one-token calls (docs/design/flash-next.md,
+  invariant 1, and "How basalt's test tiers carry over to Metal"): every token of "random normal" with the planted
+  tokens in rows 1, 5, ..., 49, in the windows of tokens 0..n-1 (n = 1..8 and 64), of widths 2..8 at row 56 and
+  reversed, hc_fused_parity's window rule (hc_fused_parity.cpp:328, its message :333).
 - HR-RCP: how often the two divisions through the correctly rounded reciprocal, ``p = e / S`` and the weights, differ
   from the correctly rounded quotient, and how often that changes a token's ten ids, on the emulation's intermediates
-  for the four fixtures and the 12 random windows (printed, not gated; docs/design/flash-next.md:135-136).
+  for the four fixtures and the 12 random windows (printed, not gated; docs/design/flash-next.md, invariant 5).
 
 Every test that runs the kernel checks the sentinels (the ids' and weights' row past the window keeps its 0xFF bytes,
 ``gpu.top10``) and counts the weights' non-finite values."""
@@ -160,7 +160,7 @@ def test_reciprocal_division_against_the_correctly_rounded_quotient():
     on route's emulation with the GPU's own ``expf_ftz``, how often each product differs from the correctly rounded
     quotient (numpy's float32 division, flushed), and the tokens whose ten ids change when ranked on the correctly
     rounded ``p``: printed, not gated, as the contract asks: "The tests count how often a quotient through the correctly
-    rounded reciprocal differs from the correctly rounded quotient." (docs/design/flash-next.md:135-136)."""
+    rounded reciprocal differs from the correctly rounded quotient." (docs/design/flash-next.md, invariant 5)."""
     fixtures = {**ref.router_cases(), **random_windows()}           # every token regular
     rank = lambda p: np.argsort(-p, axis=1, kind="stable")[:, :10]   # noqa: E731
     counts = []
