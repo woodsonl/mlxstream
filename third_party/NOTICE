@@ -392,13 +392,16 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   GEMM gate's bound, `expect(ex.rel() < 5e-3, "the product against the copy in double");`, and its use of `Err`
   over the product against double. License: `third_party/BASALT-LICENSE`.
 
-## NVIDIA CUDA Toolkit libdevice (13.0)
+## NVIDIA CUDA Toolkit libdevice (13.0, NVIDIA CUDA Toolkit EULA)
 
 - `kernels/common/basalt_libdevice.metal` and `tests/basalt_sampler_ref.py` (`nv_exp`, `nv_logf`) — transcribed from
-  libdevice's `__nv_exp` and `__nv_logf` (NVIDIA Corporation, CUDA Toolkit 13.0) as nvcc 13.0 (V13.0.48,
-  `-arch=sm_120 -lineinfo -O3 -DNDEBUG`) inlined them into basalt's `src/kernels/cuda/sampler.cu`: their constants and
-  their sequences of binary64 and binary32 operations, read from that PTX (`docs/research/basalt-nvcc/sampler.md`
-  sections 2.5-2.6).
+  libdevice's `__nv_exp` and `__nv_logf` (NVIDIA Corporation, CUDA Toolkit 13.0; NVIDIA CUDA Toolkit EULA) as nvcc
+  13.0 (V13.0.48, `-arch=sm_120 -lineinfo -O3 -DNDEBUG`) inlined them into basalt's `src/kernels/cuda/sampler.cu`:
+  their constants and their sequences of binary64 and binary32 operations, read from that PTX
+  (`docs/research/basalt-nvcc/sampler.md` sections 2.5-2.6). License: the CUDA Toolkit 13.0 End User License
+  Agreement, "License Agreement for NVIDIA Software Development Kits"
+  (https://docs.nvidia.com/cuda/archive/13.0.0/eula/index.html), whose Attachment A lists libdevice
+  (`libdevice.10.bc`) as the NVIDIA Common Device Math Functions Library.
 
 ## Test data
 
