@@ -156,8 +156,8 @@ The sequences shared by many sites:
   2. `rsqrtf` (`rsqrt.approx.f32`, `MUFU.RSQ`) in `gr_norm_rs`, `gr_write_norm_rs`, `gdn_l2`, `gdn_out_norm` and
      `rms_rows`. Metal: `fast::rsqrt`; no argument reaches the subnormal wrapper.
   3. The library `expf`, libdevice's `__nv_expf` inlined, whose one approximate step is `ex2.approx.ftz.f32`, in
-     `route_kernel` (`:642`) and `gate_attn` (`:770`). Metal: the contract's `precise::exp`
-     (`flash-next.md:153`), or `nv_expf`, every other step transcribed, proposed in section 3 for the owner.
+     `route_kernel` (`:642`) and `gate_attn` (`:770`). Metal: `nv_expf`, every other step transcribed
+     (`flash-next.md:153-154`; section 3).
   4. `powf`, libdevice's `__nv_powf` inlined, whose one approximate step is `rcp.approx.ftz.f32`, in `rope` (`:751`).
      Metal: `nv_powf` with `1.0f / x` there; for this pack's theta_scale no result depends on that reciprocal's last
      bits [M] (section 4).
@@ -457,8 +457,7 @@ passes −q, of either sign) t saturates at 1 above about 87.34, where k = 252 a
 with d, every fma step stays normal, and from about 88.72 the scale multiply overflows to +inf on both machines
 (`ex2.approx.ftz` and `fast::exp2` themselves return +inf once f reaches 128).
 
-Metal: the contract maps the library `expf` to `metal::precise::exp` (`flash-next.md:153`); this page proposes
-`nv_expf(d)`, a transcription, for the owner's decision (the paragraph after the code):
+Metal: `nv_expf(d)`, the transcription the contract asks for (`flash-next.md:153-154`), explained after the code:
 
 ```
 float t = saturate(fma(d, as_type<float>(0x3BBB989Du), 0.5f));
@@ -473,16 +472,12 @@ float e = ieee_mul(fast::exp2(f), as_type<float>(uint(k + 1.0f) << 23));
 tiny and e = 1 on both machines, and for k ≠ 126 the fma results are far from the subnormal range (|f| ≥ 2^-48 when
 nonzero). `ex2.approx.ftz` maps to `fast::exp2` (invariant 5); both flush a subnormal input and output, and the
 output is subnormal only for f < −126, d below about −174.7, where e is +0 anyway. The scale multiply is the one
-step that writes a subnormal (k = 0, f < 0), so it is `ieee_mul`. A NaN d gives a NaN e. The contract's table
-maps the library `expf` to `metal::precise::exp` (`flash-next.md:153`), which is a different function:
-`precise::exp` is not `__nv_expf`'s sequence, and the bits then differ wherever the two round differently.
-`nv_expf` reproduces every operation but `ex2.approx`, which follows the contract's own mapping; it extends the
-owner's libdevice decision (`origin/woodsonl/basalt-sampler:kernels/common/basalt_libdevice.metal` transcribes only
-`__nv_exp` and `__nv_logf`), so it needs the owner's sign-off. The deciding fact: that decision covers library functions
-without a correctly rounded Metal counterpart, and Metal does not document its `exp` as correctly rounded (the MSL
-specification gives its math functions ulp bounds). Until the owner decides, the contract's `precise::exp` stands.
-`gate_attn_kernel` (section 4) inlines the same function. The elementwise spec (`spec-kernels-elem.md`) and the hc lane's router spec (§9 Q1) raise the same
-question.
+step that writes a subnormal (k = 0, f < 0), so it is `ieee_mul`. A NaN d gives a NaN e. `nv_expf` reproduces
+every operation but `ex2.approx`, which follows the contract's own mapping. The owner chose the transcription on
+October 24, 2026, for this function and for `powf`, `cosf`, `sinf` and `log1pf`, as for the sampler's `exp` and
+`logf`: Metal's `precise::exp` is a different function, and its bits differ from `__nv_expf`'s wherever the two
+round differently. `gate_attn_kernel` (section 4) inlines the same function. The same choice answers the question
+the elementwise spec (`spec-kernels-elem.md`) and the hc lane's router spec (§9 Q1) raise.
 
 ### `route_kernel<16>` (`:626-664`)
 
@@ -491,7 +486,7 @@ question.
 | `:635` | `v[i] = lg[lane + i * 32]`, i = 0..15 | 16 `LDG`s | the same loads, one SIMD-group per token |
 | `:638` | `mx = fmaxf(mx, v[i])` from `-INFINITY`, i ascending | `FMNMX mx, v0, -INF, !PT`, then `FMNMX` with v1..v15 in order | `fmaxf_bits(mx, v[i])`: the other operand for a NaN, the larger by key. mx is never NaN (−inf if every logit is) |
 | `:639` | `warp_max`: `v = fmaxf(v, __shfl_xor_sync(.., v, o))`, o = 16..1 (`:26-30`) | `SHFL.BFLY`; `FMNMX` | `fmaxf_bits(v, simd_shuffle_xor(v, o))`, o = 16, 8, 4, 2, 1 |
-| `:642` | `v[i] = expf(v[i] - mx)` | `FADD d, v, -mx`, then the sequence above | `nv_expf(v - mx)` as proposed (the contract: `precise::exp`, pending the owner; above); plain `-`: a d that Metal reads differently is so small that e = 1 on both |
+| `:642` | `v[i] = expf(v[i] - mx)` | `FADD d, v, -mx`, then the sequence above | `nv_expf(v - mx)` (above); plain `-`: a d that Metal reads differently is so small that e = 1 on both |
 | `:642` | `sum += v[i]` from `0.0f`, i ascending | `FADD sum, RZ, e0` (0 + e0), then `FADD` with e1..e15 in order | `sum = ieee_add(sum, e)` from `0.0f`, i ascending |
 | `:643` | `1.0f / warp_sum(sum)` | warp_sum; rcp.rn (sigm's fast path, slow path `__cuda_sm20_rcp_rn_f32_slowpath`) | `1.0f / warp_sum_ieee(sum)`. For finite logits the sum is in [1, 512] (the maximum's e is exactly 1), so the reciprocal is normal and Metal's `/` gives its bits; a NaN sum gives NaN |
 | `:645` | `v[i] *= rcp; if (isnan(v[i])) v[i] = -FLT_MAX;` | `FMUL v, e, rcp`; `FSETP.NAN.AND P, PT, \|v\|, \|v\|, PT`; `FSEL v, v, -3.40282346638528859812e+38, !P` | `v = ieee_mul(e, rcp); v = isnan(v) ? -FLT_MAX : v` |
@@ -749,7 +744,7 @@ constants, and ptxas fuses `__nv_expf`'s last multiply with the `1.0f +`.
 
 | Line | Expression | SASS | Metal |
 |---|---|---|---|
-| `:770` | `expf(-q)`, q = `qf[t * 24 * 512 + h * 512 + 256 + d]` | `FFMA.SAT t, q, -R9, 0.5` (R9 = 0x3BBB989D); `FFMA.RM j, t, R11, 12582913` (R11 = 252); `FADD n, j, -12583039`; `IMAD.SHL.U32 s, j, 0x800000`; `FFMA f, q, -1.4426950216293334961, -n`; `FFMA f, q, -1.925963033500011079e-08, f`; `MUFU.EX2 x, f` | `e = nv_expf(-q)` as proposed (the contract: `precise::exp`, pending the owner; section 3): fma(q, −c, 0.5) and fma(−q, c, 0.5) are the same exact value, so the folded negation changes no bit |
+| `:770` | `expf(-q)`, q = `qf[t * 24 * 512 + h * 512 + 256 + d]` | `FFMA.SAT t, q, -R9, 0.5` (R9 = 0x3BBB989D); `FFMA.RM j, t, R11, 12582913` (R11 = 252); `FADD n, j, -12583039`; `IMAD.SHL.U32 s, j, 0x800000`; `FFMA f, q, -1.4426950216293334961, -n`; `FFMA f, q, -1.925963033500011079e-08, f`; `MUFU.EX2 x, f` | `e = nv_expf(-q)` (section 3): fma(q, −c, 0.5) and fma(−q, c, 0.5) are the same exact value, so the folded negation changes no bit |
 | `:770` | `1.0f + e` | `FFMA den, s, x, 1`: the scale multiply s · x and the add in one rounding | `1.0f + e`. s is a power of two, so s · x is exact whenever it is normal and `nv_expf` returns it unrounded; when it is below 2^-126, 1 + it rounds to 1 whichever way it was formed. A product above `FLT_MAX` is +inf on both. So the fused and the unfused forms give the same den, at least 1 |
 | `:770` | `1.0f / den` | rcp.rn: the range test `IADD3`, `LOP3.LUT`, `ISETP.GT.U32`; `MUFU.RCP r, den`; `FFMA d, den, r, -1`; `FADD.FTZ d, -d, -RZ`; `FFMA r, r, d, r`; else `__cuda_sm20_rcp_rn_f32_slowpath` | `ieee_div(1.0f, den)` (`basalt_q8_1.metal:181`, divisor at least 1): r is subnormal for den above 2^126, q below about −87.3, and +0 once den is +inf |
 | `:770` | `a[i] * r` | `FMUL p, a, r` | `ieee_mul(a, r)`: a subnormal r times an infinite a is ±inf in CUDA (stored as fp16 ±inf) but 0 · inf = NaN in Metal. For a finite a (an attention output, at most 65504 in magnitude when V is finite) and any subnormal operand, the product is below 2^-110 and rounds to the fp16 zero of its sign either way |
