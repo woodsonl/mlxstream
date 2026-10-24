@@ -154,12 +154,12 @@ ones this pack runs.
    reciprocal differs from the correctly rounded quotient. For the other approximate operations basalt computes,
    whether a `--use_fast_math` file produces them or an IEEE-built kernel writes them (the list above), the mapping
    is the `metal::fast::` function of the same operation: `fast::exp2` of the product with log2(e) that `__expf` or
-   basalt's PTX forms, `fast::rsqrt` for `rsqrtf` (Table 8.2). MSL has no `log1p`, so `log1pf` gets a helper of its
-   own, and the library `expf` maps to `metal::precise::exp`. One helper serves each operation at every site, so
-   kernels that basalt checks bitwise against each other (`qsa_dec_attn_parity`, `dec_gdn_parity`, and
-   `hc_fused_parity`'s window checks) stay bitwise equal on Metal. Where `MUFU.RCP` is not correctly rounded, where
-   basalt approximates an exponential or a square root (`ex2.approx`, `rsqrtf`), and where it calls `log1pf` or the
-   library `expf`, the Metal result can therefore differ from CUDA's last bits. Basalt's tolerances accept that, and
+   basalt's PTX forms, `fast::rsqrt` for `rsqrtf` (Table 8.2). libdevice's `exp`, `logf`, `expf`, `powf`, `cosf`,
+   `sinf` and `log1pf` are transcribed from the PTX nvcc inlines, each approximate step in them mapped as above. One
+   helper serves each operation at every site, so kernels that basalt checks bitwise against each other
+   (`qsa_dec_attn_parity`, `dec_gdn_parity`, and `hc_fused_parity`'s window checks) stay bitwise equal on Metal. Where
+   `MUFU.RCP` is not correctly rounded and where basalt approximates an exponential or a square root (`ex2.approx`,
+   `rsqrtf`), the Metal result can therefore differ from CUDA's last bits. Basalt's tolerances accept that, and
    invariant 1 still holds, because each Metal kernel rounds the same way at every window width. A stored NaN carries
    sm_120's canonical encoding: the `FADD`, `FMUL`, `FFMA`, `MUFU` and division sequences that make or pass a NaN give
    0x7fffffff, and its hardware fp16 conversion (`__float2half`) gives 0x7fff, where this GPU's arithmetic gives
