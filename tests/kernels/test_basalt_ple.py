@@ -126,7 +126,18 @@ gamma rows and eps = f32(1e-6) (native_ple_postops.cu:352-353, :358), unless sta
 - B-H1 ``test_history_batch_regression``: H1 (ple_parity.cpp:177-214) as written, on basalt_ple_history_batch at count
   1 and bound 256: H1's initial history and 12 tokens (``h1_fixture``), each token's row in row 0 of a normalized
   buffer whose other rows hold 0xFF bytes, the history the GPU returned fed to the next run, each run followed by the
-  host shift (:203-204) and H1's memcmp (:210), then ``++bad;`` (:212)."""
+  host shift (:203-204) and H1's memcmp (:210), then ``++bad;`` (:212).
+- B-CHAIN ``test_batch_equals_chained_rows``: the batch's own claim, "element for element the arithmetic of T calls
+  of native_ple_postops with the history advanced after each" (native_ple_postops.hpp:32-33), byte for byte. One
+  batch (``basalt_ple_gpu.batch``: native_ple_postops_batch's seven launches, native_ple_postops.cu:389-395, at bound
+  256) against T chained one-row calls with the advance after each (``basalt_ple_gpu.postops_chain``, on the decode
+  builds), on every result, normalized, gate and gated row and on the final history, for T in 1, 2, 8, 9, 10, 64 and
+  256: at 8 one old history row survives the chunk, at 9 none does, and at 10 row 9's first tap reads the chunk's row
+  0. Continued chunks, as basalt continues ss.ple.hist across sub-batches and chunks (prefill.cpp:1518-1520,
+  :1540-1541): batch(T1), then batch(T2) fed the history the GPU returned (not H-ORACLE's), against one chain over the
+  T1 + T2 rows from the initial history, for (T1, T2) = (2, 15) and (9, 8). The rows are
+  ``basalt_ple_ref.projected``'s draw at the case's rows on C3's fixtures' norms and taps, synthetic and real, and
+  every compared row is finite."""
 
 import functools
 
@@ -135,8 +146,9 @@ import pytest
 
 from monolith import kernels
 from tests.basalt_ple_ref import (D, DIL, EPS, H, HIST, KERN, KEY_BLOCK, N, ROWS, STAGES, T_MAX, Fixture,
-                                  commit_record, committed, gnorm, h_oracle, host_norm, le, nonfinite, r_contract,
-                                  r_struct, real, real_tensors, rel_l1, synthetic, taps)
+                                  commit_record, committed, gnorm, h_oracle, host_norm, le, nonfinite,
+                                  projected as projected_rows, r_contract, r_struct, real, real_tensors, rel_l1,
+                                  synthetic, taps)
 from tests.contract.gguf_reference import q2_0
 from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_gpu as gpu
@@ -794,3 +806,38 @@ def test_history_batch_regression():
         "B-H1, H1 on basalt_ple_history_batch at count 1: `if (std::memcmp(actual.data(), expected.data(), count * "
         "sizeof(float)) != 0) {` (ple_parity.cpp:210), then `++bad;` (:212): history mismatch after token "
         f"{bad}")
+
+
+# ---- B-CHAIN: the prompt path's batch against chained one-row calls (native_ple_postops.hpp:32-38) -----------------
+CHAINS = {  # case: the rows of its chunks, run in turn at bound BOUND, each fed the history the one before returned
+    **{f"T={t}": (t,) for t in (1, 2, 8, 9, 10, 64, BOUND)},    # 8, 9, 10: across the history's boundary
+    "T=2+15": (2, 15),      # the second chunk reads seven initial history rows and two of the first chunk's
+    "T=9+8": (9, 8),        # the second chunk reads the first chunk's rows only, through the history
+}
+CHAIN_STAGES = ("result", "normalized", "gate", "gated")
+
+
+@pytest.mark.parametrize("name", list(FIXTURES))
+@pytest.mark.parametrize("case", list(CHAINS))
+def test_batch_equals_chained_rows(case, name):
+    chunks = CHAINS[case]
+    fx, key, value = projected_rows(block(name)[0], sum(chunks))     # C3's fixture's norms and taps
+    hist = np.ascontiguousarray(fx.hist.T).ravel()
+    want = ple_gpu.postops_chain(key, value, fx.hidden, hist, fx)
+    wrong, nf, t0 = [], [], 0
+    for i, t in enumerate(chunks):
+        rows = slice(t0, t0 + t)
+        got = ple_gpu.batch(key[rows], value[rows], fx.hidden[rows], hist, fx, t, BOUND)
+        hist = got["hist"]                        # the GPU's bytes, as basalt's ss.ple.hist stays on device
+        wrong += [(i, k, r) for k in CHAIN_STAGES for r in range(t) if got[k][r].tobytes() != want[k][t0 + r].tobytes()]
+        nf += [(i, k, nonfinite(got[k][:t])) for k in CHAIN_STAGES if nonfinite(got[k][:t])]
+        t0 += t
+    wrong += [] if hist.tobytes() == want["hist"][-1].tobytes() else ["history"]
+    nf += [("history", nonfinite(hist))] if nonfinite(hist) else []
+    assert not wrong and not nf, (
+        "B-CHAIN, the batch's claim, \"element for element the arithmetic of T calls of native_ple_postops with the "
+        "history advanced after each\" (native_ple_postops.hpp:32-33), byte for byte: the batch (a chunk continued "
+        "from the one before, fed its GPU history as returned) against the one-row calls chained over all the rows "
+        f"from the initial history, on every result, normalized, gate and gated row and on the final history: {case} "
+        f"[{name}]: (chunk, stage, row) {wrong[:8]} of {len(wrong)} differ; and every compared row finite on this "
+        f"finite fixture: (chunk, stage, non-finite) {nf}")

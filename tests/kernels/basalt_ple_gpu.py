@@ -6,7 +6,8 @@ binding between GUARD bytes of 0xA5 (basalt's guards, ple_parity.cpp:178-190). `
 row, as the window op dispatches it: main's q8_1, mmvq and mmvf, then the block's kernels. The prompt path's five
 entries (``*_batch``: the prompt builds of the norm and the gate, and the three batch kernels) compile through
 basalt_prompt_gpu.prompt_pipeline at the bound B of their exact-size buffers and run on its run_rows, the chunk's rows
-in StepState at slot 15."""
+in StepState at slot 15. ``batch`` runs native_ple_postops_batch's seven launches on them, and ``postops_chain``, its
+oracle, the decode kernels after the projections, row by row with the history's advance after each."""
 
 import numpy as np
 
@@ -353,3 +354,80 @@ def history_batch(hist, normalized, rows, done=0):
     out = _batch("basalt_ple_history_batch", "history", len(normalized),
                  [_words(hist, HS).tobytes(), normalized.tobytes()], None, rows, done)
     return np.frombuffer(out[0], np.uint32)
+
+
+def batch(key, value, hidden, hist, w, rows, b):
+    """native_ple_postops_batch (native_ple_postops.cu:382-397) as the handler dispatches it, on the wrappers above at
+    bound ``b`` with ``rows`` (t_this_step) in StepState: basalt's seven launches in order (:389-395), the key norm
+    into its own rows where basalt normalizes the key in place (:389), the query norm and then the conv norm each into
+    rows of normalized values (basalt's query_norm holds both, :390, :393), the result out of place where basalt adds
+    into hidden (:394), then the history (:395). The raw keys ``key`` and the hidden rows ``hidden`` (rows of PLE_D
+    values) and the values ``value`` (rows of PLE_N) fill the leading rows of their b-row inputs, whose other rows hold
+    0xFF bytes; ``hist`` is the history (HS values in basalt's layout), ``w`` holds the norms and taps
+    (tests.basalt_ple_ref.Fixture's w_nk, w_nq, w_nc and conv1d). Returns a dict of float32: ``key_norm``,
+    ``normalized`` (the conv norm's), ``gated`` and ``result`` (b, PLE_D), ``gate`` (b, PLE_H), and ``hist``, the
+    history after the run (HS)."""
+    def inputs(a, n):
+        a = _words(a, n)
+        assert len(a) <= b, (a.shape, b)
+        return np.concatenate([a, np.full((b - len(a), n), 0xFFFFFFFF, np.uint32)])
+
+    key, hidden, value = inputs(key, kernels.PLE_D), inputs(hidden, kernels.PLE_D), inputs(value, kernels.PLE_N)
+    key_norm = gr_norm_batch(key, w.w_nk, rows)                                       # :389
+    query = gr_norm_batch(hidden, w.w_nq, rows)                                       # :390
+    gate = gate_batch(key_norm, query, rows)                                          # :391
+    gated = broadcast_batch(value, gate, rows)                                        # :392
+    normalized = gr_norm_batch(gated, w.w_nc, rows)                                   # :393
+    result = conv_batch(hist, normalized, w.conv1d, hidden, gated, rows)              # :394
+    return {"key_norm": key_norm, "gate": gate, "gated": gated, "normalized": normalized, "result": result,
+            "hist": history_batch(hist, normalized, rows).view(np.float32)}           # :395
+
+
+def postops_chain(key, value, hidden, hist, w):
+    """The batch's oracle, its header's claim (native_ple_postops.hpp:32-33): "element for element the arithmetic of T
+    calls of native_ple_postops with the history advanced after each". native_ple_postops
+    (native_ple_postops.cu:352-359) and the history's advance (verify.cpp:1118) on the decode builds (no guard),
+    ``chain``'s stages after the projections, on each of the T raw keys ``key`` (T, PLE_D), values ``value``
+    (T, PLE_N) and hidden rows ``hidden`` (T, PLE_D) in turn, from the history ``hist`` (HS values in basalt's layout),
+    with ``w``'s norms and taps. Row r is one command buffer: the key norm, the query norm into normalized row r, the
+    gate, the broadcast, the conv norm over normalized row r, the convolution into conv and result row r, and the
+    advance. Every output starts as 0xFF bytes, and row r of every row buffer binds at r times its row bytes. Returns
+    a dict of (T, ...) float32: ``key_norm``, ``gate``, ``gated``, ``normalized``, ``conv`` and ``result``, and
+    ``hist``, the history after each row."""
+    N, D, H = kernels.PLE_N, kernels.PLE_D, kernels.PLE_H
+    nm = kernels.basalt_gr_norm_macros(N)
+    norm = gpu.pipeline(kernels.basalt_gr_norm_source(), "basalt_gr_norm", tuple(sorted(nm.items())))
+    grid = kernels.basalt_gr_norm_grid(H, nm)
+    gate_pso = gpu.pipeline(kernels.basalt_ple_source(), "basalt_ple_gate")
+    for pso, threads in ((norm, grid[1]), (gate_pso, kernels.PLE_GRIDS["gate"][1])):
+        assert pso.max_threads_per_threadgroup >= threads, (pso.max_threads_per_threadgroup, threads)
+    rows = {"key": _words(key, D), "value": _words(value, N), "hidden": _words(hidden, D)}
+    T = len(rows["key"])
+    assert len(rows["value"]) == len(rows["hidden"]) == T, {k: a.shape for k, a in rows.items()}
+    outs = {"key_norm": D, "gate": H, "gated": D, "normalized": D, "conv": D, "result": D}     # a row's values
+    rows.update({k: np.full((T, n), 0xFFFFFFFF, np.uint32) for k, n in outs.items()})
+    data = {**{k: a.tobytes() for k, a in rows.items()}, "hist": _words(hist, HS).tobytes(),
+            **{k: _words(getattr(w, k), D).tobytes() for k in ("w_nk", "w_nq", "w_nc")},
+            "taps": np.ascontiguousarray(w.conv1d).view(np.uint16).reshape(4 * D).tobytes()}
+    b = {k: nt.Buffer(gpu.device(), v) for k, v in data.items()}
+    width = {k: a.shape[1] for k, a in rows.items()}
+
+    def at(k, r=0):
+        return b[k], 4 * width.get(k, 0) * r
+
+    norm_p, gate_p = kernels.basalt_gr_norm_params(N, H, kernels.PLE_RMS_EPS), kernels.basalt_ple_gate_params()
+    q, hists = nt.Queue(gpu.device()), []
+    for r in range(T):
+        kn, nr, g, gd, h = (at(k, r) for k in ("key_norm", "normalized", "gate", "gated", "hidden"))
+        _submit(q,
+                _launch(norm, [at("key", r), at("w_nk"), kn], grid, norm_p),                       # postops.cu:352
+                _launch(norm, [h, at("w_nq"), nr], grid, norm_p),                                  # :353
+                _dispatch("gate", [kn, nr, g], gate_p),                                            # :355
+                _dispatch("broadcast", [at("value", r), g, gd]),                                   # :356
+                _launch(norm, [gd, at("w_nc"), nr], grid, norm_p),                                 # :358
+                _dispatch("conv", [at("hist"), nr, at("taps"), h, gd, at("conv", r), at("result", r)]),  # :359
+                _dispatch("advance", [at("hist"), nr]))                                            # verify.cpp:1118
+        hists.append(b["hist"].read(0, 4 * HS))
+    got = {k: np.frombuffer(b[k].read(0, b[k].nbytes), np.float32).reshape(T, n) for k, n in outs.items()}
+    got["hist"] = np.frombuffer(b"".join(hists), np.float32).reshape(T, HS)
+    return got

@@ -65,7 +65,16 @@ import ...``.
   1. hidden is nonzero (every row's every stream: with hidden = 0, s = 0 and gate = 0.5, the key is never observed);
   2. min over rows and streams of |s[c]| >= 0.1;
   3. the block's share of result, sum |gated + conv_out| / sum |result|, is at least 0.3 on every row;
-  4. T = 12 rows from one initial history: each row's normalized row enters the history the next rows read."""
+  4. T = 12 rows from one initial history: each row's normalized row enters the history the next rows read.
+- ``projected(fx, rows, seed)``: T§7.3's projected form (W1's scales, ple_win_parity.cpp:48-56) at any row count, for
+  the bitwise tests at counts other than 12. ``default_rng(seed)`` draws, in order, the raw key f32(0.2 * N(0,1))
+  (rows x D), the value f32(0.5 * N(0,1)) (rows x N), the history f32(N(0,1)) (9 x D) and hidden's unit draw z
+  (rows x D); hidden = f32(sigma_h * z) by rule 3 on R-contract; the norms and conv1d are ``fx``'s (``synthetic()``'s
+  or ``real()``'s). It asserts properties 1 and 3 on every row, neither 2 (about 8 % of |s| fall below 0.1, so no
+  seed meets it at 64 rows) nor 4, which only the float64 tests need, and returns (``fx`` with this history and hidden
+  and no key, value or emb, the raw keys, the values). ``PROJECTED_SEED`` = 0 meets properties 1 and 3: at 1, 2, 8, 9,
+  10, 12, 17, 32, 64 and 256 rows the smallest row share is 0.59-0.70 on ``synthetic()``'s norms and taps and
+  0.47-0.71 on ``real()``'s."""
 
 import functools
 import json
@@ -91,6 +100,7 @@ KEY_BLOCK = 18                  # a type-42 (Q2_0) block: the f16 d, then 16 byt
 SYNTHETIC_SEED = 54             # the first seed from 0 for which property 2 holds: min |s| 0.1251, min row share 0.628
 VALUE_SEED = 790                # test_ple_value_float64's
 REAL_SEED = 279                 # the first seed from 0 for which property 2 holds: min |s| 0.1219, min row share 0.562
+PROJECTED_SEED = 0              # projected()'s: properties 1 and 3 hold at 1 to 256 rows (the module docstring)
 
 
 class PackTensor(NamedTuple):
@@ -348,6 +358,28 @@ def _with_activations(rng, emb_scale, **weights):
     fx = fx._replace(hidden=(sigma * z).astype(F32))
     check_fixture(fx, r_struct(fx))
     return fx
+
+
+def projected(fx, rows, seed=PROJECTED_SEED):
+    """T§7.3's projected form at ``rows`` rows, drawn as the module docstring says."""
+    rng = np.random.default_rng(seed)
+    key = (0.2 * rng.standard_normal((rows, D))).astype(F32)
+    value = (0.5 * rng.standard_normal((rows, N))).astype(F32)
+    hist = rng.standard_normal((HIST, D)).astype(F32)
+    z = rng.standard_normal((rows, D))
+    fx = fx._replace(key=None, value=None, emb=None, hist=hist, hidden=z.astype(F32))
+    ref = r_contract(fx, key, value)
+    sigma = np.abs(ref.gated + ref.conv_out).mean() / np.abs(fx.hidden.astype(F64)).mean()
+    fx = fx._replace(hidden=(sigma * z).astype(F32))
+    ref = r_contract(fx, key, value)
+    zero = int(np.count_nonzero(~(np.abs(fx.hidden.reshape(rows, H, N)).max(axis=2) > 0)))
+    assert zero == 0, (f"T§6.3 property 1, \"hidden is nonzero\": {zero} of {rows * H} row streams are zero (with "
+                       "hidden = 0, query = 0, s = 0 and gate = 0.5 exactly, so the key is never observed)")
+    share = np.abs(ref.gated + ref.conv_out).sum(axis=1) / np.abs(ref.result).sum(axis=1)
+    assert (share >= 0.3).all(), ("T§6.3 property 3, \"The block's share of result is at least 0.3. The share is "
+                                  f"Σ|gated + conv_out| / Σ|result| per row\": rows {np.flatnonzero(share < 0.3)} "
+                                  f"of {rows}, smallest {share.min():.4f}")
+    return fx, key, value
 
 
 def synthetic(seed=SYNTHETIC_SEED):
