@@ -1,0 +1,322 @@
+"""Single-kernel runs of basalt's sampler family (kernels/common/basalt_sampler.metal) for the GPU tests: one wrapper
+per path, each running the path's dispatches in one command buffer on the family's bindings (the slot map at the top
+of the .metal file), as the handler emits them; ``split_part`` runs the split path's first stage alone and returns
+its block lists.
+
+- The source is ``basalt_sampler_source()`` with StepState for ``t_max = T_MAX + 1`` spliced in after the prelude
+  (``pending_tokens`` holds a 70-row probe's queries), compiled with STEP_STATE=1: the kernels read the window's row
+  count, position and seed there, as in a program.
+- A window of T rows runs the grids of T + 1 rows with ``t_this_step = T``: the extra row's threadgroups must exit at
+  the row guard, so its output slot keeps its prefill (asserted).
+- Every output starts as ``fill`` bytes (0xFF: an unwritten row reads -1 and matches no id), every scratch as 0xFF;
+  each buffer is exactly the size its rows need, so shader validation sees a store past it.
+- A wrapper takes the reference module's ``SamplerParams`` (tests/basalt_sampler_ref.py) and packs ``BsSampleParams``
+  with the mode its kernels gate on; the seed goes to StepState ``rng_lo`` / ``rng_hi``, the counter to ``ctr_base``.
+- The probe (basalt's sample_tokens_probe, the sampled wrappers' ``query``): flags PROBE in the record, row t's query
+  in StepState ``pending_tokens[t + 1]``, as the engine's draft tokens sit there, and the queried row count in the
+  ``nq`` buffer.
+- The coupled draft's kernels (``coupled_stage``, ``coupled_draft``): one draft row; the request as basalt's 72-byte
+  SamplerParams image, the token ring and the step record in buffers, as basalt's captured round reads them; the
+  node's structure (nv, id_vocab, cap, j, the subset's maps) in its BsCoupledParams record.
+"""
+
+import struct
+from types import SimpleNamespace
+
+import numpy as np
+
+from monolith import kernels
+from monolith.core.step_state import StepStateLayout
+from monolith.runtime import _native as nt
+from tests.basalt_sampler_ref import sampled_k
+from tests.kernels import basalt_gpu as gpu
+
+T_MAX = 70                                     # the widest window a test runs (the probe's, sampler_parity.cpp:398)
+LAYOUT = StepStateLayout(t_max=T_MAX + 1)
+SOURCE = kernels.basalt_sampler_source().replace(kernels.PRELUDE, kernels.PRELUDE + LAYOUT.to_msl() + "\n", 1)
+AM_CTAS = 8                                    # bs_greedy_partial's threadgroups per row (basalt's kAmCtas)
+TOP_PROB_THREADS = 1024                        # bs_greedy_top_prob's threadgroup, exactly (basalt's kAmThreads)
+SPLIT_THREADS = 128                            # bs_split_part's threadgroup, exactly (basalt's kSplitWarps * 32)
+
+
+def pipeline(name):
+    return gpu.pipeline(SOURCE, name, (("STEP_STATE", "1"),))
+
+
+def without_cuda_nan():
+    """``SOURCE`` with ``cuda_nan`` taken out of the sampler's kernels (basalt_fp.metal, which defines it, unchanged):
+    the NaN tests' negative control (test_basalt_nan.py's), whose stores keep this GPU's NaN. A test swaps it in for
+    ``SOURCE`` (monkeypatch), and ``pipeline`` compiles it."""
+    body = kernels.template("basalt_sampler.metal")
+    assert SOURCE.count(body) == 1 and "cuda_nan(" in body
+    return SOURCE.replace(body, body.replace("cuda_nan(", "("))
+
+
+def threads(pso, n=1024):
+    """basalt's ``n`` threads, or the widest multiple of 32 the pipeline allows (the kernel's result does not depend
+    on it)."""
+    return min(n, pso.max_threads_per_threadgroup // 32 * 32)
+
+
+def record(p, vocab, rows, hist_len, mode, bias=False, probe=False, id_map=False):
+    """``BsSampleParams`` for ``p`` (SamplerParams) on a window of ``rows`` grid rows."""
+    return kernels.basalt_sampler_params(
+        vocab, rows, -(-vocab // kernels.BS_BLOCK), hist_len, mode=mode, bias=bias, probe=probe, id_map=id_map,
+        top_k=p.top_k, top_p=p.top_p, min_p=p.min_p, temperature=p.temperature, min_keep=p.min_keep,
+        penalty_last_n=p.penalty_last_n, penalty_repeat=p.penalty_repeat, penalty_freq=p.penalty_freq,
+        penalty_present=p.penalty_present)
+
+
+def launch(steps, logits, p, *, mode, hist=None, hist_len=0, bias=None, id_map=None, query=None, nq=0, position=0,
+           fill=0xFF, scratch=None, lbuf=None, loff=0, queue=None):
+    """Run ``steps``, (pipeline, grid, threads) in order, on one window: ``logits`` (T, V) float32, ``p`` the request,
+    ``hist`` the flat (T, hist_len) int32 history rows, ``bias`` (V,) float32, ``id_map`` (V,) int32 (flags MAP),
+    ``query`` the probe's T query ids (flags PROBE; rows t < ``nq`` write their query's probability), ``position``
+    StepState's.
+    ``scratch``: {slot: a byte count, a fresh buffer starting as 0xFF; or an ``nt.Buffer`` the caller holds, to read
+    back}. ``lbuf``: a buffer already holding ``logits``, bound in place of a fresh upload (sampler_parity's
+    DeviceRows, rows uploaded once and sampled many times: the test reads it back), at byte offset ``loff`` (basalt's
+    ``d_l + t * NV``: ``logits`` then gives only the shape). ``queue``: the ``nt.Queue`` to run on (basalt's stream),
+    else a new one.
+    Every slot the family binds is bound, a 16-byte placeholder where the request has no such datum. Returns the T
+    picks and the T probabilities' bits; asserts the extra row of each output untouched."""
+    l = np.ascontiguousarray(logits, np.float32)
+    T, V = l.shape
+    rows = T + 1
+    dev = gpu.device()
+
+    def buf(data, prefill=None):
+        b = nt.Buffer(dev, data)
+        if prefill is not None:
+            b.fill(prefill)
+        return b
+
+    st = LAYOUT.pack({"t_this_step": T, "position": position, "rng_lo": p.seed & 0xFFFFFFFF,
+                      "rng_hi": (p.seed >> 32) & 0xFFFFFFFF,
+                      "pending_tokens": [] if query is None else [0] + [int(q) for q in query]})
+    slots = {0: buf(l.tobytes()) if lbuf is None else lbuf, 1: buf(struct.pack("<Q", p.counter & (2 ** 64 - 1))),
+             2: buf(struct.pack("<I", nq)),
+             3: buf(bytes(16) if bias is None else np.ascontiguousarray(bias, np.float32).tobytes()),
+             4: buf(bytes(16) if hist is None else np.ascontiguousarray(hist, np.int32).tobytes()),
+             5: buf(4 * rows, fill), 6: buf(4 * rows, fill),
+             7: buf(record(p, V, rows, hist_len, mode, bias is not None, query is not None, id_map is not None)),
+             11: buf(bytes(16) if id_map is None else np.ascontiguousarray(id_map, np.int32).tobytes()), 15: buf(st)}
+    slots.update({k: n if isinstance(n, nt.Buffer) else buf(n, 0xFF) for k, n in (scratch or {}).items()})
+    ds = []
+    for pso, grid, tg in steps:
+        d = nt.Dispatch().pipeline(pso)
+        for k, b in slots.items():
+            d = d.buffer(k, b, loff if k == 0 else 0)
+        ds.append(d.grid(*grid).threadgroup(tg))
+    r = (nt.Queue(dev) if queue is None else queue).run(ds)
+    assert not r.error, r.error
+    token = np.frombuffer(slots[5].read(0, 4 * rows), np.int32)
+    qbits = np.frombuffer(slots[6].read(0, 4 * rows), np.uint32)
+    unset = np.frombuffer(bytes([fill]) * 4, np.uint32)[0]
+    assert token.view(np.uint32)[T] == unset and qbits[T] == unset, "the row past t_this_step was written"
+    return token[:T].copy(), qbits[:T].copy()
+
+
+def greedy_cl(logits, p, *, hist=None, hist_len=0, position=0, fill=0xFF, lbuf=None):
+    """G-CL, basalt's sampler_greedy_cluster_kernel as two dispatches: ``bs_greedy_partial`` over (8, rows)
+    threadgroups of 1,024 threads, each storing its (key, id) pair, then ``bs_greedy_merge``, one SIMD-group per row
+    over its 8 pairs. Mode 0, the greedy request without a penalty window or a bias; a history, if given, is bound and
+    never read. Returns the T picks."""
+    part, merge = pipeline("bs_greedy_partial"), pipeline("bs_greedy_merge")
+    rows = len(logits) + 1
+    return launch([(part, (AM_CTAS, rows), threads(part)), (merge, (rows,), 32)], logits, p, mode=0, hist=hist,
+                  hist_len=hist_len, position=position, fill=fill, scratch={8: rows * AM_CTAS * 8}, lbuf=lbuf)[0]
+
+
+def bitmap_bytes(p, rows, V, hist_len):
+    """The one-block kernels' bitmap scratch, sized as basalt sizes its shared one (sampler.cu:988-990): ceil(V / 32)
+    words per row when the request has a window (penalty_last_n > 0 and a history), else a 16-byte placeholder, so
+    validation sees a bitmap store the request did not size."""
+    return rows * -(-V // 32) * 4 if p.penalty_last_n > 0 and hist_len > 0 else 16
+
+
+def greedy_1b(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None):
+    """G-1B, basalt's sampler_greedy_kernel: ``bs_greedy_one_block`` alone, one threadgroup of up to 1,024 threads
+    per row, in mode 1 whatever the request asks (the forced runs; the engine runs it after the cluster pair, which
+    would hide a G-1B that never wrote), its bitmap scratch ``bitmap_bytes``. Returns the T picks."""
+    pso = pipeline("bs_greedy_one_block")
+    T, V = np.shape(logits)
+    return launch([(pso, (T + 1,), threads(pso))], logits, p, mode=1, hist=hist, hist_len=hist_len, bias=bias,
+                  position=position, fill=fill, scratch={10: bitmap_bytes(p, T + 1, V, hist_len)}, lbuf=lbuf)[0]
+
+
+def top_prob(logits, p, *, id_map=None, hist=None, hist_len=0, position=0, fill=0xFF, lbuf=None):
+    """basalt's sampler_greedy_top_prob_cluster_kernel (the drafter's greedy tail) as two dispatches:
+    ``bs_greedy_partial``, as in ``greedy_cl``, then ``bs_greedy_top_prob``, one threadgroup of exactly 1,024 threads
+    per row: the merge, the pick's probability and, with ``id_map`` (V,) int32, the map. The request's parameters
+    are not read (the kernel has no mode gate); a history, if given, is bound and never read. Refuses a pipeline that
+    cannot run 1,024 threads, whose sums would not be basalt's. Returns the T picks and the probabilities' bits."""
+    part, prob = pipeline("bs_greedy_partial"), pipeline("bs_greedy_top_prob")
+    if prob.max_threads_per_threadgroup < TOP_PROB_THREADS:
+        raise RuntimeError(f"bs_greedy_top_prob runs at most {prob.max_threads_per_threadgroup} threads per "
+                           f"threadgroup; its probability needs exactly {TOP_PROB_THREADS}")
+    rows = len(logits) + 1
+    return launch([(part, (AM_CTAS, rows), threads(part)), (prob, (rows,), TOP_PROB_THREADS)], logits, p, mode=0,
+                  hist=hist, hist_len=hist_len, id_map=id_map, position=position, fill=fill,
+                  scratch={8: rows * AM_CTAS * 8}, lbuf=lbuf)
+
+
+def split_part(logits, p, *, hist=None, hist_len=0, bias=None, position=0, fill=0xFF, lbuf=None):
+    """S-SPLIT's first stage alone, basalt's sampler_split_part_kernel: ``bs_split_part`` over (n_blocks, rows)
+    threadgroups of exactly 128 threads, in mode 2 whatever the request asks, each storing its 4,096-logit block's
+    top-k list (k = sampled_k(top_k, V)) to ``cand`` at (t * n_blocks + b) * k as (id, value bits). ``cand`` holds
+    exactly the rows' lists, starting as 0xFF bytes. Returns the T rows' lists, (T, n_blocks, k, 2) uint32; asserts
+    the extra row's untouched."""
+    pso = pipeline("bs_split_part")
+    T, V = np.shape(logits)
+    rows, nb, k = T + 1, -(-V // kernels.BS_BLOCK), sampled_k(p.top_k, V)
+    cand = nt.Buffer(gpu.device(), rows * nb * k * 8)
+    cand.fill(0xFF)
+    launch([(pso, (nb, rows), SPLIT_THREADS)], logits, p, mode=2, hist=hist, hist_len=hist_len, bias=bias,
+           position=position, fill=fill, scratch={9: cand}, lbuf=lbuf)
+    lists = np.frombuffer(cand.read(0, cand.nbytes), np.uint32).reshape(rows, nb, k, 2)
+    assert np.all(lists[T] == 0xFFFFFFFF), "the row past t_this_step was written"
+    return lists[:T].copy()
+
+
+def probed(picks, qbits, fill, query):
+    """A sampled wrapper's result: with the probe (``query``) the picks and the probabilities' bits, else the picks,
+    ``qprob`` asserted to keep its prefill."""
+    if query is not None:
+        return picks, qbits
+    assert np.all(qbits == np.frombuffer(bytes([fill]) * 4, np.uint32)[0]), "qprob was written without the probe"
+    return picks
+
+
+def split(logits, p, *, hist=None, hist_len=0, bias=None, query=None, nq=0, position=0, fill=0xFF, lbuf=None, loff=0,
+          queue=None):
+    """S-SPLIT, basalt's sampler_split_part_kernel then sampler_split_merge_kernel: ``bs_split_part`` as in
+    ``split_part``, then ``bs_split_merge``, one SIMD-group per row, which merges the row's block lists from ``cand``
+    and runs the sampled tail. Mode 2 whatever the request asks, without the cluster pair the engine runs first (it
+    would hide a row the split never wrote); ``cand`` holds exactly the rows' lists. Returns the T picks, ``qprob``
+    asserted untouched; with the probe (``query``, ``nq``: S-SPLIT+Q) the picks and the probabilities' bits."""
+    part, merge = pipeline("bs_split_part"), pipeline("bs_split_merge")
+    T, V = np.shape(logits)
+    rows, nb = T + 1, -(-V // kernels.BS_BLOCK)
+    picks, qbits = launch([(part, (nb, rows), SPLIT_THREADS), (merge, (rows,), 32)], logits, p, mode=2, hist=hist,
+                          hist_len=hist_len, bias=bias, query=query, nq=nq, position=position, fill=fill,
+                          scratch={9: rows * nb * sampled_k(p.top_k, V) * 8}, lbuf=lbuf, loff=loff, queue=queue)
+    return probed(picks, qbits, fill, query)
+
+
+def one_block(logits, p, *, hist=None, hist_len=0, bias=None, query=None, nq=0, position=0, fill=0xFF, lbuf=None,
+              loff=0, queue=None):
+    """S-1B, basalt's sampler_one_block_kernel: ``bs_sample_one_block`` alone, one threadgroup of up to 1,024 threads
+    per row, in mode 2 whatever the request asks and at any row count or vocabulary (the forced runs, F.2; the engine
+    runs it after the cluster pair, which would hide a row it never wrote), its bitmap scratch ``bitmap_bytes``.
+    Returns the T picks, ``qprob`` asserted untouched; with the probe (``query``, ``nq``: S-1B+Q) the picks and the
+    probabilities' bits."""
+    pso = pipeline("bs_sample_one_block")
+    T, V = np.shape(logits)
+    picks, qbits = launch([(pso, (T + 1,), threads(pso))], logits, p, mode=2, hist=hist, hist_len=hist_len, bias=bias,
+                          query=query, nq=nq, position=position, fill=fill,
+                          scratch={10: bitmap_bytes(p, T + 1, V, hist_len)}, lbuf=lbuf, loff=loff, queue=queue)
+    return probed(picks, qbits, fill, query)
+
+
+def rows_alone(path, logits, p, *, hist=None, hist_len=0, query=None, nq=0, position=0):
+    """W.1, invariant 1 (a row's output never depends on the window width T or its place in it): ``path``'s window
+    against each row t run alone, a one-row window of its logits and history row at ``position + t``; with the probe
+    (``query``, ``nq``), row t's query and nq 1 when the window queries the row (t < nq), else nq 0. Returns the rows
+    whose outputs (the picks; and the probabilities' bits, for a path that returns them) differ bitwise."""
+    run = globals()[path]
+
+    def outs(r):
+        return [np.asarray(a).view(np.uint32) for a in (r if isinstance(r, tuple) else (r,))]
+
+    def probe(t=None):
+        if query is None:
+            return {}
+        return {"query": query, "nq": nq} if t is None else {"query": query[t:t + 1], "nq": int(t < nq)}
+
+    batch = outs(run(logits, p, hist=hist, hist_len=hist_len, position=position, **probe()))
+    bad = []
+    for t in range(len(logits)):
+        h = None if hist is None else np.asarray(hist)[t * hist_len:(t + 1) * hist_len]
+        one = outs(run(logits[t:t + 1], p, hist=h, hist_len=hist_len, position=position + t, **probe(t)))
+        if any(b[t] != o[0] for b, o in zip(batch, one)):
+            bad.append(t)
+    return bad
+
+
+# ---- the coupled draft (basalt's coupled_draft_stage and coupled_draft_sample, sampler.cu:1040-1071) ----------------
+
+CPL_CAP, CPL_MAX_T = 256, 8           # coupled_parity's ring (:576): cap history slots, then max_t drafts
+CPL_PART_THREADS = 512                # bs_coupled_part's threadgroup, exactly (basalt's 16 warps)
+
+
+def coupled_image(p):
+    """The round's request: SamplerParams ``p``'s 72-byte image (kernels.basalt_coupled_params)."""
+    return kernels.basalt_coupled_params(
+        top_k=p.top_k, top_p=p.top_p, min_p=p.min_p, temperature=p.temperature, min_keep=p.min_keep,
+        penalty_last_n=p.penalty_last_n, penalty_repeat=p.penalty_repeat, penalty_freq=p.penalty_freq,
+        penalty_present=p.penalty_present, seed=p.seed, counter=p.counter, greedy=p.greedy)
+
+
+def coupled_run(steps, node, bufs):
+    """Run ``steps``, (kernel, threadgroups, threads) in order, in one command buffer on the coupled kernels' slots
+    (the map at the top of the .metal file): the node's record at 7, StepState at 15 (not done), ``bufs`` {slot: bytes,
+    or an ``nt.Buffer`` the caller reads back}, a 16-byte placeholder in every other slot."""
+    dev = gpu.device()
+    slots = {k: nt.Buffer(dev, bytes(16)) for k in (0, 5, 6, 9, 11, 12, 13, 14, 16, 17, 18)}
+    slots.update({k: b if isinstance(b, nt.Buffer) else nt.Buffer(dev, b) for k, b in bufs.items()})
+    slots.update({7: nt.Buffer(dev, node), 15: nt.Buffer(dev, LAYOUT.pack({}))})
+    ds = []
+    for name, grid, tg in steps:
+        d = nt.Dispatch().pipeline(pipeline(name))
+        for k, b in slots.items():
+            d = d.buffer(k, b)
+        ds.append(d.grid(grid).threadgroup(tg))
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+
+
+def coupled_stage(mparams, mhist, ring, cap, *, threads=256):
+    """basalt's coupled_draft_stage: ``bs_coupled_stage``, one threadgroup of ``threads`` (basalt's 256), copies the
+    host-staged image ``mparams`` (72 bytes) into the round's copy, which starts as 0xFF bytes, and the staged history
+    ``mhist`` (cap,) int32's slots [cap - h, cap) into ``ring`` (cap + max_t,) int32. Returns the copy's bytes and the
+    ring."""
+    dev = gpu.device()
+    cp, rb = nt.Buffer(dev, 72), nt.Buffer(dev, np.ascontiguousarray(ring, np.int32).tobytes())
+    cp.fill(0xFF)
+    coupled_run([("bs_coupled_stage", 1, threads)], kernels.basalt_coupled_node(1, 1, cap, 0),   # the stage reads cap
+                {13: cp, 14: rb, 16: bytes(mparams), 17: np.ascontiguousarray(mhist, np.int32).tobytes()})
+    return cp.read(0, 72), np.frombuffer(rb.read(0, rb.nbytes), np.int32).copy()
+
+
+def coupled_draft(logits, p, *, j, ring, cell=0, sub_to_id=None, id_to_sub=None, cap=CPL_CAP, threads=1024):
+    """basalt's coupled_draft_sample (sampler.cu:1052-1071) on one draft row, ``logits`` (nv,) float32, and the request
+    ``p``, whose image is the round's copy (coupled_parity uploads it there; no stage): ``bs_coupled_penalize``, one
+    threadgroup of ``threads`` (basalt's 1,024), penalises the row in place over draft j's window in ``ring`` (cap +
+    max_t,) int32; then ``bs_coupled_part``, ceil(nv / 4,096) + 1 threadgroups of exactly 512 (the extra one must exit
+    at the block guard), stores each block's list to cand at b * 64, which starts as 0xFF bytes; then
+    ``bs_coupled_merge``, one SIMD-group, merges the lists and draws the draft's token with the counter cell + 1, into
+    the id and probability words (each exactly 4 bytes, starting as 0xFF bytes) and ring[cap + j]. ``sub_to_id`` (nv,)
+    and ``id_to_sub`` (id_vocab,) int32: the subset's maps (the node's flags), or None; ``cell``: the step record's.
+    Returns .logits, the row's bits after the run, .cand, the (n_blocks, 64, 2) uint32 lists, .ring, .id and .prob,
+    the probability's bits; asserts the extra block untouched."""
+    l = np.ascontiguousarray(logits, np.float32)
+    nv, dev = l.size, gpu.device()
+    nb = -(-nv // kernels.BS_BLOCK)
+    node = kernels.basalt_coupled_node(nv, nv if id_to_sub is None else len(id_to_sub), cap, j,
+                                       id_to_sub=id_to_sub is not None, sub_to_id=sub_to_id is not None)
+    bl, cand = nt.Buffer(dev, l.tobytes()), nt.Buffer(dev, (nb + 1) * kernels.BS_SEL_MAX * 8)
+    rb, oid, opr = nt.Buffer(dev, np.ascontiguousarray(ring, np.int32).tobytes()), nt.Buffer(dev, 4), nt.Buffer(dev, 4)
+    for b in (cand, oid, opr):
+        b.fill(0xFF)
+    bufs = {0: bl, 5: oid, 6: opr, 9: cand, 13: coupled_image(p), 14: rb, 18: np.int32(cell).tobytes()}
+    bufs.update({k: np.ascontiguousarray(m, np.int32).tobytes() for k, m in ((11, sub_to_id), (12, id_to_sub))
+                 if m is not None})
+    coupled_run([("bs_coupled_penalize", 1, threads), ("bs_coupled_part", nb + 1, CPL_PART_THREADS),
+                 ("bs_coupled_merge", 1, 32)], node, bufs)
+    lists = np.frombuffer(cand.read(0, cand.nbytes), np.uint32).reshape(nb + 1, kernels.BS_SEL_MAX, 2)
+    assert np.all(lists[nb] == 0xFFFFFFFF), "the block past the row's was written"
+    return SimpleNamespace(logits=np.frombuffer(bl.read(0, bl.nbytes), np.uint32).copy(), cand=lists[:nb].copy(),
+                           ring=np.frombuffer(rb.read(0, rb.nbytes), np.int32).copy(),
+                           id=int(np.frombuffer(oid.read(0, 4), np.int32)[0]),
+                           prob=int(np.frombuffer(opr.read(0, 4), np.uint32)[0]))
