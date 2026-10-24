@@ -277,6 +277,16 @@ def _host_rows(name="dhead", shape=(64, ROW), dtype=U8):
     return build
 
 
+def _host_rows_window(g, src, bad, tmp):
+    """The verify head over the file's rows beside the head over host rows ``dhead``, or (bad) host rows named after the
+    window the file's rows bind."""
+    x1, w = g.input("x1", (1, QCOL), U8), weight(g, "gguf/head", src)
+    head(g, "y.v", x1, w)
+    rows = g.input(basalt_windows(src, [w])[1]["gguf/head"][0] if bad else "dhead", (64, ROW), U8, host=True)
+    head(g, "y", x1, rows)
+    return {}
+
+
 def _rows_held(kind):
     """The op reads one row more than the rows hold (the head and the top-1: their logits' width; the proxy: n_rows,
     within a copy that has room for it)."""
@@ -448,6 +458,11 @@ REFUSALS = [
     *[(f"head host rows named after StepState's {f}", _host_rows(name=n),
        f"the host input '{n}' is named after StepState's '{f}'")
       for n, f in (("draft_tokens", "draft_tokens"), ("tokens", "pending_tokens"))],
+    *[(f"head host rows named after the program's {n}", _host_rows(name=n),
+       f"the host input '{n}' is named after the program's {own}; a host input binds")
+      for n, own in (("step_state", "StepState"), ("ring", "token ring"))],
+    ("head host rows named after the verify head's window", _host_rows_window,
+     r"the host input 'basalt\.[0-9a-f]{16}' is named after the program's weights window; a host input binds"),
     *[(f"{k} reads a row past its rows", _rows_held(k), f"'dhead' holds {N_DVOCAB} rows; the op reads {N_DVOCAB + 1}")
       for k in KINDS],
     ("head of 9 columns", _head_shape((8, 10), (9, 10)), r"unsupported shape \(n_in 2560, ncols 9\)"),

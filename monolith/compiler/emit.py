@@ -1478,6 +1478,10 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
             if v.is_host and fld in layout.offsets:                   # _Ctx.buf would bind the field, not the session's
                 raise ValueError(f"emit_program: the host input {v.name!r} is named after StepState's {fld!r}; a host "
                                  "input binds the session's buffer of its name")
+            if v.is_host and (v.name in (program.step_state, program.ring) or v.name in program.buffers):  # the windows so far
+                own = {program.step_state: "StepState", program.ring: "token ring"}.get(v.name, "weights window")
+                raise ValueError(f"emit_program: the host input {v.name!r} is named after the program's {own}; a host "
+                                 "input binds the session's buffer of its name")
             if v.is_host:                                             # the session's buffer: the value's bytes exactly
                 program.buffers[v.name] = BufferSpec(_value_bytes(v, t), None, "host")
             elif fld not in layout.offsets:                           # not StepState-backed: a host-written arena buffer

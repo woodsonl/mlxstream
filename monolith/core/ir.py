@@ -130,7 +130,8 @@ class Graph:
         """A value the host writes before a step. ``host``: the session allocates its buffer (at least the value's
         bytes) and passes the same one to every program that binds it (data it derives and updates outside the
         programs, such as a drafter's gathered head rows); the emitter refuses one named after a StepState field,
-        which an input of that name binds. Otherwise each program allocates its own."""
+        which an input of that name binds, or after one of the program's own buffers (StepState, the token ring, a
+        weights window). Otherwise each program allocates its own."""
         v = self.value(name, shape, dtype, scoped=False)
         v.is_input = True
         v.is_host = host
