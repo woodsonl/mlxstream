@@ -376,19 +376,26 @@ def _table(ctx: _Ctx, op: Op, v: Value, dtype: DType, rows: int, what: str) -> N
         raise ValueError(f"{op.kind}: {v.name!r} is {v.dtype} {list(shape)}, not {dtype} [>= {rows}] ({what})")
 
 
-def _blob_buffers(ctx: _Ctx, names: Sequence[str], blob: int) -> List[str]:
+def _blob_buffers(ctx: _Ctx, op: Op, names: Sequence[str], blob: int) -> List[str]:
     """The buffers the plan's addresses point into: a graph value's buffer (a ``.basalt`` section's window), the value
-    itself holding at least a blob (its own bytes: a window reaches to page boundaries and may hold its neighbours),
-    else a buffer the session allocates (the expert cache), which the program declares with role "host", holding at
-    least a blob, so that Engine requires the session to pass it."""
+    itself holding at least a blob (its own bytes: a window reaches to page boundaries and may hold its neighbours; a
+    weight's dtype is its storage byte and its shape counts values, so a weight holds its ggml type's rows, as
+    ``_weight`` takes them and its entry holds them, unless it declares a section's bytes, u8), else a buffer the
+    session allocates (the expert cache), which the program declares with role "host", holding at least a blob, so
+    that Engine requires the session to pass it."""
     bufs = []
     for name in names:
         buf = name
         if name in ctx.values:
             v = ctx.values[name]
-            nbytes = math.prod(ctx.shape(v)) * v.dtype.itemsize
+            shape, kind = ctx.shape(v), v.format if v.is_weight else v.dtype.short
+            if v.is_weight and kind != "u8":
+                tid, n_out, n_in = _weight(ctx, op, v, GGML_TYPES)
+                nbytes = n_out * ggml_row_bytes(tid, n_in)
+            else:
+                nbytes = math.prod(shape) * v.dtype.itemsize
             if nbytes < blob:
-                raise ValueError(f"basalt_experts: blobs {name!r} is {v.dtype} {list(ctx.shape(v))}, {nbytes} bytes; "
+                raise ValueError(f"basalt_experts: blobs {name!r} is {kind} {list(shape)}, {nbytes} bytes; "
                                  f"each address the plan puts in it reaches a whole blob, so it holds at least one "
                                  f"blob ({blob} bytes)")
             buf = ctx.buf(v)[0]
@@ -430,7 +437,7 @@ def _experts(ctx: _Ctx, op: Op) -> None:
     ptr, start, count = _bind(ctx, op, 1, grp_ptr, 8), _bind(ctx, op, 2, grp_start, 4), _bind(ctx, op, 3, n_groups, 4)
     dst, tok = _bind(ctx, op, 4, ent_dst, 4), _bind(ctx, op, 4, ent_tok, 4)
     xb, ob = _bind(ctx, op, 5, xq, 4), _bind(ctx, op, 6, out, 4)
-    reads = _blob_buffers(ctx, blobs, lay["bytes"])
+    reads = _blob_buffers(ctx, op, blobs, lay["bytes"])
     gate, up, hq = (ctx.scratch(f"basalt_experts.{s}", nb)
                     for s, nb in zip(("gate", "up", "hq"), kernels.basalt_expert_scratch(cap, n_ff)))
     prm = ctx.params("basalt_experts", kernels.basalt_expert_params(n_embd, n_ff))
@@ -464,8 +471,9 @@ def _s2_plan(ctx: _Ctx, op: Op) -> None:
                               (ent_tok, DType.I32, n, "a token per entry")):
         _table(ctx, op, v, dt, rows, what)
     need, bshape = n_expert * kernels.S2_BLOB_BYTES, ctx.shape(base)
-    if base.dtype != DType.U8 or len(bshape) != 1 or bshape[0] < need:
-        raise ValueError(f"basalt_s2_plan: base {base.name!r} is {base.dtype} {list(bshape)}; the router's ids reach "
+    kind = base.format if base.is_weight else base.dtype.short      # a weight's dtype is its storage byte, not its type
+    if kind != "u8" or len(bshape) != 1 or bshape[0] < need:
+        raise ValueError(f"basalt_s2_plan: base {base.name!r} is {kind} {list(bshape)}; the router's ids reach "
                          f"n_expert ({n_expert}) blobs of {kernels.S2_BLOB_BYTES} bytes from it, u8 [>= {need}]")
     bindings = [_bind(ctx, op, 0, ids, 4), _bind(ctx, op, 1, base, 2), _bind(ctx, op, 2, grp_ptr, 8),
                 _bind(ctx, op, 3, grp_start, 4), _bind(ctx, op, 4, counts, 4), _bind(ctx, op, 5, ent_dst, 4),

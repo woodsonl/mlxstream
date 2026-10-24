@@ -6,6 +6,7 @@ session's blob buffers declared host, the follow-up dispatches behind their barr
 refusal, a valid input with exactly one defect refused by that defect's own check (its message). The GPU side is
 tests/kernels/test_basalt_expert_ops_program.py."""
 
+import json
 import math
 
 import pytest
@@ -15,6 +16,7 @@ from monolith.compiler.coverage import check_coverage
 from monolith.compiler.emit import basalt_windows
 from monolith.core import DType, Graph
 from monolith.core.ir import OpClass
+from monolith.formats.gguf import ggml_row_bytes
 from monolith.ops import OPS
 from monolith.packs.basalt import BasaltSource
 from monolith.runtime.program import BufferSpec
@@ -278,6 +280,17 @@ def test_blobs_in_a_graph_value_keep_its_buffer(src):
     assert not any(b.role == "host" for b in prog.buffers.values())
 
 
+def test_blobs_in_a_weight_of_section_bytes(src):
+    """A weight that declares the ``experts`` section's bytes (u8) holds as many bytes as values, as the section's
+    constant does: the routed op reads its blobs through the section's window."""
+    g = Graph("step")
+    g.weight("experts", (N_EXPERT * BLOB,), "u8")
+    routed(g, 2, blobs=["experts"])
+    prog = emit(g, src, 2)
+    win = basalt_windows(src, g.values.values(), 2)[1]["experts"][0]
+    assert [o.meta.get("indirect_reads") for o in prog.ops[1:]] == [[win], None, [win]]
+
+
 @pytest.mark.parametrize("t", (1, 3, 8))
 def test_follow_ups_wait_for_their_first_dispatch(src, t):
     """In the finished program (place_barriers, then the backend's finalize) under ``barriers="minimal"``, each SwiGLU
@@ -372,6 +385,33 @@ def _routed_blobs_value(g, src, bad, tmp):
     return {}
 
 
+def gguf_file(directory, shape):
+    """A .basalt file whose gguf section holds one Q2_0 tensor ``w`` of ``shape`` (row-major) as zeros, and a section
+    after it, so that the tensor's window ends on a page inside the file."""
+    directory.mkdir()
+    nbytes = ggml_row_bytes(42, shape[-1]) * math.prod(shape[:-1])
+    meta = {"format": "basalt", "version": 1,
+            "tensors": {"w": {"type_id": 42, "shape": shape[::-1], "offset": 0, "bytes": nbytes}}}
+    path = directory / "w.basalt"
+    path.write_bytes(write_basalt({"meta": json.dumps(meta).encode(), "gguf": bytes(nbytes), "end": b"\0"}))
+    return BasaltSource(path)
+
+
+def _routed_blobs_weight(g, src, bad, tmp):
+    """The routed experts on blobs in a Q2_0 weight of a .basalt file's gguf section: 1920 rows of 2560 values, 720
+    bytes each, one blob, or a row short of one (its 4,912,640 values still more than a blob's bytes)."""
+    shape = (1919 if bad else 1920, H)
+    routed(g, 2, blobs=[g.weight("gguf/w", shape, "q2_0").name])
+    return {"packs": [gguf_file(tmp, shape)]}
+
+
+def _routed_blobs_format(g, src, bad, tmp):
+    """The routed experts on blobs in a pack entry of one blob that a weight declares as 1920 Q2_0 rows of 2560 values,
+    or as NVFP4 values of that shape, a format whose bytes no ggml type gives."""
+    routed(g, 2, blobs=[g.weight("p.w", (1920, H), "nvfp4" if bad else "q2_0").name])
+    return {"packs": [pack(tmp, {"p.w": (0, BLOB)})]}
+
+
 def _routed_table_at(i, at, good=None):
     """The routed experts with plan table i a pack constant at byte ``at`` (valid: ``good``, its alignment)."""
     def build(g, src, bad, tmp):
@@ -391,6 +431,14 @@ def _plan_at(what, at, good, dtype=U8, shape=(N_EXPERT * BLOB,)):
         plan_only(g, **{what: g.const(f"p.{what}", sh, dt)})
         return {"packs": [pack(tmp, {f"p.{what}": (at if bad else good, math.prod(sh) * dt.itemsize)})]}
     return build
+
+
+def _plan_base_weight(g, src, bad, tmp):
+    """The plan over a weight: the file's ``mtp/experts`` section declared as its bytes (u8), or a Q2_0 tensor of as
+    many values, which holds 18 bytes for each 64 of them."""
+    n = N_EXPERT * BLOB
+    plan_only(g, base=g.weight("gguf/w", (n,), "q2_0") if bad else g.weight("mtp/experts", (n,), "u8"))
+    return {"packs": [gguf_file(tmp, (n,))] if bad else []}
 
 
 def _q8_0_at(g, src, bad, tmp):
@@ -487,6 +535,10 @@ REFUSALS = [
     ("routed blobs not names", case(r2, {}, {"blobs": ["cache.0", 1]}), "attr blobs must list the buffers"),
     ("routed blobs in a value a byte short of a blob", _routed_blobs_value,
      rf"blobs 'moe.cache' is u8 \[{BLOB - 1}\], {BLOB - 1} bytes; .* at least one blob \({BLOB} bytes\)"),
+    ("routed blobs in a weight a row short of a blob", _routed_blobs_weight,
+     rf"blobs 'gguf/w' is q2_0 \[1919, 2560\], {BLOB - 720} bytes; .* at least one blob \({BLOB} bytes\)"),
+    ("routed blobs in a weight of no ggml type", _routed_blobs_format,
+     r"the weight 'p.w' \(nvfp4 \[1920, 2560\]\) is not a weight or constant \[n_out, n_in\] of ggml type"),
     ("routed out a row short", case(r2, {}, {"out_rows": 19}),
      r"'moe.out' is f32 \[19, 2560\]; .* so out is f32 \[>= T x k_per_tok \(20\), n_embd\]"),
     ("routed out i32", case(r2, {}, {"out_dtype": I32}), r"'moe.out' is i32 \[20, 2560\]; an entry writes the row"),
@@ -523,6 +575,8 @@ REFUSALS = [
     ("plan base i32", _plan_at("base", 2, 2, I32), r"base 'p.base' is i32 \[5529600\]; the router's ids reach"),
     ("plan base of two dims", _plan_at("base", 2, 2, shape=(N_EXPERT * BLOB, 1)),
      r"base 'p.base' is u8 \[5529600, 1\]; the router's ids reach"),
+    ("plan base a weight of q2_0 values", _plan_base_weight,
+     r"base 'gguf/w' is q2_0 \[5529600\]; the router's ids reach"),
     ("plan base at an odd byte", _plan_at("base", 1, 2), "'p.base' " + ALIGN.format(1, 1, 2)),
     ("plan ids off 4 bytes", _plan_at("ids", 2, 4), "'p.ids' " + ALIGN.format(2, 0, 4)),
     # the quantizer
