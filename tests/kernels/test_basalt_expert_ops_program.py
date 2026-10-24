@@ -26,6 +26,9 @@ T = 1 .. 8 (basalt captures one graph per width), each run bitwise equal to the 
 - The device plan's tables, valid and equal to a host transcription of ``group_resident_kernel``, for every routing
   pattern the merged drafter tests use (tests/kernels/test_basalt_s2_experts.py) and the edges of its range; the
   tables' padding keeps its bytes.
+- Window invariance (docs/design/flash-next.md invariant 1, ``CONTRIBUTING.md:14`` of basalt): each token's rows of
+  every output of the T-wide program, for every T, bit for bit the 1-wide program's on that token alone, and finite;
+  the routed experts over 40 cached experts, so that at 8 tokens each threadgroup row takes several groups.
 
 The program's outputs and workspaces start as 0xff bytes and the harness's as other patterns, so a value neither
 writes cannot match."""
@@ -120,6 +123,20 @@ def plan_bytes(name, cap, ptr, start, dst, tok, n_groups):
     return {f"{name}.{t}": d.tobytes() for t, d in zip(PLAN, data)}
 
 
+def session_cache(rng, n_embd, n_ff, n_expert=E):
+    """The session's cache: n_expert random blobs, the first half in cache.0 and the rest in cache.1, each PAD bytes
+    past the previous one's end, so that a call's addresses cross buffers. Returns the arenas, each expert's (buffer,
+    byte offset) and the buffers by name."""
+    lay, half = kernels.basalt_expert_layout(n_embd, n_ff), n_expert // 2
+    arenas = [np.zeros(PAD + half * (lay["bytes"] + PAD), np.uint8) for _ in CACHE]
+    where = []
+    for e in range(n_expert):
+        i, at = e // half, PAD + e % half * (lay["bytes"] + PAD)
+        arenas[i][at: at + lay["bytes"]] = random_blob(rng, n_embd, n_ff)
+        where.append((i, at))
+    return arenas, where, {name: gpu.nt.Buffer(gpu.device(), a.tobytes()) for name, a in zip(CACHE, arenas)}
+
+
 def check_routed(eng, prog, t, x, want):
     """The program's IEEE rows, gate, up and q8_1 scratch and output bit for bit the harness's."""
     assert eng.read("moe.xq") == gpu.q8_1(x.ravel(), "ieee").tobytes()
@@ -138,14 +155,8 @@ def test_routed_over_the_session_cache(files, n_embd, n_ff):
     plan, which must leave the output as it was."""
     rng = np.random.default_rng(31 + n_embd)
     lay = kernels.basalt_expert_layout(n_embd, n_ff)
-    arenas = [np.zeros(PAD + E // 2 * (lay["bytes"] + PAD), np.uint8) for _ in CACHE]
-    where = []                                                       # expert -> (cache buffer, byte offset)
-    for e in range(E):
-        i, at = e // (E // 2), PAD + e % (E // 2) * (lay["bytes"] + PAD)
-        arenas[i][at: at + lay["bytes"]] = random_blob(rng, n_embd, n_ff)
-        where.append((i, at))
+    arenas, where, cache = session_cache(rng, n_embd, n_ff)
     dev = gpu.device()
-    cache = {name: gpu.nt.Buffer(dev, a.tobytes()) for name, a in zip(CACHE, arenas)}
     src = BasaltSource(files[0])
     for t in WIDTHS:
         cap = t * K
@@ -328,3 +339,71 @@ def test_plan_tables_are_valid(files, name, ids, k):
     assert start[: ng + 1].tolist() == want_start and dst[:n].tolist() == order and len(experts) == ng
     padding = (ptr[ng:], start[ng + 1:], counts[2:], dst[n:], tok[n:])
     assert all(np.all(p == (2 ** 64 - 1 if i == 0 else -1)) for i, p in enumerate(padding))
+
+
+# ---- window invariance ---------------------------------------------------------------------------------------------
+
+def window_invariance(step, per_token, floats):
+    """docs/design/flash-next.md invariant 1 (``CONTRIBUTING.md:14`` of basalt) at program level. ``step(t, cols)`` runs
+    the t-wide program on the tokens ``cols`` and returns its outputs' bytes. For every width t, the program over
+    tokens 0 .. t - 1: each token's bytes of every output (``per_token``: an output's bytes a token) bit for bit the
+    1-wide program's on that token alone, and the outputs ``floats`` finite."""
+    wide = {t: step(t, list(range(t))) for t in WIDTHS}
+    ones = [step(1, [j]) for j in range(max(WIDTHS))]
+    for t in WIDTHS:
+        for name, nb in per_token.items():
+            got = wide[t][name]
+            if name in floats:
+                assert np.all(np.isfinite(np.frombuffer(got, F32))), (name, t)
+            for j in range(t):
+                assert got[j * nb: (j + 1) * nb] == ones[j][name], (name, t, j)
+
+
+@pytest.mark.parametrize("n_embd, n_ff", [(H, FF), (512, 256)], ids=["2560x640", "512x256"])
+def test_routed_window_invariance(files, n_embd, n_ff):
+    """The routed experts on one routing of 8 tokens over a cache of 40 experts (10 distinct a token), each plan
+    ``resident_plan``'s: a token's IEEE rows and its 10 output rows the same at every width (cap = t * 10 entries, the
+    threadgroup rows min(cap, 24), scratch for cap entries) as alone. At 8 tokens the plan has more groups than the
+    dispatches' 24 threadgroup rows, so each row takes several groups (the group stride)."""
+    rng, n_expert = np.random.default_rng(71 + n_embd), 40
+    blob = kernels.basalt_expert_layout(n_embd, n_ff)["bytes"]
+    _, where, cache = session_cache(rng, n_embd, n_ff, n_expert)
+    ids, x = routing(rng, 8, n_expert).reshape(8, K), rng.standard_normal((8, n_embd)).astype(F32)
+    src, engines = BasaltSource(files[0]), {}
+    for t in WIDTHS:
+        g = Graph("step")
+        routed(g, t, n_embd=n_embd, n_ff=n_ff)
+        engines[t] = Engine(emit(g, src, t), gpu.device(), buffers=cache, pipeline_cache=PIPELINES)
+    p8 = engines[8].program
+    gy = next(o.grid[1] for o in p8.ops if p8.kernels[o.kernel].function == "basalt_expert_gu")     # the down's too
+    assert len(resident_plan(ids.ravel())[0]) > gy == kernels.EXPERT_GROUP_ROWS
+    per_token = {"moe.xq": n_embd // 32 * kernels.Q8_1_BLOCK_BYTES, "moe.out": K * n_embd * 4}
+
+    def step(t, cols):
+        experts, start, dst, tok = resident_plan(ids[cols].ravel())
+        ptr = [cache[CACHE[where[e][0]]].gpu_address + where[e][1] for e in experts]
+        check_plan(t, start, dst, tok, ptr, [(b.gpu_address, b.nbytes) for b in cache.values()], blob)
+        run(engines[t], {"moe.x": x[cols].tobytes(), **plan_bytes("moe", t * K, ptr, start, dst, tok, len(experts))},
+            per_token)
+        return {name: engines[t].read(name, t * nb) for name, nb in per_token.items()}
+
+    window_invariance(step, per_token, {"moe.out"})
+
+
+def test_drafter_window_invariance(files):
+    """The drafter's plan, quantizer and experts on one routing of 8 tokens over the file's ``mtp/experts`` (16 experts,
+    10 distinct a token): a token's q8_0 rows, scales and 10 output rows the same at every width (n = t * 10 ids,
+    cap_groups = cap_entries = n, groups that gather more tokens as t grows) as alone."""
+    rng, src, engines = np.random.default_rng(81), BasaltSource(files[0]), {}
+    ids, x = routing(rng, 8).reshape(8, K), rng.standard_normal((8, H)).astype(F32)
+    for t in WIDTHS:
+        g = Graph("step")
+        drafter(g, t, n_expert=E)
+        engines[t] = Engine(emit(g, src, t), gpu.device(), pipeline_cache=PIPELINES)
+    per_token = {"mtp.xq": H // 32 * kernels.Q8_0_BLOCK_BYTES, "mtp.xs": H // 32 * 4, "mtp.out": K * H * 4}
+
+    def step(t, cols):
+        run(engines[t], {"mtp.ids": ids[cols].tobytes(), "mtp.x": x[cols].tobytes()}, per_token)
+        return {name: engines[t].read(name, t * nb) for name, nb in per_token.items()}
+
+    window_invariance(step, per_token, {"mtp.xs", "mtp.out"})
