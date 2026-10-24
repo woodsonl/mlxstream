@@ -5,7 +5,11 @@
 """decode_cluster_parity's argmax half (basalt src/kernels/decode_cluster_parity.cpp:174-243, :412-421) on the Metal
 sampler family: the cluster argmax, here its partials and merge dispatches (``greedy_cl``,
 tests/kernels/basalt_sampler_gpu.py), against the one-block greedy kernel (``greedy_1b``) and the host's answer, the
-lowest index of the largest non-NaN value above -inf, else 0.
+lowest index of the largest non-NaN value above -inf, else 0, with the half's gate,
+``if (a[(size_t) t] != b[(size_t) t] || a[(size_t) t] != hb) ++bad;`` (:237). The other half, the QSA top-k
+(``run_topk_case``, :122-172, gated at :165, over the contexts of :396-411), checks qsa_block_topk_cluster, the
+sparse-attention indexer's block selection (src/kernels/cuda/qsa_select.cu), which is not a sampler kernel; it carries
+over with that kernel's port, as does the graph case's top-k side (DCP.2's d1, test_basalt_sampler_program.py).
 
 DCP.1: for each vocabulary of basalt's list, each of its 12 argmax patterns (``fill_logits``, :175-212, on the port's
 own seeded draws: normal(0, 3), then the pattern's overwrites) and T in (1, 5), even rows take the pattern and odd rows

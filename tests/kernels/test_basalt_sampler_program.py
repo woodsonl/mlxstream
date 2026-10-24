@@ -19,7 +19,8 @@ pick from the cluster's.
   vary and are basalt's host list. Also on the one-block path, forced on the same shapes (F.2).
 - DCP.2, decode_cluster_parity's graph case, argmax side (:245-306): one program of 5 rows at basalt's vocabulary
   (built at t = 5 and at t = 8), replayed 6 times over fresh logits written into the same buffer, against the
-  one-block greedy kernel on the same logits.
+  one-block greedy kernel on the same logits. Its QSA side, d1 (qsa_block_topk_cluster's captured ids against
+  qsa_block_topk_ref's, :261, :290, :296), carries over with that kernel's port (test_basalt_decode_cluster.py).
 - The greedy-only build (attr ``greedy_only``, the cluster pair alone), the port's: its picks equal the full build's in
   mode 0 and the host argmax, at t = 1 and 8.
 - The bias flag without a bias input, the port's: a record's BIAS flag changes no pick in modes 1 and 2 of a program
@@ -200,7 +201,7 @@ def test_basalt_decode_cluster_graph_replay(t):
     with the build's record (mode 0: the cluster pair alone), encoded once and replayed 6 times, each replay over
     fresh logits written into the same buffer (fill_logits' random pattern, then ties-across, alternately; the
     port's own seeded draws), against the one-block greedy kernel (``greedy_1b`` through basalt's neutral window,
-    :45-62) on the same logits."""
+    :45-62) on the same logits: the gate's d2 (:297-298); its d1 (:296) is the QSA top-k's."""
     nq, rs = 5, np.random.RandomState(20261002)
     eng = program(t)
     assert functions(eng) == SPLIT
