@@ -352,6 +352,19 @@ def _routed_session_rows(g, src, bad, tmp):
     return {}
 
 
+def _routed_other_kind(g, src, bad, tmp):
+    """The routed experts at 4352 x 256 on 4896-byte rows, as wide as the IEEE q8_1 of 4352 values: the IEEE
+    quantizer's, or basalt_q8_0_scaled's of 4608 values, its op carrying the attr quantizer "ieee"."""
+    if bad:
+        xq = g.value("w.xq", (2, 4896), U8)
+        op(g, "basalt_q8_0_scaled", [g.input("w.x", (2, 4608), F32)], [xq, g.value("w.xs", (2, 144), F32)],
+           quantizer="ieee")
+    else:
+        xq = q8_1(g, "w.xq", [g.input("w.x", (2, 4352), F32)], "ieee", rows=2)
+    routed(g, 2, n_embd=4352, n_ff=256, xq=xq)
+    return {}
+
+
 def _routed_table_at(i, at, good=None):
     """The routed experts with plan table i a pack constant at byte ``at`` (valid: ``good``, its alignment)."""
     def build(g, src, bad, tmp):
@@ -460,6 +473,7 @@ REFUSALS = [
      r"'w.xq' is u8 \[2, 2880\], not u8 \[2, 576\] \(q8_1 rows of the output's width\)"),
     ("routed on native q8_1 rows", case(r2, {}, {"quantizer": "native"}), "is not a basalt_q8_1 op's ieee rows"),
     ("routed on rows the session writes", _routed_session_rows, r"'w.xq' is not a basalt_q8_1 op's ieee rows"),
+    ("routed on another kind's rows", _routed_other_kind, r"'w.xq' is not a basalt_q8_1 op's ieee rows"),
     *ROUTED_TABLE,
     ("routed grp_ptr off 8 bytes", _routed_table_at(0, 4, 8), ALIGN.format(4, 1, 8)),
     ("routed grp_start off 4 bytes", _routed_table_at(1, 2, 4), ALIGN.format(2, 2, 4)),

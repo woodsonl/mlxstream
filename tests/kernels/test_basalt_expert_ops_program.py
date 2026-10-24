@@ -1,3 +1,10 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jesús Gulfo
+# adapted from basalt (jesdga95/basalt) src/kernels/cuda/verify_kernels.cu:947-1013 and
+# src/kernels/s2_expert_grouped_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE):
+# resident_plan_kernel's plan and its invariants, as the plan these tests supply and check until that producer is
+# ported (resident_plan, check_plan), and the parity test's routings as tests/kernels/test_basalt_s2_experts.py draws
+# them (merged_routings).
 """basalt's expert ops (monolith/ops/basalt.py) in compiled programs on the GPU: one static program per window width,
 T = 1 .. 8 (basalt captures one graph per width), each run bitwise equal to the merged single-kernel harness
 (tests/kernels/basalt_gpu.py) on the same bytes, under shader validation.
