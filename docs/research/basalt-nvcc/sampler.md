@@ -601,10 +601,10 @@ bits.
   `rcp.rn.f32`, `div.rn.f64`); the `.FTZ` instructions in the listings are CUDA's own (inside `rcp.rn`'s fast path,
   where they flush nothing, and inside the slow-path subroutines). The amended flush-to-zero rule for approximate
   reciprocals therefore has no site here. The one approximate operation is `:311`'s `__expf` (section 3.3).
-- **Two library functions are not in invariant 5's list.** The contract maps the library `expf` to
-  `metal::precise::exp` and gives `log1pf` a helper; `sampler.cu` calls the library `logf` (`:403`) and the
-  binary64 `exp` (`:379`, `:410`). This record transcribes CUDA's sequences for both (sections 2.5 and 2.6), which
-  gives CUDA's bits for every argument; the contract should name them.
+- **The library functions.** `sampler.cu` calls the library `logf` (`:403`) and the binary64 `exp` (`:379`,
+  `:410`). This record transcribes CUDA's sequences for both (sections 2.5 and 2.6), which gives CUDA's bits for
+  every argument, and invariant 5 names them among the libdevice functions the port transcribes from the PTX nvcc
+  inlines.
 - **binary64 in software.** MSL has no `double` on the GPU. The tail needs `dadd`, `dmul`, `dfma`, `ddiv`, the two
   conversions and four comparisons, IEEE with subnormals, on integer words. They run on one SIMD-group per row over
   at most 64 entries, mostly on lane 0.
