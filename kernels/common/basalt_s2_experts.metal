@@ -12,7 +12,7 @@
 // Both files build with nvcc's IEEE defaults: every float operation is IEEE's, subnormals kept
 // (docs/research/basalt-nvcc/s2_experts.md). This GPU flushes subnormals, and here the activation scale is the
 // quantizer's fp32 s, any non-negative float, so a subnormal can occur at every rounding site: each goes through
-// basalt_q8_1.metal's IEEE helpers (ieee_div127, ieee_rcp, ieee_mul, ieee_fma, ieee_div, warp_sum_ieee), whose
+// the IEEE helpers (ieee_mul in basalt_ieee.metal; ieee_div127, ieee_rcp, ieee_fma, ieee_div, warp_sum_ieee), whose
 // hardware path is the plain operation (fma() where SASS has FFMA), and every compare that a subnormal could reach is
 // on bits. Contraction is off (basalt_fp.metal's pragma). A NaN can come only from FFMA, FADD, FMUL and div.rn.f32 (or
 // pass through them), each of which gives sm_120's canonical 0x7fffffff, so every float the gate/up, SwiGLU and down
