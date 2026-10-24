@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jesús Gulfo
+# adapted from basalt (jesdga95/basalt) src/kernels/router_top10_parity.cpp:148-160 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE): its assertion that the router's floor cannot
+# fire, the check and its message verbatim (test_router_floor_cannot_fire_on_finite_logits).
 """The hyper-connection unit's own test code and kernel sources, GPU-free.
 
 - HF-COMPILE: each of the unit's kernel files, its comments removed, has ``#pragma STDC FP_CONTRACT OFF`` ahead of its
