@@ -6,6 +6,8 @@ session's blob buffers declared host, the follow-up dispatches behind their barr
 refusal, a valid input with exactly one defect refused by that defect's own check (its message). The GPU side is
 tests/kernels/test_basalt_expert_ops_program.py."""
 
+import math
+
 import pytest
 
 from monolith import kernels
@@ -56,14 +58,19 @@ def section(g, name, n_expert=N_EXPERT):
     return g.values.get(name) or g.const(name, (n_expert * BLOB,), U8)
 
 
+def dims(r):
+    """A table's shape: its rows, or a whole shape."""
+    return r if isinstance(r, tuple) else (r,)
+
+
 def plan_inputs(g, name, cap_groups, cap_entries, rows=None, dtypes=TABLES):
     """A plan the session writes: the five tables as inputs (basalt's ``resident_plan`` is not ported yet)."""
     rows = rows or (cap_groups, cap_groups + 1, 1, cap_entries, cap_entries)
-    return [g.input(f"{name}.{s}", (r,), dt) for s, r, dt in zip(PLAN, rows, dtypes)]
+    return [g.input(f"{name}.{s}", dims(r), dt) for s, r, dt in zip(PLAN, rows, dtypes)]
 
 
 def routed(g, t, *, name="moe", n_embd=H, n_ff=FF, tables=None, rows=None, dtypes=TABLES, xq=None,
-           quantizer="ieee", out_rows=None, out_dtype=F32, **attrs):
+           quantizer="ieee", out_rows=None, out_shape=None, out_dtype=F32, **attrs):
     """basalt's decode call of the routed experts at t tokens (``verify.cpp:1731``, ``:1744``, ``:1764``): the FFN
     input's IEEE q8_1 rows, a plan of the call's t * K entries, and native_expert_grouped with k_per_tok K (so
     cap_groups = cap_entries = t * K) into a row per entry, its blobs in the session's cache. ``attrs`` override the
@@ -72,7 +79,7 @@ def routed(g, t, *, name="moe", n_embd=H, n_ff=FF, tables=None, rows=None, dtype
     if xq is None:
         xq = q8_1(g, f"{name}.xq", [g.input(f"{name}.x", (t, n_embd), F32)], quantizer, rows=t)
     tables = tables or plan_inputs(g, name, cap, cap, rows, dtypes)
-    out = g.value(f"{name}.out", (cap if out_rows is None else out_rows, n_embd), out_dtype)
+    out = g.value(f"{name}.out", out_shape or (cap if out_rows is None else out_rows, n_embd), out_dtype)
     a = {"n_ff": n_ff, "k_per_tok": K, "blobs": CACHE, **attrs}
     op(g, "basalt_experts", [*tables, xq], [out], **{k: v for k, v in a.items() if v is not None})
     return out
@@ -82,7 +89,7 @@ def plan(g, ids, base, *, name="mtp", rows=None, dtypes=TABLES, **attrs):
     """``basalt_s2_plan`` of the routed ``ids`` over ``base``, into tables of the ids' n entries (``rows`` otherwise)."""
     n = ids.shape[0]
     rows = rows or (n, n + 1, 2, n, n)
-    tables = [g.value(f"{name}.{s}", (r,), dt) for s, r, dt in zip(PLAN, rows, dtypes)]
+    tables = [g.value(f"{name}.{s}", dims(r), dt) for s, r, dt in zip(PLAN, rows, dtypes)]
     a = {"k_per_tok": K, "n_expert": N_EXPERT, **attrs}
     op(g, "basalt_s2_plan", [ids, base], tables, **{k: v for k, v in a.items() if v is not None})
     return tables
@@ -97,7 +104,8 @@ def q8_0(g, x, name="mtp", t=None, widths=None):
     return xq, xs
 
 
-def drafter(g, t, *, name="mtp", n=None, n_expert=N_EXPERT, tables=None, xq=None, xs=None, out_shape=None, **attrs):
+def drafter(g, t, *, name="mtp", n=None, n_expert=N_EXPERT, tables=None, xq=None, xs=None, out_shape=None,
+            out_dtype=F32, **attrs):
     """basalt's drafter MoE at t tokens (``mtp.cpp:931-935``): moe_group_resident over its t * K routed ids and the
     resident experts (``mtp/experts``, ``n_expert`` blobs), quantize_q8_0_scaled of the FFN input, and moe_grouped_s2
     with cap_groups = cap_entries = t * K into a row per routed id. Given ``xq``, the op reads it and ``xs`` (None: no
@@ -108,7 +116,7 @@ def drafter(g, t, *, name="mtp", n=None, n_expert=N_EXPERT, tables=None, xq=None
                       n_expert=n_expert)
     if xq is None:
         xq, xs = q8_0(g, g.input(f"{name}.x", (t, H), F32), name)
-    out = g.value(f"{name}.out", out_shape or (n, H), F32)
+    out = g.value(f"{name}.out", out_shape or (n, H), out_dtype)
     a = {"cap_groups": n, "cap_entries": n, **attrs}
     op(g, "basalt_s2_experts", [*tables, xq] + ([] if xs is None else [xs]), [out],
        **{k: v for k, v in a.items() if v is not None})
@@ -355,14 +363,13 @@ def _routed_table_at(i, at, good=None):
     return build
 
 
-def _plan_at(what, at, good, dtype=U8):
-    """The plan with its ids (i32) or its base (``dtype``) a pack constant at byte ``at``; valid: a u8 base, and both
-    at ``good``."""
+def _plan_at(what, at, good, dtype=U8, shape=(N_EXPERT * BLOB,)):
+    """The plan with its ids (i32 [20]) or its base (``dtype`` ``shape``) a pack constant at byte ``at``; valid: a base
+    of u8 [n_expert * blob], and both at ``good``."""
     def build(g, src, bad, tmp):
-        nbytes = 20 * 4 if what == "ids" else N_EXPERT * BLOB
-        dt = I32 if what == "ids" else dtype if bad else U8
-        plan_only(g, **{what: g.const(f"p.{what}", (nbytes // dt.itemsize,), dt)})
-        return {"packs": [pack(tmp, {f"p.{what}": (at if bad else good, nbytes)})]}
+        dt, sh = (I32, (20,)) if what == "ids" else (dtype, shape) if bad else (U8, (N_EXPERT * BLOB,))
+        plan_only(g, **{what: g.const(f"p.{what}", sh, dt)})
+        return {"packs": [pack(tmp, {f"p.{what}": (at if bad else good, math.prod(sh) * dt.itemsize)})]}
     return build
 
 
@@ -419,11 +426,14 @@ ROUTED_TABLE = [(f"routed {s} {d}", case(r2, {}, {"rows": rows, "dtypes": dts}),
     ("grp_start", "without the end", (20, 20, 1, 20, 20), TABLES, r"'moe.grp_start' is i32 \[20\], not i32 \[>= 21\]"),
     ("n_groups", "f32", None, TABLES[:2] + (F32,) + TABLES[3:], r"'moe.n_groups' is f32 \[1\], not i32 \[>= 1\]"),
     ("ent_dst", "an entry short", (20, 21, 1, 19, 20), TABLES, r"'moe.ent_dst' is i32 \[19\], not i32 \[>= 20\]"),
+    ("ent_dst", "of two dims", (20, 21, 1, (20, 1), 20), TABLES, r"'moe.ent_dst' is i32 \[20, 1\], not i32 \[>= 20\]"),
     ("ent_tok", "i64", None, TABLES[:4] + (I64,), r"'moe.ent_tok' is i64 \[20\], not i32 \[>= 20\] \(a token"))]
 PLAN_TABLE = [(f"plan {s} {d}", case(plan_only, {}, {"rows": rows, "dtypes": dts}), why) for s, d, rows, dts, why in (
     ("grp_ptr", "i32", None, (I32,) + TABLES[1:], r"'mtp.grp_ptr' is i32 \[20\], not i64 \[>= 20\]"),
     ("grp_ptr", "a group short", (19, 21, 2, 20, 20), TABLES, r"'mtp.grp_ptr' is i64 \[19\], not i64 \[>= 20\]"),
     ("grp_start", "without the end", (20, 20, 2, 20, 20), TABLES, r"'mtp.grp_start' is i32 \[20\], not i32 \[>= 21\]"),
+    ("grp_start", "of two dims", (20, (21, 1), 2, 20, 20), TABLES,
+     r"'mtp.grp_start' is i32 \[21, 1\], not i32 \[>= 21\]"),
     ("counts", "one count", (20, 21, 1, 20, 20), TABLES, r"'mtp.n_groups' is i32 \[1\], not i32 \[>= 2\] \(the group"),
     ("ent_dst", "an entry short", (20, 21, 2, 19, 20), TABLES, r"'mtp.ent_dst' is i32 \[19\], not i32 \[>= 20\]"),
     ("ent_tok", "i64", None, TABLES[:4] + (I64,), r"'mtp.ent_tok' is i64 \[20\], not i32 \[>= 20\]"))]
@@ -435,9 +445,12 @@ REFUSALS = [
     ("routed k_per_tok 0", case(r2, {}, {"k_per_tok": 0}), r"must be positive ints, got \[640, 0\]"),
     ("routed blobs empty", case(r2, {}, {"blobs": []}), "attr blobs must list the buffers its blobs live in"),
     ("routed blobs a string", case(r2, {}, {"blobs": "cache.0"}), "attr blobs must list the buffers"),
+    ("routed blobs not names", case(r2, {}, {"blobs": ["cache.0", 1]}), "attr blobs must list the buffers"),
     ("routed out a row short", case(r2, {}, {"out_rows": 19}),
      r"'moe.out' is f32 \[19, 2560\]; .* so out is f32 \[>= T x k_per_tok \(20\), n_embd\]"),
     ("routed out i32", case(r2, {}, {"out_dtype": I32}), r"'moe.out' is i32 \[20, 2560\]; an entry writes the row"),
+    ("routed out of three dims", case(r2, {}, {"out_shape": (20, H, 1)}),
+     r"'moe.out' is f32 \[20, 2560, 1\]; an entry writes the row"),
     ("routed tables of 2 tokens, xq of 3", case(routed, {"t": 2, "rows": (20, 21, 1, 20, 20), "out_rows": 30},
                                                  {"t": 3, "rows": (20, 21, 1, 20, 20), "out_rows": 30}),
      r"'moe.grp_ptr' is i64 \[20\], not i64 \[>= 30\] \(an address per group\)"),
@@ -465,7 +478,9 @@ REFUSALS = [
     *PLAN_TABLE,
     ("plan base of fewer blobs than n_expert", case(plan_only, {}, {"n_expert": N_EXPERT + 1}),
      rf"the router's ids reach n_expert \(5\) blobs of {BLOB} bytes from it, u8 \[>= {5 * BLOB}\]"),
-    ("plan base i32", _plan_at("base", 2, 2, I32), r"base 'p.base' is i32 \[1382400\]; the router's ids reach"),
+    ("plan base i32", _plan_at("base", 2, 2, I32), r"base 'p.base' is i32 \[5529600\]; the router's ids reach"),
+    ("plan base of two dims", _plan_at("base", 2, 2, shape=(N_EXPERT * BLOB, 1)),
+     r"base 'p.base' is u8 \[5529600, 1\]; the router's ids reach"),
     ("plan base at an odd byte", _plan_at("base", 1, 2), "'p.base' " + ALIGN.format(1, 1, 2)),
     ("plan ids off 4 bytes", _plan_at("ids", 2, 4), "'p.ids' " + ALIGN.format(2, 0, 4)),
     # the quantizer
@@ -496,6 +511,8 @@ REFUSALS = [
      r"'mtp.xs' is f32 \[2, 81\], not f32 \[2, 80\] \(their fp32 scales\)"),
     ("s2 out a row short", case(d2, {}, {"out_shape": (19, H)}), r"'mtp.out' is f32 \[19, 2560\]; .* f32 \[>= 20, 2560\]"),
     ("s2 out of another width", case(d2, {}, {"out_shape": (20, 2048)}), r"'mtp.out' is f32 \[20, 2048\]; an entry"),
+    ("s2 out i32", case(d2, {}, {"out_dtype": I32}), r"'mtp.out' is i32 \[20, 2560\]; an entry writes the row"),
+    ("s2 out of three dims", case(d2, {}, {"out_shape": (20, H, 1)}), r"'mtp.out' is f32 \[20, 2560, 1\]; an entry"),
     ("s2 cap_groups past CUDA's grid", case(d2, {"cap_groups": 65535}, {"cap_groups": 65536}),
      r"moe_grouped_s2: cap_groups must be 1..65535, got 65536"),
     ("s2 cap_entries past CUDA's grid", case(d2, {"cap_entries": 858_993_458}, {"cap_entries": 858_993_459}),
