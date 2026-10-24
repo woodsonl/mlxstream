@@ -52,6 +52,7 @@ class Value:
     producer: Optional["Op"] = None
     consumers: List["Op"] = field(default_factory=list)
     is_input: bool = False
+    is_host: bool = False        # an input the session allocates and passes to every program that binds it (role "host")
     is_weight: bool = False
     is_state: bool = False       # persistent per-sequence buffer (KV cache, recurrent state): read and updated in place
     is_const: bool = False       # a constant table or aux tensor from the pack (RoPE tables, norm weights, A_log …)
@@ -125,9 +126,16 @@ class Graph:
         self.symbols.update(d for d in v.shape if isinstance(d, Sym))
         return v
 
-    def input(self, name: str, shape: Sequence[Dim], dtype: DType) -> Value:
+    def input(self, name: str, shape: Sequence[Dim], dtype: DType, *, host: bool = False) -> Value:
+        """A value the host writes before a step. ``host``: the session allocates its buffer (at least the value's
+        bytes) and passes the same one to every program that binds it (data it derives and updates outside the
+        programs, such as a drafter's gathered head rows); the emitter refuses one named after a StepState field,
+        which an input of that name binds, or after one of the program's own buffers (StepState, the token ring, a
+        weights window, a params record, a scratch arena, the accept or confidence log). Otherwise each program
+        allocates its own."""
         v = self.value(name, shape, dtype, scoped=False)
         v.is_input = True
+        v.is_host = host
         return v
 
     def weight(self, name: str, shape: Sequence[int], format: str) -> Value:
