@@ -55,10 +55,11 @@ probe on (+Q, sample_tokens_probe: each queried row also writes its query's prob
   unwritten, gives each queried row its query's probability within 1e-6 of the double reference, 0 exactly outside
   the kept list, finite, and bit for bit the float64 evaluation of the kernel's order (P.6), and gives the same bits
   for a row run alone on the split.
-- A2-A5, A7 and A8, the port's additions (spec T§10.2): the sampled kernels' penalty window is the tail; the
+- A2-A5, A7, A8 and A10, the port's additions (spec T§10.2): the sampled kernels' penalty window is the tail; the
   temperature comes after the filters; min_keep 3 and 10 clamp the top_p cut; the seed's high word and the counter's
   wrap reach the draw; subnormal logits are ordered exactly; min_p above 1 keeps nothing and picks the list's head,
-  with the probe the head's probability 1.0.
+  with the probe the head's probability 1.0; a penalty window longer than the history rows counts their slots and
+  reads nothing past them, on G-1B and the sampled paths.
 - TP.1, the port's addition (spec S§19.3): the drafter's greedy tail, ``top_prob`` (the cluster partials, then
   bs_greedy_top_prob), picks the host argmax, mapped, with the float64 softmax probability of the pick within
   q5k_head_parity's 1e-5; a NaN probability is stored as sm_120's (invariant 5; docs/research/basalt-nvcc/nan.md).
@@ -855,6 +856,34 @@ def test_basalt_sampler_sampled_penalty_window_tail(path):
     assert want == [0] * 16 and full.count(3) == 9, f"spec T§10.2 A2: the tail picks {want}, the whole window {full}"
     assert run(path, l, p, want, hist, 8) == 0, \
         "A2: the 16 tail-window picks equal sampled_reference (all 0); the full window would differ"
+
+
+@pytest.mark.parametrize("path", ["greedy_1b"] + SAMPLED)
+def test_basalt_sampler_window_past_history(path):
+    """A10: a penalty window longer than the history rows, penalty_last_n 64 over rows of 4 slots, as basalt's engine
+    binds min(penalty_last_n, 4,096) slots (generate.cpp:8195-8196): every kernel counts the row's 4 slots
+    (sampler.cu:97-103, :590-596; window_of's clamp) and reads nothing past them. 8 rows of 20,000 normal logits, each
+    with 20.0 at the id in its history's last slot and 19.0 at four others, under repeat 2 (20.0 falls to 10.0): G-1B
+    picks the lowest 19.0, and the sampled paths draw among the four (top_k 4, temperature 1, seed 101). Each pick is
+    the reference's over the clamped window, and the picks are not the unpenalised ones."""
+    T, V, H = 8, 20000, 4
+    rs = np.random.RandomState(20261024)
+    l = rs.standard_normal((T, V)).astype(np.float32)
+    hist = np.full(T * H, -1, np.int32)
+    for t in range(T):
+        ids = rs.choice(V, 5, replace=False)
+        l[t, ids[0]], l[t, ids[1:]], hist[t * H + H - 1] = 20.0, 19.0, ids[0]
+    greedy = path == "greedy_1b"
+    p = SamplerParams(greedy=greedy, temperature=0.0 if greedy else 1.0, top_k=4, top_p=1.0, seed=101,
+                      penalty_last_n=64, penalty_repeat=2.0)
+    win = [window_of(hist, H, t, p.penalty_last_n) for t in range(T)]
+    if greedy:
+        want, plain = ([greedy_pen(l[t], w, p) for t, w in enumerate(ws)] for ws in (win, [[]] * T))
+    else:
+        want, plain = ([mirror_pick(mirror_select(l[t], V, w, p, 4), 4, p, t) for t, w in enumerate(ws)]
+                       for ws in (win, [[]] * T))
+    assert all(len(w) == H for w in win) and want != plain, f"the window decides the picks: {want}, unpenalised {plain}"
+    assert run(path, l, p, want, hist, H) == 0, "A10: a window past the history counts the row's 4 slots"
 
 
 @pytest.mark.parametrize("path", SAMPLED)

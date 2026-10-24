@@ -26,7 +26,8 @@ pick from the cluster's.
   built without the input (its kernels never read slot 3's placeholder).
 - MG.1, the port's: one penalised request in each mode, the record's ``mode`` deciding which dispatches run: mode 0
   the cluster pick, mode 1 the one-block greedy pick, mode 2 the sampled pick; the scratch of a dispatch its mode
-  gates off keeps its 0xFF bytes. On the split and on the one-block path (forced).
+  gates off keeps its 0xFF bytes. On the split and on the one-block path (forced), with a penalty window of the
+  built history's 4 slots and of 64, wider than it.
 """
 
 import struct
@@ -263,14 +264,17 @@ def test_basalt_sampler_bias_flag_without_bias_input(forced):
 
 # ---- MG.1: the mode word gates the dispatches ------------------------------------------------------------------------
 
+@pytest.mark.parametrize("last_n", [4, 64], ids=["window4", "window64"])
 @pytest.mark.parametrize("forced", [False, True], ids=["split", "one_block-F"])
-def test_basalt_sampler_mode_selects_path(forced):
+def test_basalt_sampler_mode_selects_path(forced, last_n):
     """MG.1: 8 rows of 248,320 normal logits, each with 20.0 at one id, the only one in its 4-slot history, and 19.0
-    at four others; the request top_k 4, top_p 1, temperature 1 under repeat 2 (20 falls to 10, out of the list).
-    Its record written in each mode: mode 0 picks the 20.0 (the cluster pair alone), mode 1 the lowest of the 19.0s
-    (the one-block greedy kernel's penalised argmax), mode 2 the draw among the four 19.0s (the sampled path,
-    mirror_pick's). A scratch whose dispatches the mode gates off keeps its 0xFF bytes: ``cand`` (the split's
-    lists) in modes 0 and 1, the bitmap (the one-block kernels') in mode 0, and on the split in mode 2."""
+    at four others; the request top_k 4, top_p 1, temperature 1 under repeat 2 (20 falls to 10, out of the list), its
+    penalty window ``last_n`` slots: the program's 4, or 64, wider than the built history, which every kernel counts as
+    the row's 4 slots (sampler.cu:97-103, :590-596; basalt's engine binds min(penalty_last_n, 4,096) slots,
+    generate.cpp:8195-8196). Its record written in each mode: mode 0 picks the 20.0 (the cluster pair alone), mode 1
+    the lowest of the 19.0s (the one-block greedy kernel's penalised argmax), mode 2 the draw among the four 19.0s
+    (the sampled path, mirror_pick's). A scratch whose dispatches the mode gates off keeps its 0xFF bytes: ``cand``
+    (the split's lists) in modes 0 and 1, the bitmap (the one-block kernels') in mode 0, and on the split in mode 2."""
     rows, H = 8, 4
     rs = np.random.RandomState(20261018)
     l = rs.standard_normal((rows, V)).astype(np.float32)
@@ -278,8 +282,9 @@ def test_basalt_sampler_mode_selects_path(forced):
     for r in range(rows):
         ids = rs.choice(V, 5, replace=False)
         l[r, ids[0]], l[r, ids[1:]], hist[r * H] = 20.0, 19.0, ids[0]
-    p = SamplerParams(top_k=4, top_p=1.0, temperature=1.0, seed=181, counter=5, penalty_last_n=H, penalty_repeat=2.0)
-    win = [window_of(hist, H, r, H) for r in range(rows)]
+    p = SamplerParams(top_k=4, top_p=1.0, temperature=1.0, seed=181, counter=5, penalty_last_n=last_n,
+                      penalty_repeat=2.0)
+    win = [window_of(hist, H, r, last_n) for r in range(rows)]
     want = [[host_argmax(l[r]) for r in range(rows)], [host_argmax(penal_vec(l[r], win[r], p)) for r in range(rows)],
             [mirror_pick(mirror_select(l[r], V, win[r], p, 4), 4, p, r) for r in range(rows)]]
     assert all(want[0][r] != want[1][r] for r in range(rows)) and \
