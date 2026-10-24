@@ -377,12 +377,21 @@ def _table(ctx: _Ctx, op: Op, v: Value, dtype: DType, rows: int, what: str) -> N
 
 
 def _blob_buffers(ctx: _Ctx, names: Sequence[str], blob: int) -> List[str]:
-    """The buffers the plan's addresses point into: a graph value's buffer (a ``.basalt`` section's window), else a
-    buffer the session allocates (the expert cache), which the program declares with role "host", holding at least a
-    blob, so that Engine requires the session to pass it."""
+    """The buffers the plan's addresses point into: a graph value's buffer (a ``.basalt`` section's window), the value
+    itself holding at least a blob (its own bytes: a window reaches to page boundaries and may hold its neighbours),
+    else a buffer the session allocates (the expert cache), which the program declares with role "host", holding at
+    least a blob, so that Engine requires the session to pass it."""
     bufs = []
     for name in names:
-        buf = ctx.buf(ctx.values[name])[0] if name in ctx.values else name
+        buf = name
+        if name in ctx.values:
+            v = ctx.values[name]
+            nbytes = math.prod(ctx.shape(v)) * v.dtype.itemsize
+            if nbytes < blob:
+                raise ValueError(f"basalt_experts: blobs {name!r} is {v.dtype} {list(ctx.shape(v))}, {nbytes} bytes; "
+                                 f"each address the plan puts in it reaches a whole blob, so it holds at least one "
+                                 f"blob ({blob} bytes)")
+            buf = ctx.buf(v)[0]
         spec = ctx.program.buffers.setdefault(buf, BufferSpec(blob, None, "host"))
         if spec.role == "host":
             spec.nbytes = max(spec.nbytes, blob)

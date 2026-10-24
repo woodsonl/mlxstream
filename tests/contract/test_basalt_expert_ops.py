@@ -365,6 +365,13 @@ def _routed_other_kind(g, src, bad, tmp):
     return {}
 
 
+def _routed_blobs_value(g, src, bad, tmp):
+    """The routed experts on blobs in a graph value of one blob, or of a byte short of one."""
+    g.input("moe.cache", (BLOB - 1 if bad else BLOB,), U8)
+    routed(g, 2, blobs=["moe.cache"])
+    return {}
+
+
 def _routed_table_at(i, at, good=None):
     """The routed experts with plan table i a pack constant at byte ``at`` (valid: ``good``, its alignment)."""
     def build(g, src, bad, tmp):
@@ -433,14 +440,31 @@ def _s2_tables_out_of_order(g, src, bad, tmp):
     return {}
 
 
+def _s2_other_kinds_tables(g, src, bad, tmp):
+    """The drafter's experts on the plan's tables, or on five tables in the plan's order that another kind makes: a
+    tap_concat (its handler writes only its first output) over 20 rows of ids and a base, with the attr k_per_tok, so
+    that only the producer's kind tells them from a plan's."""
+    if not bad:
+        drafter(g, 2)
+        return {}
+    ids, base = g.input("mtp.ids", (20, 8), U8), g.input("mtp.base", (N_EXPERT * BLOB // 8, 8), U8)
+    tables = [g.value(f"mtp.{s}", (r,), dt) for s, r, dt in zip(PLAN, (20, 21, 2, 20, 20), TABLES)]
+    op(g, "tap_concat", [ids, base], tables, k_per_tok=K)
+    drafter(g, 2, tables=tables)
+    return {}
+
+
 ROUTED_TABLE = [(f"routed {s} {d}", case(r2, {}, {"rows": rows, "dtypes": dts}), why) for s, d, rows, dts, why in (
     ("grp_ptr", "i32", None, (I32,) + TABLES[1:], r"'moe.grp_ptr' is i32 \[20\], not i64 \[>= 20\] \(an address"),
     ("grp_ptr", "a group short", (19, 21, 1, 20, 20), TABLES, r"'moe.grp_ptr' is i64 \[19\], not i64 \[>= 20\]"),
     ("grp_start", "without the end", (20, 20, 1, 20, 20), TABLES, r"'moe.grp_start' is i32 \[20\], not i32 \[>= 21\]"),
     ("n_groups", "f32", None, TABLES[:2] + (F32,) + TABLES[3:], r"'moe.n_groups' is f32 \[1\], not i32 \[>= 1\]"),
+    ("n_groups", "no rows", (20, 21, 0, 20, 20), TABLES, r"'moe.n_groups' is i32 \[0\], not i32 \[>= 1\] \(the group"),
     ("ent_dst", "an entry short", (20, 21, 1, 19, 20), TABLES, r"'moe.ent_dst' is i32 \[19\], not i32 \[>= 20\]"),
     ("ent_dst", "of two dims", (20, 21, 1, (20, 1), 20), TABLES, r"'moe.ent_dst' is i32 \[20, 1\], not i32 \[>= 20\]"),
-    ("ent_tok", "i64", None, TABLES[:4] + (I64,), r"'moe.ent_tok' is i64 \[20\], not i32 \[>= 20\] \(a token"))]
+    ("ent_tok", "i64", None, TABLES[:4] + (I64,), r"'moe.ent_tok' is i64 \[20\], not i32 \[>= 20\] \(a token"),
+    ("ent_tok", "an entry short", (20, 21, 1, 20, 19), TABLES,
+     r"'moe.ent_tok' is i32 \[19\], not i32 \[>= 20\] \(a token"))]
 PLAN_TABLE = [(f"plan {s} {d}", case(plan_only, {}, {"rows": rows, "dtypes": dts}), why) for s, d, rows, dts, why in (
     ("grp_ptr", "i32", None, (I32,) + TABLES[1:], r"'mtp.grp_ptr' is i32 \[20\], not i64 \[>= 20\]"),
     ("grp_ptr", "a group short", (19, 21, 2, 20, 20), TABLES, r"'mtp.grp_ptr' is i64 \[19\], not i64 \[>= 20\]"),
@@ -449,7 +473,9 @@ PLAN_TABLE = [(f"plan {s} {d}", case(plan_only, {}, {"rows": rows, "dtypes": dts
      r"'mtp.grp_start' is i32 \[21, 1\], not i32 \[>= 21\]"),
     ("counts", "one count", (20, 21, 1, 20, 20), TABLES, r"'mtp.n_groups' is i32 \[1\], not i32 \[>= 2\] \(the group"),
     ("ent_dst", "an entry short", (20, 21, 2, 19, 20), TABLES, r"'mtp.ent_dst' is i32 \[19\], not i32 \[>= 20\]"),
-    ("ent_tok", "i64", None, TABLES[:4] + (I64,), r"'mtp.ent_tok' is i64 \[20\], not i32 \[>= 20\]"))]
+    ("ent_tok", "i64", None, TABLES[:4] + (I64,), r"'mtp.ent_tok' is i64 \[20\], not i32 \[>= 20\]"),
+    ("ent_tok", "an entry short", (20, 21, 2, 20, 19), TABLES,
+     r"'mtp.ent_tok' is i32 \[19\], not i32 \[>= 20\] \(a token"))]
 ALIGN = r"binds at byte {} of [\w.]+; slot {} needs {}-byte alignment"
 
 REFUSALS = [
@@ -459,6 +485,8 @@ REFUSALS = [
     ("routed blobs empty", case(r2, {}, {"blobs": []}), "attr blobs must list the buffers its blobs live in"),
     ("routed blobs a string", case(r2, {}, {"blobs": "cache.0"}), "attr blobs must list the buffers"),
     ("routed blobs not names", case(r2, {}, {"blobs": ["cache.0", 1]}), "attr blobs must list the buffers"),
+    ("routed blobs in a value a byte short of a blob", _routed_blobs_value,
+     rf"blobs 'moe.cache' is u8 \[{BLOB - 1}\], {BLOB - 1} bytes; .* at least one blob \({BLOB} bytes\)"),
     ("routed out a row short", case(r2, {}, {"out_rows": 19}),
      r"'moe.out' is f32 \[19, 2560\]; .* so out is f32 \[>= T x k_per_tok \(20\), n_embd\]"),
     ("routed out i32", case(r2, {}, {"out_dtype": I32}), r"'moe.out' is i32 \[20, 2560\]; an entry writes the row"),
@@ -514,6 +542,8 @@ REFUSALS = [
     ("s2 cap_groups missing", case(d2, {}, {"cap_groups": None}), "attrs cap_groups, cap_entries must be positive ints"),
     ("s2 on the session's tables", _s2_session_tables, "its tables are not one basalt_s2_plan's outputs"),
     ("s2 on the plan's tables out of order", _s2_tables_out_of_order, "its tables are not one basalt_s2_plan's outputs"),
+    ("s2 on another kind's tables in the plan's order", _s2_other_kinds_tables,
+     "its tables are not one basalt_s2_plan's outputs"),
     ("s2 cap_groups below the plan's ids", case(d2, {}, {"cap_groups": 19}), "cap_groups 19 < the plan's 20 ids"),
     ("s2 cap_entries below the plan's ids", case(d2, {}, {"cap_entries": 19}), "cap_entries 19 < the plan's 20 entries"),
     ("s2 of 9 tokens", case(d2, {"t": 8}, {"t": 9}), "9 tokens; the kernels take at most 8 entries a group"),

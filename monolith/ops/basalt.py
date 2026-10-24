@@ -70,13 +70,13 @@ plan's ids.
   ``basalt_q8_1`` op's ``ieee`` rows (basalt's F4, ``verify.cpp:1731``). The tables hold the capacity (cap addresses,
   cap + 1 starts, cap destinations and tokens, at least one count) and out cap rows: an entry's destination
   is its routing index (basalt's ``resident_plan``, ``verify_kernels.cu:1002-1005``). ``blobs`` names the buffers the
-  addresses point into: a graph value (its buffer; a ``.basalt`` file's ``experts`` section through its window, in
-  tests) or a buffer the session allocates (the expert cache), which the program declares with role ``host``, so that
-  ``Engine`` requires the session to pass it. The plan is its producer's (basalt's ``resident_plan``, not ported yet;
-  until then a test supplies it): groups in first-appearance order, their entries in routing order, each address
-  2-byte aligned and inside a named buffer, ``grp_start`` from 0 and nondecreasing, at most cap groups and cap
-  entries, each ``ent_tok`` < T. A group's entries are taken six at a time however many there are (``GRP_NC``), so T
-  needs no bound here.
+  addresses point into: a graph value of at least one blob (its buffer; a ``.basalt`` file's ``experts`` section
+  through its window, in tests) or a buffer the session allocates (the expert cache), which the program declares with
+  role ``host`` and at least one blob's bytes, so that ``Engine`` requires the session to pass it. The plan is its
+  producer's (basalt's ``resident_plan``, not ported yet; until then a test supplies it): groups in first-appearance
+  order, their entries in routing order, each group's blob 2-byte aligned and wholly inside one named buffer (never
+  split across buffers), ``grp_start`` from 0 and nondecreasing, at most cap groups and cap entries, each ``ent_tok``
+  < T. A group's entries are taken six at a time however many there are (``GRP_NC``), so T needs no bound here.
 * ``basalt_s2_plan`` (``moe_group_resident``), attrs ``k_per_tok`` and ``n_expert``: ``(ids [n] I32, base)`` →
   ``(grp_ptr, grp_start, counts, ent_dst, ent_tok)``, one threadgroup of 128 over the n routed ids, 1 <= n <= 128: a
   group per distinct id in first-appearance order, its entries in routing order, group g's blob at ``base + id *
