@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 
 from ..backends.metal.context import dispatch, current_backend
 
@@ -33,13 +34,14 @@ from ..core.shapes import N_CHAIN, N_FIRST, N_INJ, Sym, T, bind, numel, step_bin
 from ..core.step_state import StepStateLayout
 from ..formats import FORMATS
 from ..formats.blm import PackInfo
+from ..formats.gguf import ggml_row_bytes
 from ..nn.module import Model
 from ..packs.basalt import BasaltSource
 from ..packs.packer import ALIGN, PackFile
 from ..runtime.program import BufferSpec, KernelSpec, OpSpec, Program
 from .barriers import place_barriers
 from .coverage import check_coverage
-from .emit_basalt import BASALT_HANDLERS
+from .emit_basalt import BASALT_HANDLERS, GGML_IDS
 from .emit_basalt_prompt import BASALT_PROMPT_HANDLERS
 from .passes import DEFAULT_PASSES
 
@@ -239,6 +241,15 @@ def _own_buffer(program: Program, name: str) -> str:
         return by_name[name]
     role = program.buffers[name].role
     return {"params": "params record", "arena": "scratch arena", "weights": "weights window"}.get(role, f"{role} buffer")
+
+
+def _stored_bytes(v: Value) -> Optional[int]:
+    """The bytes of a weight held as stored, counted by its format: a value a byte for u8 (a section's bytes), whole
+    rows of a ggml type's blocks; None for any other format, which only its pack lays out."""
+    if v.format == "u8":
+        return math.prod(v.shape)
+    tid = GGML_IDS.get(v.format)
+    return None if tid is None or not v.shape else math.prod(v.shape[:-1]) * ggml_row_bytes(tid, v.shape[-1])
 
 
 def _size_stat(ctx: _Ctx, name: str) -> None:
@@ -1523,14 +1534,22 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
         elif v.is_weight or v.is_const:
             if v.name not in ctx.windows:
                 raise KeyError(f"emit_program: the pack has no entry for {v.name!r}")
+            aux = next((pk.aux[v.name] for pk in packs if v.name in pk.aux), None)
             if v.is_const:
-                aux = next((pk.aux[v.name] for pk in packs if v.name in pk.aux), None)
                 if aux is not None and _value_bytes(v, t) > int(aux["nbytes"]):
                     raise ValueError(
                         f"emit_program: constant {v.name!r} needs {_value_bytes(v, t)} bytes "
                         f"for shape {v.shape}, but its pack entry has only {aux['nbytes']} bytes "
                         f"(shape {aux['shape']}); repack with the requested context capacity"
                     )
+            elif v.format == "u8" and any(v.name in pk.slabs for pk in packs):    # as _weight refuses a ggml type's
+                raise ValueError(f"emit_program: the weight {v.name!r} (u8) is a block-lane-major pack slab, not bytes "
+                                 "as stored")
+            elif aux is not None and (need := _stored_bytes(v)) is not None and need != int(aux["nbytes"]):
+                # the kernels read every byte a weight declares (the routed experts' blobs, the drafter plan's base, u8
+                # rows), so its entry holds exactly those, as a .basalt entry does (BasaltSource.bind)
+                raise ValueError(f"emit_program: the weight {v.name!r} is {need} bytes of {v.format} {list(v.shape)}, "
+                                 f"but its pack entry holds {aux['nbytes']}")
     program.buffers[program.step_state] = BufferSpec(layout.size, layout.pack({"t_this_step": t}), "step_state")
     program.buffers[program.ring] = BufferSpec(ring_capacity * 8, None, "ring")
     order = list(g.ops)

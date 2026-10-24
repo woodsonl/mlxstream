@@ -385,6 +385,20 @@ def _routed_blobs_value(g, src, bad, tmp):
     return {}
 
 
+def _routed_blobs_u8_entry(g, src, bad, tmp):
+    """The routed experts on blobs in a pack aux entry that a u8 weight declares as one blob's bytes: an entry of that
+    blob, or of 4,096 bytes."""
+    routed(g, 2, blobs=[g.weight("p.c", (BLOB,), "u8").name])
+    return {"packs": [pack(tmp, {"p.c": (0, 4096 if bad else BLOB)})]}
+
+
+def _routed_blobs_u8_slab(g, src, bad, tmp):
+    """The routed experts on blobs in a pack's one-blob entry that a u8 weight declares: an aux entry, or a
+    block-lane-major (bf16) slab of those bytes."""
+    routed(g, 2, blobs=[g.weight("p.c", (BLOB,), "u8").name])
+    return {"packs": [pack(tmp, {"p.c": (0, BLOB)}, slab=bad)]}
+
+
 def _routed_blobs_field(g, src, bad, tmp):
     """The routed experts on blobs in an input of one blob, or in one named after StepState's anchor field, which binds
     the field (4 of StepState's 176 bytes), not a buffer of its own."""
@@ -449,6 +463,14 @@ def _plan_base_weight(g, src, bad, tmp):
     n = N_EXPERT * BLOB
     plan_only(g, base=g.weight("gguf/w", (n,), "q2_0") if bad else g.weight("mtp/experts", (n,), "u8"))
     return {"packs": [gguf_file(tmp, (n,))] if bad else []}
+
+
+def _plan_base_u8_entry(g, src, bad, tmp):
+    """The plan over a pack aux entry that a u8 weight declares as n_expert blobs: an entry of those bytes, or of
+    4,096."""
+    n = N_EXPERT * BLOB
+    plan_only(g, base=g.weight("p.b", (n,), "u8"))
+    return {"packs": [pack(tmp, {"p.b": (0, 4096 if bad else n)})]}
 
 
 def _q8_0_at(g, src, bad, tmp):
@@ -566,6 +588,10 @@ REFUSALS = [
      rf"blobs 'gguf/w' is q2_0 \[1919, 2560\], {BLOB - 720} bytes; .* at least one blob \({BLOB} bytes\)"),
     ("routed blobs in a weight of no ggml type", _routed_blobs_format,
      r"the weight 'p.w' \(nvfp4 \[1920, 2560\]\) is not a weight or constant \[n_out, n_in\] of ggml type"),
+    ("routed blobs in a u8 weight on a shorter pack entry", _routed_blobs_u8_entry,
+     rf"the weight 'p\.c' is {BLOB} bytes of u8 \[{BLOB}\], but its pack entry holds 4096"),
+    ("routed blobs in a u8 weight on a pack slab", _routed_blobs_u8_slab,
+     r"the weight 'p\.c' \(u8\) is a block-lane-major pack slab, not bytes as stored"),
     ("routed blobs in an input named after a StepState field", _routed_blobs_field,
      r"blobs 'anchor' binds the program's StepState \(an input named after a StepState field binds the field\)"),
     *[(f"routed blobs named after the program's {own}", case(r2, {"blobs": ["cache.0"]}, {"blobs": [name]}),
@@ -614,6 +640,8 @@ REFUSALS = [
      r"base 'p.base' is u8 \[5529600, 1\]; the router's ids reach"),
     ("plan base a weight of q2_0 values", _plan_base_weight,
      r"base 'gguf/w' is q2_0 \[5529600\]; the router's ids reach"),
+    ("plan base a u8 weight on a shorter pack entry", _plan_base_u8_entry,
+     rf"the weight 'p\.b' is {N_EXPERT * BLOB} bytes of u8 \[{N_EXPERT * BLOB}\], but its pack entry holds 4096"),
     ("plan base at an odd byte", _plan_at("base", 1, 2), "'p.base' " + ALIGN.format(1, 1, 2)),
     ("plan ids off 4 bytes", _plan_at("ids", 2, 4), "'p.ids' " + ALIGN.format(2, 0, 4)),
     # the quantizer
