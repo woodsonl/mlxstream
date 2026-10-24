@@ -27,7 +27,8 @@ through it) and static programs (the tests') are both accepted; every dispatch b
   ``srow = (K / 32 + 7) & ~7``): as basalt does (``gemm.cu:134-154``), the copy's BF16 image into the GEMM scratch,
   then ``Gemm::bf16``'s product on it; the image is rebuilt on every call, in the scratch the entries share, as
   basalt's is. A copy whose rows or columns differ from the product's N x K is refused (basalt exits,
-  ``gemm.cu:137-141``). The entry must agree with ``w`` (a BF16 tensor for ``bf16``, GGUF blocks for ``native``, as
+  ``gemm.cu:137-141``), as are codes and scales of two copies (basalt reads both from the one copy it finds,
+  ``gemm.cu:136``). The entry must agree with ``w`` (a BF16 tensor for ``bf16``, GGUF blocks for ``native``, as
   ``native_proj`` and ``bf16_proj`` require, ``src/prefill/prefill.cpp:1188-1199``) and with the inputs (``bf16``
   and ``native`` take ``(x, w)``, ``bf16_w`` ``(x, wq, ws)``); a mismatch is refused: so are ``entry="bf16_w"`` on a
   BF16 ``w``, two inputs (basalt's fall-through for a matrix without a copy, ``gemm.cu:155``, is written

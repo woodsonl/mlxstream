@@ -106,7 +106,9 @@ def _gemm_copy(ctx: _Ctx, op: Op) -> None:
     x's), as ``bf16_w`` takes them; a copy of another shape is refused with basalt's message (``:137-141``, where it
     exits). The image reads every byte of the codes and the scales, so each must be a constant held as rows (not a
     weight, not a pack slab) whose pack row, if a pack holds it, is exactly its bytes, as ``_weight`` requires of a
-    weight's rows; basalt's reads stay inside the copy it allocated at its size (``hc_fused.cu:1212-1217``)."""
+    weight's rows; basalt's reads stay inside the copy it allocated at its size (``hc_fused.cu:1212-1217``). The codes
+    and the scales must be one copy's, ``hc8/<name>/q`` and ``hc8/<name>/s``, as basalt's are: it finds the copy by
+    the matrix's pointer (``hc8_view``, ``gemm.cu:136``) and reads both from it."""
     (x, wq, ws), (y,) = op.inputs, op.outputs
     rows, macros = prompt_rows(ctx, op, same_rows=(x,))
     n, k = ctx.shape(y)[-1], ctx.shape(x)[-1]
@@ -117,6 +119,9 @@ def _gemm_copy(ctx: _Ctx, op: Op) -> None:
                          f"{' x '.join(map(str, ctx.shape(wq)))}, the product wants {n} x {k}")
     _expect(ctx, op, wq, (n, k), DType.U8, "the copy's int8 codes")
     _expect(ctx, op, ws, (n, (k // 32 + 7) & ~7), DType.F16, "the copy's fp16 scales, (K / 32 + 7) & ~7 a row")
+    if not (wq.name.startswith("hc8/") and wq.name.endswith("/q") and ws.name == wq.name[:-2] + "/s"):
+        raise ValueError(f"{op.kind}: the codes {wq.name!r} and the scales {ws.name!r} are not one copy's "
+                         "hc8/<name>/q and hc8/<name>/s")
     for v in (wq, ws):
         if not v.is_const or any(v.name in pk.slabs for pk in ctx.packs):
             raise ValueError(f"{op.kind}: {v.name!r} is {'a pack slab' if v.is_const else 'not a constant'}; a copy's "
