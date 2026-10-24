@@ -66,6 +66,8 @@ probe on (+Q, sample_tokens_probe: each queried row also writes its query's prob
   q5k_head_parity's 1e-5; a NaN probability is stored as sm_120's (invariant 5; docs/research/basalt-nvcc/nan.md).
 - The one-block geometry, the port's (spec S§16.3 (c)): S-1B at 32 and 96 threads per row reads fixture 16's lists
   as M16.1 does, so the 1,024 threads this GPU runs it at are not what makes its list.
+- The launch guards, the port's: a 9th partial threadgroup of a row, a split block at or past n_blocks, a split part
+  not of 128 threads, and a split merge not of 32 threads or of more than 64 blocks return before they store.
 - PL.1, the port's building-block check of the split path's first stage (``split_part``, bs_split_part alone): each
   4,096-logit block's list in the scratch equals mirror_select's over the block, ids and value bits.
 - W.1, invariant 1: each path's window, row for row, equals its rows run alone (the top-prob path's probabilities,
@@ -1064,6 +1066,48 @@ def test_basalt_sampler_greedy_top_prob_geometry():
     ids, bits = gpu.launch([(part, (gpu.AM_CTAS, rows), gpu.threads(part)), (prob, (rows,), 512)], l,
                            SamplerParams(greedy=True, temperature=0.0), mode=0, scratch={8: rows * gpu.AM_CTAS * 8})
     assert np.all(ids == -1) and np.all(bits == 0xFFFFFFFF), "a 512-thread dispatch wrote a pick or a probability"
+
+
+GUARDS = ["partial-9", "split-blocks+1", "split-256", "merge-64", "merge-65-blocks"]
+
+
+@pytest.mark.parametrize("case", GUARDS)
+def test_basalt_sampler_launch_guards(case):
+    """The port's: a dispatch outside a kernel's geometry, or a record outside its sizes, returns before it stores.
+    bs_greedy_partial over 9 threadgroups a row: a 9th would store the next row's first partial, so the extra row's
+    partials keep their 0xFF bytes and the picks are the host argmax. bs_split_part over n_blocks + 1 blocks: an extra
+    block would store the next row's first list, so the lists are the n_blocks dispatch's and the extra row's keep
+    their 0xFF bytes; at 256 threads every list keeps them. bs_split_merge at 64 threads, and on a record of 65
+    blocks (one past its lists), after bs_split_part's lists: no pick. 3 rows of 12,388 normal logits (4 blocks),
+    266,240 (65 blocks) for the last case."""
+    nv = 65 * kernels.BS_BLOCK if case == "merge-65-blocks" else 3 * kernels.BS_BLOCK + 100
+    l = normal_rows(23, rows=3, nv=nv)
+    T, rows, nb = len(l), len(l) + 1, -(-nv // kernels.BS_BLOCK)
+    p = SamplerParams(top_k=20, top_p=0.95, temperature=1.0, seed=23)
+    k = sampled_k(p.top_k, nv)
+    part, merge = gpu.pipeline("bs_greedy_partial"), gpu.pipeline("bs_greedy_merge")
+    spart, smerge = gpu.pipeline("bs_split_part"), gpu.pipeline("bs_split_merge")
+    if case == "partial-9":
+        buf = nt.Buffer(device(), rows * gpu.AM_CTAS * 8)
+        buf.fill(0xFF)
+        ids, _ = gpu.launch([(part, (gpu.AM_CTAS + 1, rows), gpu.threads(part)), (merge, (rows,), 32)], l, p, mode=0,
+                            scratch={8: buf})
+        pairs = np.frombuffer(buf.read(0, buf.nbytes), np.uint32).reshape(rows, gpu.AM_CTAS * 2)
+        assert ids.tolist() == [host_argmax(r) for r in l] and np.all(pairs[T] == 0xFFFFFFFF), \
+            "a 9th threadgroup stored a partial"
+    elif case.startswith("split"):
+        buf = nt.Buffer(device(), rows * nb * k * 8)
+        buf.fill(0xFF)
+        grid, width = ((nb + 1, rows), gpu.SPLIT_THREADS) if case == "split-blocks+1" else ((nb, rows), 256)
+        gpu.launch([(spart, grid, width)], l, p, mode=2, scratch={9: buf})
+        lists = np.frombuffer(buf.read(0, buf.nbytes), np.uint32).reshape(rows, nb, k, 2)
+        want = gpu.split_part(l, p) if width == gpu.SPLIT_THREADS else np.full((T, nb, k, 2), 0xFFFFFFFF, np.uint32)
+        assert np.array_equal(lists[:T], want) and np.all(lists[T] == 0xFFFFFFFF), f"{case}: a list was stored"
+    else:
+        width = 64 if case == "merge-64" else 32
+        ids, bits = gpu.launch([(spart, (nb, rows), gpu.SPLIT_THREADS), (smerge, (rows,), width)], l, p, mode=2,
+                               scratch={9: rows * nb * k * 8})
+        assert np.all(ids == -1) and np.all(bits == 0xFFFFFFFF), f"{case}: the merge stored a pick"
 
 
 def test_basalt_sampler_greedy_top_prob_nan(monkeypatch):

@@ -169,6 +169,16 @@ def test_basalt_sampler_params_refusals_and_min_p():
     assert struct.unpack_from(RECORD, rec)[4:10] == (2, 3, 20, f32(0.95), 2.0, 1.0)   # min_p above 1 is basalt's to accept
 
 
+def test_basalt_coupled_node_refusals():
+    """basalt_coupled_node refuses what coupled_draft_sample exits on (sampler.cu:1057-1060): no logits, or more blocks
+    than the merge's 64 lists; 64 blocks exactly is the widest node."""
+    for nv in (0, -1, 64 * 4096 + 1):
+        with pytest.raises(ValueError, match="basalt_coupled"):
+            kernels.basalt_coupled_node(nv, nv, 256, 0)
+    assert struct.unpack("<8I", kernels.basalt_coupled_node(64 * 4096, 106299, 256, 3, sub_to_id=True)) == (
+        64 * 4096, 106299, 256, 3, 2, 0, 0, 0)
+
+
 def test_basalt_sampler_mode_table():
     """The mode rule against basalt's verify window (verify.cpp:2496-2498, :2659; sampler.cu:991)."""
     nan, inf = float("nan"), math.inf

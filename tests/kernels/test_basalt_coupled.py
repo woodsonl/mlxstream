@@ -32,6 +32,8 @@ from it with the verify row's counter cell + 1, mapped through the subset, and k
   nothing, and the draft is the list's head with probability 1.0.
 - NaN (``test_basalt_coupled_penalize_nan``): a counted NaN logit, and a counted +inf less an infinite presence term,
   are stored as sm_120's NaN (invariant 5; docs/research/basalt-nvcc/nan.md).
+- The launch guards (``test_basalt_coupled_launch_guards``), the port's: a penalize node wider than seen's 8,192
+  words, a part not of 512 threads, and a merge not of 32 threads or of more than 64 blocks return before they store.
 """
 
 import functools
@@ -42,10 +44,12 @@ import numpy as np
 import pytest
 
 from monolith import kernels
+from monolith.runtime import _native as nt
 from tests.basalt_sampler_ref import (COUPLED_HIST_CAP, COUPLED_VOCABS, coupled_cases, coupled_draft_counter,
                                       coupled_hist_base, coupled_hist_len, coupled_hist_start, mirror_pick,
                                       mirror_select, penal_vec, raw32, sampled_k, SamplerParams)
 from tests.kernels import basalt_sampler_gpu as gpu
+from tests.kernels.basalt_gpu import device
 from tests.kernels.test_basalt_nan import check as nan_check
 from tests.kernels.test_basalt_sampler import block_lists, kernel_qprob
 
@@ -343,3 +347,41 @@ def test_basalt_coupled_penalize_nan(monkeypatch):
         at[list(planted)] = True
         assert (r.id, r.prob) == (c.id, c.prob)
         assert nan_check(r.logits, c.logits, at) == len(planted)
+
+
+CPL_GUARDS = ["penalize-262145", "part-1024", "merge-64", "merge-65-blocks"]
+
+
+@pytest.mark.parametrize("case", CPL_GUARDS)
+def test_basalt_coupled_launch_guards(case):
+    """The port's: a coupled dispatch outside its kernel's geometry, or a node past its sizes, returns before it
+    stores. bs_coupled_penalize on a node of 262,145 logits, one word past seen's 8,192, whose atomic OR no shader
+    validation checks (D14): the row, ids 5 and 262,144 in its window under repeat 2, comes back bit for bit.
+    bs_coupled_part at 1,024 threads: cand keeps its 0xFF bytes. bs_coupled_merge at 64 threads, and on a node of 65
+    blocks (one past its lists), after bs_coupled_part's lists: the id and probability keep their 0xFF bytes and the
+    ring its draft's slot. A node past 64 blocks is packed by hand: basalt_coupled_node refuses it, as basalt's
+    coupled_draft_sample does (sampler.cu:1057-1060)."""
+    nv = {"penalize-262145": 64 * kernels.BS_BLOCK + 1, "merge-65-blocks": 65 * kernels.BS_BLOCK}.get(case, 12388)
+    nb, dev = -(-nv // kernels.BS_BLOCK), device()
+    node = struct.pack("<IIIIIIII", nv, nv, CAP, 0, 0, 0, 0, 0)
+    l = np.random.RandomState(29).standard_normal(nv).astype(np.float32)
+    ring = np.full(CAP + gpu.CPL_MAX_T, -7, np.int32)
+    ring[CAP - 2:CAP] = (5, 64 * kernels.BS_BLOCK)
+    p = SamplerParams(top_k=20, temperature=1.0, seed=29, penalty_last_n=CAP, penalty_repeat=2.0)
+    row, cand, rb = (nt.Buffer(dev, b) for b in (l.tobytes(), nb * kernels.BS_SEL_MAX * 8, ring.tobytes()))
+    oid, opr = nt.Buffer(dev, 4), nt.Buffer(dev, 4)
+    for b in (cand, oid, opr):
+        b.fill(0xFF)
+    bufs = {0: row, 5: oid, 6: opr, 9: cand, 13: gpu.coupled_image(p), 14: rb}
+    if case == "penalize-262145":
+        gpu.coupled_run([("bs_coupled_penalize", 1, 1024)], node, bufs)
+        assert row.read(0, row.nbytes) == l.tobytes(), "a node past seen's words penalised its row"
+    elif case == "part-1024":
+        gpu.coupled_run([("bs_coupled_part", nb, 1024)], node, bufs)
+        assert set(cand.read(0, cand.nbytes)) == {0xFF}, "a 1,024-thread part stored a list"
+    else:
+        gpu.coupled_run([("bs_coupled_part", nb, gpu.CPL_PART_THREADS),
+                         ("bs_coupled_merge", 1, 64 if case == "merge-64" else 32)], node, bufs)
+        assert set(cand.read(0, cand.nbytes)) != {0xFF}, "the part stored its lists"
+        assert oid.read(0, 4) == opr.read(0, 4) == b"\xff" * 4 and rb.read(0, rb.nbytes) == ring.tobytes(), \
+            f"{case}: the merge stored a draft"
