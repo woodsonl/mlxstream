@@ -385,13 +385,14 @@ def _routed_blobs_value(g, src, bad, tmp):
     return {}
 
 
-def gguf_file(directory, shape):
-    """A .basalt file whose gguf section holds one Q2_0 tensor ``w`` of ``shape`` (row-major) as zeros, and a section
-    after it, so that the tensor's window ends on a page inside the file."""
+def gguf_file(directory, shape, type_id=42):
+    """A .basalt file whose gguf section holds one tensor ``w`` of ggml type ``type_id`` (Q2_0 unless given) and
+    ``shape`` (row-major) as zeros, and a section after it, so that the tensor's window ends on a page inside the
+    file."""
     directory.mkdir()
-    nbytes = ggml_row_bytes(42, shape[-1]) * math.prod(shape[:-1])
+    nbytes = ggml_row_bytes(type_id, shape[-1]) * math.prod(shape[:-1])
     meta = {"format": "basalt", "version": 1,
-            "tensors": {"w": {"type_id": 42, "shape": shape[::-1], "offset": 0, "bytes": nbytes}}}
+            "tensors": {"w": {"type_id": type_id, "shape": shape[::-1], "offset": 0, "bytes": nbytes}}}
     path = directory / "w.basalt"
     path.write_bytes(write_basalt({"meta": json.dumps(meta).encode(), "gguf": bytes(nbytes), "end": b"\0"}))
     return BasaltSource(path)
@@ -465,6 +466,23 @@ def _s2_session_rows(xq_w, xs_w):
         drafter(g, 2, xq=xq, xs=xs)
         return {}
     return build
+
+
+def _s2_xq_gguf(fmt, type_id):
+    """The drafter's experts on q8_0 rows the session writes (u8 [2, 2720]), or on a ``fmt`` weight of that shape in a
+    .basalt file's gguf section (both programs carry the file): 3,060 bytes, where basalt_s2_gu reads 5,440."""
+    def build(g, src, bad, tmp):
+        xq = g.weight("gguf/w", (2, 2720), fmt) if bad else g.input("mtp.xq", (2, 2720), U8)
+        drafter(g, 2, xq=xq, xs=g.input("mtp.xs", (2, 80), F32))
+        return {"packs": [gguf_file(tmp, (2, 2720), type_id)]}
+    return build
+
+
+def _s2_xq_aux(g, src, bad, tmp):
+    """The drafter's experts on q8_0 rows in a pack entry that a weight declares as its bytes (u8 [2, 2720], 5,440
+    bytes), or as q4_0 values of that shape (an entry of their 3,060 bytes)."""
+    drafter(g, 2, xq=g.weight("p.xq", (2, 2720), "q4_0" if bad else "u8"), xs=g.input("mtp.xs", (2, 80), F32))
+    return {"packs": [pack(tmp, {"p.xq": (0, 3060 if bad else 5440)})]}
 
 
 def _s2_without_scales(g, src, bad, tmp):
@@ -607,6 +625,12 @@ REFUSALS = [
      r"'mtp.xq' is u8 \[2, 2754\], not u8 \[2, 2720\] \(block_q8_0 rows of 2560 values\)"),
     ("s2 scales of another width", _s2_session_rows(2720, 81),
      r"'mtp.xs' is f32 \[2, 81\], not f32 \[2, 80\] \(their fp32 scales\)"),
+    ("s2 q8_0 rows a q4_0 weight", _s2_xq_gguf("q4_0", 2),
+     r"'gguf/w' is q4_0 \[2, 2720\], not u8 \[2, 2720\] \(block_q8_0 rows of 2560 values\)"),
+    ("s2 q8_0 rows an iq4_nl weight", _s2_xq_gguf("iq4_nl", 20),
+     r"'gguf/w' is iq4_nl \[2, 2720\], not u8 \[2, 2720\] \(block_q8_0 rows of 2560 values\)"),
+    ("s2 q8_0 rows a q4_0 pack-aux weight", _s2_xq_aux,
+     r"'p.xq' is q4_0 \[2, 2720\], not u8 \[2, 2720\] \(block_q8_0 rows of 2560 values\)"),
     ("s2 out a row short", case(d2, {}, {"out_shape": (19, H)}), r"'mtp.out' is f32 \[19, 2560\]; .* f32 \[>= 20, 2560\]"),
     ("s2 out of another width", case(d2, {}, {"out_shape": (20, 2048)}), r"'mtp.out' is f32 \[20, 2048\]; an entry"),
     ("s2 out i32", case(d2, {}, {"out_dtype": I32}), r"'mtp.out' is i32 \[20, 2560\]; an entry writes the row"),

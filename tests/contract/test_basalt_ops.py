@@ -377,6 +377,13 @@ def _xq_width(g, src, bad, tmp):
     return {}
 
 
+def _xq_weight(g, src, bad, tmp):
+    """mmvq on q8_1 rows in a pack entry that a weight declares as its bytes (u8 [2, 2880], 5,760 bytes), or as q4_0
+    values of that shape (an entry of their 3,240 bytes, where the GEMV reads 5,760)."""
+    gemv(g, "basalt_mmvq", "y", g.weight("p", (2, 2880), "q4_0" if bad else "u8"), weight(g, "gguf/mmvq.8", src))
+    return {"packs": [pack(tmp, {"p": (0, 3240 if bad else 5760)})]}
+
+
 def _out_width(kind, extra):
     """``kind`` whose (last) output is ``extra`` values wider than its weight's rows."""
     def build(g, src, bad, tmp):
@@ -491,6 +498,8 @@ REFUSALS = [
     ("dense_tc on a Q8_0 matrix", _weight_type("basalt_dense_tc", "gguf/mmvq.12", "gguf/mmvq.8"), "of ggml type"),
     ("mmvf on a Q8_0 matrix", _weight_type("basalt_mmvf", "dense/mmvf.q", "gguf/mmvq.8"), r"of ggml type \['bf16'\]"),
     ("mmvq rows of another input", _xq_width, r"is u8 \[2, 720\], not u8 \[2, 2880\] \(q8_1 rows of the weight's"),
+    ("mmvq rows a q4_0 pack-aux weight", _xq_weight,
+     r"'p' is q4_0 \[2, 2880\], not u8 \[2, 2880\] \(q8_1 rows of the weight's columns\)"),
     *[(f"{k} output wider than its rows", _out_width(k, 2), "contiguous columns of the weight's rows")
       for k in ("basalt_mmvq", "basalt_dense_tc", "basalt_dense_tc_pair", "basalt_mmvf")],
     ("mmvf ldy < n_out", _out_width("basalt_mmvf", -1), r"holds 127 values a row .* so ldy >= n_out"),

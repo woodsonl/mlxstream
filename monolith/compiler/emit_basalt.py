@@ -49,8 +49,12 @@ def _columns(ctx: _Ctx, op: Op) -> int:
 
 
 def _expect(ctx: _Ctx, op: Op, v: Value, shape: Tuple[int, int], dtype: DType, why: str) -> None:
-    if (ctx.shape(v), v.dtype) != (shape, dtype):
-        raise ValueError(f"{op.kind}: {v.name!r} is {v.dtype} {list(ctx.shape(v))}, not {dtype} {list(shape)} ({why})")
+    """``v`` holds ``shape`` values of ``dtype``. A weight's dtype is its storage byte and its shape counts its format's
+    values, so a weight holds them only when its format is that dtype: u8, bytes as stored (a q4_0 weight's
+    ``[2, 2720]`` is 3,060 bytes, not the 5,440 a reader of u8 rows takes)."""
+    kind = v.format if v.is_weight else v.dtype.short
+    if (ctx.shape(v), v.dtype, kind) != (shape, dtype, dtype.short):
+        raise ValueError(f"{op.kind}: {v.name!r} is {kind} {list(ctx.shape(v))}, not {dtype} {list(shape)} ({why})")
 
 
 def _weight(ctx: _Ctx, op: Op, w: Value, types: Sequence[int]) -> Tuple[int, int, int]:
