@@ -13,7 +13,9 @@ the random one (:216); the cluster output starts as 0xA5 bytes, the one-block ou
 side runs as basalt's ``greedy_one_block`` does (:45-62): a one-slot history of -1 per row with penalty_last_n 1, a
 window that counts nothing. basalt skips without clusters (:390-393); the port has none to lack, so it never skips.
 numpy's float32 compares keep subnormals, as the host's do: the denormal pattern's largest values are subnormals,
-which this GPU's own compares would see as zero.
+which this GPU's own compares would see as zero. Each denormal case of more than one logit is asserted to hold a row
+whose pick a compare that flushed subnormals would miss; a case whose draws put each denormal row's largest value at
+id 0, where the flushed row's tie also lands, is drawn again (``case_rows``).
 """
 
 from dataclasses import replace
@@ -22,6 +24,7 @@ import numpy as np
 import pytest
 
 from tests.basalt_sampler_ref import SamplerParams
+from tests.kernels import basalt_emu as emu
 from tests.kernels import basalt_sampler_gpu as gpu
 
 F32 = np.float32
@@ -89,13 +92,27 @@ def test_basalt_decode_cluster_host_orders_subnormals():
     assert host_argmax(F32([-np.inf, np.nan, -0.0, 0.0])) == 2
 
 
+def case_rows(nv, pattern, T):
+    """The case's T rows (:216): even rows the pattern, odd rows the random one, on RandomState([20261002, nv, pattern
+    index, T]). A denormal case in which a compare that read subnormals as zero would pick what the host picks in every
+    row (each denormal row's largest value at id 0) is drawn again with a fifth seed word, the draw's number."""
+    for draw in range(8):
+        rs = np.random.RandomState([20261002, nv, PATTERNS.index(pattern), T] + ([draw] if draw else []))
+        l = np.stack([fill_logits(rs, nv, pattern if t % 2 == 0 else "random") for t in range(T)])
+        if pattern != "denormal" or nv == 1 or any(host_argmax(emu.ftz(r)) != host_argmax(r) for r in l):
+            break
+    return l
+
+
 @pytest.mark.parametrize("T", (1, 5))
 @pytest.mark.parametrize("pattern", PATTERNS)
 @pytest.mark.parametrize("nv", VOCABS)
 def test_basalt_decode_cluster_argmax(nv, pattern, T):
-    """DCP.1, ``run_argmax_case`` (:214-243): every row's cluster pick equals its one-block pick and the host's."""
-    rs = np.random.RandomState([20261002, nv, PATTERNS.index(pattern), T])
-    l = np.stack([fill_logits(rs, nv, pattern if t % 2 == 0 else "random") for t in range(T)])
+    """DCP.1, ``run_argmax_case`` (:214-243): every row's cluster pick equals its one-block pick and the host's. A
+    denormal case of more than one logit has a row whose pick a compare that flushed subnormals would miss."""
+    l = case_rows(nv, pattern, T)
+    if pattern == "denormal" and nv > 1:
+        assert any(host_argmax(emu.ftz(r)) != host_argmax(r) for r in l), "a flushing compare would pass this case"
     a = gpu.greedy_cl(l, GREEDY, fill=0xA5)
     b = gpu.greedy_1b(l, NEUTRAL, hist=np.full(T, -1, np.int32), hist_len=1, fill=0x5A)
     hb = [host_argmax(r) for r in l]
