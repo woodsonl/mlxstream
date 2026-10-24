@@ -39,6 +39,8 @@ was read before the claim that orders it). Weakening the written memory orders t
 [M]; those rest on the transcription and the argument recorded with them, not on a test.
 """
 
+import multiprocessing
+import queue
 import threading
 import time
 
@@ -237,6 +239,29 @@ def test_the_pool_refuses_a_mismatched_pair():
         p.count_phase(np.zeros(8, np.int64), np.zeros(8, np.int64))
 
 
+def test_the_binding_refuses_what_the_equal_length_check_does_not_cover():
+    """Equal lengths do not make two arrays distinct. The same array for both would let the worker-id write
+    replace the count, and a shifted view of one buffer would let two jobs write one element at once; neither is
+    a length error, and `.noconvert()` prevents a conversion copy rather than aliasing."""
+    p = pool()
+    a = np.zeros(8, I32)
+    with pytest.raises(ValueError, match="share storage"):
+        p.count_phase(a, a)
+    b = np.zeros(9, I32)
+    with pytest.raises(ValueError, match="share storage"):
+        p.count_phase(b[:8], b[1:])
+    p.count_phase(np.zeros(8, I32), np.zeros(8, I32))              # two distinct buffers are fine
+
+
+def test_the_binding_refuses_an_unusable_spin():
+    """The spin crosses into C++ as microseconds. A NaN, an infinity, or a value past the integer's range makes
+    that conversion undefined rather than merely wrong, so it is refused before it happens."""
+    for bad in (float("nan"), float("inf"), -1.0, 1e18):
+        with pytest.raises(ValueError, match="finite"):
+            _nt.ExpertPool(n_workers=1, spin_before_sleep_ms=bad)
+    _nt.ExpertPool(n_workers=1, spin_before_sleep_ms=0.0)          # zero is a pool that never spins
+
+
 def test_many_pools_live_and_die():
     """Construction and teardown are their own risk: the destructor sets the stop flag and bumps the epoch so a
     parked worker notices rather than sleeping through it, then joins. A worker that missed the bump would hang
@@ -247,24 +272,46 @@ def test_many_pools_live_and_die():
         del p
 
 
-def test_a_pool_driven_from_another_thread():
-    """The pump thread is whatever Python thread called Engine.run and can differ between runs, so the pool must
-    work from a thread that did not construct it."""
-    p = pool()
-    out = np.zeros(64, I32)
-    who = np.full(64, -99, I32)
+def _drive_from_a_thread(q):
+    """Run in a child process: a pool driven from a thread that did not construct it, reporting the counts back."""
+    import numpy as _np
+    from monolith.runtime import _native as _n
+
+    p = _n.ExpertPool(n_workers=0, host_works=True, spin_before_sleep_ms=2.0)
+    out = _np.zeros(64, _np.int32)
+    who = _np.full(64, -99, _np.int32)
     err = []
 
     def drive():
         try:
             for _ in range(20):
                 p.count_phase(out, who)
-        except Exception as e:                   # noqa: BLE001 - reported through the assertion below
-            err.append(e)
+        except Exception as e:                   # noqa: BLE001 - carried back through the queue below
+            err.append(repr(e))
 
     t = threading.Thread(target=drive)
     t.start()
-    t.join(timeout=60)
-    assert not t.is_alive(), "the pool did not finish when driven from another thread"
+    t.join()
+    q.put((list(out), err))
+
+
+def test_a_pool_driven_from_another_thread():
+    """The pump thread is whatever Python thread called Engine.run and can differ between runs, so the pool must
+    work from a thread that did not construct it.
+
+    In a child process, because the failure this guards against is a hang. A thread that never returns would
+    outlive `join(timeout=...)` in this process and keep the whole test run alive after the assertion failed;
+    a child can be terminated, so the deadline is real."""
+    ctx = multiprocessing.get_context("spawn")
+    q = ctx.Queue()
+    proc = ctx.Process(target=_drive_from_a_thread, args=(q,))
+    proc.start()
+    try:
+        counts, err = q.get(timeout=120)
+    except queue.Empty:
+        proc.terminate()
+        proc.join(10)
+        pytest.fail("the pool did not finish when driven from another thread")
+    proc.join(30)
     assert not err, err
-    assert list(out) == [20] * 64
+    assert counts == [20] * 64

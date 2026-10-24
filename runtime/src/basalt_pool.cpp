@@ -21,6 +21,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <vector>
 
 namespace monolith::basalt_cpu {
 
@@ -166,6 +167,20 @@ void ExpertPool::worker(int id) {
     }
 }
 
+void ExpertPool::poison() {
+    poisoned_.store(true, std::memory_order_release);
+    // Exhaust the queue in the same step. A worker blocked inside its job is unreachable, but it returns to
+    // `drain` eventually, and `claim` tests only the epoch and the index: without this it would take the rest of
+    // this batch and call a body whose owner has already returned. Setting the index to the job count makes every
+    // later claim fail, and the epoch field is left alone so a claim in flight still fails on it.
+    uint64_t h = head_.load(std::memory_order_acquire);
+    for (;;) {
+        const uint64_t n = (h >> 16) & 0xffffu;
+        const uint64_t drained = (h & ~0xffffull) | n;                // index := njobs
+        if (head_.compare_exchange_weak(h, drained, std::memory_order_acq_rel, std::memory_order_acquire)) return;
+    }
+}
+
 bool ExpertPool::wait_parked(const char* what, std::string& error) {
     hstate_.store(kWaitParked, std::memory_order_relaxed);
     uint32_t spins = 0;
@@ -176,7 +191,7 @@ bool ExpertPool::wait_parked(const char* what, std::string& error) {
         spin_pause();
         if ((++spins & (kSpinSample - 1)) != 0) continue;
         if (std::chrono::steady_clock::now() - t0 > kStall) {
-            poisoned_.store(true, std::memory_order_release);
+            poison();
             error = std::string("the CPU expert pool stalled ") + what + " (" +
                     std::to_string(parked_.load(std::memory_order_acquire)) + " of " + std::to_string(n_) +
                     " workers parked)";
@@ -201,7 +216,7 @@ bool ExpertPool::wait_done(int n, std::string& error) {
             t0 = now;
             seen = d;
         } else if (now - t0 > kStall) {
-            poisoned_.store(true, std::memory_order_release);
+            poison();
             error = "the CPU expert pool stalled waiting for a batch to finish (" + std::to_string(d) + " of " +
                     std::to_string(n) + " jobs done)";
             return false;
@@ -242,7 +257,7 @@ bool ExpertPool::run_phase(int n_tasks, const std::function<void(int, int)>& bod
 PoolTask::PoolTask(std::shared_ptr<ExpertPool> pool, Work work) : pool_(std::move(pool)), work_(std::move(work)) {}
 
 PoolTask::~PoolTask() {
-    if (pool_) pool_->release_owner(this);
+    if (pool_) pool_->release_owner(this);                        // a poisoned pool was already abandoned
 }
 
 bool PoolTask::run(const HostCall& call, std::string& error) {
@@ -256,14 +271,31 @@ bool PoolTask::run(const HostCall& call, std::string& error) {
         error = "the CPU expert pool is already driven by another host task";
         return false;
     }
-    std::function<void(int, int)> body;
-    const int n = work_(call.step, call.point, body);
+    // The body lives on the heap because a stalled phase leaves a worker that may still call it. basalt's
+    // abort() takes the whole process and so never has to answer this; here the phase returns and this frame
+    // goes away, so the body has to outlive the frame whenever the pool is poisoned.
+    auto body = std::make_unique<std::function<void(int, int)>>();
+    const int n = work_(call.step, call.point, *body);
     if (n <= 0) return true;                                      // a point with nothing to do
-    if (!body) {
+    if (!*body) {
         error = "the host point asked for " + std::to_string(n) + " jobs and gave no body to run";
         return false;
     }
-    return pool_->run_phase(n, body, error, &last_);
+    const bool ok = pool_->run_phase(n, *body, error, &last_);
+    if (!ok && pool_->poisoned()) abandon(std::move(body));
+    return ok;
+}
+
+void PoolTask::abandon(std::unique_ptr<std::function<void(int, int)>> body) {
+    // A poisoned pool's workers may still hold this body and pointers into the caller's buffers, and there is no
+    // way to interrupt them. Both the body and one reference to the pool are leaked on purpose, for the process's
+    // life: the destructor would join a worker that never returns, and freeing the body under a running one is a
+    // use-after-free. This is what basalt's abort() buys for free.
+    static std::vector<std::unique_ptr<std::function<void(int, int)>>> abandoned_bodies;
+    static std::vector<std::shared_ptr<ExpertPool>> abandoned_pools;
+    abandoned_bodies.push_back(std::move(body));
+    abandoned_pools.push_back(pool_);
+    pool_.reset();                                                // this task no longer reaches it
 }
 
 }  // namespace monolith::basalt_cpu

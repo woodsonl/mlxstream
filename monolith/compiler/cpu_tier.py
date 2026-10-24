@@ -54,6 +54,7 @@ def decode_host_points(
     all_resident: bool,
     task: str = "cpu_experts",
     staging: str = "cpu_staging",
+    step_state: str = "step_state",
 ) -> List[HostPoint]:
     """The decode program's host points, in program order.
 
@@ -61,13 +62,16 @@ def decode_host_points(
     identity tests run in. It selects between the two forms and nothing else does.
 
     ``staging`` is the buffer the pool writes its rows into. It is named in each point's ``writes`` so that
-    ``Program.check_host_points`` refuses any op of the window that reads it; ``step_state`` is named in ``reads``
-    for the same reason, since the task reads the step's own state.
+    ``Program.check_host_points`` refuses any op of the window that reads it; the step-state buffer is named in
+    ``reads`` for the same reason, since the task reads the step's own state. ``step_state`` takes the program's
+    own ``Program.step_state`` name rather than assuming the default, because a program that renamed it would get
+    points declaring a buffer it does not have, which ``check_host_points`` rejects, or a buffer that is not the
+    one its ops actually write.
     """
     if all_resident:
         return []                    # the zero-doorbell graph: the host services nothing
     return [
-        HostPoint(task=task, publish=w.publish, wait=w.wait, writes=[staging], reads=["step_state"])
+        HostPoint(task=task, publish=w.publish, wait=w.wait, writes=[staging], reads=[step_state])
         for w in layers
     ]
 

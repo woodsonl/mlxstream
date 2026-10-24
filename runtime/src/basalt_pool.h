@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -93,7 +94,9 @@ class ExpertPool {
     bool host_works() const { return host_works_; }
 
     /// True once a wait has stalled. The workers may still hold pointers into the caller's buffers, so a poisoned
-    /// pool is never destroyed, never reused and leaked for the process's life.
+    /// pool is never destroyed, never reused and leaked for the process's life. `PoolTask` enforces that by
+    /// abandoning its reference and its job body; a caller that drives the pool directly owns the same duty, and
+    /// `run_phase` refuses a poisoned pool so the refusal does not depend on the caller remembering.
     bool poisoned() const { return poisoned_.load(std::memory_order_acquire); }
 
     /// Claim the pool for one owner, by compare-exchange. Returns false and names nothing it does not know when
@@ -120,6 +123,7 @@ class ExpertPool {
     int claim(uint32_t epoch);
     uint32_t begin_batch(int n);
     void publish();
+    void poison();                                 // marks the pool and exhausts the queue, in that order
     bool wait_parked(const char* what, std::string& error);
     bool wait_done(int n, std::string& error);
 
@@ -178,6 +182,8 @@ class PoolTask : public HostTask {
     PhaseTimes last_times() const { return last_; }
 
   private:
+    void abandon(std::unique_ptr<std::function<void(int, int)>> body);
+
     std::shared_ptr<ExpertPool> pool_;
     Work work_;
     PhaseTimes last_;

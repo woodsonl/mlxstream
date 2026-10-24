@@ -2,6 +2,7 @@
 // description and on `done_` directly, where a property test can only hope to schedule into the window.
 #include "basalt_pool.h"
 #include <cstdio>
+#include <unistd.h>
 #include <string>
 #include <vector>
 using namespace monolith::basalt_cpu;
@@ -18,7 +19,13 @@ int main() {
             count[(size_t) job] += 1;
             mark[(size_t) job] = 1;
         }, err, nullptr);
-        if (!ok) { std::fprintf(stderr, "phase %d failed: %s\n", k, err.c_str()); return 2; }
+        if (!ok) {
+            // _exit, not return: the pool's contract forbids destroying it once a stall has poisoned it, and a
+            // return here would unwind the automatic `pool` and join a worker that may never come back.
+            std::fprintf(stderr, "phase %d failed: %s\n", k, err.c_str());
+            std::fflush(stderr);
+            _exit(2);
+        }
         for (int j = 0; j < n; ++j) if (!mark[(size_t) j]) { std::fprintf(stderr, "job %d did not run\n", j); return 3; }
     }
     for (int j = 0; j < n; ++j)

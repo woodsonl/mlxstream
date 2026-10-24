@@ -5,6 +5,9 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+#import <Foundation/Foundation.h>
+#include <algorithm>
+#include <cmath>
 #include <array>
 #include <cstring>
 #include <stdexcept>
@@ -217,6 +220,11 @@ NB_MODULE(_native, m) {
   // every worker and the synchronisation this pool exists to get right would never be exercised.
   nb::class_<bc::ExpertPool>(m, "ExpertPool")
       .def("__init__", [](bc::ExpertPool* self, int n_workers, bool host_works, double spin_before_sleep_ms) {
+             // Checked before the conversion: a NaN, an infinity, or a value past the integer's range makes the
+             // float-to-integer conversion undefined rather than merely wrong.
+             need(std::isfinite(spin_before_sleep_ms) && spin_before_sleep_ms >= 0.0 &&
+                      spin_before_sleep_ms <= 24.0 * 60.0 * 60.0 * 1000.0,
+                  "ExpertPool: spin_before_sleep_ms must be finite and 0 to 86,400,000");
              new (self) bc::ExpertPool(n_workers, host_works,
                                        std::chrono::microseconds((long long) (spin_before_sleep_ms * 1000.0)));
            },
@@ -230,9 +238,13 @@ NB_MODULE(_native, m) {
       // exactly once per phase is the property the epoch-tagged claim exists to give.
       .def("count_phase", [](bc::ExpertPool& p, I32Out1 out, I32Out1 who) {
              need(who.shape(0) == out.shape(0), "count_phase: who must hold as many ints as out");
-             const int n = (int) out.shape(0);
+             need(out.shape(0) <= (size_t) 0xffff, "count_phase: a pool batch holds 0 to 65535 jobs");
+             const int n = (int) out.shape(0);                     // bounded above, so the narrowing is exact
              int32_t* op = out.data();
              int32_t* wp = who.data();
+             // Two different arrays, not merely two of the same length: sharing storage would let the worker-id
+             // write replace the count, and a shifted view would let two jobs write one element concurrently.
+             need(op + n <= wp || wp + n <= op, "count_phase: out and who must not share storage");
              std::string err;
              bc::PhaseTimes t;
              bool ok;
@@ -245,15 +257,22 @@ NB_MODULE(_native, m) {
            }, nb::arg("out").noconvert(), nb::arg("who").noconvert(),
            "run one phase of out.size() jobs; job j does out[j] += 1 and writes its worker id to who[j]")
       .def("stall_phase", [](bc::ExpertPool& p, double hold_s) {
-             // One job that outlives kStall, so the stall path and the poisoning can be tested. The pool it
-             // poisons must be abandoned, never destroyed: its worker still holds this lambda.
+             need(std::isfinite(hold_s) && hold_s >= 0.0 && hold_s <= 24.0 * 60.0 * 60.0,
+                  "stall_phase: hold_s must be finite and 0 to 86,400");
+             // One job that outlives kStall, so the stall path and the poisoning can be tested. A poisoned pool's
+             // worker is still inside this body, so neither the body nor the pool may be freed. The body is
+             // function-local static and the pool is held through a non-owning reference the binding cannot free,
+             // but the Python object CAN still be collected, so the test keeps its own reference and this leaks
+             // the body on the poisoning path, which is the same bargain PoolTask::abandon makes.
              std::string err;
              bool ok;
              {
                nb::gil_scoped_release unlock;
-               ok = p.run_phase(1, [hold_s](int, int) {
-                      std::this_thread::sleep_for(std::chrono::duration<double>(hold_s));
-                    }, err, nullptr);
+               auto* body = new std::function<void(int, int)>([hold_s](int, int) {
+                 std::this_thread::sleep_for(std::chrono::duration<double>(hold_s));
+               });
+               ok = p.run_phase(1, *body, err, nullptr);
+               if (ok || !p.poisoned()) delete body;               // nothing can still be running it
              }
              return nb::make_tuple(ok, err);
            }, nb::arg("hold_s"), "run one job that sleeps hold_s seconds, so a wait can be made to stall");
