@@ -620,7 +620,7 @@ def basalt_dense_tc_pair_grid(n_out0: int, n_out1: int) -> Tuple[int, int]:
 
 
 # ---- basalt's Q5_K head (kernels/common/basalt_q5k_head.metal; docs/research/basalt-nvcc/q5k_head.md)
-# adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:337-386, :500-535 and
+# adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:337-386, :406-408, :500-535 and
 # src/kernels/cuda/head_proxy.cuh:17-28 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE)
 
 Q5K_HEAD_THREADS = 256      # basalt's WPB * WARP: 8 SIMD-groups, one row each
@@ -668,6 +668,18 @@ def basalt_q5k_head_params(n_in: int, n_out: int, has_map: bool = False, n_block
     if not 0 < n_out < 2 ** 31:
         raise ValueError(f"basalt_q5k_head: n_out must be in 1..INT_MAX, got {n_out}")
     return struct.pack("<IIII", n_in, n_out, int(has_map), n_blocks)
+
+
+def basalt_q5k_mask_grid(n_out: int) -> Tuple[int, int]:
+    """``q5k_head_mask_unmapped``'s launch (q5k_head.cu:406-408): ceil(n_out / 256) threadgroups of 256, a row each."""
+    return -(-n_out // 256), 256
+
+
+def basalt_q5k_top1_part_bytes(grid: int) -> int:
+    """The top-1's partials, which its merge reads: (max, row, sum) per threadgroup of ``grid``, 12 bytes each. basalt
+    keeps them in ``q5k_head_top1_scratch_bytes()`` (q5k_head.cu:370), room for 4096 and its counter; the port's merge
+    is a dispatch of its own and needs no counter."""
+    return 12 * grid
 
 
 # basalt's 2-bit proxy of the head's rows (head_proxy.cuh:17-28; q5k_head.cu:500-535)
@@ -779,6 +791,144 @@ def basalt_gr_post_grid(n_embd: int, hc: int, t: int) -> Tuple[int, int]:
     """(threadgroups, threads per threadgroup): one thread per element of the T rows, in threadgroups of 256 (basalt's
     ``THREADS`` and ``blocks``, native_gr_postops.cu:35, :83)."""
     return -(-t * hc * n_embd // 256), 256
+
+
+# ---- basalt's grouped RMSNorm (kernels/common/basalt_gr_norm.metal; docs/research/basalt-nvcc/ple.md) ----
+# The launch rules below are adapted from basalt (jesdga95/basalt) src/kernels/cuda/native_gr_norm.cu:85-100 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+def basalt_gr_norm_source() -> str:
+    """basalt's ``native_gr_rms_norm_weighted``, ``weighted_rms_norm<256>`` and ``<1024>`` (``basalt_gr_norm``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_gr_norm.metal")
+
+
+def basalt_gr_norm_macros(n_cols: int) -> Dict[str, str]:
+    """basalt's block choice (native_gr_norm.cu:93-96): 256 threads below 1024 columns, 1024 from there."""
+    return {"NORM_BLOCK": "1024" if n_cols >= 1024 else "256"}
+
+
+def basalt_gr_norm_params(n_cols: int, gamma_rows: int, eps: float) -> bytes:
+    """``GrNormParams``: n_cols, gamma_rows (row r is normalized with gamma row r % gamma_rows) and eps as float32
+    bits. basalt's refusals (native_gr_norm.cu:87), eps taken as its float: n_cols outside its int's 1..INT_MAX (which
+    also keeps the column loop's counter from wrapping), or eps not finite or below 0; and a gamma_rows below 1."""
+    import numpy as np
+
+    with np.errstate(over="ignore"):
+        e = np.float32(eps)
+    if not 0 < n_cols < 2 ** 31 or gamma_rows <= 0 or not np.isfinite(e) or e < 0:
+        raise ValueError(f"basalt_gr_norm: require 1 <= n_cols <= INT_MAX, gamma_rows >= 1 and a finite eps >= 0 "
+                         f"(n_cols {n_cols}, gamma_rows {gamma_rows}, eps {eps})")
+    return struct.pack("<4I", n_cols, gamma_rows, int(e.view(np.uint32)), 0)
+
+
+def basalt_gr_norm_grid(n_rows: int, macros: Mapping[str, str]) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup): one threadgroup of NORM_BLOCK threads per row; basalt refuses
+    n_rows below 1 (native_gr_norm.cu:87)."""
+    if n_rows <= 0:
+        raise ValueError(f"basalt_gr_norm: n_rows must be positive, got {n_rows}")
+    return n_rows, int(macros["NORM_BLOCK"])
+
+
+# ---- basalt's n-gram block (kernels/common/basalt_ple.metal; docs/research/basalt-nvcc/ple.md) ----
+# The launch rules and constants below are adapted from basalt (jesdga95/basalt)
+# src/kernels/cuda/native_ple_postops.cu:36, :352-359, src/kernels/cuda/ple.cu:36, :210,
+# src/kernels/cuda/elementwise.cu:277-287, src/kernels/cuda/verify_kernels.cu:1086-1090,
+# include/basalt/kernels/ngram.hpp:30-41 and include/basalt/kernels/verify_kernels.hpp:21 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+PLE_N = 2560            # a hyper-connection stream's width (NG_N_EMBD)
+PLE_H = 4               # the hyper-connection streams (NG_HC)
+PLE_D = 10240           # their channels, PLE_H * PLE_N (NG_HC_DIM)
+PLE_HIST = 9            # the history's rows (NG_HIST)
+PLE_SNAP_SLOTS = 8      # the per-row snapshots: a verify window's most rows (kVerifyMaxT)
+PLE_RMS_EPS = 1e-6      # the three grouped norms' eps (NG_RMS_EPS)
+
+PLE_GRIDS = {           # entry (basalt_ple_<name>) -> (threadgroups, threads), basalt's launches
+    "gate": (4, 512),           # native_ple_postops.cu:355: gate_kernel<<<H, 512>>>, one block per stream
+    "broadcast": (40, 256),     # native_ple_postops.cu:356: broadcast_kernel<<<D / 256, 256>>>
+    "conv": (40, 256),          # native_ple_postops.cu:359: conv_residual_kernel<<<D / 256, 256>>>
+    "advance": (40, 256),       # ple.cu:210: (NG_HC_DIM + THREADS - 1) / THREADS blocks of THREADS = 256 (:36)
+    "snapshot": (64, 256),      # elementwise.cu:284-285: min(ceil(n4 / 256), 64) blocks of 256, n4 = 23,040 float4s
+    "restore": (64, 256),       # verify_kernels.cu:1087-1088: min(ceil(n / 256), 64) blocks of 256, n = 92,160
+}
+
+
+def basalt_ple_source() -> str:
+    """basalt's ``gate_kernel`` (``basalt_ple_gate``), ``broadcast_kernel`` (``basalt_ple_broadcast``),
+    ``conv_residual_kernel`` (``basalt_ple_conv``), ``history_advance_kernel`` (``basalt_ple_advance``),
+    ``copy_from_mapped_kernel`` as the history's snapshot (``basalt_ple_snapshot``) and ``copy_indexed_kernel`` as the
+    commit's restore (``basalt_ple_restore``)."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_ple.metal")
+
+
+def basalt_ple_gate_params() -> bytes:
+    """``PleGateParams``: the gate's scale as float32 bits, basalt's host constant ``1.0f / std::sqrt(float(N))``
+    (native_ple_postops.cu:355; host code, which --use_fast_math leaves IEEE), 0x3CA1E89B."""
+    import numpy as np
+
+    bits = int((np.float32(1) / np.sqrt(np.float32(PLE_N))).view(np.uint32))
+    assert bits == 0x3CA1E89B, hex(bits)
+    return struct.pack("<4I", bits, 0, 0, 0)
+
+
+# ---- basalt's prompt path: the GEMM and the 16-bit conversions (kernels/common/basalt_prompt_gemm.metal; docs/research/basalt-nvcc/prefill_kernels.md) ----
+
+# The rows every prompt-path kernel reads (invariant 4): StepState.t_this_step clamped to the compiled bound ROWS_MAX in
+# a dynamic-T program (T_SRC 0), the compiled count T_STATIC_ROWS in a static one (T_SRC 2), whose advance resets
+# t_this_step to 1. A builder places it after its PRELUDE-led prefix, behind which the emitter splices the StepState
+# struct, and before its kernels. The row macros are uint literals ("64u"): MSL's min(uint, int) is ambiguous.
+PROMPT_ROWS = """
+inline uint prompt_rows(device const StepState* st) {          // invariant 4: the chunk's rows are StepState data
+#if T_SRC == 2
+  return T_STATIC_ROWS;                                        // a static program's compiled count
+#else
+  return min(st->t_this_step, ROWS_MAX);                       // ROWS_MAX: the program's bound, the buffers' rows
+#endif
+}
+"""
+
+
+def basalt_prompt_gemm_source() -> str:
+    """basalt's ``Gemm::bf16`` product and ``Gemm::native``'s FP16 product (``basalt_prompt_gemm``), and the
+    conversions ``to_f16`` and ``to_bf16`` (``basalt_prompt_convert``)."""
+    return PRELUDE + template("basalt_fp.metal") + PROMPT_ROWS + template("basalt_prompt_gemm.metal")
+
+
+# The padded multiply-adds a product dispatch may run, measured on 2026-10-20 on an Apple M3 Max (40 GPU cores, macOS
+# 27.0.1): whole products at B 256 with at least 40 threadgroups ran 769-2456 G MAC/s (three runs, each the least of 5
+# at a warm clock; one run alone gave 1 << 29); the slowest, FP16 640 x 2560 (one threadgroup per core) at 769, times
+# 0.5 ms, rounded down to a power of two.
+PROMPT_GEMM_MACS = 1 << 28
+
+
+def basalt_prompt_gemm_slices(rows: int, n: int, k: int) -> List[Tuple[int, int, int, int]]:
+    """The static slices ``(row0, nrows, col0, ncols)`` of a product at bound ``rows`` (B) with ``n`` outputs over
+    ``k``, each its own dispatch and params record, covering [0, Bp) x [0, n) once, Bp = 64 * ceil(B / 64). A slice
+    runs its tiles' 64 * ceil(nrows / 64) * 64 * ceil(ncols / 64) * k multiply-adds. Columns: CB = min(n, max(64, c)),
+    c the largest multiple of 64 with Bp * c * k <= PROMPT_GEMM_MACS (0 if none). Rows: Bp when c >= 64, else
+    RB = min(Bp, max(64, r)), r the largest multiple of 64 with r * 64 * k <= PROMPT_GEMM_MACS. So every slice is
+    within the budget or one tile, every row slice is a multiple of 64 tall and every column slice but the last (which
+    ends at n) a multiple of 64 wide: a slice's grid covers its block and no other. Slices change no bit (each output's
+    chain is the same in any slice)."""
+    if k <= 0 or k % 16:
+        raise ValueError(f"basalt_prompt_gemm: k must be a positive multiple of 16, got {k}")
+    if rows < 1 or n < 1:
+        raise ValueError(f"basalt_prompt_gemm: need at least one row and one output, got {rows} rows, {n} outputs")
+    bp = 64 * -(-rows // 64)
+    c = PROMPT_GEMM_MACS // (bp * k) // 64 * 64
+    cb = min(n, max(64, c))
+    rb = bp if c >= 64 else min(bp, max(64, PROMPT_GEMM_MACS // (64 * k) // 64 * 64))
+    return [(r0, min(rb, bp - r0), c0, min(cb, n - c0)) for r0 in range(0, bp, rb) for c0 in range(0, n, cb)]
+
+
+def basalt_prompt_gemm_params(n: int, k: int, row0: int, col0: int) -> bytes:
+    """``PromptGemmParams``: the product's n and k, the slice's first row and first column."""
+    return struct.pack("<4I", n, k, row0, col0)
+
+
+def basalt_prompt_convert_params(n: int) -> bytes:
+    """``PromptConvertParams``: the row width n (the conversion runs the chunk's rows times n elements)."""
+    return struct.pack("<I", n)
 
 
 # ---- basalt's router top-10 (kernels/common/basalt_router.metal; docs/research/basalt-nvcc/hc_fused.md section 8)
