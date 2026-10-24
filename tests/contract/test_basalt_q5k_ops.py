@@ -11,9 +11,9 @@ import pytest
 
 from monolith import kernels
 from monolith.compiler.coverage import check_coverage
-from monolith.compiler.emit import basalt_windows
+from monolith.compiler.emit import ACCEPT_LOG, CONF_LOG, basalt_windows
 from monolith.core import DType, Graph
-from monolith.core.ir import OpClass
+from monolith.core.ir import BlockDomain, OpClass
 from monolith.core.shapes import T
 from monolith.formats.gguf import ggml_row_bytes
 from monolith.ops import OPS
@@ -287,6 +287,26 @@ def _host_rows_window(g, src, bad, tmp):
     return {}
 
 
+def _top1_host_rows(name):
+    """The top-1 over host rows ``dhead`` and their map, or (bad) host rows named ``name``."""
+    def build(g, src, bad, tmp):
+        rows = g.input(name if bad else "dhead", (64, ROW), U8, host=True)
+        top1(g, "y", g.input("x1", (1, QCOL), U8), rows, g.input("dvocab", (64,), I32, host=True))
+        return {}
+    return build
+
+
+def _host_rows_log(kind, log):
+    """The head over host rows ``dhead`` beside the round's ``kind`` (the accept scan, the verify select), which writes
+    the log ``log``, or (bad) host rows named ``log``."""
+    def build(g, src, bad, tmp):
+        head(g, "y", g.input("x1", (1, QCOL), U8), g.input(log if bad else "dhead", (64, ROW), U8, host=True))
+        g.op(kind, [g.input("ids", (1,), I32)], [g.value("out", (1,), DType.U32)], domain=BlockDomain("span", 1),
+             klass=OpClass.SERIAL, **({"gamma": 1} if kind == "verify_select" else {}))
+        return {}
+    return build
+
+
 def _rows_held(kind):
     """The op reads one row more than the rows hold (the head and the top-1: their logits' width; the proxy: n_rows,
     within a copy that has room for it)."""
@@ -463,6 +483,15 @@ REFUSALS = [
       for n, own in (("step_state", "StepState"), ("ring", "token ring"))],
     ("head host rows named after the verify head's window", _host_rows_window,
      r"the host input 'basalt\.[0-9a-f]{16}' is named after the program's weights window; a host input binds"),
+    ("head host rows named after the head's params record", _host_rows(name="params.S2.basalt_q5k_head.0"),
+     r"the program's params record took the name of the host input 'params\.S2\.basalt_q5k_head\.0'; a host input "
+     "binds"),
+    ("top-1 host rows named after its partials' scratch arena", _top1_host_rows("ws.T2.basalt_q5k_top1.part.1"),
+     r"the program's scratch arena took the name of the host input 'ws\.T2\.basalt_q5k_top1\.part\.1'; a host input "
+     "binds"),
+    *[(f"head host rows named after the {what}", _host_rows_log(k, log),
+       f"the program's {what} took the name of the host input '{log}'; a host input binds")
+      for k, log, what in (("accept_scan", ACCEPT_LOG, "accept log"), ("verify_select", CONF_LOG, "confidence log"))],
     *[(f"{k} reads a row past its rows", _rows_held(k), f"'dhead' holds {N_DVOCAB} rows; the op reads {N_DVOCAB + 1}")
       for k in KINDS],
     ("head of 9 columns", _head_shape((8, 10), (9, 10)), r"unsupported shape \(n_in 2560, ncols 9\)"),

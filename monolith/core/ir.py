@@ -131,7 +131,8 @@ class Graph:
         bytes) and passes the same one to every program that binds it (data it derives and updates outside the
         programs, such as a drafter's gathered head rows); the emitter refuses one named after a StepState field,
         which an input of that name binds, or after one of the program's own buffers (StepState, the token ring, a
-        weights window). Otherwise each program allocates its own."""
+        weights window, a params record, a scratch arena, the accept or confidence log). Otherwise each program
+        allocates its own."""
         v = self.value(name, shape, dtype, scoped=False)
         v.is_input = True
         v.is_host = host
