@@ -1345,7 +1345,8 @@ def _verify_select(ctx: _Ctx, op: Op) -> None:
         mode, thr = 0, (float(op.attrs.get("threshold", 0.0)) if conf is not None else 0.0)
     prm = ctx.params("verify_select", kernels.select_params(gamma, thr, ctx.t, mode=mode, cost=cost, log_cap=kernels.ACCEPT_LOG_CAP,
                                                             ctx_cap=ctx.ctx_cap_target, lm=bool(op.attrs.get("lm"))))
-    ctx.program.buffers.setdefault(CONF_LOG, BufferSpec(kernels.ACCEPT_LOG_CAP * kernels.CONF_LOG_WIDTH * 4, None, "arena"))
+    # assigned, not setdefault: a host input of this name loses its spec to the log, and emit_program refuses it
+    ctx.program.buffers[CONF_LOG] = BufferSpec(kernels.ACCEPT_LOG_CAP * kernels.CONF_LOG_WIDTH * 4, None, "arena")
     cb = ctx.buf(conf) if conf is not None else (ctx.scratch("verify_select.conf", gamma * 4), 0)
     ctx.add(k, [(0, *ctx.buf(drafts)), (1, *cb), (2, ctx.program.step_state, 0), (3, prm, 0), (4, CONF_LOG, 0)], (1, 1, 1), (32, 1, 1), op.kind,
             writes=[2, 4])
@@ -1356,7 +1357,8 @@ def _accept_scan(ctx: _Ctx, op: Op) -> None:
     k = ctx.kernel("spec_ops", _spec_ops(ctx), "accept_scan", kernels.eos_macros(ctx.eos))
     prm = ctx.params("accept_scan", kernels.accept_params(ctx.ring_capacity, ctx.eos, kernels.ACCEPT_LOG_CAP, ctx_cap=ctx.ctx_cap,
                                                           lm=bool(op.attrs.get("lm"))))
-    ctx.program.buffers.setdefault(ACCEPT_LOG, BufferSpec(kernels.ACCEPT_LOG_CAP * 4, None, "arena"))
+    # assigned, not setdefault: a host input of this name loses its spec to the log, and emit_program refuses it
+    ctx.program.buffers[ACCEPT_LOG] = BufferSpec(kernels.ACCEPT_LOG_CAP * 4, None, "arena")
     ctx.add(k, [(0, *ctx.buf(token)), (1, ctx.program.step_state, 0), (2, ctx.program.ring, 0), (3, prm, 0), (4, ACCEPT_LOG, 0)],
             (1, 1, 1), (32, 1, 1), op.kind, writes=[1, 2, 4])
 
@@ -1469,6 +1471,7 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
     ctx.ctx_cap_target, ctx.ctx_cap = _context_capacity(ctx, g)
     program.context_capacity = ctx.ctx_cap
     hoisted = {op.attrs["stat_value"]: ctx.slab_info(op.inputs[1].name).n_blocks for op in g.ops if op.kind == "gemv" and op.attrs.get("stat_value")}
+    host: Dict[str, BufferSpec] = {}                                  # host input -> its own spec (checked after the tail)
     for v in g.values.values():
         if v.is_view:
             continue                                                  # rows of its base's buffer
@@ -1476,7 +1479,16 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
             program.buffers[v.name] = BufferSpec(_value_bytes(v, t), None, "state")
         elif v.is_input:
             fld = "pending_tokens" if v.name == "tokens" else v.name
-            if fld not in layout.offsets:                             # not StepState-backed: a host-written arena buffer
+            if v.is_host and fld in layout.offsets:                   # _Ctx.buf would bind the field, not the session's
+                raise ValueError(f"emit_program: the host input {v.name!r} is named after StepState's {fld!r}; a host "
+                                 "input binds the session's buffer of its name")
+            if v.is_host and (v.name in (program.step_state, program.ring) or v.name in program.buffers):  # the windows so far
+                own = {program.step_state: "StepState", program.ring: "token ring"}.get(v.name, "weights window")
+                raise ValueError(f"emit_program: the host input {v.name!r} is named after the program's {own}; a host "
+                                 "input binds the session's buffer of its name")
+            if v.is_host:                                             # the session's buffer: the value's bytes exactly
+                program.buffers[v.name] = host[v.name] = BufferSpec(_value_bytes(v, t), None, "host")
+            elif fld not in layout.offsets:                           # not StepState-backed: a host-written arena buffer
                 program.buffers[v.name] = BufferSpec(max(_value_bytes(v, t), 16), None, "arena")
         elif not v.is_source:
             nbytes = _value_bytes(v, t)
@@ -1513,6 +1525,16 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
                 writes=[1, 2])
     elif tail is not None:
         raise ValueError(f"emit_program: unknown tail {tail!r}")
+    # a buffer added after the input loop under a host input's name (a params record, a scratch arena, a log, StepState,
+    # the ring) replaced its spec, and the ops bind that buffer in place of the session's
+    for name, own in host.items():
+        spec = program.buffers[name]
+        if spec is not own:
+            what = {ACCEPT_LOG: "accept log", CONF_LOG: "confidence log"}.get(name) or {
+                "params": "params record", "arena": "scratch arena", "weights": "weights window", "step_state": "StepState",
+                "ring": "token ring"}.get(spec.role, f"{spec.role} buffer")
+            raise ValueError(f"emit_program: the program's {what} took the name of the host input {name!r}; a host input "
+                             "binds the session's buffer of its name")
     # an arena value no dispatch binds is not allocated: the graph allots the attention's partial workspaces for the
     # two-dispatch kernels, and with v3 (core and merge in one) nothing reads or writes them — the 8B's part_o alone
     # is 8 MiB per layer at a 32K context. A value a dispatch reaches only through GPU addresses (its indirect reads

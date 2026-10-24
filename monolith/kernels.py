@@ -634,7 +634,7 @@ def basalt_dense_tc_pair_grid(n_out0: int, n_out1: int) -> Tuple[int, int]:
 
 
 # ---- basalt's Q5_K head (kernels/common/basalt_q5k_head.metal; docs/research/basalt-nvcc/q5k_head.md)
-# adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:337-386, :500-535 and
+# adapted from basalt (jesdga95/basalt) src/kernels/cuda/q5k_head.cu:337-386, :406-408, :500-535 and
 # src/kernels/cuda/head_proxy.cuh:17-28 @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE)
 
 Q5K_HEAD_THREADS = 256      # basalt's WPB * WARP: 8 SIMD-groups, one row each
@@ -682,6 +682,18 @@ def basalt_q5k_head_params(n_in: int, n_out: int, has_map: bool = False, n_block
     if not 0 < n_out < 2 ** 31:
         raise ValueError(f"basalt_q5k_head: n_out must be in 1..INT_MAX, got {n_out}")
     return struct.pack("<IIII", n_in, n_out, int(has_map), n_blocks)
+
+
+def basalt_q5k_mask_grid(n_out: int) -> Tuple[int, int]:
+    """``q5k_head_mask_unmapped``'s launch (q5k_head.cu:406-408): ceil(n_out / 256) threadgroups of 256, a row each."""
+    return -(-n_out // 256), 256
+
+
+def basalt_q5k_top1_part_bytes(grid: int) -> int:
+    """The top-1's partials, which its merge reads: (max, row, sum) per threadgroup of ``grid``, 12 bytes each. basalt
+    keeps them in ``q5k_head_top1_scratch_bytes()`` (q5k_head.cu:370), room for 4096 and its counter; the port's merge
+    is a dispatch of its own and needs no counter."""
+    return 12 * grid
 
 
 # basalt's 2-bit proxy of the head's rows (head_proxy.cuh:17-28; q5k_head.cu:500-535)
