@@ -341,7 +341,7 @@ Notes:
   (0fBFB8AA3B = −L). Rounding to nearest even and the flush are symmetric in sign, so `expf_ftz(-x)`, which computes
   `mul_ftz(-x, L)` = fl((−x)·L), has exactly the bits of the SASS multiply fl(x·(−L)). The multiply is `mul.ftz.f32`
   without `.rn` and so could fuse with an add it fed; in both sites it feeds `ex2`. The library `expf` of an IEEE file
-  (a different, longer sequence that the contract maps to `metal::precise::exp`) does not occur on this path.
+  (a different, longer sequence, which the contract transcribes as `nv_expf`) does not occur on this path.
 - **Every division is a reciprocal.** `div.approx.f32` is defined by the PTX ISA as a·(1/b), and `ptxas` emits exactly
   that: `MUFU.RCP` of the divisor and an `FMUL.FTZ`. The multiply carries no rounding modifier, so where an add without
   one consumes the quotient (norm `:72`) `ptxas` fuses them into an `FFMA.FTZ`. `1.0f / x` skips the multiply. None of
