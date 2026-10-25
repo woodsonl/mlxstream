@@ -14,6 +14,7 @@ from monolith import kernels
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dspark_synth import build, write_checkpoint  # noqa: E402
 
+from monolith.bench import bf16_ulp_diff  # noqa: E402
 from monolith.compiler import emit_program  # noqa: E402
 from monolith.compiler.passes import DEFAULT_PASSES  # noqa: E402
 from monolith.core import DType, Graph, T  # noqa: E402
@@ -194,8 +195,10 @@ def test_draft_program_matches_oracle(tmp_path, threshold, yarn, head_dim, fused
             ref = corrected[k].float().numpy()
             cos, max_abs, scale = _bars(lg, ref)
             assert cos > 0.999, ("corrected logits", step, k, cos)
-            top2 = np.sort(ref)[-2:]
-            assert got_toks[k] == toks[k] or top2[1] - top2[0] <= 0.05, ("draft", step, k, got_toks, toks)   # a near-tie may flip
+            drafted = got_toks[k]                                           # the oracle's scores are exact bfloat16s
+            assert 0 <= drafted < len(ref) and (drafted == toks[k] or ref.max() - ref[drafted] <= 0.05
+                                                or bf16_ulp_diff(ref.max(), ref[drafted]) <= 1), \
+                ("draft", step, k, got_toks, toks)   # a near tie, or one bfloat16 step below the best, may flip
             if got_toks[k] != toks[k]:
                 break                                                       # the chain diverges after a flip
         else:

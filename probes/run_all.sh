@@ -7,7 +7,8 @@
 #   touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
 #   softwareupdate -i "$(softwareupdate -l | grep -o 'Command Line Tools for Xcode-[0-9.]*' | tail -1)"
 # NOTE: Apple GPUs do not preempt a running dispatch (p6). Every probe is bounded; the longest single dispatch is ~1.5 s
-# (p6), so expect brief display stalls on a machine with a screen. Never add an unbounded spin to a probe.
+# on the M3 Pro and M5 Pro and up to 3.8 s (p8) on the M3 Ultra and the 40-core M3 Max (README.md), so expect brief
+# display stalls on a machine with a screen. Never add an unbounded spin to a probe.
 set -uo pipefail
 cd "$(dirname "$0")"
 command -v clang >/dev/null || { echo "clang not found - install the Xcode Command Line Tools (see header)"; exit 1; }

@@ -59,7 +59,8 @@ uses sampled proposals with rejection correction. See [sampling semantics](specu
 ## Prefill policy
 
 `--prefill-chunk-size` accepts `N`, `N-exact`, or `auto-exact`. The default, `auto-exact`, selects the
-backend's qualified chunk size: 512 tokens for the Qwen3.8-27B recipe on the 40-core M5 Max and 128 elsewhere.
+backend's qualified chunk size: 512 tokens on the 40-core M5 Max for the Qwen3.8-27B recipe and for the 27B
+in affine 4-bit groups, 512 on the 60-core M3 Ultra, and 128 elsewhere.
 Context and chunk sizes are separate controls: a larger chunk increases temporary work/storage without
 extending context capacity.
 

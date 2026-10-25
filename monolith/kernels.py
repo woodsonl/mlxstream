@@ -1311,22 +1311,23 @@ def gqa_mma_simdgroups(head_dim: int, heads_per_kv: int) -> int:
 
 
 def gqa_v3_simdgroups(head_dim: int) -> int:
-    """v3's SIMD-groups per threadgroup for a head dim: 32 (1024 threads) where D / 4 slices and the fold buffer of
-    nsg · (D + 4) floats allow it (D = 128), halved otherwise (D = 32 → 8, D = 64 → 16, D = 256 → 16)."""
-    nsg = min(GQA_V3_SIMDGROUPS, max(4, head_dim // 4))
-    while nsg > 4 and ((head_dim // 4) % nsg or nsg * (head_dim + 4) * 4 > THREADGROUP_MEMORY_LIMIT):
+    """v3's SIMD-groups per threadgroup for a head dim: 32 (1024 threads) where D / 4 slices and threadgroup memory (the
+    fold buffer of nsg · (D + 4) floats and the query's D floats) allow it (D = 128), halved otherwise (D = 32 → 8,
+    D = 64 → 16, D = 96 → 8, D = 256 → 16, D = 960 → 4)."""
+    nsg = GQA_V3_SIMDGROUPS
+    while nsg > 4 and ((head_dim // 4) % nsg or (nsg * (head_dim + 4) + head_dim) * 4 > THREADGROUP_MEMORY_LIMIT):
         nsg //= 2
     return nsg
 
 
 def gqa_v3_macros(head_dim: int, *, nsg: Optional[int] = None, lm_mode: int = 0, chain_i: int = 0) -> Dict[str, str]:
     """v3: ``nsg`` SIMD-groups per threadgroup (a power of two ≤ 32 dividing D / 4; its fold buffer of
-    nsg · (D + 4) floats must fit threadgroup memory; None = :func:`gqa_v3_simdgroups`). ``lm_mode`` / ``chain_i``
-    as :func:`gqa_macros`."""
+    nsg · (D + 4) floats and the query's D floats must fit threadgroup memory; None = :func:`gqa_v3_simdgroups`).
+    ``lm_mode`` / ``chain_i`` as :func:`gqa_macros`."""
     if nsg is None:
         nsg = gqa_v3_simdgroups(head_dim)
-    if head_dim % 32 or nsg not in (4, 8, 16, 32) or (head_dim // 4) % nsg or nsg * (head_dim + 4) * 4 > THREADGROUP_MEMORY_LIMIT:
-        raise ValueError("gqa_decode_v3: head_dim a multiple of 32, nsg in (4, 8, 16, 32) dividing head_dim / 4, the fold buffer within threadgroup memory")
+    if head_dim % 32 or nsg not in (4, 8, 16, 32) or (head_dim // 4) % nsg or (nsg * (head_dim + 4) + head_dim) * 4 > THREADGROUP_MEMORY_LIMIT:
+        raise ValueError("gqa_decode_v3: head_dim a multiple of 32, nsg in (4, 8, 16, 32) dividing head_dim / 4, the fold buffer and the query within threadgroup memory")
     if lm_mode not in (0, 1, 2, 3) or chain_i < 0 or (chain_i and lm_mode != 2):
         raise ValueError(f"gqa_decode_v3: lm_mode must be 0, 1, 2 or 3 and chain_i belongs to mode 2 (got {lm_mode}, {chain_i})")
     m = {"D": str(head_dim), "NSG3": f"{nsg}u"}

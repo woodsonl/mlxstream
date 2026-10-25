@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from monolith import kernels
 from monolith.backends.metal.context import using_backend
 from monolith.compiler.emit import _gqa_kernel, _gqa_mma_direct
 
@@ -47,3 +48,20 @@ def test_automatic_and_other_backends_are_unchanged():
                 kv_heads=kv, qk_norm=True), 8, 33024)
     with using_backend("m5_max_32c"):
         assert _gqa_kernel(context(), 32, 8, d=64, qk_norm=False) == "v3"
+
+
+@pytest.mark.parametrize("d,nsg", [(32, 8), (64, 16), (96, 8), (128, 32), (256, 16), (960, 4), (1632, 4)])
+def test_automatic_v3_geometry_builds_for_each_head_dim(d, nsg):
+    # auto runs v3 wherever mma does not; head_dim 96 made 24 SIMD-groups, which gqa_v3_macros rejects
+    assert _gqa_kernel(context(attention="auto", t=1), 16, 8, d=d) == "v3"
+    assert kernels.gqa_v3_simdgroups(d) == nsg
+    assert kernels.gqa_v3_macros(d)["NSG3"] == f"{nsg}u"
+
+
+def test_v3_threadgroup_budget_counts_the_query():
+    # gqa_decode_v3 declares query[D] beside the fold buffer: head_dim 960 at 8 SIMD-groups needs 34,688 bytes, and
+    # head_dim 1664 needs 33,344 even at 4, so v3 fits head dims up to 1632
+    with pytest.raises(ValueError):
+        kernels.gqa_v3_macros(960, nsg=8)
+    with pytest.raises(ValueError):
+        kernels.gqa_v3_macros(1664)
