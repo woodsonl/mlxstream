@@ -116,7 +116,9 @@ class GemmBench:
                 "pct_nominal": round(100 * useful / 1e9 / (ms / 1e3) / self.profile.nominal_gbps, 1) if self.profile and self.profile.nominal_gbps > 0 else None,
                 "tflops": round(2 * tm * n * k / (ms / 1e3) / 1e12, 2),
                 "max_ulp_at_rms": round(chk.max_ulp_at_rms, 3) if chk else None, "max_ulp_elementwise": chk.max_ulp_elementwise if chk else None,
-                "max_rel_err": chk.max_rel_err if chk else None, "ok": chk.ok() if chk else None, "out_bf16": out_bf16, "macros": macros}
+                "max_ulp_at_scale": round(chk.max_ulp_at_scale, 3) if chk else None,
+                "max_rel_err": chk.max_rel_err if chk else None, "out_bf16": out_bf16, "macros": macros,
+                "ok": (chk.ok_rounded() if out_bf16 else chk.ok()) if chk else None}     # BF16 output: one rounding of the FP32 result
 
 
 def fmt_row(r: dict) -> str:

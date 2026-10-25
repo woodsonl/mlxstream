@@ -2,6 +2,7 @@
 here without a GPU; tools/profile_writer.py runs the harnesses and hands them these numbers."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -103,3 +104,36 @@ def test_decide_and_merge_produce_a_loadable_profile(tmp_path):
     eng9, notes9 = decide(dict(no_tile, family="Apple9"), None)
     assert eng9["accelerator"] == "off" and eng9["accelerator_min_t"] == {} and eng9["attention"] == "v1" and eng9["sibling_order"] == "either"
     assert "no tile measurement" in notes9["accelerator"] and "accelerator_fp8" not in eng9["cost_T"]
+
+
+def test_gemm_bench_judges_each_output_by_its_rule(monkeypatch):
+    """GemmBench.run judges 32-bit output by OracleCheck.ok (the writer's strict check) and BF16 output by
+    ok_rounded (one rounding of the FP32 result, the timed run), and reports the metric each rule reads."""
+    import tools.profile_writer as pw                                        # puts tools/bench on sys.path
+    from monolith.bench import OracleCheck
+
+    gemm_bench = pw.gemm_bench
+
+    class Stub:                                                              # nt.Library / Pipeline / Dispatch: every call chains
+        max_threads_per_threadgroup = 1024
+
+        def __init__(self, *a, **kw):
+            pass
+
+        def __getattr__(self, name):
+            return lambda *a, **kw: self
+
+    class Buf(Stub):
+        def read(self, off, size):
+            return bytes(size)
+
+    info = SimpleNamespace(gpu_cores=20, apple_family=10, name="fake")
+    monkeypatch.setattr(gemm_bench, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info), Buffer=Buf, Library=Stub,
+                                                          Pipeline=Stub, Dispatch=Stub,
+                                                          Queue=lambda dev: SimpleNamespace(run=lambda ds: SimpleNamespace(error=None, gpu_ms=1.0))))
+    # within one BF16 rounding (1 ulp at scale, rel 5e-3) but past the strict rule (3 ulp at RMS, rel 5e-3 > 1e-4)
+    monkeypatch.setattr(gemm_bench, "check_against_oracle", lambda y, ref: OracleCheck(3.0, 4, 5e-3, 1.0))
+    gb = gemm_bench.GemmBench()
+    bf16 = gb.run("fp8_e4m3", 64, 1024, tm=8, copies=1, reps=1, out_bf16=True)
+    strict = gb.run("fp8_e4m3", 64, 1024, tm=8, copies=1, reps=1)
+    assert bf16["ok"] is True and strict["ok"] is False and bf16["max_ulp_at_scale"] == strict["max_ulp_at_scale"] == 1.0
