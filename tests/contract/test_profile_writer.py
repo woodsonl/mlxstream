@@ -526,6 +526,21 @@ def test_writer_rejects_bad_arguments_before_measuring(monkeypatch, args):
     assert e.value.code == 2
 
 
+@pytest.mark.parametrize("formats", [["nvfp4", "q4_0"], ["q4_0"], []])
+def test_measure_refuses_formats_the_harnesses_cannot_build(monkeypatch, formats):
+    """measure() refuses a format outside monolith.bench.RANDOM_FORMATS, or none, before it builds a harness, as main()
+    does at argument parsing, so a direct caller never hands a harness a format random_spec cannot make."""
+    import tools.profile_writer as pw
+
+    class Bench(_Bench):
+        def __init__(self):
+            pytest.fail("measure() built a harness before checking its formats")
+
+    monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+    with pytest.raises(ValueError, match="the formats the harnesses build"):
+        pw.measure(formats=formats, ts=[1, 2], accelerator=False, attention=None, log=lambda s: None)
+
+
 def test_random_formats_are_the_formats_random_spec_makes():
     """The writer's --formats check reads monolith.bench.RANDOM_FORMATS: it names exactly the registered formats
     random_spec makes, else the check admits a format the harnesses cannot build or refuses one they can."""

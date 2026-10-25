@@ -102,11 +102,13 @@ def measure(*, shape: Tuple[int, int] = (17408, 5120), formats: Sequence[str] = 
             log: Callable[[str], None] = print) -> Dict[str, Any]:
     """Run the harnesses and return the measurement mapping ``monolith.backends.metal.calibration.decide`` reads.
     ``current_lane_order`` and ``current_placement`` are the profile's values, which a tie in their probes keeps."""
+    if not formats or set(formats) - set(RANDOM_FORMATS):
+        raise ValueError(f"measure: formats {list(formats)} are not from {', '.join(RANDOM_FORMATS)}, the formats the harnesses build")
+    formats = list(dict.fromkeys(formats))                                   # once each: a second sweep would reset the first's record
     b = gemv_bench.Bench()
     n, k = shape
     m: Dict[str, Any] = {"family": f"Apple{b.info.apple_family}", "chip": b.info.name, "shape": f"{n}x{k}", "copies": copies, "reps": reps,
                          "oracle_fail": []}                         # shader geometries and probes that fail the oracle: no profile
-    formats = [f for f in dict.fromkeys(formats) if f in RANDOM_FORMATS]      # once each: a second sweep would reset the first's record
     ref = "fp8_e4m3" if "fp8_e4m3" in formats else formats[0]
     # 1. the lane order: the reference format at T = 1, crew x1
     m["lane_order_gbps"] = {}
