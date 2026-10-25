@@ -200,6 +200,7 @@ def main(argv=None) -> int:
     if existing:
         get_backend(existing.get("backend", "common")).validate_device(Profile.from_dict(name, existing), info)
     print(f"{info.name}: {info.gpu_cores} cores, Apple{info.apple_family}; profile {name} ({'merging ' + str(src) if existing else 'new'}) -> {path}", flush=True)
+    selected = config_for_device(info.gpu_cores, info.apple_family, info.name)
     t0 = time.time()
     m = measure(shape=(n, k), formats=formats, ts=ts, tms=tms, copies=copies, reps=reps, accelerator=not a.no_accelerator,
                 attention=attention, ctxs=ctxs, attn_ts=attn_ts, log=lambda s: print(s, flush=True))
@@ -207,7 +208,6 @@ def main(argv=None) -> int:
     device = device_facts(info, target_gb=a.target_gb, nominal_gbps=a.nominal_gbps)
     doc = merge_profile(existing, device=device, engine=engine, measurements=m, notes=notes, written=time.strftime("%Y-%m-%d"),
                         command="python " + " ".join(sys.argv))
-    selected = config_for_device(info.gpu_cores, info.apple_family, info.name)
     doc.setdefault("name", name)
     doc.setdefault("backend", selected.backend if selected else "common")
     doc.setdefault("validation", "unmeasured")

@@ -507,9 +507,20 @@ def test_exact_sub_reproduces_shorter_passes(dev):
 
 # ---- v3: core and merge in one dispatch, a threadgroup per query row (#113) -----------------------------------------------
 
+@pytest.mark.parametrize("d,nsg", [(448, 16), (896, 8), (960, 4), (1632, 4)])
+def test_v3_builds_at_its_budgets_tightest_geometries(dev, d, nsg):
+    # the fold buffer and query[D] near the 32 KB limit: 448 at 16 SIMD-groups declares 30,720 bytes, 896 at 8 declares
+    # 32,384 and 1632 at 4, the largest head dim v3 fits, declares 32,704; 960 is the head dim the query[D] term moved
+    # from 8 SIMD-groups (34,688 bytes) to 4 (19,264). A threadgroup array the budget leaves out fails to build here
+    assert kernels.gqa_v3_simdgroups(d) == nsg
+    lib = nt.Library(dev, kernels.gqa_source(v3=True), dict(kernels.gqa_v3_macros(d), SINGLE_BLOCK="1"))
+    assert nt.Pipeline(lib, "gqa_decode_v3").max_threads_per_threadgroup >= nsg * 32
+
+
 @pytest.mark.parametrize("cfg", [Cfg(16, 8, 128, 128, 1024, 8, v3=True), Cfg(8, 2, 256, 64, 512, 8, v3=True, nsg3=16),
-                                 Cfg(4, 1, 128, 32, 4096, 8, v3=True, nsg3=16), Cfg(4, 2, 128, 128, 128, 4, gate=False, v3=True)],
-                         ids=["v3_0.6B_geometry", "v3_d256_16sg", "v3_d128_16sg_long", "v3_nogate_fullrope"])
+                                 Cfg(4, 1, 128, 32, 4096, 8, v3=True, nsg3=16), Cfg(4, 2, 128, 128, 128, 4, gate=False, v3=True),
+                                 Cfg(16, 8, 96, 96, 1024, 8, v3=True)],
+                         ids=["v3_0.6B_geometry", "v3_d256_16sg", "v3_d128_16sg_long", "v3_nogate_fullrope", "v3_d96_8sg"])
 def test_v3_matches_kernel_contract(dev, cfg):
     """v3 against the numpy model of the kernel contract: its fold is per key within a SIMD-group (exact FP32 rescaling)
     and over the SIMD-groups in threadgroup memory, so it meets the same 2-ulp bar as v2's hierarchical fold; contexts
@@ -724,7 +735,7 @@ def test_static_geometry_keeps_position_and_active_length_dynamic(dev, kind, d, 
             np.testing.assert_array_equal(a, b)
 
 
-@pytest.mark.parametrize("nsg", [16, 32])
+@pytest.mark.parametrize("nsg", [4, 16, 32])   # 4: head dims 928 to 1632 run v3 at four SIMD-groups
 @pytest.mark.parametrize("position", [31, 32, 63, 64, 65, 127, 128, 129, 1023])
 @pytest.mark.parametrize("single_block", [False, True])
 def test_v3_cached_key_pair_boundaries(dev, nsg, position, single_block):

@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'contract'))
 from test_nn_lowering import _checkpoint
 from dspark_synth import write_checkpoint as write_dspark, build
+from greedy_ties import agree as _agree, score_row
 from lm_synth import write_checkpoint as write_lm
 from monolith.generate import Session
 from monolith.formats import PackLayout
@@ -33,6 +34,7 @@ def test_large_prefill_shares_state_with_small_decode(tmp_path, draft_kind, acce
     pack_model(model(), str(target), str(target / 'pack'), PackLayout(rows=16))
     reference = Session(model(), str(target / 'pack'), prefill_chunk_size=8, eos=-1, autotune=False,
                         accelerator='off', attention='v1')
+    ties = 1 if accelerator == 'on' else 0                 # the one-step ties each comparison may take
     m = model()
     options = {}
     if draft_kind == 'lm':
@@ -53,7 +55,7 @@ def test_large_prefill_shares_state_with_small_decode(tmp_path, draft_kind, acce
         ids = np.random.default_rng(count).integers(0, 50, count).tolist()
         expected = reference.generate(ids, 12).tokens
         result = session.generate(ids, 12)
-        assert result.tokens == expected
+        _agree(reference, ids, result.tokens, expected, ties)
         dec = session.engine(0 if draft_kind else 1)
         if not resident:
             pre = session.prefill_engine(count)
@@ -76,13 +78,13 @@ def test_large_prefill_shares_state_with_small_decode(tmp_path, draft_kind, acce
             if resident:
                 assert session.engine(0) is dec
             changed = ids[:-1] + [(ids[-1] + 1) % 50]
-            assert session.generate(changed, 12).tokens == reference.generate(changed, 12).tokens
+            _agree(reference, changed, session.generate(changed, 12).tokens, reference.generate(changed, 12).tokens, ties)
     if resident:
         # A one-token answer ends before decode is allocated. The next short
         # request must not inherit either its state or original weight windows.
         session.generate(list(range(50)) * 3, 1)
         ids = [7, 3, 1, 8, 4]
-        assert session.generate(ids, 12).tokens == reference.generate(ids, 12).tokens
+        _agree(reference, ids, session.generate(ids, 12).tokens, reference.generate(ids, 12).tokens, ties)
         if prefix_cache:
             ids = list(range(50)) * 3
             session.prefix_cache.items.clear()
@@ -93,7 +95,7 @@ def test_large_prefill_shares_state_with_small_decode(tmp_path, draft_kind, acce
             changed = ids[:120] + [3, 7, 4, 2]
             result = session.generate(changed, 12, cache_prefix_tokens=120)
             assert result.cached_prompt_tokens == 120
-            assert result.tokens == reference.generate(changed, 12).tokens
+            _agree(reference, changed, result.tokens, reference.generate(changed, 12).tokens, ties)
             # Preserve the earlier system/tool checkpoint when project context
             # inside the last message changes, while preferring the deep hit
             # for a new question with otherwise identical context.
@@ -103,9 +105,28 @@ def test_large_prefill_shares_state_with_small_decode(tmp_path, draft_kind, acce
             question = ids[:120] + [9, 8, 7]
             reused = session.generate(question, 12, cache_prefix_tokens=[100, 120])
             assert reused.cached_prompt_tokens == 120
-            assert reused.tokens == reference.generate(question, 12).tokens
+            _agree(reference, question, reused.tokens, reference.generate(question, 12).tokens, ties)
             project_changed = ids.copy()
             project_changed[110] = (project_changed[110] + 1) % 50
             reused = session.generate(project_changed, 12, cache_prefix_tokens=[100, 120])
             assert reused.cached_prompt_tokens == 100
-            assert reused.tokens == reference.generate(project_changed, 12).tokens
+            _agree(reference, project_changed, reused.tokens, reference.generate(project_changed, 12).tokens, ties)
+
+
+def test_tie_rows_hold_the_scores_the_reference_chose_by(tmp_path):
+    # greedy_ties.score_row, the scores agree reads: the prompt pass's row for token 0 and the decode step's row 0 for a
+    # later token, with the steps queued past the last leaving that row alone
+    _checkpoint(tmp_path)
+    model = Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=512)
+    pack_model(model, str(tmp_path), str(tmp_path / 'pack'), PackLayout(rows=16))
+    reference = Session(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=512), str(tmp_path / 'pack'),
+                        prefill_chunk_size=8, eos=-1, autotune=False, accelerator='off', attention='v1')
+    for count in (3, 5, 13, 16):                       # the 4- and 8-row prompt programs, a partial last chunk, a whole one
+        ids = np.random.default_rng(count).integers(0, 50, count).tolist()
+        tokens = reference.generate(ids, 6).tokens
+        for n in (1, 2, 6):
+            row = score_row(reference, ids, n - 1)
+            assert row[tokens[n - 1]] == row.max(), (count, n)
+            if n > 1:   # a repeated token is a later step's maximum too: the row must match its own position's prompt row
+                same, after = (score_row(reference, ids + tokens[:k], 0) for k in (n - 1, n))
+                assert np.abs(row - same).max() < np.abs(row - after).max(), (count, n)

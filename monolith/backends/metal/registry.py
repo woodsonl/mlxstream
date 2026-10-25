@@ -55,9 +55,11 @@ def config_path(name):
         raise ValueError(f"no backend configuration for {name!r}; supply an explicit output path") from None
 
 
-def config_for_device(gpu_cores, apple_family, chip=None):
+def config_for_device(gpu_cores, apple_family, chip):
+    if not (chip and chip.strip()):
+        raise ValueError("a chip name is required: core count and GPU family do not identify a chip")
     from .config import load_configs
     candidates = [p for p in load_configs().values()
                   if p.gpu_cores == gpu_cores and p.family == f"Apple{apple_family}"
-                  and (chip is None or p.chip.casefold() == chip.strip().casefold())]
+                  and p.chip.casefold() == chip.strip().casefold()]
     return candidates[0] if len(candidates) == 1 else None

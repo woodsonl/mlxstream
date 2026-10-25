@@ -126,7 +126,7 @@ def main() -> int:
             row = {"chip": info.name, "date": time.strftime("%Y-%m-%d %H:%M"), "engine": who, "model": a.model if who == "ours" else a.mlx_model, "prompt": f"{cat}{i}", "prompt_tokens": len(ids),
                    "bytes_per_token": bytes_per_token if who == "ours" else mlx_bytes,
                    "new_tokens": a.max_new_tokens, "tps": round(r["tps"], 2), "wall_ms_per_token": round(r["wall_ms_per_token"], 3),
-                   "gpu_ms_per_token": round(r.get("gpu_ms_per_token", 0.0), 3), "gbps": round(gbps, 1), "pct_nominal": round(100 * gbps / nominal, 1),
+                   "gpu_ms_per_token": round(r.get("gpu_ms_per_token", 0.0), 3), "gbps": round(gbps, 1), "pct_nominal": round(100 * gbps / nominal, 1) if nominal > 0 else None,
                    "host_pct": round(r.get("host_pct", 0.0), 2), "agree_prefix": agree, "reps": a.reps}
             rows.append(row)
         o, m = best["ours"], best["mlx"]
@@ -146,7 +146,7 @@ def main() -> int:
         mlx = [r for r in rows if r["engine"] == "mlx" and (c is None or r["prompt"].rstrip("0123456789") == c)]
         to, tm = mean_tps(ours), mean_tps(mlx)
         gb, gm = bytes_per_token * to / 1e9, mlx_bytes * tm / 1e9
-        print(f"| {c or 'all'} | {to:.2f} | {tm:.2f} | {to / tm:.3f} | {gb:.0f} ({100 * gb / nominal:.0f} %) | {gm:.0f} ({100 * gm / nominal:.0f} %) |")
+        print(f"| {c or 'all'} | {to:.2f} | {tm:.2f} | {to / tm:.3f} | {gb:.0f} ({f'{100 * gb / nominal:.0f} %' if nominal > 0 else 'nominal unknown'}) | {gm:.0f} ({f'{100 * gm / nominal:.0f} %' if nominal > 0 else 'nominal unknown'}) |")
     ratio = mean_tps([r for r in rows if r["engine"] == "ours"]) / mean_tps([r for r in rows if r["engine"] == "mlx"])
     verdict = "go (>= 1.10x)" if ratio >= 1.10 else ("parity (within +-5 %)" if abs(ratio - 1) <= 0.05 else ("ahead but short of 1.10x" if ratio > 1 else "behind"))
     print(f"\nours / mlx-lm = {ratio:.3f}: {verdict}; rows appended to {out}")

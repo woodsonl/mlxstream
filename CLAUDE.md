@@ -187,12 +187,13 @@ is described by the design documents and source code.
 
 ## Probes
 
-`./probes/run_all.sh` builds and runs the 17 probes (~6 min, Xcode Command Line Tools only; shaders compile at runtime,
+`./probes/run_all.sh` builds and runs the 18 probes (~6 min, Xcode Command Line Tools only; shaders compile at runtime,
 including the MPP tensor ops of `p14`; `p15` opens a window and needs the screen unlocked) and saves
 `probes/results/<chip>_<cores>c_macOS<ver>_<time>.txt`.
 `./probes/remote_run.sh user@host` does the same over SSH. Geometry is derived from the GPU core count (`GPU_CORES=<n>`
-overrides). Commit every results file. Measured so far: an M3 Pro (2026-09-19, 13 probes) and an M5 Pro (2026-09-22,
-all 16, repeats of `p6`/`p6b`/`p12`); the M5 Pro's profile is the writer's (`tools/profile_writer.py`), the M3 Pro's
+overrides). Commit every results file. Measured so far: an M3 Pro (2026-09-19, 13 probes), an M5 Pro (2026-09-22,
+all 16, repeats of `p6`/`p6b`/`p12`), the 60-core M3 Ultra (2026-10-10, `p1`–`p14`) and the 40-core M3 Max
+(2026-10-14, `p1`–`p14`; five `p16` runs, 2026-10-16 and 2026-10-17); the M5 Pro's profile is the writer's (`tools/profile_writer.py`), the M3 Pro's
 hand-derived. `p12`–`p14` never ran on the M3 Pro (dropped with the machine, 2026-09-25). `./probes/build/p13_decode_gemv
 check` (same for `p14`) compiles every kernel variant without dispatching.
 

@@ -9,7 +9,7 @@ configuration or autotuning cache.
 | --- | --- | --- |
 | `m3_pro` | [18 cores](m3_pro/config.json) | Existing probe-derived settings preserved |
 | `m3_max_30c` | [30 cores](m3_max_30c/config.json) | Unmeasured native fallback. On the 36 GB machine, DSpark serving fits through 20480 context; 22528 does not |
-| `m3_max_40c` | [40 cores](m3_max_40c/config.json) | Measured (`profile_writer`, 48 GB): the Apple9 matrix tile from 4 rows (NVFP4, FP8) and 8 (INT4, BF16). DSpark serving is capped at 20480 context, the 30-core part's measured fit |
+| `m3_max_40c` | [40 cores](m3_max_40c/config.json) | Measured (`profile_writer`, 48 GB): the Apple9 matrix tile from 2 rows for NVFP4 and BF16 (a paired DSpark-round A/B), 4 for FP8 and 8 for INT4; kernel choices for decode and the 32-row prompt-pass tiles. Prompt passes keep 128 rows: a 512-row exact pass with the DSpark drafter resident ran out of GPU memory on that machine |
 | `m3_ultra_60c` | [60 cores](m3_ultra_60c/config.json) | Measured (`profile_writer`, 256 GB): the Apple9 matrix tile from 4 rows |
 | `m4_pro` | [16 cores](m4_pro/config-16c.json), [20 cores](m4_pro/config-20c.json) | 20 cores measured (`profile_writer`, 48 GB): the Apple9 matrix tile from 2 rows (NVFP4); 16 cores an unmeasured native fallback |
 | `m4_max` | [32 cores](m4_max/config-32c.json), [40 cores](m4_max/config-40c.json) | Unmeasured native fallback |
@@ -73,7 +73,7 @@ lowering strategy. A `.metal` file with the same relative name overrides only
 that chip's source. Shared compiler fusion helpers remain reusable. Direct
 source-building experiments can use `with using_backend("m5_max_32c"):`.
 
-The 40-core backend's `scheduling.py` owns automatic GDN mixer fusion, the
+The 40-core M5 Max backend's `scheduling.py` owns automatic GDN mixer fusion, the
 measured routed-expert crews in `routed.py`, and the two-kernel INT4 MLP
 layout in `mlp.py`. The routed policies apply only to NVFP4 top-8 experts:
 2048 hidden / 768 intermediate dimensions at static T=1 or T=8, and
@@ -86,11 +86,11 @@ retain their existing geometry. The GDN recipe requires static T=8,
 matching shapes/formats and a complete
 normalization boundary. Dynamic/speculative mixer fusion requires a decoder
 recipe. Attention, MLP and DSpark context
-maps live in [the 40-core recipes directory](m5_max_40c/recipes/); they do not
+maps live in [the 40-core M5 Max recipes directory](m5_max_40c/recipes/); they do not
 enable context routing by themselves. The serving setup selects request recipes. See the
 [mixer design](../../../docs/design/mixers.md).
 The additional direct-cache attention shapes live in `m5_max_40c/attention.py`.
-The 40-core `prefill.py` owns large-prompt D=256 attention preparation and
+The 40-core M5 Max `prefill.py` owns large-prompt D=256 attention preparation and
 locally reduced 2048-key partitions, plus measured NVFP4/FP8 projection tiles.
 The 512-row Qwen path uses contiguous NVFP4 and FP8 operands, shared GDN Q/K
 preparation, and masked matrix tails. FP8 stays eight-bit; only native BF16

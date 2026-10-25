@@ -4,9 +4,10 @@
   "chip": "Apple M3 Max",
   "gpu_family": "Apple9",
   "gpu_cores": 40,
-  "nominal_gbps": 280.0,
+  "nominal_gbps": 400.0,
+  "nominal_note": "[S] Apple's tech specs give 400GB/s of memory bandwidth for the 16-core CPU, 40-core GPU M3 Max (support.apple.com/en-us/117737)",
   "validation": "measured",
-  "note": "Measured on a 40-core, 48 GB M3 Max (macOS 27.0.1) by tools/profile_writer.py with the Apple9 matrix tile. The 30-core M3 Max keeps its own unmeasured configuration.",
+  "note": "Measured on a 40-core, 48 GB M3 Max (macOS 27.0.1) by tools/profile_writer.py with the Apple9 matrix tile. sibling_order keeps the default \"either\" (the writer carries it over from the file; engine.note's \"the probes'\" assumes a probe-derived value): p11 favors bus-first on this chip, p12 (5) reverses it once the ALU-bound op runs as long as the bus-bound one (108 %), and a paired serve A/B of bus_first against either (two rounds, the 27B with its DSpark drafter) showed no gain. With the accelerator on, the large NVFP4 and BF16 GEMVs at T = 1 run on its rows kernels: plain decode of the 27B was level (55.3 to 60.4 ms per token against 60.1 to 61.0 with it off, overlapping ranges over three paired rounds of 128 tokens), and a 10-token prompt pass took 168 ms against 1.8 s. threadgroups_per_core 2, the writer's pick at a 4 % margin, decodes the 27B level with 1: 54.4 to 54.8 ms per token against 54.3 to 55.0 (three paired rounds on the shipped kernel choices). accelerator_min_t is 2 for NVFP4 and BF16, set by hand over the writer's 4 and 8 (the writer times the tile without its K-split): in a paired serve A/B of the DSpark round (two alternating rounds, the best of each arm's second and third requests, 128 tokens) the 27B decoded math at 82.3 to 83.2 tok/s against 75.1 to 76.6, chat 40.5 to 41.2 against 37.3 to 37.6 and text 34.4 to 34.5 against 33.1 to 33.9, with code level, and a refresh resets both to the writer's values. In the same A/B, 1 threadgroup per core decoded no faster (chat 36.1 to 36.9 tok/s). FP8 keeps the writer's 4: a separate paired A/B of the same design with FP8 from T = 2 (2026-10-15, the same tokens in both arms) decoded chat at 36.0 to 37.1 tok/s against 39.9 to 40.3 and text at 31.20 to 32.65 against 32.68 to 33.84, with code and math overlapping, although on the writer's shape the tile with its K-split costs 1.010 T = 1 passes against the T = 2 shader's 1.204 and the autotuner times the two the same on the 27B's FP8 shapes. INT4 keeps the writer's 8, unmeasured end to end on this chip (the A/Bs above served the NVFP4 27B): with the K-split its TM 8 row (1.515) costs less than the T = 4 shader pass (2.344), the start calibration.accelerator_plan's rule would pick. cost_T's accelerator rows are set by hand from the tile with its K-split, as the engine dispatches it (the writer times it without): on the writer's 17408x5120 shape on 2026-10-15, in units of the same session's best T = 1 shader pass, TM 8, 16 and 32 cost 0.890, 1.428 and 2.766 for NVFP4 (K-split 8, 4, 4), 1.046, 1.109 and 1.249 for BF16 (4, 2, 8), 1.010, 1.096 and 2.063 for FP8 (4, 4, 4) and 1.515, 2.078 and 3.538 for INT4 (2, 2, 8), where the writer wrote 1.958, 3.169 and 6.934; 1.372, 1.741 and 2.511; 1.593, 2.370 and 5.210; and 2.610, 4.074 and 8.046. Only compiler.emit.verify_costs reads them (verify='cost'; serve verifies a fixed length), and a refresh resets them too. attention auto runs v3 below T = 4 and, with the accelerator on, the mma kernel at T >= 4 for head_dim 128 and 256 (compiler.emit); the writer timed v1 to v3 only, at 32 query heads where the 27B has 24, and the serve A/B of v1 against auto is the evidence for that range: an 11,281-token prompt's cold first token took 91.2 s with v1 against 76.1 s with auto, and its decode went from 27.0 to 32.2 tok/s. Against v2 (October 15, with this configuration's engine block), plain decode of the 27B after an 8,000-token prompt took 61.5 to 64.4 ms per token with auto against 64.9 to 66.2 with v2 and its prompt pass 51.8 to 52.0 s against 60.6 to 60.8 s (two alternating rounds of 128 tokens; the outputs differ at one punctuation token), and at the 27B's attention shape (24 heads, 4 KV heads, D 256, one query row) gqa_bench timed v3 at 0.100 ms per layer against v2's 0.310 over 1,024 keys, 0.301 to 0.303 against 0.336 to 0.339 over 4,096 and 0.401 to 0.550 against 0.629 to 0.632 over 16,384, with its two rounds disagreeing over 32,768. The writer's T = 1 attention timings in this file (v3 at 0.088 ms over 4,096 keys) are below what that run and the October 15 writer run this configuration replaces (commit 9ce1de5: 0.304 ms) measure for the same kernel; replayed through a refresh, that run sets attention to v2, and a contract test pins auto.",
   "engine": {
     "family": "Apple9",
     "lane_order": "interleaved16",
@@ -14,82 +15,82 @@
     "threadgroups_per_core": 2,
     "sibling_order": "either",
     "max_cb_ms": 16,
-    "attention": "v2",
+    "attention": "auto",
     "attention_rows": 4,
     "attention_v2_threadgroups": 2,
     "accelerator": "on",
     "accelerator_min_t": {
-      "nvfp4": 4,
+      "nvfp4": 2,
       "fp8": 4,
       "int4_affine": 8,
-      "bf16": 8
+      "bf16": 2
     },
     "cost_T": {
       "nvfp4": {
         "1": 1.0,
-        "2": 1.27,
-        "4": 1.924,
-        "8": 5.464
+        "2": 1.264,
+        "4": 1.931,
+        "8": 6.061
       },
       "fp8": {
         "1": 1.0,
-        "2": 1.218,
-        "4": 1.746,
-        "8": 2.804
+        "2": 1.204,
+        "4": 1.781,
+        "8": 2.914
       },
       "int4_affine": {
         "1": 1.0,
-        "2": 1.385,
-        "4": 2.288,
-        "8": 6.179
+        "2": 1.388,
+        "4": 2.344,
+        "8": 6.682
       },
       "bf16": {
         "1": 1.0,
-        "2": 1.144,
-        "4": 1.245,
-        "8": 2.204
+        "2": 1.052,
+        "4": 1.154,
+        "8": 2.236
       },
       "accelerator_nvfp4": {
-        "8": 1.941,
-        "16": 3.124,
-        "32": 6.826
+        "8": 0.89,
+        "16": 1.428,
+        "32": 2.766
       },
       "accelerator_fp8": {
-        "8": 1.561,
-        "16": 2.279,
-        "32": 5.05
+        "8": 1.01,
+        "16": 1.096,
+        "32": 2.063
       },
       "accelerator_int4_affine": {
-        "8": 2.576,
-        "16": 3.983,
-        "32": 7.869
+        "8": 1.515,
+        "16": 2.078,
+        "32": 3.538
       },
       "accelerator_bf16": {
-        "8": 1.361,
-        "16": 1.726,
-        "32": 2.524
+        "8": 1.046,
+        "16": 1.109,
+        "32": 1.249
       }
     },
-    "note": "written by tools/profile_writer.py from the kernel harnesses (min-of-N over >= 2 GB streamed per point): cost_T = the pass cost relative to a T = 1 shader pass at the best geometry per T; accelerator_<fmt> = gemm_tile at TM rows in the same unit; sibling_order and max_cb_ms are the probes' (p11, p6/p6b) and attention_rows the file's: they carry over"
+    "note": "written by tools/profile_writer.py from the kernel harnesses (min-of-N over >= 2 GB streamed per point): cost_T = the pass cost relative to a T = 1 shader pass at the best geometry per T; accelerator_<fmt> = gemm_tile at TM rows in the same unit; sibling_order and max_cb_ms are the probes' (p11, p6/p6b) and attention_rows the file's: they carry over. On this chip accelerator_min_t for NVFP4 and BF16 and the accelerator_<fmt> rows are set by hand from the tile with its K-split, and sibling_order keeps the file's default; the top-level note gives the measurements"
   },
+  "kernel_choices": "kernel-choices.json",
   "memory_gb": 48,
   "os": "macOS 27.0.1",
   "gpu_working_set_gb": 37.44,
   "max_buffer_gb": 28.08,
-  "measured": "2026-10-15",
-  "nominal_note": "[M] stand-in: the best measured streaming rate (278 GB/s) rounded up; replace with the spec figure",
+  "measured": "2026-10-14",
   "hosts_target_model": true,
   "hosts_target_model_note": "21 GB of weights against recommendedMaxWorkingSetSize 37.44 GB, maxBufferLength 28.08 GB",
   "writer": {
     "tool": "tools/profile_writer.py",
-    "written": "2026-10-15",
-    "command": "python tools/profile_writer.py",
+    "written": "2026-10-14",
+    "command": "python tools/profile_writer.py --nominal-gbps 400",
     "decisions": {
-      "lane_order": "a tie (interleaved16 278 GB/s, contiguous 277 GB/s): the profile keeps interleaved16",
-      "scale_placement": "block streams 1.065x inline (the unit's padding gone)",
-      "threadgroups_per_core": "x2 at 0.297 ms against x1 0.307",
-      "accelerator": "nvfp4: the tile from T = 4 (tile TM8 1.94, TM16 3.12, TM32 6.83 vs shader T2 1.27, T4 1.92, T8 5.46); fp8: the tile from T = 4 (tile TM8 1.56, TM16 2.28, TM32 5.05 vs shader T2 1.22, T4 1.75, T8 2.80); int4_affine: the tile from T = 8 (tile TM8 2.58, TM16 3.98, TM32 7.87 vs shader T2 1.39, T4 2.29, T8 6.18); bf16: the tile from T = 8 (tile TM8 1.36, TM16 1.73, TM32 2.52 vs shader T2 1.14, T4 1.25, T8 2.20)",
-      "attention": "v2 faster at every point: (1024, 1): 0.334 vs 0.436 ms, (1024, 4): 0.285 vs 0.458 ms, (4096, 1): 0.190 vs 0.247 ms, (4096, 4): 0.550 vs 0.930 ms; v3 not faster at every point (at (4096, 1): 0.304 vs v1 0.247 / v2 0.190 ms)"
+      "lane_order": "interleaved16 at 301 GB/s against 282",
+      "scale_placement": "block streams 1.078x inline (the unit's padding gone)",
+      "threadgroups_per_core": "x2 at 0.283 ms against x1 0.295",
+      "accelerator": "nvfp4: the tile from T = 4 (tile TM8 1.96, TM16 3.17, TM32 6.93 vs shader T2 1.26, T4 1.93, T8 6.06); fp8: the tile from T = 4 (tile TM8 1.59, TM16 2.37, TM32 5.21 vs shader T2 1.20, T4 1.78, T8 2.91); int4_affine: the tile from T = 8 (tile TM8 2.61, TM16 4.07, TM32 8.05 vs shader T2 1.39, T4 2.34, T8 6.68); bf16: the tile from T = 8 (tile TM8 1.37, TM16 1.74, TM32 2.51 vs shader T2 1.05, T4 1.15, T8 2.24)",
+      "attention": "v3 faster than v1 and v2 at every point: (1024, 1): 0.030 vs v1 0.122 / v2 0.092 ms, (1024, 4): 0.098 vs v1 0.211 / v2 0.289 ms, (4096, 1): 0.088 vs v1 0.239 / v2 0.172 ms, (4096, 4): 0.317 vs v1 0.842 / v2 0.523 ms"
     },
     "measurements": {
       "family": "Apple9",
@@ -98,43 +99,43 @@
       "copies": null,
       "reps": 3,
       "lane_order_gbps": {
-        "interleaved16": 278.5,
-        "contiguous": 276.8
+        "interleaved16": 301.1,
+        "contiguous": 282.2
       },
       "lane_order_measured_with": "interleaved16",
       "scale_placement_gbps": {
-        "inline": 215.3,
-        "block": 229.2
+        "inline": 223.9,
+        "block": 241.3
       },
       "scale_placement_measured_with": "nvfp4",
       "threadgroups_ms": {
-        "1": 0.3066,
-        "2": 0.2969
+        "1": 0.2953,
+        "2": 0.283
       },
       "shader_ms": {
         "nvfp4": {
-          "1": 0.1902,
-          "2": 0.2416,
-          "4": 0.3659,
-          "8": 1.0393
+          "1": 0.1871,
+          "2": 0.2365,
+          "4": 0.3612,
+          "8": 1.1341
         },
         "fp8_e4m3": {
-          "1": 0.2552,
-          "2": 0.3108,
-          "4": 0.4455,
-          "8": 0.7157
+          "1": 0.2435,
+          "2": 0.2932,
+          "4": 0.4337,
+          "8": 0.7096
         },
         "int4_affine": {
-          "1": 0.191,
-          "2": 0.2646,
-          "4": 0.4371,
-          "8": 1.1802
+          "1": 0.186,
+          "2": 0.2581,
+          "4": 0.4359,
+          "8": 1.2428
         },
         "bf16": {
-          "1": 0.5015,
-          "2": 0.5739,
-          "4": 0.6244,
-          "8": 1.1052
+          "1": 0.4883,
+          "2": 0.5138,
+          "4": 0.5637,
+          "8": 1.0917
         }
       },
       "shader_geometry": {
@@ -165,92 +166,92 @@
       },
       "shader_gbps": {
         "nvfp4": {
-          "1": 263.6,
-          "2": 207.5,
-          "4": 137.0,
-          "8": 48.2
+          "1": 267.9,
+          "2": 212.0,
+          "4": 138.8,
+          "8": 44.2
         },
         "fp8_e4m3": {
-          "1": 349.3,
-          "2": 286.8,
-          "4": 200.1,
-          "8": 124.5
+          "1": 366.0,
+          "2": 304.0,
+          "4": 205.5,
+          "8": 125.6
         },
         "int4_affine": {
-          "1": 262.5,
-          "2": 189.5,
-          "4": 114.7,
-          "8": 42.5
+          "1": 269.5,
+          "2": 194.3,
+          "4": 115.0,
+          "8": 40.3
         },
         "bf16": {
-          "1": 355.4,
-          "2": 310.6,
-          "4": 285.5,
-          "8": 161.3
+          "1": 365.1,
+          "2": 346.9,
+          "4": 316.2,
+          "8": 163.3
         }
       },
       "tile_ms": {
         "nvfp4": {
-          "8": 0.3692,
-          "16": 0.5942,
-          "32": 1.2984
+          "8": 0.3664,
+          "16": 0.593,
+          "32": 1.2974
         },
         "fp8_e4m3": {
-          "8": 0.3984,
-          "16": 0.5815,
-          "32": 1.2888
+          "8": 0.3879,
+          "16": 0.577,
+          "32": 1.2686
         },
         "int4_affine": {
-          "8": 0.4921,
-          "16": 0.7607,
-          "32": 1.5029
+          "8": 0.4855,
+          "16": 0.7578,
+          "32": 1.4965
         },
         "bf16": {
-          "8": 0.6823,
-          "16": 0.8658,
-          "32": 1.2657
+          "8": 0.6698,
+          "16": 0.8499,
+          "32": 1.2263
         }
       },
       "tile_gbps": {
         "nvfp4": {
-          "8": 135.8,
-          "16": 84.4,
+          "8": 136.8,
+          "16": 84.5,
           "32": 38.6
         },
         "fp8_e4m3": {
-          "8": 223.7,
-          "16": 153.3,
-          "32": 69.2
+          "8": 229.8,
+          "16": 154.5,
+          "32": 70.3
         },
         "int4_affine": {
-          "8": 101.9,
-          "16": 65.9,
-          "32": 33.4
+          "8": 103.3,
+          "16": 66.2,
+          "32": 33.5
         },
         "bf16": {
-          "8": 261.3,
-          "16": 205.9,
-          "32": 140.8
+          "8": 266.1,
+          "16": 209.7,
+          "32": 145.4
         }
       },
       "attention_ms": {
         "v1": {
-          "(1024, 1)": 0.4365,
-          "(1024, 4)": 0.4582,
-          "(4096, 1)": 0.2467,
-          "(4096, 4)": 0.9305
+          "(1024, 1)": 0.1218,
+          "(1024, 4)": 0.2114,
+          "(4096, 1)": 0.2394,
+          "(4096, 4)": 0.8424
         },
         "v2": {
-          "(1024, 1)": 0.3343,
-          "(1024, 4)": 0.285,
-          "(4096, 1)": 0.1897,
-          "(4096, 4)": 0.5503
+          "(1024, 1)": 0.0921,
+          "(1024, 4)": 0.2893,
+          "(4096, 1)": 0.1725,
+          "(4096, 4)": 0.5232
         },
         "v3": {
-          "(1024, 1)": 0.1012,
-          "(1024, 4)": 0.0983,
-          "(4096, 1)": 0.3039,
-          "(4096, 4)": 0.318
+          "(1024, 1)": 0.0296,
+          "(1024, 4)": 0.0978,
+          "(4096, 1)": 0.0876,
+          "(4096, 4)": 0.3165
         }
       },
       "attention_rep": 8

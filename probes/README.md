@@ -21,7 +21,7 @@ virtualized macOS (hosted CI runners): its paravirtual GPU does not schedule lik
 | `p4_core_model` | threadgroup → core mapping; full-speed SIMD-groups per core |
 | `p5_bandwidth` | streaming GB/s vs number of SIMD-groups; a naive NVFP4 decode+dot |
 | `p5b_access_pattern` | striped vs interleaved vs block-cooperative lane access |
-| `p6_preemption` | does a long dispatch block other GPU work? (runs three ~1.5 s dispatches) |
+| `p6_preemption` | does a long dispatch block other GPU work? (runs three long dispatches: 1.2 to 1.4 s on the M3 Pro and M5 Pro, up to 2.8 s on the M3 Ultra and 40-core M3 Max) |
 | `p6b_interleave` | at what granularity is the GPU shared with other clients: dispatch or command buffer? |
 | `p7_dispatch_overhead` | CPU encode, GPU per-dispatch overhead, ICB replay, sync round trip |
 | `p8_threadgroup_mem` | is threadgroup memory faster than device memory? |
@@ -35,9 +35,12 @@ virtualized macOS (hosted CI runners): its paravirtual GPU does not schedule lik
 | `p16_host_handoff` | host handoffs between GPU passes through `MTLSharedEvent`, the host-step runtime's mechanism: GPU-to-CPU and CPU-to-GPU visibility over 1,000 steps with an in-buffer `encodeWaitForEvent` and with a second command buffer the CPU commits after its work; the GPU idle gap across one handoff (stage-boundary timestamps) for each, with the second command buffer encoded before and after the signal (a lower bound on the host-step runtime's handoff, which `tools/bench/host_handoff.py` measures), against a plain pass boundary; how long after a command buffer's status reads Completed its last signal is visible; whether a command buffer parked at an in-buffer wait for 2 to 6 s survives the GPU watchdog, after a pass and as its first command. `P16_PARKS=0` skips the parks (about 37 s; on the M3 Max every park of 5 s or more hits the watchdog) |
 
 Safety: an Apple9 GPU does not preempt a running dispatch and an Apple10 GPU does so only sometimes (`p6`), so every
-loop here is bounded and the longest single dispatch is ~1.5 s. Expect brief display stalls during `p3`/`p6`/`p6b`. Never add an unbounded spin to a probe.
+loop here is bounded. The longest single dispatch is ~1.5 s on the M3 Pro and M5 Pro; on the 60-core M3 Ultra and the
+40-core M3 Max, `p6`'s long dispatch runs 2.8 s and a `p8` case 3.4–3.8 s (lithos-ai/lithos-metal issue 60). Expect
+brief display stalls during `p3`/`p6`/`p6b`/`p8`. Never add an unbounded spin to a probe.
 
 To characterize a new chip: run everything, commit the results file, retain its measurements with the backend configuration, and derive a
 profile (`cores`, full-speed SIMD-groups per core, in-flight limit, best block size, GB/s, cores needed to saturate the
 bus; a hand-derived first cut per chip is in `../monolith/backends/metal/`). `results/` holds the complete M3 Pro reference run and
-the M5 Pro runs (11 files: the full suite, repeats of `p6`/`p6b`/`p12`, and `p13`/`p14`).
+the M5 Pro runs (11 files: the full suite, repeats of `p6`/`p6b`/`p12`, and `p13`/`p14`), with `p1`–`p14` runs from
+the 60-core M3 Ultra and the 40-core M3 Max, and the 40-core M3 Max's five `p16` runs.
