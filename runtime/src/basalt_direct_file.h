@@ -94,6 +94,13 @@ class DirectFile {
     static void* alloc_aligned(size_t bytes);
     static void free_aligned(void* p);
 
+    /// One driver at a time. `wait` pops from a single completion queue shared by every caller, so two drivers
+    /// each take completions belonging to the other and a driver that discards what is not its own then waits
+    /// forever for a completion already consumed. basalt never meets this because exactly one reader thread
+    /// owns every call into this class; nothing here enforces that, so a caller holds this across a whole
+    /// submit-and-collect cycle. A port addition, like the expert pool's in-phase flag.
+    std::mutex& drive_mutex() { return drive_mu_; }
+
   private:
     struct Pending {
         uint64_t offset;
@@ -111,6 +118,7 @@ class DirectFile {
     std::deque<Pending> queue_;
     std::deque<Completion> done_;
     std::vector<std::thread> pool_;
+    std::mutex drive_mu_;
     bool stop_ = false;
 };
 

@@ -30,6 +30,7 @@ about the bytes and the protocol, and none of them would change if the caching a
 
 import os
 import pathlib
+import threading
 
 import numpy as np
 import pytest
@@ -163,6 +164,54 @@ def test_d2_completions_are_keyed_by_tag_not_ordered_by_submission(reader, table
     # Informational: with 16 threads over 200 reads this is almost always out of order, but ordering is the
     # scheduler's business and the contract is the tag, so a run that happens to stay ordered is not a failure.
     assert len(tags) == len(offsets)
+
+
+def test_d6_every_offset_is_checked_before_any_read_is_submitted(reader, table):
+    """A bad offset late in the list must not leave the earlier reads queued. They were submitted against
+    buffers the failing call is about to free, and a worker thread writes through those pointers, so freeing
+    them early is a write to freed memory. Validating up front is what makes the failure clean; the reader
+    still works afterwards, which is what this asserts."""
+    good = [0, PAGE, PAGE * 2]
+    with pytest.raises(ValueError, match="multiple of 4096"):
+        reader.read_many(good + [PAGE * 3 + 1], PAGE)
+    order = reader.read_many(good, PAGE)
+    assert sorted(tag for tag, _ in order) == [0, 1, 2], "the reader was left in a bad state by the refusal"
+
+
+def test_d7_two_threads_reading_at_once_both_finish(reader, table):
+    """`wait` pops from ONE completion queue shared by every caller, and each caller drops whatever is not its
+    own. So two overlapping drivers consume each other's completions, and with the lock removed this case
+    returns one thread a list carrying the OTHER thread's tags (measured: 0, 0, 1, 1, ... rather than 0, 1, 2),
+    which in a caller keying rows off those tags is the wrong row served as the right one; the thread whose
+    completions were taken can also wait forever for one already consumed. basalt never meets this because
+    exactly one reader thread owns every call into the class; the binding is reachable from any Python thread,
+    so it serialises each submit-and-collect cycle itself.
+
+    Batches of 512 are what make the overlap real rather than lucky: one read is over in microseconds, so two
+    threads doing one each almost never have both in flight and a pair of single reads passes with no lock at
+    all (measured). 512 in flight holds the window open. The join is bounded because the other failure arm is
+    a hang."""
+    batch = [((i * 7) % 400) * PAGE for i in range(512)]
+    results, errors = {}, []
+
+    def drive(name):
+        try:
+            for _ in range(8):
+                order = reader.read_many(batch, PAGE)
+                assert sorted(tag for tag, _ in order) == list(range(len(batch))), \
+                    f"thread {name} was handed another driver's completions"
+            results[name] = True
+        except BaseException as exc:              # carried out, because a raise here dies with the thread
+            errors.append((name, exc))
+
+    threads = [threading.Thread(target=drive, args=(n,), daemon=True) for n in (0, 1)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=60)
+    assert not errors, errors
+    assert [th.is_alive() for th in threads] == [False, False], "a reader thread never finished: the reads deadlocked"
+    assert results == {0: True, 1: True}
 
 
 def test_d3_a_wake_posts_a_synthetic_completion(reader):

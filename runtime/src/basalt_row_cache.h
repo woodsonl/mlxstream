@@ -63,6 +63,7 @@ class RowCache {
     static uint64_t mix(uint32_t r);
     uint64_t set_of(uint32_t row) const { return sets_ == 0 ? 0 : mix(row) % sets_; }
     uint64_t sets() const { return sets_; }
+    uint32_t row_bytes() const { return rb_; }
 
   private:
     uint64_t sets_ = 0;

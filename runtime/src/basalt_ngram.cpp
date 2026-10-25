@@ -6,6 +6,8 @@
 
 #include "basalt_ngram.h"
 
+#include <cstddef>
+
 namespace monolith::basalt_cpu {
 
 namespace {
@@ -32,7 +34,9 @@ void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const 
         bool cut = false;
         for (int s = 1; s < NGRAM_SIZE; ++s) {
             // `prev` is oldest first, so entry (n_prev - s): s = 1 reads the NEWEST predecessor.
-            const int32_t t = cut ? TOKEN_NULL : prev[i * n_prev + (n_prev - s)];
+            // size_t, not int: `i * PLE_N_HEADS` overflows a 32-bit int above about 134 million tokens, and
+            // signed overflow is undefined, so the store below could land outside `out`.
+            const int32_t t = cut ? TOKEN_NULL : prev[(size_t) i * n_prev + (n_prev - s)];
             // The cut is taken BEFORE the store, so the position whose predecessor was EOS is itself EOS, and
             // once set it stays set: every older position is forced to EOS too, never to TOKEN_NULL.
             cut = cut || t < 0 || t == PLE_EOS_TOKEN_ID;
@@ -48,7 +52,7 @@ void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const 
                 const int h = base + g;
                 // Unsigned 64-bit modulo and a 64-bit add; the truncation to uint32 is last and is never lossy,
                 // because the sum of the vocabulary sizes is 320001446 and so the largest index is 320001445.
-                out[i * PLE_N_HEADS + h] = (uint32_t) (mixed % c.vocab[h] + c.offset[h]);
+                out[(size_t) i * PLE_N_HEADS + h] = (uint32_t) (mixed % c.vocab[h] + c.offset[h]);
             }
         }
     }

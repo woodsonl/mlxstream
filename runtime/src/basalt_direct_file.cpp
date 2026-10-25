@@ -7,6 +7,7 @@
 #include "basalt_direct_file.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 
 #include <fcntl.h>
@@ -94,7 +95,13 @@ void DirectFile::worker() {
         // One blocking read per thread, which is what makes the thread count the queue depth. A read whose
         // range crosses the end of the file comes back short rather than failing, and the caller checks the
         // byte count; only a negative return is an error.
-        const ssize_t got = ::pread(fd_, p.buffer, p.length, (off_t) p.offset);
+        // Retried on EINTR, because a signal is not a failed read. The host process is a Python interpreter,
+        // so a handler can run on any pool thread that does not block the signal, and treating that as an error
+        // would report a readable row as unreadable.
+        ssize_t got;
+        do {
+            got = ::pread(fd_, p.buffer, p.length, (off_t) p.offset);
+        } while (got < 0 && errno == EINTR);
         lk.lock();
         done_.push_back(Completion{p.tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
         cv_done_.notify_all();

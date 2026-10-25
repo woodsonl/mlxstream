@@ -26,7 +26,11 @@ void RowCache::init(uint64_t rows, uint32_t row_bytes) {
 }
 
 const uint8_t* RowCache::find(uint32_t row) const {
-    if (sets_ == 0) return nullptr;
+    // The marker is not a row. basalt never reaches this case because its caller drops a row at or past the
+    // table's row count before any lookup, and the table has fewer rows than the marker; nothing in this port's
+    // own callers enforces that, and without the guard a lookup of the marker matches an EMPTY way and returns
+    // zeroed bytes as a hit.
+    if (sets_ == 0 || row == ROW_CACHE_EMPTY) return nullptr;
     const uint64_t s = set_of(row);                // modulo, never a mask: sets need not be a power of two
     for (uint32_t w = 0; w < ROW_CACHE_WAYS; ++w)
         if (keys_[(size_t) (s * ROW_CACHE_WAYS + w)] == row)
@@ -37,7 +41,7 @@ const uint8_t* RowCache::find(uint32_t row) const {
 void RowCache::insert(uint32_t row, const uint8_t* bytes) {
     // A row already present is left exactly as it is, and the replacement pointer does not move: a hit updates
     // nothing, which is what makes this round robin rather than least-recently-used.
-    if (sets_ == 0 || find(row) != nullptr) return;
+    if (sets_ == 0 || row == ROW_CACHE_EMPTY || find(row) != nullptr) return;
     const uint64_t s = set_of(row);
     const uint32_t w = next_[(size_t) s];
     next_[(size_t) s] = (uint8_t) ((w + 1) % ROW_CACHE_WAYS);   // advances on every insert, occupied or not

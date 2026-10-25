@@ -479,7 +479,9 @@ NB_MODULE(_native, m) {
                "basalt_ngram_rows: tokens, prev and out must have one row per token");
           need(prev.shape(1) == (size_t) (bc::NGRAM_SIZE - 1), "basalt_ngram_rows: prev rows hold 2 predecessors");
           need(out.shape(1) == (size_t) bc::PLE_N_HEADS, "basalt_ngram_rows: out rows hold 16 head indices");
-          need(n <= (size_t) INT32_MAX, "basalt_ngram_rows: too many tokens");
+          // A decode window is tens of tokens; this bound exists so the row count cannot approach the
+          // arithmetic's limits, not because a larger batch is meaningful.
+          need(n <= (size_t) (1 << 20), "basalt_ngram_rows: at most 1,048,576 tokens");
           // Two separate arrays, not two views of one: out is written while prev is read, and a shifted view
           // would let the write land under the read. The same storage check the expert bindings make.
           const auto* pp = (const unsigned char*) prev.data();
@@ -553,9 +555,14 @@ NB_MODULE(_native, m) {
       .def_static("mix", &bc::RowCache::mix, nb::arg("row"))
       .def("set_of", &bc::RowCache::set_of, nb::arg("row"))
       .def("insert", [](bc::RowCache& c, uint32_t row, U8In1 bytes) {
+             // insert copies row_bytes from this pointer, so a shorter array would be read past its end.
+             need(bytes.shape(0) == (size_t) c.row_bytes(), "RowCache.insert: bytes must be row_bytes long");
              c.insert(row, bytes.data());
            }, nb::arg("row"), nb::arg("bytes").noconvert())
       .def("get", [](bc::RowCache& c, uint32_t row, U8Out1 out) {
+             // A slot holds exactly row_bytes, so a longer `out` would read past it, and past the whole data
+             // array on the last slot.
+             need(out.shape(0) == (size_t) c.row_bytes(), "RowCache.get: out must be row_bytes long");
              const uint8_t* p = c.find(row);
              if (p == nullptr) return false;
              std::memcpy(out.data(), p, out.shape(0));
@@ -588,11 +595,14 @@ NB_MODULE(_native, m) {
              bool ok = false;
              {
                nb::gil_scoped_release unlock;
+               // Held across the whole submit-and-collect cycle: the completion queue is shared, so a second
+               // driver would take this read's completion and then wait forever for one already consumed.
+               std::lock_guard<std::mutex> drive(f.drive_mutex());
                void* buf = bc::DirectFile::alloc_aligned(length);
                if (buf == nullptr) throw std::bad_alloc();
                std::string err;
                if (!f.submit(offset, buf, length, tag, err)) {
-                 bc::DirectFile::free_aligned(buf);
+                 bc::DirectFile::free_aligned(buf);     // nothing was queued, so nothing can still write to it
                  throw std::invalid_argument(err);
                }
                // Keyed by tag, never by arrival: a wake posted earlier, or any other completion still
@@ -622,30 +632,41 @@ NB_MODULE(_native, m) {
              need(length > 0 && length % bc::DIRECT_ALIGNMENT == 0,
                   "read_many: length must be a nonzero multiple of 4096");
              need(!offsets.empty() && offsets.size() <= 4096, "read_many: 1 to 4096 offsets");
+             // Every offset checked BEFORE anything is submitted, so a bad one later in the list cannot
+             // leave earlier reads queued against buffers this call is about to free.
+             for (uint64_t off : offsets)
+               need(off % bc::DIRECT_ALIGNMENT == 0, "read_many: every offset must be a multiple of 4096");
+
              std::vector<std::pair<uint64_t, uint32_t>> order;
              {
                nb::gil_scoped_release unlock;
+               std::lock_guard<std::mutex> drive(f.drive_mutex());
                std::vector<void*> bufs(offsets.size(), nullptr);
+               size_t submitted = 0;
                std::string err;
-               for (size_t i = 0; i < offsets.size(); ++i) {
+               bool failed = false, oom = false;
+               for (size_t i = 0; i < offsets.size() && !failed; ++i) {
                  bufs[i] = bc::DirectFile::alloc_aligned(length);
-                 if (bufs[i] == nullptr) throw std::bad_alloc();
-                 if (!f.submit(offsets[i], bufs[i], length, (uint64_t) i, err)) {
-                   for (void* b : bufs) bc::DirectFile::free_aligned(b);
-                   throw std::invalid_argument(err);
-                 }
+                 if (bufs[i] == nullptr) { failed = oom = true; break; }
+                 if (!f.submit(offsets[i], bufs[i], length, (uint64_t) i, err)) { failed = true; break; }
+                 ++submitted;
                }
+               // Collect every read that WAS submitted before any buffer is freed, whether or not the rest
+               // failed: a worker thread still holds a pointer into one of these and writes through it, so
+               // freeing early is a write to freed memory rather than a leak.
                size_t seen = 0;
-               while (seen < offsets.size()) {
+               while (seen < submitted) {
                  bc::Completion got[64];
                  const int n = f.wait(got, 64, -1);
                  for (int k = 0; k < n; ++k) {
-                   if (got[k].tag == bc::DIRECT_WAKE_TAG) continue;
-                   order.emplace_back(got[k].tag, got[k].bytes);
+                   if (got[k].tag >= submitted) continue;        // a wake, or a tag this call never issued
+                   if (!failed) order.emplace_back(got[k].tag, got[k].bytes);
                    ++seen;
                  }
                }
                for (void* b : bufs) bc::DirectFile::free_aligned(b);
+               if (oom) throw std::bad_alloc();
+               if (failed) throw std::invalid_argument(err);
              }
              return order;
            }, nb::arg("offsets"), nb::arg("length"),

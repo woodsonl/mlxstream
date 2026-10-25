@@ -204,6 +204,31 @@ def test_c3_the_fill_counter_never_decreases_and_stays_within_capacity():
     assert cache.size == cache.capacity, "400 rows into 32 ways left the cache unfilled"
 
 
+def test_c5_the_vacancy_marker_is_not_a_row():
+    """Looking up the marker itself must miss. A set with any empty way holds the marker in its key array, so
+    without the guard the lookup matches that way and hands back its zeroed bytes as a hit: a row of zeros
+    reported as real data. basalt never reaches this because its caller drops a row at or past the table's row
+    count first; nothing in this port's callers does, and the binding takes the value directly."""
+    cache = _nt.RowCache(rows=8 * 4, row_bytes=RB)
+    assert get(cache, 0xFFFFFFFF) is None, "the vacancy marker was served as a cached row"
+    cache.insert(0xFFFFFFFF, row_bytes(1))
+    assert cache.size == 0, "the vacancy marker was stored as a row"
+    assert get(cache, 0xFFFFFFFF) is None
+
+
+def test_c6_the_bindings_refuse_a_wrong_sized_buffer():
+    """insert copies row_bytes from the pointer it is given and get copies out's length from a slot holding
+    row_bytes, so a mismatched array is read past its end in one direction or the other."""
+    cache = _nt.RowCache(rows=8 * 4, row_bytes=RB)
+    with pytest.raises(ValueError, match="row_bytes long"):
+        cache.insert(1, np.zeros(RB - 1, np.uint8))
+    with pytest.raises(ValueError, match="row_bytes long"):
+        cache.insert(1, np.zeros(RB + 1, np.uint8))
+    cache.insert(1, row_bytes(1))
+    with pytest.raises(ValueError, match="row_bytes long"):
+        cache.get(1, np.zeros(RB + 1, np.uint8))
+
+
 def test_c4_the_vacancy_marker_cannot_collide_with_a_real_row():
     """The marker is 0xFFFFFFFF and the table has 320,001,536 rows, so no live key can equal it. This holds the
     gap rather than the marker, since a port that grew the table past 2^32 would break it silently."""
