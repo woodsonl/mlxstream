@@ -12,8 +12,9 @@
 //     order at least one sees the other's write, so either the worker sees the new epoch and does not sleep, or
 //     the host sees the sleeper and notifies under the mutex the worker holds until it is inside `wait`. The
 //     store-buffer interleaving in which neither sees the other is exactly what seq_cst forbids. On arm64 this is
-//     not free, where basalt's comment says it costs x86 nothing: it lowers to `ldaddal`/`dmb ish` rather than an
-//     already-fenced `lock xadd`. It is still required.
+//     not free, where basalt's comment says it costs x86 nothing: the seq_cst load is `ldar` where an acquire
+//     load would be `ldapr`, and `ldar` is what orders it against the `ldaddal` before it [M, Apple clang 21.0.0,
+//     -O2, arm64; no `dmb` is emitted, the LSE and RCpc instructions carrying it]. It is still required.
 //   * The batch description is plain, and is made visible solely by the release store of `head_` and the matching
 //     acquire load in `claim`.
 

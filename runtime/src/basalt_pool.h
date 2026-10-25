@@ -16,10 +16,19 @@
 // claim is a compare-exchange that only succeeds for the epoch the worker woke for, and a late worker's claim
 // simply fails.
 //
-// WHY THE EPOCH IS IN THE WORD, which is the single thing a port must not simplify away. A worker that went to
-// sleep is still counted as parked when it wakes, so for a moment after it has seen a new epoch the host believes
-// it is idle. Without the epoch a late worker could claim from the NEXT batch while the host was still writing it,
-// run a job twice, or add to `done` after the host had reset it, and `done != n` would then never end.
+// WHY THE EPOCH IS IN THE WORD. A worker that went to sleep is still counted as parked when it wakes: it reads
+// the new epoch, and only then decrements `parked_`. In that gap the host may read `parked_ == n_`, pass its next
+// pre-phase barrier and publish the next batch, so the worker enters `drain` holding the epoch it woke for while
+// `head_` already carries the next. The park barriers narrow that window and do not close it. basalt's reason for
+// the epoch is that such a worker could otherwise claim from the next batch while the host was still writing it,
+// run a job twice, or add to `done` after the host had reset it (`pool.hpp:18-23`).
+//
+// Here, neither of the last two is reachable even with the epoch test removed, because three other things hold:
+// the claim's acquire of `head_` synchronises with `begin_batch`'s release and the batch description is written
+// before it, the index CAS hands out each job exactly once, and `wait_done` has seen every increment of the
+// previous batch before the reset. A late claim therefore lands on the next batch as an early, correct
+// participant. The epoch test stays because this is a 1:1 port of basalt's protocol, not because a measurement
+// here showed its removal breaking (docs/research/basalt-cpu-pool.md section 4 records what was measured).
 //
 // WHAT THIS PORT CHANGES, and why each is not a numeric difference:
 //   * A stall reports instead of aborting. basalt calls `release_gpu_waits` then `std::abort()`; this returns
