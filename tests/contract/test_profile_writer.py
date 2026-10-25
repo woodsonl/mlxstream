@@ -1,5 +1,6 @@
-"""The profile writer's decisions (monolith.core.profile_writer, #49): pure functions over harness numbers, tested
-here without a GPU; tools/profile_writer.py runs the harnesses and hands them these numbers."""
+"""The profile writer (#49) without a GPU: its decisions (monolith.core.profile_writer, pure functions over harness
+numbers), tools/profile_writer.py's measure() and main() on fake harnesses and devices, and the harness and kernel
+contracts the writer relies on (gemm_bench on stubbed runtime objects, gemm_macros' refusals, the shared tile lists)."""
 
 import json
 from types import SimpleNamespace
@@ -113,7 +114,7 @@ def test_decide_and_merge_produce_a_loadable_profile(tmp_path):
     no_tile = dict(_measurements(), tile_ms={}, tile_geometry_ms={}, attention_ms={})
     eng9, notes9 = decide(dict(no_tile, family="Apple9"), None)
     assert eng9["accelerator"] == "off" and eng9["accelerator_min_t"] == {} and eng9["attention"] == "v1" and eng9["sibling_order"] == "either"
-    assert notes9["accelerator"].startswith("no tile measurement (the tile step was skipped); the switch stays off: carried over")
+    assert notes9["accelerator"].startswith("no tile measurement (the tile step was skipped); the switch stays off (off by default")
     assert "accelerator_fp8" not in eng9["cost_T"]
 
 
@@ -194,6 +195,8 @@ def test_writer_records_the_autotuners_tile_pick(monkeypatch):
     assert {r[2:] for r in tried} == {(None, 3)} and checked == [(tm, md, 1, 1) for tm, md, *_ in tried if tile[tm].get(md) is not None]
     assert m["tile_ms"] == {"nvfp4": {8: 0.55, 16: 1.2}} and m["tile_mode"] == {"nvfp4": {8: "ksplit4nc", 16: "crew"}}
     assert m["tile_gbps"] == {"nvfp4": {8: 1 / 0.55, 16: 1 / 1.2}}          # the picked geometry's rate: TM 16's is crew's
+    # every geometry that passed both checks, none that failed one; no record for TM 32, whose crew failed
+    assert m["tile_geometry_ms"] == {"nvfp4": {8: {"crew": 1.0, "ksplit4nc": 0.55}, 16: {"crew": 1.2, "crew2": 1.19, "ksplit2": 1.17, "ksplit4": 1.18}}}
     assert m["tile_oracle_fail"] == {"nvfp4": {8: ["crew2", "ksplit2", "ksplit4", "ksplit8"], 32: ["crew"]}} and shapes == {(17408, 5120)}   # measure()'s shape
     # each failing check with the numbers its own rule reads: ulp at scale for BF16 output, ulp at RMS for 32-bit output
     assert all(any(s in line for line in lines) for s in (
@@ -238,11 +241,15 @@ def test_writer_prices_the_start_on_the_unsplit_tile(monkeypatch, x2_ms, tgs, st
 
     monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
-    m = pw.measure(formats=["nvfp4"], ts=[1, 2, 4, 8], tms=[8], attention=None, log=lambda s: None)
+    lines = []
+    m = pw.measure(formats=["nvfp4"], ts=[1, 2, 4, 8], tms=[8], attention=None, log=lines.append)
     assert m["tile_geometry_ms"]["nvfp4"][8] == {"crew": 1.0, "crew2": 0.8, "ksplit4": 0.55}
-    engine = decide(m)[0]
+    assert all(f"tile nvfp4 TM=8 {g}: {t:.4f} ms" in lines for g, t in (("crew", 1.0), ("crew2", 0.8), ("ksplit4", 0.55)))   # a dry run's record
+    engine, notes = decide(m)
     assert engine["threadgroups_per_core"] == tgs and engine["accelerator_min_t"] == {"nvfp4": start}   # crew 2.0 or crew2 1.6 x T1
     assert engine["cost_T"]["accelerator_nvfp4"] == {"8": 1.1}                                          # the pick: ksplit4
+    assert notes["accelerator"].startswith(f"the unsplit tile ({'crew' if tgs == 1 else 'crew2'}): nvfp4: the tile from T = {start}")
+    assert "the autotuner's pick would start the tile at T = 2 for nvfp4" in notes["accelerator"]       # 1.1 vs the T = 2 pass 1.3
 
 
 def test_a_refresh_keeps_the_accelerator_switch():
@@ -253,17 +260,30 @@ def test_a_refresh_keeps_the_accelerator_switch():
     engine, notes = decide(lose, {"accelerator": "on"})
     assert engine["accelerator"] == "on" and engine["accelerator_min_t"] == {"nvfp4": NEVER}   # rows that lose at every T
     assert decide(_measurements())[0]["accelerator"] == "off"                            # no file: off
+    assert decide(_measurements(), {"sibling_order": "alu_first"})[0]["accelerator"] == "off"   # a file without the switch (m3_pro)
     assert all(path in notes["accelerator"] for path in ("rows GEMVs", "MMA kernel", "GDN prepared path", "does not time"))
+    assert "the switch stays on (carried over from the file)" in notes["accelerator"]
+    assert "the switch stays off (off by default: the file holds none)" in decide(_measurements())[1]["accelerator"]
 
 
-def _held_starts_file(monkeypatch, pw, tmp_path):
-    """A profile for the fake device that holds the tile on and a start for each of four formats, written by main()."""
+def test_decide_never_starts_a_format_whose_unsplit_tile_has_no_row():
+    """A format with the pick's rows but no unsplit row at the chosen threadgroups per core (a record from before the
+    writer kept every geometry, say) gets the never-start, not a missing key that compiler.emit would read as T = 2."""
+    engine, notes = decide(dict(_measurements(), tile_geometry_ms={}), {"accelerator": "on"})
+    assert engine["accelerator_min_t"] == {"fp8": NEVER, "nvfp4": NEVER} and "accelerator_fp8" in engine["cost_T"]
+    assert "no crew row for fp8, nvfp4: the tile never takes them" in notes["accelerator"]
+    assert "plus the noise margin" in engine["note"]                                  # the start's rule, a tie to the tile
+
+
+def _held_starts_file(monkeypatch, pw, tmp_path, held=None, accelerator="on"):
+    """A profile for the fake device, written by main(), that holds the switch and the starts given (by default the tile
+    on and a start for each of four formats, two of which _measurements() never measures)."""
     out = tmp_path / "p.json"
     _fake_device(monkeypatch, pw)
     monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_oracle_fail={}, oracle_fail=[]))
     assert pw.main(["--name", "x-20c", "--out", str(out)]) == 0
     doc = json.loads(out.read_text())
-    doc["engine"].update(accelerator="on", accelerator_min_t={"nvfp4": 2, "fp8": 4, "int4_affine": 8, "bf16": 2})
+    doc["engine"].update(accelerator=accelerator, accelerator_min_t={"nvfp4": 2, "fp8": 4, "int4_affine": 8, "bf16": 2} if held is None else held)
     assert Profile.from_dict("x-20c", doc).cost_t["accelerator_fp8"]
     out.write_text(json.dumps(doc, indent=2) + "\n")
     return out
@@ -310,6 +330,73 @@ def test_a_refusal_refuses_a_file_that_holds_starts(monkeypatch, tmp_path):
     assert pw.main(["--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
     new = tmp_path / "new.json"
     assert pw.main(["--name", "x-20c", "--out", str(new)]) == 0 and Profile.from_dict("x-20c", json.loads(new.read_text())).accelerator == "off"
+
+
+def test_a_full_refresh_over_held_starts_writes_and_a_partial_one_refuses(monkeypatch, tmp_path):
+    """Over a file whose starts are exactly the formats the run measures, a refresh that prices them all writes, keeping
+    the switch on and re-pricing the starts; a refusal or --no-accelerator over the same file writes nothing."""
+    import tools.profile_writer as pw
+
+    out = _held_starts_file(monkeypatch, pw, tmp_path, held={"nvfp4": 2, "fp8": 4})
+    before = out.read_bytes()
+    base = dict(_measurements(), tile_oracle_fail={}, oracle_fail=[])
+    refused = dict(base, tile_ms={}, tile_geometry_ms={}, tile_error="nvfp4 TM=8 crew: gemm_tile: K must be a multiple of 1024", tile_refused=True)
+    for args, m in ((["--name", "x-20c", "--out", str(out)], refused),
+                    (["--no-accelerator", "--name", "x-20c", "--out", str(out)], dict(base, tile_ms={}, tile_geometry_ms={}))):
+        monkeypatch.setattr(pw, "measure", lambda m=m, **kw: dict(m))
+        assert pw.main(args) == 1 and out.read_bytes() == before
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(base))
+    assert pw.main(["--name", "x-20c", "--out", str(out)]) == 0                            # every held start priced: it writes
+    engine = json.loads(out.read_text())["engine"]
+    assert engine["accelerator"] == "on" and engine["accelerator_min_t"] == {"fp8": 2, "nvfp4": 2}
+
+
+def test_a_refusal_known_from_the_arguments_does_not_measure(monkeypatch, tmp_path, capsys):
+    """A --formats subset or --no-accelerator over a file that holds other starts is refused before the measurement
+    (exit 1, nothing written), naming the formats; --dry-run measures and warns that a write would be refused."""
+    import tools.profile_writer as pw
+
+    out = _held_starts_file(monkeypatch, pw, tmp_path)
+    before = out.read_bytes()
+    monkeypatch.setattr(pw, "measure", lambda **kw: pytest.fail("measured before refusing"))
+    capsys.readouterr()
+    for extra in (["--formats", "fp8_e4m3"], ["--no-accelerator"]):
+        assert pw.main(extra + ["--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
+    assert "no tile rows for bf16, int4_affine, nvfp4" in capsys.readouterr().out
+    full = _measurements()
+    m = dict(full, **{key: {"fp8_e4m3": full[key]["fp8_e4m3"]} for key in ("shader_ms", "tile_ms", "tile_geometry_ms")},
+             tile_oracle_fail={}, oracle_fail=[])
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(m))
+    assert pw.main(["--formats", "fp8_e4m3", "--dry-run", "--name", "x-20c", "--out", str(out)]) == 0 and out.read_bytes() == before
+    assert "a write would be refused: no tile start for bf16, int4_affine, nvfp4" in capsys.readouterr().out
+
+
+def test_the_carried_switch_refuses_implicit_starts(monkeypatch, tmp_path, capsys):
+    """compiler.emit starts a format missing from accelerator_min_t at T = 2: over a file with the switch on and no
+    starts, a run that prices no format (--no-accelerator here) writes nothing; with the switch off it writes."""
+    import tools.profile_writer as pw
+
+    out = _held_starts_file(monkeypatch, pw, tmp_path, held={})
+    before = out.read_bytes()
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_ms={}, tile_geometry_ms={}, tile_oracle_fail={}, oracle_fail=[]))
+    capsys.readouterr()
+    assert pw.main(["--no-accelerator", "--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
+    assert "no tile start for fp8, nvfp4" in capsys.readouterr().out
+    off = _held_starts_file(monkeypatch, pw, tmp_path, held={}, accelerator="off")
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_ms={}, tile_geometry_ms={}, tile_oracle_fail={}, oracle_fail=[]))
+    assert pw.main(["--no-accelerator", "--name", "x-20c", "--out", str(off)]) == 0
+
+
+def test_a_null_start_table_holds_no_starts(monkeypatch, tmp_path):
+    """The loader reads a null accelerator_min_t as no starts, and so does main()'s refresh guard."""
+    import tools.profile_writer as pw
+
+    out = _held_starts_file(monkeypatch, pw, tmp_path, accelerator="off")
+    doc = json.loads(out.read_text())
+    doc["engine"]["accelerator_min_t"] = None
+    out.write_text(json.dumps(doc, indent=2) + "\n")
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_oracle_fail={}, oracle_fail=[]))
+    assert pw.main(["--name", "x-20c", "--out", str(out)]) == 0
 
 
 def test_writer_tile_pick_crew2_unscaled_and_duplicate_formats(monkeypatch):

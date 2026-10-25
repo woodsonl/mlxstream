@@ -205,12 +205,13 @@ def measure(*, shape: Tuple[int, int] = (17408, 5120), formats: Sequence[str] = 
                                 m["tile_oracle_fail"][fmt].setdefault(tm, []).append(mode)
                                 log(f"tile {fmt} TM={tm} {mode}: ORACLE FAIL ({_failed_checks(r, None)}) — recorded; no profile is written")
                             unbuilt = not ran and str(e).startswith(("MSL compile failed", "pipeline failed"))   # the first tile kernel
-                            raise RuntimeError(f"{fmt} TM={tm} {mode}: {e}" + (" (a chip without tensor ops runs --no-accelerator)" if unbuilt else "")) from e
+                            raise RuntimeError(f"{fmt} TM={tm} {mode}: {e}" + (" (a chip without tensor ops runs --no-accelerator, which a file holding tile starts refuses)" if unbuilt else "")) from e
                         if r["ok"] is False or strict["ok"] is False:
                             m["tile_oracle_fail"][fmt].setdefault(tm, []).append(mode)
                             log(f"tile {fmt} TM={tm} {mode}: ORACLE FAIL ({_failed_checks(r, strict)}) — recorded; no profile is written")
                         else:
                             ms[mode], gbps[mode] = r["ms"], r["gbps"]
+                            log(f"tile {fmt} TM={tm} {mode}: {r['ms']:.4f} ms")   # every geometry, a dry run's only record of it
                         return r
 
                     run("crew")
@@ -308,6 +309,12 @@ def main(argv=None) -> int:
         get_backend(existing.get("backend", "common")).validate_device(Profile.from_dict(name, existing), info)
     print(f"{info.name}: {info.gpu_cores} cores, Apple{info.apple_family}; profile {name} ({'merging ' + str(src) if existing else 'new'}) -> {path}", flush=True)
     selected = config_for_device(info.gpu_cores, info.apple_family, info.name)
+    held = ((existing or {}).get("engine") or {}).get("accelerator_min_t") or {}     # a refresh must price every one of them
+    early = sorted(set(held) - (set() if a.no_accelerator else {cost_key(f) for f in formats}))
+    if early and not a.dry_run:                                     # decided by the arguments: refuse before measuring
+        print(f"no profile written: no tile rows for {', '.join(early)}, whose start {src} holds (a --formats subset or "
+              "--no-accelerator): refresh every format with the tile, or measure with --dry-run", flush=True)
+        return 1
     t0 = time.time()
     m = measure(shape=(n, k), formats=formats, ts=ts, tms=tms, copies=copies, reps=reps, accelerator=not a.no_accelerator,
                 attention=attention, ctxs=ctxs, attn_ts=attn_ts, current_lane_order=(existing or {}).get("engine", {}).get("lane_order"),
@@ -316,11 +323,6 @@ def main(argv=None) -> int:
     problems = [f"fails the oracle: {f}" for f in fails + m["oracle_fail"]]
     if "tile_error" in m and not m["tile_refused"]:
         problems.append(f"the tile step failed: {m['tile_error']}")
-    held = (existing or {}).get("engine", {}).get("accelerator_min_t", {})
-    unpriced = sorted(set(held) - {cost_key(f) for f, rows in m["tile_ms"].items() if rows})
-    if unpriced and not a.dry_run:                                  # the file's other starts would not match this run's lane order or units
-        problems.append(f"no tile rows for {', '.join(unpriced)}, whose start {src} holds (a --formats subset, --no-accelerator "
-                        "or a shape one format's tile refuses): refresh every format with the tile, or measure with --dry-run")
     if problems:                                                    # a wrong or failing kernel: no profile until it is fixed
         print("\nno profile written:", *(f"  {p}" for p in problems), sep="\n")
         return 1
@@ -335,6 +337,15 @@ def main(argv=None) -> int:
     print(f"\nmeasured in {time.time() - t0:.0f} s\nengine: {json.dumps(engine, indent=2)}\ndecisions:")
     for key, why in notes.items():
         print(f"  {key}: {why}")
+    # compiler.emit starts a format missing from accelerator_min_t at T = 2: every start the file holds, and with the
+    # switch on every format this run measured, must be priced (a refusal or no tile leaves them unpriced)
+    want = set(held) | ({cost_key(f) for f in m["shader_ms"]} if engine["accelerator"] == "on" else set())
+    unpriced = sorted(want - set(engine["accelerator_min_t"]))
+    if unpriced:
+        why = (f"no tile start for {', '.join(unpriced)}, which {src} holds a start for or the switch it carries on would start "
+               "at T = 2: refresh every format with the tile")
+        print(f"\na write would be refused: {why}" if a.dry_run else f"\nno profile written: {why}")
+        return 0 if a.dry_run else 1
     if a.dry_run:
         return 0
     with open(path, "w") as f:
