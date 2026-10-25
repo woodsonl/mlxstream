@@ -38,6 +38,14 @@ bool run_split_multi_native(ExpertPool& pool, const NativeFmt& fmt, ExpertJobMul
         if (jobs[j].nt < 1 || jobs[j].nt > MAXT)
             throw std::invalid_argument("run_split_multi_native: a job carries 1 to 8 tokens");
 
+    // Refused here, not left to `run_phase`: a poisoned pool makes every phase fail, and each failure takes the
+    // leak path below, so a caller that retries would grow the process without bound. After this, a failure means
+    // this call's own phase stalled, which is when the leak is the right answer.
+    if (pool.poisoned()) {
+        error = "the CPU expert pool stalled earlier and cannot be reused";
+        return false;
+    }
+
     const int threads = pool.workers() + (pool.host_works() ? 1 : 0);
     const int tasks = 3 * threads;              // about three tasks per thread, so the tail is short
     const int gu_blocks = fmt.n_embd / QK;      // the gate and up rows' reduction, in Q2_0 blocks

@@ -390,6 +390,10 @@ NB_MODULE(_native, m) {
              need(bc::H == 0 || d_row <= (blob_bytes - down_off) / bc::H,
                   "run_experts: the down rows run past the blob");
 
+             // Before the buffers exist, so a retry against a pool that stalled earlier cannot allocate and then
+             // leak them: every phase on a poisoned pool fails, and the failure path below retains what it was
+             // given.
+             need(!p.poisoned(), "run_experts: the CPU expert pool stalled earlier and cannot be reused");
              std::vector<bc::ActQ> acts((size_t) ntok);
              for (int t = 0; t < ntok; ++t) {
                std::memcpy(acts[(size_t) t].q, q.data() + (size_t) t * bc::H, bc::H);

@@ -265,6 +265,29 @@ def test_e1_more_experts_than_buffers(layer):
     assert len(rows) == 100, f"{100 - len(rows)} experts produced a duplicate row"
 
 
+@pytest.mark.slow
+def test_e3_a_poisoned_pool_is_refused_before_anything_is_allocated(layer):
+    """E3. A pool that stalled once can never run another phase, so every later call fails. The refusal has to come
+    BEFORE the call allocates its activations, jobs and scratch, because the failure path retains those buffers on
+    purpose: a stalled worker may still be reading them and there is no way to interrupt it. Refusing late would
+    make each retry leak a set, and a caller that catches the error and retries would grow the process without
+    bound.
+
+    Costs about 60 seconds, the pool's stall limit, which is the only way to poison a pool. Carries the ``slow``
+    marker for a run that wants to deselect it; the tier does not deselect it."""
+    blobs, q, scale, hx = layer
+    p = _nt.ExpertPool(n_workers=2, host_works=False, spin_before_sleep_ms=1.0)
+    ok, err = p.stall_phase(70.0)
+    assert not ok and p.poisoned, f"the pool should have stalled and poisoned: {err}"
+
+    job_nt, job_tok = jobs_of([1])
+    # twice, because one refusal proves the guard and the second proves a retry does not accumulate
+    for attempt in range(2):
+        with pytest.raises(ValueError, match="cannot be reused"):
+            run(p, blobs[:1], q, scale, hx, job_nt, job_tok)
+    globals().setdefault("_poisoned_pools", []).append(p)   # never destroyed: a worker still holds its body
+
+
 def test_e2_the_binding_refuses_a_bad_shape(layer):
     blobs, q, scale, hx = layer
     pool = _nt.ExpertPool(n_workers=2, spin_before_sleep_ms=1.0)
