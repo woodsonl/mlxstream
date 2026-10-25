@@ -61,12 +61,9 @@ def make_blob(rng, n):
     then 16 code bytes, and every bit pattern of both is a legal block."""
     b = rng.integers(0, 256, size=(n, BLOB), dtype=np.uint8)
     # keep the block scales finite, so the test is about the split rather than about NaN propagation
-    for e in range(n):
-        for off, nrows, row in ((0, FF, GU_ROW), (UP_OFF, FF, GU_ROW), (DOWN_OFF, H, D_ROW)):
-            for r in range(nrows):
-                base = off + r * row
-                for blk in range(row // BB):
-                    b[e, base + blk * BB + 1] &= 0x3B          # clear the exponent's top bits: no inf, no NaN
+    for off, nrows, row in ((0, FF, GU_ROW), (UP_OFF, FF, GU_ROW), (DOWN_OFF, H, D_ROW)):
+        blocks = b[:, off:off + nrows * row].reshape(n, nrows, row // BB, BB)   # a view, so this writes through
+        blocks[..., 1] &= 0x3B                                 # clear the exponent's top bits: no inf, no NaN
     return b
 
 
@@ -164,17 +161,22 @@ def test_b2_the_same_token_in_two_jobs_gives_the_same_rows(layer):
     """B2. Fact 4. The activation is shared read-only across the batch, so one token routed to two experts reads
     the same quantized input in both; the port never re-quantizes the FFN input."""
     blobs, q, scale, hx = layer
+    # The SAME expert as two jobs, so a token reaching both goes through identical weights and any difference in
+    # its rows is the batching, not the matrix. Two jobs is also what makes the comparison meaningful: one token
+    # occupies a different slot in each.
+    same = np.concatenate([blobs[:1], blobs[:1]])
     job_nt = np.array([2, 2], np.int32)
     job_tok = np.zeros((2, MAXT), np.int32)
     job_tok[0, :2] = [3, 5]
-    job_tok[1, :2] = [5, 3]                      # the same two tokens, swapped
-    out = run(_nt.ExpertPool(n_workers=4, spin_before_sleep_ms=1.0), blobs[:2], q, scale, hx, job_nt, job_tok)
-    # expert 0 slot 0 and expert 1 slot 1 are both token 3 through DIFFERENT experts, so they differ; what must
-    # hold is that re-running with the jobs' token order swapped reproduces them exactly
-    job_tok2 = job_tok.copy()
-    job_tok2[0, :2] = [3, 5]
-    out2 = run(_nt.ExpertPool(n_workers=2, spin_before_sleep_ms=1.0), blobs[:2], q, scale, hx, job_nt, job_tok2)
-    assert np.array_equal(out[0, :2].view(np.uint32), out2[0, :2].view(np.uint32))
+    job_tok[1, :2] = [5, 3]                      # the same two tokens, swapped between the slots
+    out = run(_nt.ExpertPool(n_workers=4, spin_before_sleep_ms=1.0), same, q, scale, hx, job_nt, job_tok)
+    # Token 3 is job 0 slot 0 and job 1 slot 1; token 5 is job 0 slot 1 and job 1 slot 0. Both pairs must be
+    # bitwise equal: the activation is shared read-only, so neither job re-quantizes its input, and the slot a
+    # token lands in does not reach its rows.
+    assert np.array_equal(out[0, 0].view(np.uint32), out[1, 1].view(np.uint32)), "token 3 differs between jobs"
+    assert np.array_equal(out[0, 1].view(np.uint32), out[1, 0].view(np.uint32)), "token 5 differs between jobs"
+    # and the equalities above are not vacuous: two different tokens through the same expert differ
+    assert not np.array_equal(out[0, 0], out[0, 1]), "the two tokens produced identical rows, so B2 proves nothing"
 
 
 # ---- C: the serial step between the phases ------------------------------------------------------------------------

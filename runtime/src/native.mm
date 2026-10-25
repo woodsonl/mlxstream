@@ -423,6 +423,16 @@ NB_MODULE(_native, m) {
                nb::gil_scoped_release unlock;
                ok = bc::run_split_multi_native(p, fmt, jobs.data(), njobs, scratch.data(), err, &gu, &dn);
              }
+             if (!ok && p.poisoned()) {
+               // A stalled phase leaves a worker that may still be reading these: the jobs name the blobs and the
+               // activations, and the scratch holds the intermediate it writes. There is no way to interrupt it,
+               // so they are leaked on purpose for the process's life, the same bargain PoolTask::abandon makes.
+               // `out` is the caller's array and is not ours to leak; the suite keeps a poisoned pool and its
+               // arrays alive, as it does for the pool's own stall case.
+               (void) new std::vector<bc::ActQ>(std::move(acts));
+               (void) new std::vector<bc::ExpertJobMulti>(std::move(jobs));
+               (void) new std::vector<bc::SplitBufMulti>(std::move(scratch));
+             }
              need(ok, err.c_str());
              return nb::make_tuple(gu.work_ms, dn.work_ms);
            }, nb::arg("blobs").noconvert(), nb::arg("gu_row"), nb::arg("d_row"), nb::arg("up_off"),

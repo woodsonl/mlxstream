@@ -7,6 +7,8 @@
 #include "basalt_cpu_experts.h"
 
 #include <algorithm>
+#include <functional>
+#include <memory>
 #include <stdexcept>
 
 #include "basalt_cpu_expf.h"
@@ -48,7 +50,13 @@ bool run_split_multi_native(ExpertPool& pool, const NativeFmt& fmt, ExpertJobMul
 
         // ---- phase 1: the gate and up rows, then the SwiGLU -----------------------------------------------
         const int64_t gu_rows = (int64_t) nb * FF;
-        auto gate_up_body = [&](int task, int worker) {
+        // On the heap and captured by value, for the reason `PoolTask::run` does the same: `run_phase` keeps only
+        // a POINTER to the function, so a stalled phase leaves a worker that may still be inside a body whose
+        // stack `std::function` has already gone, and by-reference captures would name dead locals of this frame.
+        // Leaked below on the poisoned path. The caller's `jobs` and `scratch` are leaked by the caller for the
+        // same reason, and a poisoned pool is itself never destroyed (`basalt_pool.h`).
+        auto gate_up_body = std::make_unique<std::function<void(int, int)>>(
+            [mjobs, scratch, fmt, gu_rows, tasks, gu_blocks, &pool](int task, int worker) {
             RowScratch& rs = *static_cast<RowScratch*>(pool.scratch(worker, sizeof(RowScratch)));
             const int64_t g0 = gu_rows * task / tasks, g1 = gu_rows * (task + 1) / tasks;
             for (int64_t r = g0; r < g1;) {
@@ -66,8 +74,11 @@ bool run_split_multi_native(ExpertPool& pool, const NativeFmt& fmt, ExpertJobMul
                         sb.ff[t][row] = swiglu(rs.gbuf[t][row], rs.ubuf[t][row]);
                 r += r1 - r0;
             }
-        };
-        if (!pool.run_phase(tasks, gate_up_body, error, gate_up)) return false;
+        });
+        if (!pool.run_phase(tasks, *gate_up_body, error, gate_up)) {
+            if (pool.poisoned()) (void) gate_up_body.release();   // a worker may still be calling it
+            return false;
+        }
 
         // ---- between the phases: the host thread alone --------------------------------------------------
         // Over all 640 values of each token's vector at once, so the 20 chunk scales do not depend on how the
@@ -78,7 +89,8 @@ bool run_split_multi_native(ExpertPool& pool, const NativeFmt& fmt, ExpertJobMul
 
         // ---- phase 2: the down rows ---------------------------------------------------------------------
         const int64_t d_rows = (int64_t) nb * H;
-        auto down_body = [&](int task, int) {
+        auto down_body = std::make_unique<std::function<void(int, int)>>(
+            [mjobs, scratch, fmt, d_rows, tasks, d_blocks](int task, int) {
             const int64_t g0 = d_rows * task / tasks, g1 = d_rows * (task + 1) / tasks;
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / H), r0 = (int) (r % H);
@@ -89,8 +101,11 @@ bool run_split_multi_native(ExpertPool& pool, const NativeFmt& fmt, ExpertJobMul
                                      mjobs[e].out, r0, r1);
                 r += r1 - r0;
             }
-        };
-        if (!pool.run_phase(tasks, down_body, error, down)) return false;
+        });
+        if (!pool.run_phase(tasks, *down_body, error, down)) {
+            if (pool.poisoned()) (void) down_body.release();      // a worker may still be calling it
+            return false;
+        }
     }
     return true;
 }
