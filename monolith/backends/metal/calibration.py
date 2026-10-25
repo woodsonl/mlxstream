@@ -184,8 +184,9 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
               "accelerator": accel, "accelerator_min_t": min_t, "cost_T": cost_t,
               "note": "written by tools/profile_writer.py from the kernel harnesses (min-of-N over >= 2 GB streamed per point): cost_T = the "
                       "pass cost relative to a T = 1 shader pass at the best geometry per T; accelerator_<fmt> = gemm_tile at TM rows in "
-                      f"the geometry the autotuner picks (crew, crew2, the K-splits {'/'.join(map(str, TILE_KSPLITS))} and their cacheless "
-                      "twins; serve dispatches it on the shapes the kernel choices list and the unsplit crew elsewhere), in the same unit; "
+                      f"the geometry the autotuner picks (crew and crew2 timed at one and two threadgroups per core, the K-splits "
+                      f"{'/'.join(map(str, TILE_KSPLITS))} and their cacheless twins; serve dispatches it on the shapes the kernel choices "
+                      "list and the unsplit crew, at the profile's threadgroups_per_core, elsewhere), in the same unit; "
                       "sibling_order and max_cb_ms are the probes' (p11, p6/p6b) and attention_rows the file's: they carry over"}
     if cur.get("gdn_mixer_fusion"):
         engine["gdn_mixer_fusion"] = dict(cur["gdn_mixer_fusion"])

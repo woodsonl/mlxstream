@@ -5,11 +5,12 @@
 * the pack's lane order (the T = 1 GEMV rate, interleaved16 vs contiguous) and the threadgroups per core (x1 vs x2),
 * ``cost_T`` per format: the shader GEMV's pass cost at T = 1, 2, 4, 8 relative to T = 1, at the best geometry per T,
 * ``accelerator_<fmt>``: the tensor-ops tile (gemm_tile) at 8 / 16 / 32 token rows in the same unit, each row in the
-  geometry the engine's autotuner picks among those that pass the oracle (one or two threadgroups per core, the
-  K-splits ``TILE_KSPLITS`` and their cacheless twins; recorded as ``tile_mode``; a geometry that fails the oracle is
-  recorded under ``tile_oracle_fail``), each timed with BF16 output as the engine compiles the tile and checked once more
-  with 32-bit output under the strict rule, and from the two the accelerator switch and ``accelerator_min_t`` per format
-  (the smallest T the tile takes); every run after the probes takes the lane order and scale placement the profile will hold,
+  geometry the engine's autotuner's rule picks among those that pass the oracle, which the autotuner itself does not
+  check (one or two threadgroups per core, the K-splits ``TILE_KSPLITS`` and their cacheless twins; recorded as
+  ``tile_mode``; a geometry that fails the oracle is recorded under ``tile_oracle_fail``), each timed with BF16 output
+  as the engine compiles the tile and checked once more with 32-bit output under the strict rule, and from the two the
+  accelerator switch and ``accelerator_min_t`` per format (the smallest T the tile takes); every run after the probes
+  takes the lane order and scale placement the profile will hold,
 * the attention kernel (v1, v2 and v3 over context lengths and T).
 
 A kernel that fails the oracle (a tile or shader GEMV geometry, or a T = 1 probe) or a tile-step error other than a
@@ -17,7 +18,10 @@ refusal stops the writer: it lists each and writes no profile (exit 1). A chip w
 
 The tile rows price the autotuner's pick. An autotuning session dispatches it, and serve does on the shapes the
 configuration's kernel choices list; serve runs every other shape on the unsplit tile (the crew). A refresh that moves
-``accelerator_min_t`` for a format those choices do not cover needs a serve A/B before it ships.
+``accelerator_min_t`` for a format those choices do not cover needs a serve A/B before it ships. The writer and the
+autotuner time crew and crew2 at one and two threadgroups per core; compiler.emit dispatches them at the
+configuration's ``threadgroups_per_core`` times that, so on a chip with two per core a crew or crew2 row prices a
+geometry the engine does not run.
 
 Everything else in a profile is the probes' record (``./probes/run_all.sh``): ``sibling_order`` (p11) and
 ``max_cb_ms`` (p6/p6b) carry over from the existing file, or take the safe defaults on a new chip. Min-of-N over
