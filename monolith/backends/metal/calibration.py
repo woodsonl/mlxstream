@@ -13,9 +13,12 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .config import COST_FORMAT
 
-NOISE = 0.03                    # the autotuner's margin (compiler.autotune.NOISE_MARGIN)
+NOISE = 0.03                    # the noise margin of these choices and of the autotuner (compiler.autotune.NOISE_MARGIN)
 COST_TS = (1, 2, 4, 8)          # the shader GEMV's measured T (the per-T variants of a speculative program)
 TILE_TMS = (8, 16, 32)          # the accelerator tile's token rows
+TILE_KSPLITS = (2, 4, 8, 16)    # the tile's K-splits (SIMD-groups sharing a row tile's K): the autotuner tries them;
+                                # gemm_tile accepts only these and 1, so the splits the shipped kernel-choices files
+                                # cache and compiler.emit's small-BF16 splits must stay inside them
 NEVER = 33                      # accelerator_min_t above the largest tile: the tile never takes this format's GEMVs
 DEFAULT_LANE_ORDER = "interleaved16"
 

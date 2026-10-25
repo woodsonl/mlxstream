@@ -52,6 +52,6 @@ def test_x_permute_is_the_inverse_of_perm_dest(layout, k, wpw, tk):
 def test_apple9_rejects_quarter_word_tiles():
     with using_backend("m4_pro"):
         info = _info()
-        with pytest.raises(ValueError, match="on Apple9"):
+        with pytest.raises(kernels.GemmRefused, match="on Apple9"):
             kernels.gemm_macros(info, tm=8, tn=64, tk=64)
         assert kernels.gemm_macros(info, tm=8)["TK"] == "128u"
