@@ -173,17 +173,14 @@ ones this pack runs.
    the bare `fast::exp2` until their lanes move them to it. One is `expf_neg` (`basalt_fp.metal`), in the routed and
    drafter experts' SwiGLU, where `1 + e` is 1 for every e the halved branch produces (`experts.md` section 2). The
    other is the sampler's `expf_approx` (`basalt_sampler.metal`), where such a term can change `probs` only through an
-   exact rounding tie (`sampler.md` section 3.3). MSL has no `log1p`, so `log1pf` is an exact transcription of
-   `__nv_log1pf` as nvcc 13.0 inlines it (`dec_gdn.md` section 6a, `log1pf_nv`), and the library `expf` maps to
-   `metal::precise::exp`. The sampler's library `logf` and binary64 `exp` have no
-   `metal::` counterpart with CUDA's bits (`precise::log` is not CUDA's `logf`, and MSL has no `double`), so they are
-   exact transcriptions of the sequences nvcc 13.0 inlines into `sampler.cu` (`sampler.md` sections 2.5-2.6), and the
+   exact rounding tie (`sampler.md` section 3.3). libdevice's `exp`, `logf`, `expf`, `powf`, `cosf`, `sinf` and `log1pf`
+   are transcribed from the PTX nvcc inlines, each approximate step in them mapped as above: `log1pf` is `log1pf_nv`
+   (`dec_gdn.md` section 6a), the sampler's `logf` and binary64 `exp` are in `sampler.md` sections 2.5-2.6, and the
    sampler's binary64 arithmetic is software IEEE binary64 with subnormals (`kernels/common/basalt_f64.metal`). One
-   helper serves each operation at every site, so
-   kernels that basalt checks bitwise against each other (`qsa_dec_attn_parity`, `dec_gdn_parity`, and
-   `hc_fused_parity`'s window checks) stay bitwise equal on Metal. Where `MUFU.RCP` is not correctly rounded, where
-   basalt approximates an exponential or a square root (`ex2.approx`, `rsqrtf`), and where it calls the library
-   `expf`, the Metal result can therefore differ from CUDA's last bits. Basalt's tolerances accept that, and
+   helper serves each operation at every site, so kernels that basalt checks bitwise against each other
+   (`qsa_dec_attn_parity`, `dec_gdn_parity`, and `hc_fused_parity`'s window checks) stay bitwise equal on Metal. Where
+   `MUFU.RCP` is not correctly rounded and where basalt approximates an exponential or a square root (`ex2.approx`,
+   `rsqrtf`), the Metal result can therefore differ from CUDA's last bits. Basalt's tolerances accept that, and
    invariant 1 still holds, because each Metal kernel rounds the same way at every window width. A stored NaN carries
    sm_120's canonical encoding: the `FADD`, `FMUL`, `FFMA`, `MUFU` and division sequences that make or pass a NaN give
    0x7fffffff, and its hardware fp16 conversion (`__float2half`) gives 0x7fff, where this GPU's arithmetic gives
