@@ -139,7 +139,7 @@ def test_exact_prompt_passes_give_the_scores_of_128_row_passes(tmp_path, attenti
 
 
 @pytest.mark.parametrize('accelerator', ['off', 'on'])
-@pytest.mark.parametrize('chunk', [512])
+@pytest.mark.parametrize('chunk', [512, 128])            # 128: serve's auto-exact where the chip measured no larger size
 def test_exact_requests_restored_off_the_grid_give_the_bits_of_cold_runs(tmp_path, chunk, accelerator):
     # A request restored from a checkpoint off the 128-row grid gives its last prompt row's scores and its tokens as the
     # same request run cold, bit for bit. auto runs v3 at the synthetic checkpoint's head dim 32, and v3 pairs the keys
@@ -148,9 +148,9 @@ def test_exact_requests_restored_off_the_grid_give_the_bits_of_cold_runs(tmp_pat
     # elsewhere warm than cold: turn 1 checkpoints its first 300 tokens; turn 2 keeps a shorter message prefix (250, as
     # serve keeps a system prompt's) and restores 300, where the cold run splits at 250. A pair and two single folds
     # sum alike unless the running maximum moves between them, so the starts lie far apart: at 428 tokens the last row's
-    # pass starts at 300 warm and 378 cold (384 from token 0), both on the large graph; at 429 the warm run's one-token
-    # chunk sends it to the 128-row graph and the cold run stays on the large one. A cold run whose passes all start on
-    # the grid gives what plain 128-row passes give.
+    # pass starts at 300 warm and 378 cold (384 from token 0); at 429 the warm run's one-token chunk sends a 512-row
+    # session to its 128-row graph while the cold run stays on the large one. A cold run whose passes all start on the
+    # grid gives what plain 128-row passes give.
     _checkpoint(tmp_path)
     pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
                PackLayout(rows=16))
@@ -187,6 +187,28 @@ def test_exact_requests_restored_off_the_grid_give_the_bits_of_cold_runs(tmp_pat
     for key in {f'prefill.{chunk}', 'prefill.128'}:
         v3 = [k for k in exact._programs[key].kernels.values() if k.function == 'gqa_decode_v3']
         assert [k.macros.get('EXACT_SUB') for k in v3] == ['128u'], key
+
+
+def test_exact_128_row_sessions_give_v1_its_plain_bits(tmp_path):
+    # An exact 128-row session compiles its prompt programs with exact_attention, v1's included: over at most 128 rows
+    # v1's EXACT_SUB form is one sub-pass, the plain kernel's work, so the same request restored off the grid (a pass of
+    # 128 rows from 300) gives a plain and an exact session the same last prompt row's scores, bit for bit.
+    _checkpoint(tmp_path)
+    pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
+               PackLayout(rows=16))
+    ids = np.random.default_rng(81).integers(0, 50, 800).tolist()
+    rows = []
+    for exact in (False, True):
+        s = Session(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path / 'pack'), eos=-1,
+                    autotune=False, attention='v1', accelerator='off', prefill_chunk_size=128, prefill_exact=exact,
+                    prefix_cache=True, prefix_cache_min_tokens=128)
+        s.generate(ids[:300] + ids[700:], 1, cache_prefix_tokens=300)
+        g = s.generate(ids[:428], 1, cache_prefix_tokens=250)
+        assert g.cached_prompt_tokens == 300 and [t['tokens'] for t in g.prefill_timings] == [128]
+        rows.append(np.frombuffer(s.read('logits'), dtype=np.uint16).reshape(-1, s.model.config.vocab_size)[127].copy())
+    assert np.array_equal(*rows), int((rows[0] != rows[1]).sum())
+    v1 = [k for k in s._programs['prefill.128'].kernels.values() if k.function in ('gqa_decode', 'gqa_merge')]
+    assert [k.macros.get('EXACT_SUB') for k in v1] == ['128u', '128u']
 
 
 def test_tie_rows_hold_the_scores_the_reference_chose_by(tmp_path):

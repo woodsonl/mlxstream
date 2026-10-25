@@ -77,6 +77,7 @@ class Session:
 
     EXACT_ROWS = 128                 # prefill_exact reproduces prompt chunks of this many rows
     prefill_exact = False
+    prefill_exact_attention = False  # prompt programs take exact_attention: v3's rows get EXACT_ROWS-row passes from token 0
 
     def __init__(self, model: Model, pack_dir: str, profile: Optional[Profile] = None, *, layout: Optional[StepStateLayout] = None,
                  eos: Union[int, Sequence[int]] = -1, ring_capacity: int = 4096, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
@@ -121,6 +122,8 @@ class Session:
             raise ValueError("prefill_chunk_size must be a positive integer")
         self.prefill_chunk_size = prefill_chunk_size
         self.prefill_exact = prefill_exact and prefill_chunk_size > self.EXACT_ROWS
+        # an exact request with 128-row chunks runs those passes itself, but where they start depends on its prefix restore
+        self.prefill_exact_attention = prefill_exact and prefill_chunk_size >= self.EXACT_ROWS
         if self.prefill_exact and prefill_chunk_size % self.EXACT_ROWS:
             # a large chunk reproduces the 128-row passes it is made of: it must start and end on their boundaries
             raise ValueError(f"an exact prefill chunk is a multiple of {self.EXACT_ROWS} rows, got {prefill_chunk_size}")
@@ -312,7 +315,7 @@ class Session:
                    target=manifest(self.pack), draft=manifest(self.drafter_pack),
                    config=[config(self.model), config(getattr(self, 'drafter', None))],
                    layout=[self.layout.size, sorted(self.layout.offsets.items())], entries=entries,
-                   prefill=[self.prefill_exact, self.prefill_chunk_size, self.EXACT_ROWS],
+                   prefill=[self.prefill_exact, self.prefill_exact_attention, self.prefill_chunk_size, self.EXACT_ROWS],
                    numerics=[self.commute_norm, self.gdn_mixer_fusion, self.fast_math, self.accelerator, self.attention,
                              self.prefill_attention, self.prefill_optimizations], extra=extra)
         return hashlib.sha256(json.dumps(doc, sort_keys=True, default=repr).encode()).hexdigest()
@@ -422,9 +425,9 @@ class Session:
             with using_backend(self.profile.backend) as backend:
                 prog = backend.optimize_prefill(prog, exact=exact)
             reuse_arenas(prog, barriers=self.barriers)
-        if prefill and self.prefill_exact:
-            # the EXACT_ROWS-row graph too: a request with a one-token chunk runs there, and v3's rows must not depend on
-            # where its passes start
+        if prefill and self.prefill_exact_attention:
+            # every prompt program of an exact session, its EXACT_ROWS-row graph included (a large session's one-token
+            # chunks run there): v3's rows must not depend on where a prefix restore starts their pass
             from .compiler.prefill import exact_attention
             prog = exact_attention(prog, self.EXACT_ROWS)
         if shared:
