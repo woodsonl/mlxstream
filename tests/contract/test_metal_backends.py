@@ -344,7 +344,7 @@ def test_tile_rows_cost_no_more_than_the_shader_passes_they_replace(name):
 def test_m3_max_40c_keeps_its_hand_set_values():
     # set by hand from paired A/Bs and the K-split tile's timing (config.json's note); a refresh writes
     # tools/profile_writer.py's own values over them (starts priced on crew2, the unsplit tile at two threadgroups per core:
-    # 4 for all four formats in its October 25 dry run; the pick's rows of its run; and attention timed at 32 query heads,
+    # 4 for all four formats in run 25c, BF16's by the noise margin; the pick's rows of its run; and attention timed at 32 query heads,
     # which the October 15 run, 9ce1de5, sets to v2) and fails here until they are measured again
     config = load_configs()['apple-m3-max-40c']
     assert config.attention == 'auto'
