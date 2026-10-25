@@ -8,6 +8,7 @@ import pytest
 
 from monolith import kernels
 from monolith.backends.metal.calibration import NOISE, TILE_KSPLITS
+from monolith.bench import RANDOM_FORMATS
 from monolith.core.profile import Profile, load_profiles
 from monolith.core.profile_writer import (NEVER, accelerator_plan, attention_choice, choose_lane_order, choose_threadgroups, cost_table, decide,
                                           merge_profile, profile_name, tile_rows)
@@ -425,7 +426,7 @@ def test_the_tile_kernel_accepts_exactly_the_shared_splits(monkeypatch):
 
 @pytest.mark.parametrize("backend", ["m4_pro", "m5_pro"])                     # the Apple9 and Apple10 tile layouts, whatever the host
 @pytest.mark.parametrize("placement", ["inline", "block"])
-@pytest.mark.parametrize("fmt", ["nvfp4", "int4_affine", "int8", "fp8_e4m3", "bf16"])
+@pytest.mark.parametrize("fmt", sorted(RANDOM_FORMATS))                       # every format --formats takes
 @pytest.mark.parametrize("k", [768, 1024, 4096, 5120, 17408])
 @pytest.mark.parametrize("tm", [8, 16, 32])
 def test_writer_sweep_is_tune_gemms_candidate_set(monkeypatch, fmt, k, tm, placement, backend):
@@ -817,6 +818,57 @@ def test_gemm_bench_refuses_a_geometry_before_allocating(monkeypatch):
     with pytest.raises(kernels.GemmRefused):
         bench.run("fp8_e4m3", 64, 5120, tm=8, ksplit=16)                     # 20 or 40 K tiles: 16 divides neither
     assert allocs == []
+
+
+@pytest.mark.parametrize("mode,kw", [("crew", {}), ("crew2", {"tg_per_core": 2}), ("ksplit4", {"ksplit": 4})])
+def test_gemm_bench_dispatches_each_mode_in_the_tuners_geometry(monkeypatch, mode, kw):
+    """GemmBench.run dispatches gemm_tile for a mode in kernels.gemm_geometry's (SIMD-groups, threadgroups, threadgroup
+    size), the geometry tune_gemm times under that name, so the writer's row for a mode prices the tuner's geometry."""
+    import struct
+    import tools.profile_writer as pw                                        # puts tools/bench on sys.path
+
+    gemm_bench, tiles = pw.gemm_bench, []
+
+    class Pipeline(_Stub):
+        def __init__(self, lib, function):
+            self.function = function
+
+    class Dispatch(_Stub):                                                   # records the tile dispatch's params, grid and threadgroup
+        def pipeline(self, pso):
+            self.function = pso.function
+            return self
+
+        def bytes(self, index, b):
+            self.params = b
+            return self
+
+        def grid(self, n):
+            self.n_tg = n
+            return self
+
+        def threadgroup(self, n):
+            self.tg = n
+            if self.function == "gemm_tile":
+                tiles.append(self)
+            return self
+
+    info = SimpleNamespace(gpu_cores=40, apple_family=10, name="fake")
+    monkeypatch.setattr(gemm_bench, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info), Buffer=_Stub, Library=_Stub,
+                                                          Pipeline=Pipeline, Dispatch=Dispatch,
+                                                          Queue=lambda dev: SimpleNamespace(run=lambda ds: SimpleNamespace(error=None, gpu_ms=1.0))))
+    r = gemm_bench.GemmBench().run("fp8_e4m3", 4096, 4096, tm=8, copies=1, reps=1, check=False, **kw)
+    (tile,) = tiles
+    n_sg = struct.unpack("<IIIIfIII", tile.params)[2]
+    assert (n_sg, tile.n_tg, tile.tg) == kernels.gemm_geometry(mode, kernels.gemm_tiles(4096, r["tn"]), 40, 384)
+
+
+def test_the_no_accelerator_hint_prefixes_are_the_runtimes():
+    """measure() adds the --no-accelerator hint when the unsplit tile's error starts with the runtime's compile or pipeline
+    failure message (runtime/src/metal_core.mm), so a reworded native message would drop the hint with every test green."""
+    from pathlib import Path
+
+    src = (Path(kernels.__file__).resolve().parents[1] / "runtime" / "src" / "metal_core.mm").read_text()
+    assert 'std::string("MSL compile failed: ")' in src and 'std::string("pipeline failed: ")' in src
 
 
 def test_the_tile_row_counts_stay_inside_tile_tms():
