@@ -25,15 +25,16 @@ from monolith.nn.rope import rope_tables_permuted               # noqa: E402
 from monolith.runtime import _native as nt                     # noqa: E402
 
 
-def check_exact(exact, ts, v2=False, steal=False):
+def check_exact(exact, ts, v2=False, steal=False, v3=False):
     """``exact`` 0 is off; else EXACT_SUB's row count: a uint, on v1 or v3 (v2 and the steal variant have no exact form),
-    below every pass's T (a pass of T <= EXACT_SUB rows is one sub-pass, the plain kernel's work)."""
+    for v1 below every pass's T (its pass of T <= EXACT_SUB rows is one sub-pass, the plain kernel's work; v3's rows
+    take the EXACT_SUB-row passes from token 0, so a shorter pass that starts off their grid differs from plain)."""
     if not 0 <= exact < 2 ** 32:
         raise ValueError(f"exact rows: 0 (off) or 1 to 2**32 - 1 (EXACT_SUB is a uint), not {exact}")
     if exact and (v2 or steal):
         raise ValueError("exact rows: v1 or v3 only (v2 and the steal variant have no exact form)")
-    if exact and min(ts) <= exact:
-        raise ValueError(f"exact rows: a pass of T <= {exact} rows is one sub-pass, the plain kernel's work; give every T above it")
+    if exact and not v3 and min(ts) <= exact:
+        raise ValueError(f"exact rows: v1's pass of T <= {exact} rows is one sub-pass, the plain kernel's work; give every T above it")
 
 
 def run(dev, heads, kv, d, ctx, t, chunk, rb, reps, v2=False, steal=False, v2_tg=1, v3=False, nsg3=None, exact=0, qk_norm=True):
@@ -41,7 +42,7 @@ def run(dev, heads, kv, d, ctx, t, chunk, rb, reps, v2=False, steal=False, v2_tg
     (a threadgroup of ``nsg3`` SIMD-groups per query row, #113, one block each as the emitter dispatches it);
     ``exact``: EXACT_SUB, the pass reproducing passes of that many rows (v1 and v3: the exact prompt passes);
     ``qk_norm`` False: no query and key norms (QK_NORM 0)."""
-    check_exact(exact, [t], v2, steal)
+    check_exact(exact, [t], v2, steal, v3)
     rng = np.random.default_rng(0)
     rep = heads // kv
     hd, kd = heads * d, kv * d
@@ -126,13 +127,14 @@ def main(argv=None) -> int:
     kernel.add_argument("--v2", action="store_true", help="the v2 kernel (design §5.6 v2, #34); --rb is then the rows per pass")
     kernel.add_argument("--v3", action="store_true", help="the v3 kernel: core and merge in one dispatch, a threadgroup per query row (#113)")
     kernel.add_argument("--steal", action="store_true", help="v1 with own-slice + steal block claiming (#44), the cursor reset included")
-    ap.add_argument("--exact", type=int, default=0, metavar="ROWS", help="v1 or v3 reproducing passes of ROWS rows (EXACT_SUB)")
+    ap.add_argument("--exact", type=int, default=0, metavar="ROWS",
+                    help="v1 or v3 reproducing passes of ROWS rows (EXACT_SUB; v3's from token 0: a --ctx off their grid times a restored pass)")
     ap.add_argument("--no-qk-norm", action="store_true", help="no query and key norms (Llama)")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args(argv)
     ts = [int(x) for x in a.t.split(",")]
     try:
-        check_exact(a.exact, ts, a.v2, a.steal)
+        check_exact(a.exact, ts, a.v2, a.steal, a.v3)
     except ValueError as e:
         ap.error(str(e))
     dev = nt.Device()
