@@ -208,8 +208,12 @@ def test_c4_a_second_driver_is_refused():
     second is filling and runs a body it did not publish. ``claim_owner`` answers a different question, which task
     OWNS the pool, and an owner holds its claim across calls, so it is the wrong grain for a phase.
 
-    ThreadSanitizer names that race directly on two native drivers (``tools/tsan/pool_tsan.cpp``); the GIL makes
-    the window unreachable from Python, so what this case asserts is the refusal a caller sees."""
+    Two Python threads reach ``run_phase`` concurrently, which is what this case does: ``count_phase`` and
+    ``stall_phase`` both release the GIL before calling it. The GIL serialises only the entry up to that release,
+    which makes the corrupting window (both drivers past the park barrier before either publishes) hard to hit
+    from Python: 400 simultaneous-entry trials did not hit it. ThreadSanitizer on two native threads names the
+    race at once (``tools/tsan/pool_tsan.cpp``). So the window is narrow here, not closed, and what this case
+    asserts is the refusal that makes a concurrent Python call safe."""
     p = pool(n_workers=3)
     out, who = np.zeros(8, I32), np.full(8, -7, I32)
     second = {}
