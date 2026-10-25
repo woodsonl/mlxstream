@@ -15,6 +15,10 @@
 A kernel that fails the oracle (a tile or shader GEMV geometry, or a T = 1 probe) or a tile-step error other than a
 refusal stops the writer: it lists each and writes no profile (exit 1). A chip without tensor ops runs ``--no-accelerator``.
 
+The tile rows price the autotuner's pick. An autotuning session dispatches it, and serve does on the shapes the
+configuration's kernel choices list; serve runs every other shape on the unsplit tile (the crew). A refresh that moves
+``accelerator_min_t`` for a format those choices do not cover needs a serve A/B before it ships.
+
 Everything else in a profile is the probes' record (``./probes/run_all.sh``): ``sibling_order`` (p11) and
 ``max_cb_ms`` (p6/p6b) carry over from the existing file, or take the safe defaults on a new chip. Min-of-N over
 >= 2 GB streamed per point (``--quick`` for a short run). The decisions are ``monolith.backends.metal.calibration``'s.

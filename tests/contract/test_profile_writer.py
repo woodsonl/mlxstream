@@ -206,7 +206,8 @@ def test_writer_records_the_autotuners_tile_pick(monkeypatch):
         assert m["tile_ms"] == m["tile_gbps"] == m["tile_mode"] == {} and error in m["tile_error"] and m["tile_refused"] is refused
         engine, notes = decide(m)
         assert m["tile_oracle_fail"] == {"nvfp4": {8: ["crew2", "ksplit2", "ksplit4", "ksplit8"], 32: ["crew"]}} and engine["accelerator_min_t"] == {}
-        assert notes["accelerator"] == f"no tile measurement: the tile step ended on an error: {m['tile_error']}"
+        assert notes["accelerator"] == (f"no tile rows for any format: the unsplit tile refused the measured shape: {m['tile_error']}" if refused
+                                        else f"no tile measurement: the tile step ended on an error: {m['tile_error']}")
     assert any("TM=16 ksplit2: dispatch failed" in line for line in lines)  # the log names the geometry whose error ended the step
 
 

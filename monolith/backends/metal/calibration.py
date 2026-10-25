@@ -169,8 +169,10 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
     tile = {cost_key(f): {int(tm): round(ms / measurements["shader_ms"][f][1], 3) for tm, ms in rows.items()}
             for f, rows in measurements.get("tile_ms", {}).items() if f in measurements["shader_ms"] and rows}
     accel, min_t, notes["accelerator"] = accelerator_plan(shader, tile)
-    if "tile_error" in measurements:
-        notes["accelerator"] = f"no tile measurement: the tile step ended on an error: {measurements['tile_error']}"
+    if "tile_error" in measurements:                            # main() writes a profile after a refusal only
+        notes["accelerator"] = (f"no tile rows for any format: the unsplit tile refused the measured shape: {measurements['tile_error']}"
+                                if measurements.get("tile_refused") else
+                                f"no tile measurement: the tile step ended on an error: {measurements['tile_error']}")
     att = measurements.get("attention_ms") or {}
     attention, notes["attention"] = attention_choice(att.get("v1", {}), att.get("v2", {}), rep=int(measurements.get("attention_rep", 4)), v3=att.get("v3"))
     cost_t: Dict[str, Dict[str, float]] = {k: {str(t): c for t, c in tbl.items()} for k, tbl in shader.items()}
@@ -183,8 +185,8 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
               "note": "written by tools/profile_writer.py from the kernel harnesses (min-of-N over >= 2 GB streamed per point): cost_T = the "
                       "pass cost relative to a T = 1 shader pass at the best geometry per T; accelerator_<fmt> = gemm_tile at TM rows in "
                       f"the geometry the autotuner picks (crew, crew2, the K-splits {'/'.join(map(str, TILE_KSPLITS))} and their cacheless "
-                      "twins), in the same unit; sibling_order and max_cb_ms are the probes' (p11, p6/p6b) and attention_rows the file's: "
-                      "they carry over"}
+                      "twins; serve dispatches it on the shapes the kernel choices list and the unsplit crew elsewhere), in the same unit; "
+                      "sibling_order and max_cb_ms are the probes' (p11, p6/p6b) and attention_rows the file's: they carry over"}
     if cur.get("gdn_mixer_fusion"):
         engine["gdn_mixer_fusion"] = dict(cur["gdn_mixer_fusion"])
         notes["gdn_mixer_fusion"] = "retained from the layer study; leaf measurements do not select mixer fusion"
