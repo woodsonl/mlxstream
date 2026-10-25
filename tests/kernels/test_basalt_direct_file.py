@@ -31,6 +31,7 @@ about the bytes and the protocol, and none of them would change if the caching a
 import os
 import pathlib
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -231,6 +232,46 @@ def test_d8_the_wake_tag_is_refused_as_a_reads_tag(reader):
         reader.read_at(0, PAGE, (1 << 64) - 1)
     ok, got, _ = reader.read_at(0, PAGE)       # the queued wake must not disturb an ordinary read either
     assert ok and got == PAGE
+
+
+def test_d9_a_close_waits_for_a_read_in_flight(table):
+    """`close` sets `stop_`, joins every worker, and THEN clears the completion queue. A close landing while a
+    driver waits therefore wipes the completion that driver is blocked on, and no worker is left to post
+    another: `wait` with a negative timeout never returns. The file is gone and the buffer is safe, so this
+    arm is a permanent hang rather than corruption, which is why nothing else here would have found it.
+    `open` carries it too, because `open` calls `close` first.
+
+    A round of 4,096 reads takes about 16 ms, and the window inside it is the gap between the last worker
+    posting and the driver consuming, so one attempt is a coin flip: measured against a build with the lock
+    removed, a single attempt hung the driver 2 to 5 times in 8. Twelve attempts put a false pass under a
+    percent. Its own reader each time, because the point is to close one mid-flight."""
+    offsets = [((i * 7) % 80) * PAGE for i in range(4096)]        # a window wide enough to close into
+    hung = []
+
+    for attempt in range(12):
+        f = _nt.DirectFile()
+        f.open(table["path"], threads=16)
+        errors = []
+
+        def drive():
+            try:
+                f.read_many(offsets, PAGE)
+            except BaseException as exc:             # carried out, because a raise here dies with the thread
+                errors.append(exc)
+
+        driver = threading.Thread(target=drive, daemon=True)
+        driver.start()
+        time.sleep(0.002)                            # mid-round, which is where the close has to land
+        closer = threading.Thread(target=f.close, daemon=True)
+        closer.start()
+        closer.join(timeout=30)
+        driver.join(timeout=30)
+        if driver.is_alive() or closer.is_alive():
+            hung.append((attempt, "driver" if driver.is_alive() else "closer"))
+            break                                    # the threads are wedged; another attempt proves nothing
+        assert not errors, errors
+
+    assert not hung, f"a close landed inside a read in flight and never came back: {hung}"
 
 
 def test_d4_the_pool_runs_the_thread_count_it_was_given(table):

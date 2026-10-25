@@ -582,12 +582,22 @@ NB_MODULE(_native, m) {
   // ordered by submission.
   nb::class_<bc::DirectFile>(m, "DirectFile")
       .def(nb::init<>())
+      // Both take the drive lock, for the same reason the reads do. `close` sets `stop_`, joins every worker,
+      // and THEN clears `done_`, so a close landing while a driver waits wipes the completion that driver is
+      // blocked on and leaves no worker to post another: `wait` with a negative timeout then never returns.
+      // `open` calls `close` first, so it carries the same hazard. The GIL is released before the lock is
+      // taken, never after: a driver holds the lock while it waits, and needs the GIL back to return.
       .def("open", [](bc::DirectFile& f, const std::string& path, int threads) {
              std::string err;
              nb::gil_scoped_release unlock;
+             std::lock_guard<std::mutex> drive(f.drive_mutex());
              if (!f.open(path, err, threads)) throw std::invalid_argument(err);
            }, nb::arg("path"), nb::arg("threads") = bc::DIRECT_IO_THREADS)
-      .def("close", &bc::DirectFile::close)
+      .def("close", [](bc::DirectFile& f) {
+             nb::gil_scoped_release unlock;
+             std::lock_guard<std::mutex> drive(f.drive_mutex());
+             f.close();
+           })
       .def_prop_ro("size", &bc::DirectFile::size)
       .def_prop_ro("threads", &bc::DirectFile::threads)
       .def_prop_ro("is_open", &bc::DirectFile::is_open)
