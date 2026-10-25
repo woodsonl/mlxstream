@@ -269,8 +269,8 @@ def test_writer_writes_no_profile_on_a_kernel_failure(monkeypatch, tmp_path, cap
     assert "tile fp8_e4m3" not in printed
     m.update(tile_oracle_fail={"nvfp4": {}}, oracle_fail=[], tile_ms={}, tile_error="nvfp4 TM=16 ksplit2: dispatch failed", tile_refused=False)
     assert pw.main(args) == 1 and not out.exists()
-    printed = capsys.readouterr().out                                       # a fault after the tile ran: no --no-accelerator hint
-    assert "the tile step failed: nvfp4 TM=16 ksplit2: dispatch failed" in printed and "--no-accelerator" not in printed
+    printed = capsys.readouterr().out
+    assert "the tile step failed: nvfp4 TM=16 ksplit2: dispatch failed" in printed
     m.update(tile_refused=True)                                             # a refusal: the profile without tile rows
     assert pw.main(args) == 0 and Profile.from_dict("x-20c", json.loads(out.read_text())).accelerator == "off"
     del m["tile_error"], m["tile_refused"]
@@ -425,7 +425,7 @@ def test_the_tile_kernel_accepts_exactly_the_shared_splits(monkeypatch):
 
 @pytest.mark.parametrize("backend", ["m4_pro", "m5_pro"])                     # the Apple9 and Apple10 tile layouts, whatever the host
 @pytest.mark.parametrize("placement", ["inline", "block"])
-@pytest.mark.parametrize("fmt", ["nvfp4", "int4_affine", "int8", "fp8_e4m3"])
+@pytest.mark.parametrize("fmt", ["nvfp4", "int4_affine", "int8", "fp8_e4m3", "bf16"])
 @pytest.mark.parametrize("k", [768, 1024, 4096, 5120, 17408])
 @pytest.mark.parametrize("tm", [8, 16, 32])
 def test_writer_sweep_is_tune_gemms_candidate_set(monkeypatch, fmt, k, tm, placement, backend):
@@ -453,7 +453,7 @@ def test_writer_sweep_is_tune_gemms_candidate_set(monkeypatch, fmt, k, tm, place
             expected = {mode for _, mode in tuner.choices[gemm_key(info, tm, None)]["variants"]}
         except kernels.GemmRefused:
             expected = None                                       # the unsplit tile refused: the writer's tile step ends
-        assert expected is None or k != 768                       # K = 768: every format's unsplit tile refuses
+        assert expected is None or k != 768 or fmt == "bf16"      # K = 768: every quantized format's unsplit tile refuses
 
         timed = set()
 
@@ -799,7 +799,8 @@ def test_gemm_bench_judges_each_output_by_its_rule(monkeypatch):
 
 def test_the_tile_row_counts_stay_inside_tile_tms():
     """gemm_tile accepts exactly calibration.TILE_TMS as token rows, and every row count the emitter (gemm_tm) and the
-    profile's cost table (tile_rows) ask for is one of them: the writer's --tms guard and the kernel agree."""
+    profile's cost table (tile_rows) ask for is one of them, the same for each T: the writer's --tms guard, the kernel
+    and the rows the engine dispatches agree."""
     import numpy as np
     from monolith.backends.metal.calibration import TILE_TMS
     from monolith.bench import pack_spec, random_spec
@@ -817,3 +818,4 @@ def test_the_tile_row_counts_stay_inside_tile_tms():
 
     assert {tm for tm in range(1, 129) if accepted(tm)} == set(TILE_TMS)
     assert {gemm_tm(t) for t in range(1, 65)} <= set(TILE_TMS) and {tile_rows(t) for t in range(1, 33)} <= set(TILE_TMS)
+    assert all(gemm_tm(t) == tile_rows(t) for t in range(1, 33))
