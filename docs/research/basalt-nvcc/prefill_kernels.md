@@ -104,7 +104,7 @@ The sequences shared by many sites:
   `FFMA r, r, d, r`; `FFMA q, a, r, RZ`; `FFMA d, -b, q, a`; `FFMA q, r, d, q`, with `@P0` calling
   `__cuda_sm3x_div_rn_noftz_f32_slowpath`. The quotient is correctly rounded and keeps subnormals. Metal: `a / b`
   where no operand or quotient can be subnormal; where one can, `ieee_div(a, b)` (divisor at least 1) or the general
-  IEEE division (`ieee_div_any(a, b)` on `origin/woodsonl/basalt-sampler`).
+  IEEE division (`ieee_div_any(a, b)`, `kernels/common/basalt_sampler.metal:70`).
 - **Division by the constant N = 2560.** The reciprocal is refined from the immediate 0x39CCCCCD (loaded as `HFMA2
   R7, -RZ, RZ, 0.724609375, -19.203125`): `FFMA r0, R7, -2560, 1` (shown as `FFMA R4, R7, -R4, 1`) and `FFMA r, r0,
   R7, 0.00039062500582076609135`. Then `FCHK P0, a, 2560`; `FFMA q, a, r, RZ`; `FFMA d, q, -2560, a`; `FFMA q, r, d,
@@ -170,10 +170,10 @@ The sequences shared by many sites:
   sum and quotient can be subnormal: the tables use `ieee_mul`, `ieee_add`, `warp_sum_ieee`, `ieee_div` (main), a
   general `ieee_fma_any` and `ieee_div_any`, and every fp32 store of an arithmetic result writes `cuda_nan(x)`.
   Plain Metal arithmetic stands only where a section shows that no subnormal can change a bit.
-- **Helpers main lacks.** `ieee_fma_any` (general IEEE fma), `ieee_div_any` (`origin/woodsonl/basalt-sampler`),
-  `expf_ieee` with `sign_flip`, `log1pf_cuda`, `nv_expf`, `nv_powf`, `nv_cosf` and `nv_sinf` (with the sampler
-  branch's `f64_round`, `f64_mul` and `f32_from_f64` for the Payne-Hanek path), and the sampler branch's float keys
-  `okey`, `f_gt`, `fmaxf_bits`. One shared copy each, beside the existing `ieee_*` and libdevice helpers.
+- **Helpers main lacks.** `ieee_fma_any` (general IEEE fma), `expf_ieee` with `sign_flip`, `log1pf_cuda`, `nv_expf`,
+  `nv_powf`, `nv_cosf` and `nv_sinf` (with `basalt_f64.metal`'s `f64_round`, `f64_mul` and `f32_from_f64` for the
+  Payne-Hanek path). One shared copy each, beside the existing `ieee_*` and libdevice helpers; `ieee_div_any` and the
+  float keys `okey`, `f_gt`, `fmaxf_bits` are `basalt_sampler.metal`'s (`:70`, `:37`, `:43`, `:48`).
 - **Invariance.** No kernel's output for a token depends on the chunk length T or on the token's place in the chunk
   (each section's note); T, `pos0`, the element counts and the page table are per-step values the port reads from the
   step's state or a buffer (invariant 4). The prompt path's routing weights, rotated keys and GDN row sums are not
@@ -427,7 +427,7 @@ sums and the tie rule below depend on it.
 below, so the probabilities, the lanes' sums, the selected sums and the stored quotients can be subnormal too. In
 `moe_combine` the routing weights `w` and every partial sum can be, and so can sigm (Notation). The sites below use
 the IEEE helpers, and every compare that orders probabilities runs on integer keys: `okey`, `f_gt` and
-`fmaxf_bits` (`origin/woodsonl/basalt-sampler:kernels/common/basalt_sampler.metal:37`, `:43`, `:48`), with −0 and +0
+`fmaxf_bits` (`kernels/common/basalt_sampler.metal:37`, `:43`, `:48`), with −0 and +0
 equal.
 
 **The library `expf` (`:642`).** This file is built without fast math, so `expf` is libdevice's `__nv_expf`,
@@ -723,8 +723,8 @@ static inline float nv_trig(float x, int add) {
 
 The PTX's own case for an infinite θ (r = θ · 0, j = 0) is left out: θ is at most 2^24 here. The slow path runs only
 for θ of at least 105615, which pair 0 reaches at position 105615 (θ = pos there) and pair 1 at about 174770; it needs
-`f64_round`, `f64_mul` and `f32_from_f64` from the soft binary64 (`origin/woodsonl/basalt-sampler:
-kernels/common/basalt_f64.metal:48`, `:234`, `:112`): CUDA rounds the 63-bit integer to binary64, the product to
+`f64_round`, `f64_mul` and `f32_from_f64` from the soft binary64 (`kernels/common/basalt_f64.metal:48`, `:234`,
+`:112`): CUDA rounds the 63-bit integer to binary64, the product to
 binary64 and that to binary32, and only the same three roundings give its bits.
 
 ### `split_q_kernel` (`:759-764`)
