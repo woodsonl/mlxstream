@@ -171,7 +171,7 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
             for f, rows in measurements.get("tile_ms", {}).items() if f in measurements["shader_ms"] and rows}
     accel, min_t, notes["accelerator"] = accelerator_plan(shader, tile)
     if "tile_error" in measurements:                            # main() writes a profile after a refusal only
-        notes["accelerator"] = (f"no tile rows for any format: the unsplit tile refused the measured shape: {measurements['tile_error']}"
+        notes["accelerator"] = (f"no tile rows for any format: one format's unsplit tile refused the measured shape, which ends the tile step: {measurements['tile_error']}"
                                 if measurements.get("tile_refused") else
                                 f"no tile measurement: the tile step ended on an error: {measurements['tile_error']}")
     att = measurements.get("attention_ms") or {}
