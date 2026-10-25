@@ -12,7 +12,7 @@ if(NOT NB_RC EQUAL 0)
 endif()
 list(APPEND CMAKE_PREFIX_PATH "${NB_DIR}")
 find_package(nanobind CONFIG REQUIRED)
-nanobind_add_module(_native NB_STATIC src/native.mm src/metal_core.mm src/basalt_cpu.cpp src/basalt_cpu_expf.cpp)
+nanobind_add_module(_native NB_STATIC src/native.mm src/metal_core.mm src/basalt_cpu.cpp src/basalt_cpu_expf.cpp src/basalt_pool.cpp)
 set_source_files_properties(src/native.mm src/metal_core.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 # basalt's CPU kernels transcribe two AVX-512 roundings (a vmulps then a vaddps) that a contracted fmla would
 # collapse into one, changing the activation codes. Measured, Apple clang keeps them apart at every contraction
