@@ -21,6 +21,7 @@
 #include "basalt_ngram.h"
 #include "basalt_ple_table.h"
 #include "basalt_row_cache.h"
+#include "basalt_direct_file.h"
 #include "basalt_pool.h"
 #include "basalt_cpu_expf.h"
 #include "metal_core.h"
@@ -561,6 +562,95 @@ NB_MODULE(_native, m) {
              return true;
            }, nb::arg("row"), nb::arg("out").noconvert(),
            "copy the row's bytes into out and return true, or return false when the row is absent");
+
+  // ---- the unbuffered reader (basalt_direct_file.h) -------------------------------------------------------
+  // Bound so a test can hold the properties that matter and that no amount of reading the code establishes: the
+  // alignment refusal, the short read at the end of the file, and that completions are keyed by tag rather than
+  // ordered by submission.
+  nb::class_<bc::DirectFile>(m, "DirectFile")
+      .def(nb::init<>())
+      .def("open", [](bc::DirectFile& f, const std::string& path, int threads) {
+             std::string err;
+             nb::gil_scoped_release unlock;
+             if (!f.open(path, err, threads)) throw std::invalid_argument(err);
+           }, nb::arg("path"), nb::arg("threads") = bc::DIRECT_IO_THREADS)
+      .def("close", &bc::DirectFile::close)
+      .def_prop_ro("size", &bc::DirectFile::size)
+      .def_prop_ro("threads", &bc::DirectFile::threads)
+      .def_prop_ro("is_open", &bc::DirectFile::is_open)
+      // Reads `length` bytes at `offset` into a fresh aligned buffer and returns them, so the Python side never
+      // has to produce a 4096-aligned array of its own. One read per call, waited on here.
+      .def("read_at", [](bc::DirectFile& f, uint64_t offset, uint32_t length, uint64_t tag) {
+             need(length > 0 && length % bc::DIRECT_ALIGNMENT == 0,
+                  "read_at: length must be a nonzero multiple of 4096");
+             std::vector<uint8_t> bytes;
+             uint32_t got = 0;
+             bool ok = false;
+             {
+               nb::gil_scoped_release unlock;
+               void* buf = bc::DirectFile::alloc_aligned(length);
+               if (buf == nullptr) throw std::bad_alloc();
+               std::string err;
+               if (!f.submit(offset, buf, length, tag, err)) {
+                 bc::DirectFile::free_aligned(buf);
+                 throw std::invalid_argument(err);
+               }
+               // Keyed by tag, never by arrival: a wake posted earlier, or any other completion still
+               // queued, arrives first and is not this read. Taking the front completion is the exact mistake
+               // this class's contract warns about.
+               bc::Completion c{};
+               for (bool mine = false; !mine;) {
+                 bc::Completion batch[64];
+                 const int n = f.wait(batch, 64, -1);
+                 for (int k = 0; k < n; ++k) {
+                   if (batch[k].tag != tag) continue;       // a wake, or another caller's read
+                   c = batch[k];
+                   mine = true;
+                 }
+               }
+               ok = c.ok;
+               got = c.bytes;
+               bytes.assign((const uint8_t*) buf, (const uint8_t*) buf + (ok ? got : 0u));
+               bc::DirectFile::free_aligned(buf);
+             }
+             return nb::make_tuple(ok, got, nb::bytes((const char*) bytes.data(), bytes.size()));
+           }, nb::arg("offset"), nb::arg("length"), nb::arg("tag") = 0,
+           "one aligned read; returns (ok, bytes_read, data)")
+      // Submits every request before waiting, so a test can see that completions come back keyed by tag rather
+      // than in submission order.
+      .def("read_many", [](bc::DirectFile& f, std::vector<uint64_t> offsets, uint32_t length) {
+             need(length > 0 && length % bc::DIRECT_ALIGNMENT == 0,
+                  "read_many: length must be a nonzero multiple of 4096");
+             need(!offsets.empty() && offsets.size() <= 4096, "read_many: 1 to 4096 offsets");
+             std::vector<std::pair<uint64_t, uint32_t>> order;
+             {
+               nb::gil_scoped_release unlock;
+               std::vector<void*> bufs(offsets.size(), nullptr);
+               std::string err;
+               for (size_t i = 0; i < offsets.size(); ++i) {
+                 bufs[i] = bc::DirectFile::alloc_aligned(length);
+                 if (bufs[i] == nullptr) throw std::bad_alloc();
+                 if (!f.submit(offsets[i], bufs[i], length, (uint64_t) i, err)) {
+                   for (void* b : bufs) bc::DirectFile::free_aligned(b);
+                   throw std::invalid_argument(err);
+                 }
+               }
+               size_t seen = 0;
+               while (seen < offsets.size()) {
+                 bc::Completion got[64];
+                 const int n = f.wait(got, 64, -1);
+                 for (int k = 0; k < n; ++k) {
+                   if (got[k].tag == bc::DIRECT_WAKE_TAG) continue;
+                   order.emplace_back(got[k].tag, got[k].bytes);
+                   ++seen;
+                 }
+               }
+               for (void* b : bufs) bc::DirectFile::free_aligned(b);
+             }
+             return order;
+           }, nb::arg("offsets"), nb::arg("length"),
+           "submit every offset, then collect; returns (tag, bytes) in completion order")
+      .def("wake", &bc::DirectFile::wake);
 
   m.def("basalt_expf_digest", [](uint32_t first_bits, uint32_t count) {
     // Refused rather than wrapped: a range that runs off the end of the bit patterns would silently digest a
