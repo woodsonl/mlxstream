@@ -343,12 +343,12 @@ def test_tile_rows_cost_no_more_than_the_shader_passes_they_replace(name):
 
 def test_m3_max_40c_keeps_its_hand_set_values():
     # set by hand from paired A/Bs and the K-split tile's timing (config.json's note); a refresh writes
-    # tools/profile_writer.py's own values over them (FP8's tile from T = 2 in its October 16 and 25 runs, the rows of
-    # its run, and attention timed at 32 query heads, which the October 15 run, 9ce1de5, sets to v2) and fails here
-    # until they are measured again
+    # tools/profile_writer.py's own values over them (FP8's and INT4's tile from T = 2 in its October 16 and 25 runs, the
+    # rows of its run, and attention timed at 32 query heads, which the October 15 run, 9ce1de5, sets to v2) and fails
+    # here until they are measured again
     config = load_configs()['apple-m3-max-40c']
     assert config.attention == 'auto'
-    assert {fmt: config.accelerator_min_t[fmt] for fmt in ('nvfp4', 'fp8', 'bf16')} == {'nvfp4': 2, 'fp8': 4, 'bf16': 2}
+    assert config.accelerator_min_t == {'nvfp4': 2, 'fp8': 4, 'int4_affine': 8, 'bf16': 2}
     assert {fmt: config.cost_t[f'accelerator_{fmt}'] for fmt in ('nvfp4', 'fp8', 'int4_affine', 'bf16')} == {
         'nvfp4': {8: 0.89, 16: 1.428, 32: 2.766}, 'fp8': {8: 1.01, 16: 1.096, 32: 2.063},
         'int4_affine': {8: 1.515, 16: 2.078, 32: 3.538}, 'bf16': {8: 1.046, 16: 1.109, 32: 1.249}}
