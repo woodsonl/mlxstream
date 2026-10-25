@@ -46,6 +46,7 @@ import gqa_bench  # noqa: E402
 from monolith.backends.metal import ChipConfig as Profile, config_path, config_for_device, get_backend  # noqa: E402
 from monolith.backends.metal.calibration import (COST_TS, NOISE, TILE_KSPLITS, TILE_TMS, choose_lane_order,  # noqa: E402
                                                  choose_scale_placement, decide, merge_profile, profile_name, tile_rows)
+from monolith.bench import RANDOM_FORMATS  # noqa: E402
 from monolith.formats import FORMATS  # noqa: E402
 from monolith.kernels import GemmRefused  # noqa: E402
 from monolith.runtime import _native as nt  # noqa: E402
@@ -262,10 +263,10 @@ def main(argv=None) -> int:
     n, k = (int(x) for x in a.shape.lower().split("x"))
     formats = [f for f in a.formats.split(",") if f]
     ts, tms, ctxs, attn_ts = a.ts, a.tms, a.ctx, a.attn_ts
-    if not formats or set(formats) - set(FORMATS.names()):
-        ap.error(f"--formats takes names from {', '.join(FORMATS.names())}")
-    if 1 not in ts:
-        ap.error("--ts must include 1: the costs are relative to the T = 1 pass")
+    if not formats or set(formats) - set(RANDOM_FORMATS):
+        ap.error(f"--formats takes names from {', '.join(RANDOM_FORMATS)}: the formats the harnesses build")
+    if 1 not in ts or min(ts) < 1:
+        ap.error("--ts takes token counts of 1 or more and must include 1: the costs are relative to the T = 1 pass")
     if set(tms) - set(TILE_TMS):
         ap.error(f"--tms takes {', '.join(map(str, TILE_TMS))}: the tile's token rows")
     attention = None if a.attention.strip().lower() == "none" else tuple(int(x) for x in a.attention.split(","))

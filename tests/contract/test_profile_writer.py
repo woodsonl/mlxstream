@@ -507,18 +507,38 @@ def test_cached_and_emitted_splits_stay_inside_tile_ksplits():
                                   ["--tms", "16,32"], ["--ts", "1"], ["--quick", "--tms", "16,8"],          # no compared T has its row
                                   ["--tms", "16", "--ts", "1,2,4,8,16"], ["--quick", "--ts", "1,2,4,8,16"],   # one compared T lacks it
                                   ["--tms", "8,"], ["--tms", ""], ["--ts", "1,x"], ["--ctx", "1024,"], ["--attn-ts", "1,"],  # not integer lists
-                                  ["--ts", "1,2,4,8,32", "--tms", "8,16"], ["--ts", "1,64"]])  # T = 32 needs TM 32; T = 64 is never compared
+                                  ["--ts", "1,2,4,8,32", "--tms", "8,16"], ["--ts", "1,64"],   # T = 32 needs TM 32; T = 64 is never compared
+                                  ["--formats", "q4_0"], ["--formats", "nvfp4,f16"],   # registered formats the harnesses cannot build
+                                  ["--ts", "0,1,2"], ["--ts", "1,2,-4"]])              # token counts below 1
 def test_writer_rejects_bad_arguments_before_measuring(monkeypatch, args):
-    """A token-row count the tile has no variant for, a cost list without T = 1 (the costs' unit), an unknown format
-    name, an empty format list, a tile sweep that leaves a compared T (2 to 32) without its tile row (tile_rows, after
-    --quick keeps the first --tms value) or compares at no T, and a malformed integer list stop the writer at argument
-    parsing (exit 2), before the device is opened."""
+    """A token-row count the tile has no variant for, a cost list without T = 1 (the costs' unit) or with a T below 1,
+    a format name the harnesses cannot build (an unregistered one or one monolith.bench.random_spec does not make), an
+    empty format list, a tile sweep that leaves a compared T (2 to 32) without its tile row (tile_rows, after --quick
+    keeps the first --tms value) or compares at no T, and a malformed integer list stop the writer at argument parsing
+    (exit 2), before the device is opened."""
     import tools.profile_writer as pw
 
     monkeypatch.setattr(pw, "nt", SimpleNamespace(Device=lambda: pytest.fail("the device opened before the arguments were checked")))
     with pytest.raises(SystemExit) as e:
         pw.main(args)
     assert e.value.code == 2
+
+
+def test_random_formats_are_the_formats_random_spec_makes():
+    """The writer's --formats check reads monolith.bench.RANDOM_FORMATS: it names exactly the registered formats
+    random_spec makes, else the check admits a format the harnesses cannot build or refuses one they can."""
+    import numpy as np
+    from monolith.bench import RANDOM_FORMATS, random_spec
+    from monolith.formats import FORMATS
+
+    made = set()
+    for f in FORMATS.names():
+        try:
+            random_spec(f, 16, 1024, np.random.default_rng(0))
+            made.add(f)
+        except KeyError:
+            pass
+    assert made == set(RANDOM_FORMATS)
 
 
 @pytest.mark.parametrize("fail", ["lane order contiguous (fp8_e4m3, T = 1)", "shader nvfp4 T=2: crew x2"])
