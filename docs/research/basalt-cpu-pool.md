@@ -40,10 +40,24 @@ which the release below orders after the reset."
 A claim (`pool.cpp:327-336`) is a compare-exchange on that word which **succeeds only for the epoch the worker woke
 for**. A late worker's claim simply fails.
 
-**Why the epoch is in the word**, which is the one thing a port must not simplify away: a worker that went to sleep
-is still counted as parked when it wakes, so for a moment after it has seen a new epoch the host believes it is
-idle. Without the epoch a late worker could claim from the next batch while the host was still writing it, run a
-job twice, or add to `done` after the host had reset it, and `done != n` would then never end.
+**Why the epoch is in the word.** A worker that went to sleep is still counted as parked when it wakes. Trace
+`worker` (`pool.cpp:296-325`): it leaves the spin loop, re-reads `seen = epoch_.load(acquire)`, and only then does
+`parked_.fetch_sub`. In the gap between those two the host may read `parked_ == n_`, pass its next pre-phase
+barrier and publish batch k+1, so the worker enters `drain` holding epoch k while `head_` already carries k+1. The
+park barriers narrow that window; they do not close it.
+
+basalt's stated reason for the epoch is that such a worker could otherwise claim from the next batch while the
+host was still writing it, run a job twice, or add to `done` after the host had reset it (`pool.hpp:18-23`). In
+this port the last two are not reachable even with the epoch test removed, because three other mechanisms hold:
+the claim's acquire of `head_` synchronises with `begin_batch`'s release and the batch description is written
+before that release, so a late claimant reads the correct body; the index compare-exchange hands out each job
+exactly once, so no job runs twice; and `wait_done` has observed every increment of the previous batch before
+`begin_batch` resets the counter, so no increment lands after a reset. A late claim therefore lands on the next
+batch as an early and correct participant in it. **Inference** from those three sites, consistent with the
+mutation measurement in section 4.
+
+The epoch test is kept because this is a 1:1 transcription of basalt's protocol. A port that drops it is relying
+on the three mechanisms above rather than on the protocol, which is a different guarantee.
 
 ### 1.2 The park: spin, then sleep
 
@@ -102,8 +116,11 @@ Two of these carry arguments that break if weakened.
 least one side sees the other's write: either the worker sees the new epoch and does not sleep, or the host sees
 the sleeper and notifies under the mutex the worker holds until it is inside `wait`. The store-buffer interleaving
 in which neither sees the other is exactly what seq_cst forbids. basalt's comment says this costs x86 nothing; on
-arm64 it is not free, lowering to `ldaddal` and `dmb ish` rather than an already-fenced `lock xadd` [M]. It is
-still required.
+arm64 it is not free, and the cost is visible in one instruction. Compiled here, the pair emits `ldaddal` followed
+by `ldar`; written with `acq_rel` and `acquire` the same pair emits `ldaddal` followed by `ldapr`, the weaker RCpc
+acquire load [M, Apple clang 21.0.0, -O2, arm64 on an M3 Max]. No `dmb` appears in either, so the whole difference
+between a correct publish and a lost wakeup is `ldar` against `ldapr`: `ldar` orders against the preceding
+`ldaddal` and `ldapr` does not. `acq_rel` would not suffice.
 
 **The batch description is plain, and nothing else orders it.** **Inference** from the table's last row: the
 description is made visible solely by the release store of `head_` and the matching acquire load in `claim`, plus
@@ -206,9 +223,12 @@ tables.
 The property suite (`tests/kernels/test_basalt_pool.py`) asserts that each job of a phase runs exactly once, under
 the schedules that break a wrong implementation. It was mutated to find its limits, and the answer is sobering:
 removing the epoch test from `claim`, removing either park barrier, removing both, and removing all three together
-each leave every case passing, over 4,000 phases of 8 jobs [M]. The windows these protections cover are nanoseconds
-wide and a trivial job never schedules into them, and the protections are layered, so no single removal is
-observable even in principle there.
+each leave every case passing, over 4,000 phases of 8 jobs [M]. Two reasons, and only the first is about the test:
+the windows these protections cover are nanoseconds wide and a trivial job never schedules into them; and for the
+epoch test specifically, the analysis in section 1.1 finds its removal produces a late claim that is harmless
+here, because the acquire on `head_`, the index compare-exchange and `wait_done`'s ordering against the reset
+each still hold. A null result against that mutation is therefore what the code predicts rather than a gap in the
+suite's reach.
 
 ThreadSanitizer (`tools/tsan/`) reads the happens-before edges directly and is the instrument for the rest. It
 found the real ordering defect the property suite passed clean over. It does **not** catch weakening the written

@@ -30,10 +30,13 @@ moment after it has seen a new epoch the host believes it is idle. Group B space
 **What this suite does NOT catch, measured.** It was mutated to find out, and the answer is sobering: removing the
 epoch test from ``claim``, removing either park barrier, removing both, and removing all three together each leave
 every case passing, over 4,000 phases of 8 jobs [M]. The windows these protections cover are nanoseconds wide and
-a trivial job never schedules into them. Two things follow. The protections are layered, so no single removal is
-observable even in principle here: with the park barriers in place a late claim cannot happen whatever the epoch
-does, and with the epoch in place a late claim fails whatever the barriers do. And a property test is the wrong
-instrument for the rest: ``tools/tsan/pool_tsan.cpp`` runs the same pool under ThreadSanitizer, which reads the
+a trivial job never schedules into them. Two things follow. For the epoch test specifically the null result is
+what the code predicts: the park barriers narrow the late-claim window without closing it (``worker`` re-reads the
+epoch before it decrements ``parked_``), but a late claim lands on the next batch harmlessly, because the claim's
+acquire of ``head_`` orders the batch description before it, the index compare-exchange hands out each job once,
+and ``wait_done`` has seen every increment before the counter is reset
+(``docs/research/basalt-cpu-pool.md`` section 1.1). The test is kept because this is a 1:1 port of basalt's
+protocol. And a property test is the wrong instrument for the rest: ``tools/tsan/pool_tsan.cpp`` runs the same pool under ThreadSanitizer, which reads the
 happens-before edges directly and found a real ordering defect this suite passed clean over (the batch description
 was read before the claim that orders it). Weakening the written memory orders to ``relaxed`` is caught by neither
 [M]; those rest on the transcription and the argument recorded with them, not on a test.
