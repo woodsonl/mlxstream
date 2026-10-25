@@ -612,9 +612,25 @@ NB_MODULE(_native, m) {
              std::lock_guard<std::mutex> drive(f.drive_mutex());
              f.close();
            })
-      .def_prop_ro("size", &bc::DirectFile::size)
-      .def_prop_ro("threads", &bc::DirectFile::threads)
-      .def_prop_ro("is_open", &bc::DirectFile::is_open)
+      // Under the drive lock as well. `close` writes `size_`, `fd_` and `pool_` outside the class's own short
+      // `mu_`, so an unsynchronised read of any of them beside a close is a data race: undefined, whatever an
+      // aligned word load happens to do on this chip. The cost is that a property read waits out a read round,
+      // which is the serialisation the reads themselves already accept, and nothing reads these in a hot path.
+      .def_prop_ro("size", [](bc::DirectFile& f) {
+             nb::gil_scoped_release unlock;
+             std::lock_guard<std::mutex> drive(f.drive_mutex());
+             return f.size();
+           })
+      .def_prop_ro("threads", [](bc::DirectFile& f) {
+             nb::gil_scoped_release unlock;
+             std::lock_guard<std::mutex> drive(f.drive_mutex());
+             return f.threads();
+           })
+      .def_prop_ro("is_open", [](bc::DirectFile& f) {
+             nb::gil_scoped_release unlock;
+             std::lock_guard<std::mutex> drive(f.drive_mutex());
+             return f.is_open();
+           })
       // Reads `length` bytes at `offset` into a fresh aligned buffer and returns them, so the Python side never
       // has to produce a 4096-aligned array of its own. One read per call, waited on here.
       .def("read_at", [](bc::DirectFile& f, uint64_t offset, uint32_t length, uint64_t tag) {

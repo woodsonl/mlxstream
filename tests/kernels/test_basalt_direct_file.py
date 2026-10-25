@@ -262,14 +262,20 @@ def test_d9_a_close_waits_for_a_read_in_flight(table):
         driver = threading.Thread(target=drive, daemon=True)
         driver.start()
         time.sleep(0.002)                            # mid-round, which is where the close has to land
-        closer = threading.Thread(target=f.close, daemon=True)
+        def shut():
+            try:
+                f.close()
+            except BaseException as exc:             # a bare target would swallow this and the case would pass
+                errors.append(exc)
+
+        closer = threading.Thread(target=shut, daemon=True)
         closer.start()
         closer.join(timeout=30)
         driver.join(timeout=30)
         if driver.is_alive() or closer.is_alive():
             hung.append((attempt, "driver" if driver.is_alive() else "closer"))
             break                                    # the threads are wedged; another attempt proves nothing
-        assert not errors, errors
+        assert not errors, errors                    # after BOTH joins, so a raising close is a failure here
 
     assert not hung, f"a close landed inside a read in flight and never came back: {hung}"
 
