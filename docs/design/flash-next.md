@@ -623,3 +623,21 @@ Both acceptance runs pin it off, and with every expert resident no swap would ha
    available memory decides the RAM tier and when serving stops a request. Measure what macOS and other processes
    take at the first load and while serving: above 7,410,173,047 bytes the largest session's RAM tier is 0, and above
    8,926,534,395 bytes (8.31 GiB) its requests stop with "RAM low".
+5. **The GPU never waits on the host.** Basalt's decode window parks a one-thread kernel on a mapped host flag
+   (`wait_flag_ge_kernel`, `src/kernels/cuda/verify_kernels.cu:919-922`) while the host serves the layer's CPU expert
+   misses (`src/core/verify.cpp:2541-2613`). A running Metal dispatch has no documented view of CPU writes, and on the
+   M3 Max the GPU watchdog kills a command buffer that waits on an event for 5 s, while 4.5 s survives
+   (`probes/p16_host_handoff`) [M]. The port runs that work at host points: the pass before each handoff signals a
+   shared event, the host serves the misses, and the host then commits the command buffer that continues the layer.
+   Each handoff idles the GPU for a median of 136 to 137 µs as built, against 0.5 µs at a plain pass boundary [M].
+
+   **Which form a decode program gets is a compile-time choice with one call site.** Basalt compiles the decode
+   graph twice and picks on `all_resident_` (`src/core/verify.cpp:876-907`): with every expert resident the
+   zero-doorbell graph services nothing from the host, and only a short cache gets the DecMoe window, which
+   services every MoE layer whether or not that layer has a CPU entry. At 48 MoE layers the unconditional form
+   costs 6.5 to 6.6 ms per step of GPU idle at the median above, so installing a point in every layer is a
+   different program rather than a slow exact one. `monolith/compiler/cpu_tier.decode_host_points` makes that
+   choice and is the only place that may: the Flash-Next model package's decode-program builder passes it the MoE
+   layer windows and the pack's residency flag and fills `Program.host_points` with what it returns, rather than
+   constructing `HostPoint`s itself. Until that builder lands the helper has no caller, and a program built
+   without it carries no host points, which is the zero-doorbell form the identity tests need.

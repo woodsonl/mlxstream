@@ -34,6 +34,9 @@
 //     function-local `thread_local` arrays. On Darwin each such access goes through the thread-local-variable
 //     descriptor and allocates lazily on first use; the buffers are scratch, so this is invisible to the output.
 //   * The hot atomics are padded to 128 bytes, which is this chip's cache line, where basalt pads to 64 [M].
+//   * `run_phase` refuses a second concurrent driver. basalt's pool has one host thread and needs no such flag;
+//     here the Python bindings release the GIL and `PoolTask` runs on the pump, so two native drivers of one pool
+//     are reachable, and two of them race on the batch description (ThreadSanitizer names it).
 #pragma once
 
 #include <atomic>
@@ -74,8 +77,9 @@ struct PhaseTimes {
     double wait_parked_after_ms = 0;
 };
 
-/// basalt's CPU expert pool. One host thread drives it; `run_phase` is not reentrant and the pool refuses a second
-/// owner, as a `HostTask` refuses a second runner.
+/// basalt's CPU expert pool. One host thread drives it. Two exclusions, answering different questions: `run_phase`
+/// refuses a second concurrent driver, and `claim_owner` refuses a second owner as a `HostTask` refuses a second
+/// runner. An owner holds its claim across calls, so the owner claim cannot serve as the per-phase exclusion.
 class ExpertPool {
   public:
     /// `n_workers` worker threads, plus the calling thread when `host_works`. A count at or below zero takes
@@ -108,7 +112,8 @@ class ExpertPool {
 
     /// Run one phase: `n_tasks` jobs, each `body(job_index, worker_id)`, where `worker_id` is 0..workers()-1 for a
     /// worker and -1 for the host's own drain. Returns false on a stall, leaving `error` set and the pool
-    /// poisoned. The body must not throw.
+    /// poisoned, and false without running anything when another thread is already inside a phase. The body must
+    /// not throw.
     bool run_phase(int n_tasks, const std::function<void(int, int)>& body, std::string& error,
                    PhaseTimes* times = nullptr);
 
@@ -142,6 +147,7 @@ class ExpertPool {
 
     std::atomic<bool> poisoned_{false};
     std::atomic<const void*> owner_{nullptr};
+    std::atomic<bool> driving_{false};             // a phase is in flight: `run_phase`'s own exclusion
 
     // The batch description. Plain, not atomic: it is made visible to a worker solely by the release/acquire pair
     // on `head_` plus the seq_cst epoch bump, so the host writes it BEFORE `begin_batch` and a worker reads it

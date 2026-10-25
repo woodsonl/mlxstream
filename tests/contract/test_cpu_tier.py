@@ -15,7 +15,7 @@ from monolith.compiler.cpu_tier import HANDOFF_IDLE_US, MoeLayerWindow, decode_h
 from monolith.runtime.program import HostPoint
 
 # 48 MoE layers, each with its point after the routing op and its wait at the combine, as the Qwen3.8 decode
-# program has them (docs/research/basalt-cpu-pool.md section 6.2).
+# program has them (docs/research/basalt-cpu-pool.md section 3.2).
 LAYERS = [MoeLayerWindow(publish=5 * i + 2, wait=5 * i + 4) for i in range(48)]
 
 
