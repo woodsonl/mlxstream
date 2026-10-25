@@ -157,7 +157,9 @@ def _attention_choice_v12(v1: Mapping[Any, float], v2: Mapping[Any, float], rep:
 def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, str]]:
     """The ``engine`` block from the writer's measurements (``tools/profile_writer.py`` builds the mapping:
     ``family``, ``lane_order_gbps`` {order: GB/s}, ``threadgroups_ms`` {count: ms}, ``shader_ms`` {format: {T: ms}},
-    ``tile_ms`` {format: {TM: ms}} (the geometry the autotuner picks, in the same T = 1 unit), ``tile_error``,
+    ``tile_ms`` {format: {TM: ms}} (the geometry the autotuner picks, in the same T = 1 unit), ``tile_geometry_ms``
+    {format: {TM: {geometry: ms}}} (every geometry timed; the unsplit tile at the threadgroups per core chosen here prices
+    ``accelerator_min_t``), ``tile_error``,
     ``tile_refused`` (the unsplit tile refused the shape: the error is that refusal),
     ``attention_ms`` {"v1": {(ctx, T): ms}, "v2": …}) and the current engine block (the values the measurement does
     not cover — sibling order, max_cb_ms, attention_rows — carry over). Returns ``(engine, notes)``."""
@@ -169,7 +171,14 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
     shader = {cost_key(f): cost_table(ms) for f, ms in measurements["shader_ms"].items()}
     tile = {cost_key(f): {int(tm): round(ms / measurements["shader_ms"][f][1], 3) for tm, ms in rows.items()}
             for f, rows in measurements.get("tile_ms", {}).items() if f in measurements["shader_ms"] and rows}
-    accel, min_t, notes["accelerator"] = accelerator_plan(shader, tile)
+    unsplit_mode = "crew" if tgs == 1 else f"crew{tgs}"        # the unsplit tile at this profile's threadgroups per core: serve's tile
+    unsplit = {cost_key(f): {int(tm): round(g[unsplit_mode] / measurements["shader_ms"][f][1], 3) for tm, g in rows.items() if unsplit_mode in g}
+               for f, rows in measurements.get("tile_geometry_ms", {}).items() if f in measurements["shader_ms"] and rows}
+    accel, min_t, notes["accelerator"] = accelerator_plan(shader, unsplit)
+    _, pick_t, _ = accelerator_plan(shader, tile)
+    if pick_t:
+        notes["accelerator"] += "; the autotuner's pick would start the tile at " + ", ".join(
+            f"T = {t} for {k}" if t != NEVER else f"no T for {k}" for k, t in pick_t.items())
     if "tile_error" in measurements:                            # main() writes a profile after a refusal only
         notes["accelerator"] = (f"no tile rows for any format: one format's unsplit tile refused the measured shape, which ends the tile step: {measurements['tile_error']}"
                                 if measurements.get("tile_refused") else
@@ -184,11 +193,13 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
               "attention": attention, "attention_rows": int(cur.get("attention_rows", 4)), "attention_v2_threadgroups": int(cur.get("attention_v2_threadgroups", 2)),
               "accelerator": accel, "accelerator_min_t": min_t, "cost_T": cost_t,
               "note": "written by tools/profile_writer.py from the kernel harnesses (min-of-N over >= 2 GB streamed per point): cost_T = the "
-                      "pass cost relative to a T = 1 shader pass at the best geometry per T; accelerator_<fmt> = gemm_tile at TM rows in "
-                      f"the geometry the autotuner picks (crew and crew2 timed at one and two threadgroups per core, the K-splits "
-                      f"{'/'.join(map(str, TILE_KSPLITS))} and their cacheless twins; serve dispatches it on the shapes the kernel choices "
-                      "list and the unsplit crew, at the profile's threadgroups_per_core, elsewhere), in the same unit; "
-                      "sibling_order and max_cb_ms are the probes' (p11, p6/p6b) and attention_rows the file's: they carry over"}
+                      "pass cost relative to a T = 1 shader pass at the best geometry per T; accelerator_min_t = the smallest T at which the "
+                      "unsplit tile at threadgroups_per_core (crew at one per core, crew2 at two), the tile serve runs on the shapes the kernel "
+                      "choices do not list, costs no more than that shader pass; accelerator_<fmt> = gemm_tile at TM rows in the geometry the "
+                      f"autotuner picks (crew and crew2 timed at one and two threadgroups per core, the K-splits {'/'.join(map(str, TILE_KSPLITS))} "
+                      "and their cacheless twins), in the same unit, which compiler.emit.verify_costs reads: a session without autotuning, which "
+                      "runs the unsplit tile, and a tuned crew2 on two threadgroups per core cost more than these rows say; sibling_order and "
+                      "max_cb_ms are the probes' (p11, p6/p6b) and attention_rows the file's: they carry over"}
     if cur.get("gdn_mixer_fusion"):
         engine["gdn_mixer_fusion"] = dict(cur["gdn_mixer_fusion"])
         notes["gdn_mixer_fusion"] = "retained from the layer study; leaf measurements do not select mixer fusion"

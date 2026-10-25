@@ -36,6 +36,7 @@ def test_writer_measures_and_the_profile_loads(tmp_path):
     assert not any(m["tile_oracle_fail"].values()), m["tile_oracle_fail"]  # a failing geometry stops the writer
     assert not m["oracle_fail"], m["oracle_fail"]                         # a failing shader geometry or probe stops it too
     assert p.cost_t["accelerator_fp8"][8] > 0 and p.accelerator in ("on", "off")
+    assert {"crew", "crew2"} <= set(m["tile_geometry_ms"]["fp8_e4m3"][8])  # every geometry recorded, the unsplit tile at both counts
     assert all(m["tile_mode"][f][8] in ("crew", "crew2", "ksplit2", "ksplit2nc", "ksplit4", "ksplit4nc")    # K = 1024: 4 K tiles,
                for f in ("fp8_e4m3", "nvfp4"))                                                                 # so splits 8 and 16 are refused
     out = tmp_path / "x.json"

@@ -69,10 +69,12 @@ def test_attention_choice():
 
 
 def _measurements():
+    tile_ms = {"fp8_e4m3": {8: 0.353, 16: 0.376, 32: 0.680}, "nvfp4": {8: 0.202, 16: 0.204, 32: 0.455}}
     return {"family": "Apple10", "chip": "Apple M5 Pro", "shape": "17408x5120",
             "lane_order_gbps": {"interleaved16": 275.0, "contiguous": 238.0}, "threadgroups_ms": {1: 0.324, 2: 0.330},
             "shader_ms": {"fp8_e4m3": {1: 0.324, 2: 0.350, 4: 0.360, 8: 1.166}, "nvfp4": {1: 0.196, 2: 0.251, 4: 0.351, 8: 1.039}},
-            "tile_ms": {"fp8_e4m3": {8: 0.353, 16: 0.376, 32: 0.680}, "nvfp4": {8: 0.202, 16: 0.204, 32: 0.455}},
+            "tile_ms": tile_ms,
+            "tile_geometry_ms": {f: {tm: {"crew": ms, "crew2": ms} for tm, ms in rows.items()} for f, rows in tile_ms.items()},   # unsplit = pick
             "attention_ms": {"v1": {(1024, 1): 0.05, (4096, 4): 0.2}, "v2": {(1024, 1): 0.06, (4096, 4): 0.21}}}
 
 
@@ -107,7 +109,7 @@ def test_decide_and_merge_produce_a_loadable_profile(tmp_path):
     assert fresh["nominal_gbps"] == 280.0 and "stand-in" in fresh["nominal_note"] and fresh["measured"] == "2026-09-25"
     assert Profile.from_dict("new", fresh).threadgroups_per_core == 1
     # no tile measurement (Apple9): the shader path, an empty min_t
-    no_tile = dict(_measurements(), tile_ms={}, attention_ms={})
+    no_tile = dict(_measurements(), tile_ms={}, tile_geometry_ms={}, attention_ms={})
     eng9, notes9 = decide(dict(no_tile, family="Apple9"), None)
     assert eng9["accelerator"] == "off" and eng9["accelerator_min_t"] == {} and eng9["attention"] == "v1" and eng9["sibling_order"] == "either"
     assert notes9["accelerator"] == "no tile measurement (the tile step was skipped)" and "accelerator_fp8" not in eng9["cost_T"]
@@ -212,6 +214,35 @@ def test_writer_records_the_autotuners_tile_pick(monkeypatch):
     assert any("TM=16 ksplit2: dispatch failed" in line for line in lines)  # the log names the geometry whose error ended the step
 
 
+@pytest.mark.parametrize("x2_ms,tgs,start", [(0.5, 1, 8), (0.4, 2, 4)])   # the x2 probe ties; x2 faster by more than NOISE
+def test_writer_prices_the_start_on_the_unsplit_tile(monkeypatch, x2_ms, tgs, start):
+    """accelerator_min_t prices the unsplit tile at the threadgroups per core the profile gets (crew at one, crew2 at
+    two), the tile serve runs on every shape its kernel choices do not list, against the shader's best geometry; cost_T's
+    accelerator rows keep the autotuner's pick, and tile_geometry_ms records every geometry that passed the oracle."""
+    import tools.profile_writer as pw
+
+    class Bench(_Bench):                                                     # shader T = 1, 2, 4, 8: 0.5, 0.65, 0.9, 2.0 ms
+        def run(self, fmt, n, k, t=1, tg_per_core=1, **kw):
+            probe = "rows" not in kw
+            return {"ms": x2_ms if probe and tg_per_core == 2 else {1: 0.5, 2: 0.65, 4: 0.9, 8: 2.0}[t], "gbps": 100.0, "ok": True,
+                    "unit_bytes": 16}
+
+    class GemmBench:                                                         # TM 8: crew 1.0, crew2 0.8, ksplit4 0.55; the rest refused
+        def run(self, fmt, n, k, *, tm, ksplit=1, tg_per_core=1, scale_cache=None, **kw):
+            ms = {"crew": 1.0, "crew2": 0.8, "ksplit4": 0.55}.get(_mode(ksplit, tg_per_core, scale_cache))
+            if ms is None:
+                raise kernels.GemmRefused("refused")
+            return {"ms": ms, "gbps": 1.0 / ms, "ok": True, "max_ulp_at_rms": 0.0, "max_rel_err": 0.0, "macros": {}}
+
+    monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+    monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
+    m = pw.measure(formats=["nvfp4"], ts=[1, 2, 4, 8], tms=[8], attention=None, log=lambda s: None)
+    assert m["tile_geometry_ms"]["nvfp4"][8] == {"crew": 1.0, "crew2": 0.8, "ksplit4": 0.55}
+    engine = decide(m)[0]
+    assert engine["threadgroups_per_core"] == tgs and engine["accelerator_min_t"] == {"nvfp4": start}   # crew 2.0 or crew2 1.6 x T1
+    assert engine["cost_T"]["accelerator_nvfp4"] == {"8": 1.1}                                          # the pick: ksplit4
+
+
 def test_writer_tile_pick_crew2_unscaled_and_duplicate_formats(monkeypatch):
     """Two threadgroups per core win when faster than crew by at least the noise margin; a format without block scales
     gets no cacheless twins; every run takes the measured lane order, each timed run the caller's copies and reps, each
@@ -268,14 +299,15 @@ def test_writer_writes_no_profile_on_a_kernel_failure(monkeypatch, tmp_path, cap
     printed = capsys.readouterr().out
     assert all(f"fails the oracle: {f}" in printed for f in ("tile nvfp4 TM=8: ksplit2, ksplit8nc", "tile nvfp4 TM=32: crew", "shader nvfp4 T=4: crew x2"))
     assert "tile fp8_e4m3" not in printed
-    m.update(tile_oracle_fail={"nvfp4": {}}, oracle_fail=[], tile_ms={}, tile_error="nvfp4 TM=16 ksplit2: dispatch failed", tile_refused=False)
+    m.update(tile_oracle_fail={"nvfp4": {}}, oracle_fail=[], tile_ms={}, tile_geometry_ms={}, tile_error="nvfp4 TM=16 ksplit2: dispatch failed",
+             tile_refused=False)                                            # a tile error clears every tile record, as measure() does
     assert pw.main(args) == 1 and not out.exists()
     printed = capsys.readouterr().out
     assert "the tile step failed: nvfp4 TM=16 ksplit2: dispatch failed" in printed
     m.update(tile_refused=True)                                             # a refusal: the profile without tile rows
     assert pw.main(args) == 0 and Profile.from_dict("x-20c", json.loads(out.read_text())).accelerator == "off"
     del m["tile_error"], m["tile_refused"]
-    m["tile_ms"] = _measurements()["tile_ms"]
+    m["tile_ms"], m["tile_geometry_ms"] = _measurements()["tile_ms"], _measurements()["tile_geometry_ms"]
     assert pw.main(args) == 0 and Profile.from_dict("x-20c", json.loads(out.read_text())).accelerator == "on"
 
 

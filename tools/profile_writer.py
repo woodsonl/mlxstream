@@ -8,21 +8,21 @@
   geometry the engine's autotuner's rule picks among those that pass the oracle, which the autotuner itself does not
   check (one or two threadgroups per core, the K-splits ``TILE_KSPLITS`` and their cacheless twins; recorded as
   ``tile_mode``; a geometry that fails the oracle is recorded under ``tile_oracle_fail``), each timed with BF16 output
-  as the engine compiles the tile and checked once more with 32-bit output under the strict rule, and from the two the
-  accelerator switch and ``accelerator_min_t`` per format (the smallest T the tile takes); every run after the probes
-  takes the lane order and scale placement the profile will hold,
+  as the engine compiles the tile and checked once more with 32-bit output under the strict rule; every geometry that
+  passes is recorded under ``tile_geometry_ms``, and from the shader's rows and the unsplit tile's the accelerator switch
+  and ``accelerator_min_t`` per format (the smallest T the tile takes); every run after the probes takes the lane order
+  and scale placement the profile will hold,
 * the attention kernel (v1, v2 and v3 over context lengths and T).
 
 A kernel that fails the oracle (a tile or shader GEMV geometry, or a T = 1 probe) or a tile-step error other than a
 refusal stops the writer: it lists each and writes no profile (exit 1). A chip without tensor ops runs ``--no-accelerator``.
 
-The tile rows price the autotuner's pick. An autotuning session dispatches it, and serve does on the shapes the
-configuration's kernel choices list; serve runs every other shape on the unsplit tile (the crew). A refresh that moves
-``accelerator_min_t`` for a format those choices do not cover needs a serve A/B before it ships. The writer and the
-autotuner time crew and crew2 at one and two threadgroups per core; compiler.emit dispatches them at the
-configuration's ``threadgroups_per_core`` times that, so on a chip with two per core a crew or crew2 pick runs at twice
-the threadgroups its row was timed at, and the writer's crew2 times the engine's crew, the unsplit tile serve runs on the
-shapes the kernel choices do not list, which the writer does not record.
+``accelerator_min_t`` prices the unsplit tile at the profile's ``threadgroups_per_core`` (crew at one per core, crew2 at
+two), the tile serve runs wherever the configuration's kernel choices list no geometry, against the shader's best
+geometry. ``cost_T``'s accelerator rows price the autotuner's pick, which an autotuned session runs and the cost verify
+rule reads. The writer and the autotuner time crew and crew2 at one and two threadgroups per core and compiler.emit
+dispatches a tuned crew mode at ``threadgroups_per_core`` times that, so on a chip with two per core a tuned crew or
+crew2 runs at twice the threadgroups its row was timed at.
 
 Everything else in a profile is the probes' record (``./probes/run_all.sh``): ``sibling_order`` (p11) and
 ``max_cb_ms`` (p6/p6b) carry over from the existing file, or take the safe defaults on a new chip. Min-of-N over
@@ -173,13 +173,13 @@ def measure(*, shape: Tuple[int, int] = (17408, 5120), formats: Sequence[str] = 
             log(f"shader {fmt:12s} T={t}: {best[0]:.3f} ms ({best[1]}, {best[2]:.0f} GB/s)" + (f" = {best[0] / base:.2f}x T={ts[0]}" if base else ""))
     # 4. the tensor-ops tile in each geometry compiler.autotune.tune_gemm tries, and per TM its pick (the module docstring): a
     # refused crew2 or K-split is skipped; a refused crew or any other error ends the step (tile_error), tile_oracle_fail kept
-    m["tile_ms"], m["tile_gbps"], m["tile_mode"], m["tile_oracle_fail"] = {}, {}, {}, {}
+    m["tile_ms"], m["tile_gbps"], m["tile_mode"], m["tile_oracle_fail"], m["tile_geometry_ms"] = {}, {}, {}, {}, {}
     if accelerator:
         ran = False                                                 # a tile variant ran: the tensor ops build on this chip
         try:
             gb = gemm_bench.GemmBench()
             for fmt in formats:
-                m["tile_ms"][fmt], m["tile_gbps"][fmt], m["tile_mode"][fmt], m["tile_oracle_fail"][fmt] = {}, {}, {}, {}
+                m["tile_ms"][fmt], m["tile_gbps"][fmt], m["tile_mode"][fmt], m["tile_oracle_fail"][fmt], m["tile_geometry_ms"][fmt] = {}, {}, {}, {}, {}
                 block_scaled = FORMATS.get(fmt).scale_group > 0
                 for tm in tms:
                     ms, gbps = {}, {}                               # the geometries that pass the oracle
@@ -220,6 +220,7 @@ def measure(*, shape: Tuple[int, int] = (17408, 5120), formats: Sequence[str] = 
                     best = min(ms, key=ms.get)
                     mode = "crew" if ms[best] > ms["crew"] * (1 - NOISE) else best
                     m["tile_ms"][fmt][tm], m["tile_gbps"][fmt][tm], m["tile_mode"][fmt][tm] = round(ms[mode], 4), gbps[mode], mode   # picked unrounded
+                    m["tile_geometry_ms"][fmt][tm] = {g: round(t, 4) for g, t in ms.items()}     # the unsplit tile prices the start
                     shader1 = m["shader_ms"][fmt].get(1)
                     log(f"tile   {fmt:12s} TM={tm}: {ms[mode]:.3f} ms ({mode}, {gbps[mode]:.0f} GB/s)"
                         + (f" = {ms[mode] / shader1:.2f}x the T=1 shader pass" if shader1 else ""))
@@ -227,7 +228,7 @@ def measure(*, shape: Tuple[int, int] = (17408, 5120), formats: Sequence[str] = 
             if "shader validation:" in str(e):
                 raise
             # never an empty message: the stop check reads the key; a wrong geometry stays recorded in tile_oracle_fail
-            m["tile_ms"], m["tile_gbps"], m["tile_mode"], m["tile_error"] = {}, {}, {}, str(e) or type(e).__name__
+            m["tile_ms"], m["tile_gbps"], m["tile_mode"], m["tile_geometry_ms"], m["tile_error"] = {}, {}, {}, {}, str(e) or type(e).__name__
             m["tile_refused"] = isinstance(e, GemmRefused)                  # the unsplit tile refused the shape: no tile rows
             log(f"tile: no measurement ({e})")
     # 5. the attention kernels v1, v2 and v3 over the contexts and T
