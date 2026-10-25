@@ -57,7 +57,8 @@ class Harness:
     def __init__(self, dev, cfg, qn, kn):
         self.dev, self.cfg = dev, cfg
         def library(source, macros, language_version=0):
-            return nt.Library(dev, source, dict(macros, QK_NORM=str(int(cfg.qk_norm)),
+            exact = {"EXACT_SUB": f"{cfg.exact_sub}u"} if getattr(cfg, "exact_sub", 0) else {}
+            return nt.Library(dev, source, dict(macros, **exact, QK_NORM=str(int(cfg.qk_norm)),
                 MMA_PROB_FP16=str(int(getattr(cfg, 'prob_fp16', False)))), language_version)
         if cfg.mma:
             macros = dict(kernels.gqa_macros(cfg.d, chunk=cfg.chunk, rb_max=16, lm_mode=cfg.lm_mode, chain_i=2 if cfg.lm_mode == 2 else 0), FIXED_CHUNK="1", MMA_SG=str(kernels.gqa_mma_simdgroups(cfg.d, cfg.rep)))
@@ -84,8 +85,6 @@ class Harness:
             self.p_dec, self.p_merge = nt.Pipeline(lib, "gqa_decode_v2"), nt.Pipeline(lib, "gqa_merge_v2")
         else:
             macros = kernels.gqa_macros(cfg.d, chunk=cfg.chunk, rb_max=cfg.rb, steal=cfg.steal, steal_hits=cfg.steal)
-            if getattr(cfg, "exact_sub", 0):
-                macros = dict(macros, EXACT_SUB=f"{cfg.exact_sub}u")
             lib = library(kernels.gqa_source(steal=cfg.steal), macros)
             self.p_dec, self.p_merge = nt.Pipeline(lib, "gqa_decode"), nt.Pipeline(lib, "gqa_merge")
             if cfg.steal:
@@ -573,6 +572,34 @@ def test_v3_is_bit_stable_and_t_active(dev, mma, heads):
     assert np.array_equal(c[:2], b[:2]) and np.all(c[2:] == 0)
     kc, _ = h3.caches()
     assert np.all(kc[pre + 2:] == 0)
+
+
+@pytest.mark.parametrize("d,heads,kv,qk_norm,gate,sub,position,t", [
+    (32, 8, 2, True, True, 128, 0, 300),           # the synthetic hybrid checkpoint's head (8 SIMD-groups), an empty cache
+    (128, 32, 8, False, False, 64, 200, 250),      # no query or key norms (Llama), 32 SIMD-groups, keys before the pass
+    (256, 24, 4, True, True, 32, 70, 100),         # the 27B's head with the accelerator off (16 SIMD-groups, rep 6)
+], ids=["d32_empty_cache", "d128_no_qk_norm", "d256_rep6"])
+def test_v3_exact_sub_reproduces_shorter_passes(dev, d, heads, kv, qk_norm, gate, sub, position, t):
+    """EXACT_SUB = S on v3: one pass of T rows equals passes of S rows from its start bit for bit (outputs and appended
+    caches). v3 pairs the keys before its pass and folds the rest one at a time, so a row's sums depend on where its pass
+    starts; T is not a multiple of S (a short last pass)."""
+    cfg = Cfg(heads, kv, d, d, position + t, t, gate=gate, v3=True, qk_norm=qk_norm)
+    ecfg = Cfg(heads, kv, d, d, position + t, t, gate=gate, v3=True, qk_norm=qk_norm)
+    ecfg.exact_sub = sub
+    rng = np.random.default_rng(d + position)
+    qn, kn = _norms(rng, d)
+    parts, whole = Harness(dev, cfg, qn, kn), Harness(dev, ecfg, qn, kn)
+    k = rbf(rng.standard_normal((cfg.ctx_max, kv, d)) * 0.5)
+    v = rbf(rng.standard_normal((cfg.ctx_max, kv, d)))
+    k[position:], v[position:] = 0, 0
+    proj = _random_proj(rng, cfg, t)
+    parts.set_caches(k, v)
+    ref = np.concatenate([parts.step(proj[s0:s0 + sub], position + s0) for s0 in range(0, t, sub)])
+    whole.set_caches(k, v)
+    got = whole.step(proj, position)
+    assert np.array_equal(got.view(np.uint32), ref.view(np.uint32)), int((got != ref).sum())
+    for a, b in zip(whole.caches(), parts.caches()):
+        assert np.array_equal(a.view(np.uint32), b.view(np.uint32))
 
 
 def test_v3_matches_layer_oracle(dev):

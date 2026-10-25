@@ -19,7 +19,8 @@
 // plain decode and an LM drafter's chain step); v2 keeps T > 1 and v1 the 32-row passes (decode-kernels.md §11).
 //
 // Macros: D (head dim, multiple of 32), NSG3 (SIMD-groups per threadgroup, D / (4·NSG3) slices per SIMD-group in the
-// fold: 32 → 1024 threads), STEP_STATE, LM_MODE / CHAIN_I as v1, PERM_OUT (the consumer tile's order). Params as v1
+// fold: 32 → 1024 threads), STEP_STATE, LM_MODE / CHAIN_I as v1, PERM_OUT (the consumer tile's order), EXACT_SUB (a
+// prompt pass reproducing passes of EXACT_SUB rows, as v1's). Params as v1
 // with n_sg = the threadgroups dispatched and pad1 = the gate rows' stride (0: out_stride). Buffers: 0 projection,
 // 1–2 caches, 3–4 RoPE tables, 5–6 norms, 7 out, 9 params, 10 the gate value [T, heads·D] (read when has_gate),
 // 15 StepState.
@@ -28,6 +29,26 @@
 #endif
 #ifndef SINGLE_BLOCK
 #define SINGLE_BLOCK 0
+#endif
+#if EXACT_SUB
+#if LM_MODE
+#error "EXACT_SUB: the target's prompt passes only"
+#endif
+// A key an EXACT_SUB row folds among its own pass's cached pairs: k and v from the caches, or, for a key this pass
+// appends, from the projection with k normed and RoPE'd — the bits the caches get (norm_rope rounds to BF16, v is copied).
+static inline void exact_cached_kv(uint key, uint position, uint j, uint lane, device const ushort* qkvg, device const ushort* k_cache,
+                                   device const ushort* v_cache, device const ushort* cos_t, device const ushort* sin_t,
+                                   device const float* k_norm, constant GqaParams& p, thread float* kf, thread float* vf) {
+  if (key < position) {
+    load_dl(k_cache + (key * p.kv_heads + j) * D + lane * DL, kf);
+    load_dl(v_cache + (key * p.kv_heads + j) * D + lane * DL, vf);
+    return;
+  }
+  device const ushort* row = qkvg + (key - position) * p.in_stride + j * D + lane * DL;
+  load_dl(row + p.k_off, kf);
+  norm_rope(kf, k_norm, cos_t + key * D, sin_t + key * D, p.eps, lane);
+  load_dl(row + p.v_off, vf);
+}
 #endif
 #define MRG_STRIDE (D + 4u)          // floats per partial in the fold buffer: o[D], m, d, then padding to 16 bytes
 
@@ -113,7 +134,36 @@ kernel void gqa_decode_v3(device const ushort* qkvg [[buffer(0)]], device ushort
       }
       m_run = m_new;
     }
-    for (; key < position; key += NSG3) {
+#if EXACT_SUB
+    // The row sums its keys as the EXACT_SUB-row pass it would be in, which starts at token t / EXACT_SUB · EXACT_SUB of
+    // this one (the session's exact passes start on those passes' boundaries): its cached pairs go on to that start,
+    // into keys this pass appends — the same fold as above.
+    for (const uint cached = position + t / EXACT_SUB * EXACT_SUB; key + NSG3 < cached; key += 2u * NSG3) {
+      float scores[2u], vf[2u][DL];
+      float m_new = m_run;
+#pragma clang loop unroll(full)
+      for (uint pair = 0; pair < 2u; pair++) {
+        float kf[DL];
+        exact_cached_kv(key + pair * NSG3, position, j, lane, qkvg, k_cache, v_cache, cos_t, sin_t, k_norm, p, kf, vf[pair]);
+        float dot = 0.0f;
+        for (uint e = 0; e < DL; e++) dot = fma(q[e], kf[e], dot);
+        dot = simd_sum(dot);
+        scores[pair] = round_bf16(round_bf16(dot) * p.scaling);
+        m_new = max(m_new, scores[pair]);
+      }
+      const float a = m_run == -INFINITY ? 0.f : exp(m_run - m_new);
+      d_run *= a;
+      for (uint e = 0; e < DL; e++) o_run[e] *= a;
+#pragma clang loop unroll(full)
+      for (uint pair = 0; pair < 2u; pair++) {
+        const float pr = exp(scores[pair] - m_new), pb = round_bf16(pr);
+        d_run += pr;
+        for (uint e = 0; e < DL; e++) o_run[e] = fma(pb, vf[pair][e], o_run[e]);
+      }
+      m_run = m_new;
+    }
+#endif
+    for (; key < position; key += NSG3) {                        // (EXACT_SUB: an unpaired key this pass appends is the next loop's, the same fold)
       float kf[DL], vf[DL];
       load_dl(k_cache + (key * p.kv_heads + j) * D + lane * DL, kf);
       load_dl(v_cache + (key * p.kv_heads + j) * D + lane * DL, vf);
