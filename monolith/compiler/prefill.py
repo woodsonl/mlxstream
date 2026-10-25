@@ -518,15 +518,15 @@ def exact_attention(program, rows):
         elif k.function.startswith('gqa_decode'):
             cores.setdefault(dict((s, n) for s, n, _ in op.bindings).get(7), []).append(op)
 
-    def chunked(op, function):
+    def has_exact_form(op, function):
         m = program.kernels[op.kernel].macros
         return (program.kernels[op.kernel].function == function and m.get('STEP_STATE') == '1'
                 and all(m.get(f, '0') == '0' for f in ('DRAFT', 'LM_MODE', 'STEAL', 'FIXED_CHUNK', 'ADAPTIVE_CHUNK')))
 
-    marked = [op for op in v3 if chunked(op, 'gqa_decode_v3')]
+    marked = [op for op in v3 if has_exact_form(op, 'gqa_decode_v3')]
     for workspace, ops in cores.items():
         folds = merges.get(workspace, [])
-        if not all(chunked(op, 'gqa_decode') for op in ops) or not all(chunked(op, 'gqa_merge') for op in folds):
+        if not all(has_exact_form(op, 'gqa_decode') for op in ops) or not all(has_exact_form(op, 'gqa_merge') for op in folds):
             continue
         marked += ops + folds
     for op in marked:
