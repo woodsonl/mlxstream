@@ -871,6 +871,37 @@ def test_the_no_accelerator_hint_prefixes_are_the_runtimes():
     assert 'std::string("MSL compile failed: ")' in src and 'std::string("pipeline failed: ")' in src
 
 
+def test_gemm_bench_reports_the_unrounded_time(monkeypatch):
+    """GemmBench.run reports the per-copy time as measured: the writer's pick compares geometries within the noise
+    margin, as tune_gemm does on its unrounded times, and a time rounded to 0.1 us can flip a pick near the margin."""
+    import tools.profile_writer as pw                                        # puts tools/bench on sys.path
+
+    gemm_bench = pw.gemm_bench
+    info = SimpleNamespace(gpu_cores=40, apple_family=10, name="fake")
+    monkeypatch.setattr(gemm_bench, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info), Buffer=_Stub, Library=_Stub,
+                                                          Pipeline=_Stub, Dispatch=_Stub,
+                                                          Queue=lambda dev: SimpleNamespace(run=lambda ds: SimpleNamespace(error=None, gpu_ms=0.0038851))))
+    assert gemm_bench.GemmBench().run("fp8_e4m3", 64, 4096, tm=8, copies=1, reps=1, check=False)["ms"] == 0.0038851
+
+
+def test_writer_picks_on_unrounded_times_and_records_them_rounded(monkeypatch):
+    """The pick compares the harness's unrounded times (a K-split at 0.003885 ms beats crew at 0.00401 by more than the
+    noise margin, which 4-decimal rounding to 0.0039 and 0.0040 would hide); the row records the pick's time to 4 decimals."""
+    import tools.profile_writer as pw
+
+    class GemmBench:                                                         # crew and ksplit2 only; every other geometry refused
+        def run(self, fmt, n, k, *, tm, ksplit=1, tg_per_core=1, scale_cache=None, **kw):
+            ms = {"crew": 0.00401, "ksplit2": 0.003885}.get(_mode(ksplit, tg_per_core, scale_cache))
+            if ms is None:
+                raise kernels.GemmRefused("refused")
+            return {"ms": ms, "gbps": 1.0 / ms, "ok": True, "max_ulp_at_rms": 0.0, "max_rel_err": 0.0, "macros": {}}
+
+    monkeypatch.setattr(pw.gemv_bench, "Bench", _Bench)
+    monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
+    m = pw.measure(formats=["fp8_e4m3"], ts=[1, 2], tms=[8], attention=None, log=lambda s: None)
+    assert m["tile_mode"]["fp8_e4m3"][8] == "ksplit2" and m["tile_ms"]["fp8_e4m3"][8] == 0.0039
+
+
 def test_the_tile_row_counts_stay_inside_tile_tms():
     """gemm_tile accepts exactly calibration.TILE_TMS as token rows, and every row count the emitter (gemm_tm) and the
     profile's cost table (tile_rows) ask for is one of them, the same for each T: the writer's --tms guard, the kernel

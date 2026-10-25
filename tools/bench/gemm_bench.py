@@ -111,7 +111,7 @@ class GemmBench:
         tiles_per_sg = n_tiles / n_sg
         return {"chip": self.info.name, "cores": cores, "kernel": "gemm_tile", "format": fmt, "n": n, "k": k, "rows": rows, "tm": tm, "tn": tn, "tk": tk,
                 "t_active": t_act, "lane_order": lane_order, "tg_per_core": tg_per_core, "tg": tg, "n_sg": n_sg, "n_tiles": n_tiles, "ksplit": ksplit,
-                "tiles_per_sg": round(tiles_per_sg, 2), "copies": copies, "ms": round(ms, 4), "scale_placement": pinfo.scale_placement,
+                "tiles_per_sg": round(tiles_per_sg, 2), "copies": copies, "ms": ms, "scale_placement": pinfo.scale_placement,
                 "gbps": round(useful / 1e9 / (ms / 1e3), 1),
                 "pct_nominal": round(100 * useful / 1e9 / (ms / 1e3) / self.profile.nominal_gbps, 1) if self.profile and self.profile.nominal_gbps > 0 else None,
                 "tflops": round(2 * tm * n * k / (ms / 1e3) / 1e12, 2),

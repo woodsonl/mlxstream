@@ -217,7 +217,7 @@ def measure(*, shape: Tuple[int, int] = (17408, 5120), formats: Sequence[str] = 
                         continue
                     best = min(ms, key=ms.get)
                     mode = "crew" if ms[best] > ms["crew"] * (1 - NOISE) else best
-                    m["tile_ms"][fmt][tm], m["tile_gbps"][fmt][tm], m["tile_mode"][fmt][tm] = ms[mode], gbps[mode], mode
+                    m["tile_ms"][fmt][tm], m["tile_gbps"][fmt][tm], m["tile_mode"][fmt][tm] = round(ms[mode], 4), gbps[mode], mode   # picked unrounded
                     shader1 = m["shader_ms"][fmt].get(1)
                     log(f"tile   {fmt:12s} TM={tm}: {ms[mode]:.3f} ms ({mode}, {gbps[mode]:.0f} GB/s)"
                         + (f" = {ms[mode] / shader1:.2f}x the T=1 shader pass" if shader1 else ""))
