@@ -10,12 +10,14 @@
 #import <Foundation/Foundation.h>
 #include <algorithm>
 #include <cmath>
+#include <vector>
 #include <array>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <tuple>
 #include "basalt_cpu.h"
+#include "basalt_cpu_experts.h"
 #include "basalt_pool.h"
 #include "basalt_cpu_expf.h"
 #include "metal_core.h"
@@ -113,6 +115,10 @@ using F32Out1 = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using I8In2 = nb::ndarray<const int8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using F32In2 = nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using F32Out2 = nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+using U8In2 = nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+using I32In1 = nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+using I32In2 = nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+using F32Out3 = nb::ndarray<float, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
 
 static void need(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(what);
@@ -356,6 +362,87 @@ NB_MODULE(_native, m) {
              return nb::make_tuple(t.wait_parked_before_ms, t.work_ms, t.wait_parked_after_ms);
            }, nb::arg("out").noconvert(), nb::arg("who").noconvert(),
            "run one phase of out.size() jobs; job j does out[j] += 1 and writes its worker id to who[j]")
+      // One layer's CPU experts, through the two phases. The activations are a shared pool, one row per token,
+      // as basalt shares one ActQ per token per layer across every job of the batch; job j takes the tokens
+      // job_tok[j][0 .. job_nt[j]) out of it and writes out[j][t].
+      .def("run_experts", [](bc::ExpertPool& p, U8In2 blobs, size_t gu_row, size_t d_row, size_t up_off,
+                             size_t down_off, I8In2 q, F32In2 scale, F32In2 hx, I32In1 job_nt, I32In2 job_tok,
+                             F32Out3 out) {
+             const int njobs = (int) blobs.shape(0), ntok = (int) q.shape(0);
+             const size_t blob_bytes = blobs.shape(1);
+             need(njobs >= 1, "run_experts: needs at least one job");
+             need(job_nt.shape(0) == (size_t) njobs && job_tok.shape(0) == (size_t) njobs,
+                  "run_experts: job_nt and job_tok must have one row per blob");
+             need(job_tok.shape(1) == (size_t) bc::MAXT, "run_experts: job_tok rows hold MAXT = 8 entries");
+             need(out.shape(0) == (size_t) njobs && out.shape(1) == (size_t) bc::MAXT &&
+                      out.shape(2) == (size_t) bc::H,
+                  "run_experts: out must be (njobs, 8, 2560)");
+             need(q.shape(1) == (size_t) bc::H && scale.shape(1) == (size_t) bc::MAXC &&
+                      hx.shape(1) == (size_t) bc::MAXC && scale.shape(0) == (size_t) ntok &&
+                      hx.shape(0) == (size_t) ntok,
+                  "run_experts: the activation pool must be (ntok, 2560) and (ntok, 80)");
+             // Every bound divides rather than multiplies, as the row kernel's own binding does.
+             need(gu_row >= (size_t) bc::BB * (bc::H / bc::QK), "run_experts: gu_row is below 18 * 40");
+             need(d_row >= (size_t) bc::BB * (bc::FF / bc::QK), "run_experts: d_row is below 18 * 10");
+             need(up_off <= blob_bytes && down_off <= blob_bytes, "run_experts: up_off and down_off run past a blob");
+             need(bc::FF == 0 || gu_row <= (blob_bytes - up_off) / bc::FF,
+                  "run_experts: the up rows run past the blob");
+             need(bc::H == 0 || d_row <= (blob_bytes - down_off) / bc::H,
+                  "run_experts: the down rows run past the blob");
+
+             // Before the buffers exist, so a retry against a pool that stalled earlier cannot allocate and then
+             // leak them: every phase on a poisoned pool fails, and the failure path below retains what it was
+             // given.
+             need(!p.poisoned(), "run_experts: the CPU expert pool stalled earlier and cannot be reused");
+             std::vector<bc::ActQ> acts((size_t) ntok);
+             for (int t = 0; t < ntok; ++t) {
+               std::memcpy(acts[(size_t) t].q, q.data() + (size_t) t * bc::H, bc::H);
+               std::memcpy(acts[(size_t) t].scale, scale.data() + (size_t) t * bc::MAXC, bc::MAXC * sizeof(float));
+               std::memcpy(acts[(size_t) t].hx, hx.data() + (size_t) t * bc::MAXC, bc::MAXC * sizeof(float));
+               acts[(size_t) t].nchunks = bc::H / bc::QKA;
+             }
+             std::vector<bc::ExpertJobMulti> jobs((size_t) njobs);
+             for (int j = 0; j < njobs; ++j) {
+               const int nt = job_nt.data()[j];
+               need(nt >= 1 && nt <= bc::MAXT, "run_experts: every job carries 1 to 8 tokens");
+               jobs[(size_t) j].blob = blobs.data() + (size_t) j * blob_bytes;
+               jobs[(size_t) j].nt = nt;
+               for (int t = 0; t < nt; ++t) {
+                 const int tok = job_tok.data()[(size_t) j * bc::MAXT + t];
+                 need(tok >= 0 && tok < ntok, "run_experts: a job names a token outside the activation pool");
+                 jobs[(size_t) j].act[t] = &acts[(size_t) tok];
+                 jobs[(size_t) j].out[t] = out.data() + ((size_t) j * bc::MAXT + t) * bc::H;
+               }
+             }
+             bc::NativeFmt fmt;
+             fmt.gu_row = gu_row;
+             fmt.d_row = d_row;
+             fmt.up_off = up_off;
+             fmt.down_off = down_off;
+             std::vector<bc::SplitBufMulti> scratch((size_t) std::min(njobs, bc::kMaxSplitMulti));
+             std::string err;
+             bc::PhaseTimes gu, dn;
+             bool ok;
+             {
+               nb::gil_scoped_release unlock;
+               ok = bc::run_split_multi_native(p, fmt, jobs.data(), njobs, scratch.data(), err, &gu, &dn);
+             }
+             if (!ok && p.poisoned()) {
+               // A stalled phase leaves a worker that may still be reading these: the jobs name the blobs and the
+               // activations, and the scratch holds the intermediate it writes. There is no way to interrupt it,
+               // so they are leaked on purpose for the process's life, the same bargain PoolTask::abandon makes.
+               // `out` is the caller's array and is not ours to leak; the suite keeps a poisoned pool and its
+               // arrays alive, as it does for the pool's own stall case.
+               (void) new std::vector<bc::ActQ>(std::move(acts));
+               (void) new std::vector<bc::ExpertJobMulti>(std::move(jobs));
+               (void) new std::vector<bc::SplitBufMulti>(std::move(scratch));
+             }
+             need(ok, err.c_str());
+             return nb::make_tuple(gu.work_ms, dn.work_ms);
+           }, nb::arg("blobs").noconvert(), nb::arg("gu_row"), nb::arg("d_row"), nb::arg("up_off"),
+           nb::arg("down_off"), nb::arg("q").noconvert(), nb::arg("scale").noconvert(), nb::arg("hx").noconvert(),
+           nb::arg("job_nt").noconvert(), nb::arg("job_tok").noconvert(), nb::arg("out").noconvert(),
+           "one layer's CPU experts through the pool's two phases")
       .def("stall_phase", [](bc::ExpertPool& p, double hold_s) {
              need(std::isfinite(hold_s) && hold_s >= 0.0 && hold_s <= 24.0 * 60.0 * 60.0,
                   "stall_phase: hold_s must be finite and 0 to 86,400");
