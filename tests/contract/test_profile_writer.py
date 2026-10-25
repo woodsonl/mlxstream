@@ -112,6 +112,34 @@ def test_decide_and_merge_produce_a_loadable_profile(tmp_path):
     assert notes9["accelerator"] == "no tile measurement (the tile step was skipped)" and "accelerator_fp8" not in eng9["cost_T"]
 
 
+class _Bench:                                                               # the shader GEMV harness: 0.5 ms per token row, every check passes
+    info = SimpleNamespace(apple_family=10, name="fake")
+
+    def run(self, fmt, n, k, t=1, **kw):
+        return {"ms": 0.5 * t, "gbps": 100.0, "ok": True, "unit_bytes": 16}
+
+
+class _Stub:                                                                # nt.Buffer / Library / Pipeline / Dispatch: every call chains
+    max_threads_per_threadgroup = 1024
+
+    def __init__(self, *a, **kw):
+        pass
+
+    def __getattr__(self, name):
+        return lambda *a, **kw: self
+
+
+def _mode(ksplit=1, tg_per_core=1, scale_cache=None):
+    """A tile geometry's name, as the writer's tile_mode and the autotuner's variants give it."""
+    return ("crew2" if tg_per_core == 2 else "crew") if ksplit == 1 else f"ksplit{ksplit}" + ("nc" if scale_cache is False else "")
+
+
+def _fake_device(monkeypatch, pw):
+    """main()'s device without Metal: a 20-core M5 Pro."""
+    info = SimpleNamespace(name="Apple M5 Pro", gpu_cores=20, apple_family=10, recommended_working_set=19 * 2 ** 30, max_buffer_length=14 * 2 ** 30)
+    monkeypatch.setattr(pw, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info)))
+
+
 def test_writer_records_the_autotuners_tile_pick(monkeypatch):
     """measure()'s tile step on fake harnesses: per TM it times each geometry the autotuner tries (crew, crew2, the
     K-splits TILE_KSPLITS and a cacheless twin where the split caches its scales or is refused) and records the
@@ -124,12 +152,6 @@ def test_writer_records_the_autotuners_tile_pick(monkeypatch):
     geometry, and the note then states that error alone."""
     import tools.profile_writer as pw
 
-    class Bench:                                                            # the shader GEMV: 0.5 ms per token row
-        info = SimpleNamespace(apple_family=10, name="fake")
-
-        def run(self, fmt, n, k, t=1, **kw):
-            return {"ms": 0.5 * t, "gbps": 100.0, "ok": True, "unit_bytes": 16}
-
     # ms per TM and geometry: absent or None = refused for the shape, negative = fails the oracle, an exception = raised;
     # TM 8's ksplit4 caches its scales, so its cacheless twin is timed too
     tile = {8: {"crew": 1.0, "crew2": 0.9, "ksplit2": -0.3, "ksplit4": 0.7, "ksplit4nc": 0.55, "ksplit8": -0.6},
@@ -141,7 +163,7 @@ def test_writer_records_the_autotuners_tile_pick(monkeypatch):
 
     class GemmBench:
         def run(self, fmt, n, k, *, tm, copies, reps, ksplit=1, tg_per_core=1, scale_cache=None, out_bf16=False, **kw):
-            mode = ("crew2" if tg_per_core == 2 else "crew") if ksplit == 1 else f"ksplit{ksplit}" + ("nc" if scale_cache is False else "")
+            mode = _mode(ksplit, tg_per_core, scale_cache)
             (tried if out_bf16 else checked).append((tm, mode, copies, reps))
             shapes.add((n, k))
             ms = tile[tm].get(mode)
@@ -156,7 +178,7 @@ def test_writer_records_the_autotuners_tile_pick(monkeypatch):
             return {"ms": 10 * abs(ms), "gbps": 0.1 / abs(ms), "ok": ok,     # the untimed check: no row takes its time
                     "max_ulp_at_scale": 0.5, "max_ulp_at_rms": 7.0, "max_rel_err": 4e-3, "macros": macros}
 
-    monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+    monkeypatch.setattr(pw.gemv_bench, "Bench", _Bench)
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
     lines = []
     m = pw.measure(formats=["nvfp4"], ts=[1, 2], tms=[8, 32, 16], attention=None, log=lines.append)
@@ -208,7 +230,7 @@ def test_writer_tile_pick_crew2_unscaled_and_duplicate_formats(monkeypatch):
 
     class GemmBench:
         def run(self, fmt, n, k, *, tm, lane_order, copies, reps, ksplit=1, tg_per_core=1, scale_cache=None, out_bf16=False, **kw):
-            mode = ("crew2" if tg_per_core == 2 else "crew") if ksplit == 1 else f"ksplit{ksplit}" + ("nc" if scale_cache is False else "")
+            mode = _mode(ksplit, tg_per_core, scale_cache)
             tried.append((fmt, mode, lane_order, copies, reps, out_bf16))
             ms = tile[fmt].get(mode)
             if ms is None:
@@ -235,8 +257,7 @@ def test_writer_writes_no_profile_on_a_kernel_failure(monkeypatch, tmp_path, cap
     gives every swept format one) write the profile, and a refusal writes it without tile rows."""
     import tools.profile_writer as pw
 
-    info = SimpleNamespace(name="Apple M5 Pro", gpu_cores=20, apple_family=10, recommended_working_set=19 * 2 ** 30, max_buffer_length=14 * 2 ** 30)
-    monkeypatch.setattr(pw, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info)))
+    _fake_device(monkeypatch, pw)
     m = dict(_measurements(), tile_oracle_fail={"fp8_e4m3": {}, "nvfp4": {32: ["crew"], 8: ["ksplit2", "ksplit8nc"]}}, oracle_fail=["shader nvfp4 T=4: crew x2"])
     monkeypatch.setattr(pw, "measure", lambda **kw: dict(m))
     out, args = tmp_path / "p.json", ["--name", "x-20c", "--out", str(tmp_path / "p.json")]
@@ -281,19 +302,12 @@ def test_writer_stops_on_a_tile_error_without_a_message(monkeypatch, tmp_path):
     ValueError is no refusal (only GemmRefused is)."""
     import tools.profile_writer as pw
 
-    class Bench:
-        info = SimpleNamespace(apple_family=10, name="fake")
-
-        def run(self, fmt, n, k, t=1, **kw):
-            return {"ms": 0.5 * t, "gbps": 100.0, "ok": True, "unit_bytes": 16}
-
     class Broken:                                                            # the tile bench fails before any run
         def __init__(self):
             raise ValueError()
 
-    info = SimpleNamespace(name="Apple M5 Pro", gpu_cores=20, apple_family=10, recommended_working_set=19 * 2 ** 30, max_buffer_length=14 * 2 ** 30)
-    monkeypatch.setattr(pw, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info)))
-    monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+    _fake_device(monkeypatch, pw)
+    monkeypatch.setattr(pw.gemv_bench, "Bench", _Bench)
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", Broken)
     m = pw.measure(formats=["nvfp4"], ts=[1, 2], attention=None, log=lambda s: None)
     assert m["tile_error"] == "ValueError" and m["tile_refused"] is False
@@ -322,8 +336,7 @@ def test_writer_lists_a_token_count_where_every_shader_geometry_fails(monkeypatc
                 raise kernels.GemmRefused("refused")
             return {"ms": 1.0, "gbps": 1.0, "ok": True, "max_ulp_at_rms": 0.0, "macros": {}}
 
-    info = SimpleNamespace(name="Apple M5 Pro", gpu_cores=20, apple_family=10, recommended_working_set=19 * 2 ** 30, max_buffer_length=14 * 2 ** 30)
-    monkeypatch.setattr(pw, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info)))
+    _fake_device(monkeypatch, pw)
     monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
     out = tmp_path / "p.json"
@@ -347,37 +360,22 @@ def test_writer_pick_follows_the_noise_rule(monkeypatch):
     table = {8: {"crew": 100, "crew2": 50}, 16: {"crew": 100, "crew2": 98}, 32: {"crew": 100, "crew2": 97}}   # every other geometry 1000
     info = pack_spec(random_spec("fp8_e4m3", 256, 4096, np.random.default_rng(0)), PackLayout(rows=16, lane_order="interleaved16"))[1]
 
-    class Stub:                                                              # nt.Buffer / Library / Pipeline / Dispatch: every call chains
-        max_threads_per_threadgroup = 1024
-
-        def __init__(self, *a, **kw):
-            pass
-
-        def __getattr__(self, name):
-            return lambda *a, **kw: self
-
     timing, geometry = {}, kernels.gemm_geometry                            # tune_gemm sizes each variant's grid just before timing it
     monkeypatch.setattr(kernels, "gemm_geometry", lambda mode, *a, **kw: timing.update(mode=mode) or geometry(mode, *a, **kw))
     tuner = object.__new__(Autotuner)
-    tuner.nt, tuner.dev, tuner.cores, tuner.choices = SimpleNamespace(Buffer=Stub, Library=Stub, Pipeline=Stub, Dispatch=Stub), None, 20, {}
+    tuner.nt, tuner.dev, tuner.cores, tuner.choices = SimpleNamespace(Buffer=_Stub, Library=_Stub, Pipeline=_Stub, Dispatch=_Stub), None, 20, {}
     picked = {}
     for tm, row in table.items():                                            # one x_permute precedes the copies: len(ds) - 1 of them
         tuner._time = lambda ds, row=row: row.get(timing["mode"], 1000) * (len(ds) - 1)
         picked[tm] = tuner.tune_gemm(info, tm, None).grid_mode
 
-    class Bench:
-        info = SimpleNamespace(apple_family=10, name="fake")
-
-        def run(self, fmt, n, k, t=1, **kw):
-            return {"ms": 0.5 * t, "gbps": 100.0, "ok": True, "unit_bytes": 16}
-
     class GemmBench:                                                         # the kernel's own refusals, the table's times
         def run(self, fmt, n, k, *, tm, ksplit=1, tg_per_core=1, scale_cache=None, **kw):
             macros = kernels.gemm_macros(info, tm=tm, ksplit=ksplit, scale_cache=scale_cache)
-            ms = table[tm].get(("crew2" if tg_per_core == 2 else "crew") if ksplit == 1 else f"ksplit{ksplit}", 1000)
+            ms = table[tm].get(_mode(ksplit, tg_per_core), 1000)
             return {"ms": ms, "gbps": 1.0 / ms, "ok": True, "max_ulp_at_rms": 0.0, "macros": macros}
 
-    monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+    monkeypatch.setattr(pw.gemv_bench, "Bench", _Bench)
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
     m = pw.measure(shape=(256, 4096), formats=["fp8_e4m3"], ts=[1, 2], tms=[8, 16, 32], attention=None, log=lambda s: None)
     assert m["tile_mode"]["fp8_e4m3"] == picked == {8: "crew2", 16: "crew", 32: "crew2"}
@@ -387,19 +385,12 @@ def test_writer_without_the_tile_writes_a_shader_profile(monkeypatch, tmp_path):
     """--no-accelerator skips the tile step (its bench is never built) and writes a profile with the tile off."""
     import tools.profile_writer as pw
 
-    class Bench:
-        info = SimpleNamespace(apple_family=10, name="fake")
-
-        def run(self, fmt, n, k, t=1, **kw):
-            return {"ms": 0.5 * t, "gbps": 100.0, "ok": True, "unit_bytes": 16}
-
     class NoTile:
         def __init__(self):
             raise AssertionError("--no-accelerator built the tile bench")
 
-    info = SimpleNamespace(name="Apple M5 Pro", gpu_cores=20, apple_family=10, recommended_working_set=19 * 2 ** 30, max_buffer_length=14 * 2 ** 30)
-    monkeypatch.setattr(pw, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info)))
-    monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+    _fake_device(monkeypatch, pw)
+    monkeypatch.setattr(pw.gemv_bench, "Bench", _Bench)
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", NoTile)
     out = tmp_path / "p.json"
     assert pw.main(["--no-accelerator", "--tms", "32", "--attention", "none", "--name", "x-20c", "--out", str(out)]) == 0   # no row check
@@ -453,14 +444,8 @@ def test_writer_sweep_is_tune_gemms_candidate_set(monkeypatch, fmt, k, tm, place
                  for p in ("inline", "block")}
         info = infos[placement]
 
-        class Stub:                                               # nt.Buffer / Library / Pipeline / Dispatch: every call chains
-            max_threads_per_threadgroup = 1024
-
-            def __init__(self, *a, **kw): pass
-            def __getattr__(self, name): return lambda *a, **kw: self
-
         tuner = object.__new__(Autotuner)
-        tuner.nt, tuner.dev, tuner.cores, tuner.choices = SimpleNamespace(Buffer=Stub, Library=Stub, Pipeline=Stub, Dispatch=Stub), None, 20, {}
+        tuner.nt, tuner.dev, tuner.cores, tuner.choices = SimpleNamespace(Buffer=_Stub, Library=_Stub, Pipeline=_Stub, Dispatch=_Stub), None, 20, {}
         tuner._time = lambda ds: 1.0
         try:
             tuner.tune_gemm(info, tm, None)
@@ -474,17 +459,11 @@ def test_writer_sweep_is_tune_gemms_candidate_set(monkeypatch, fmt, k, tm, place
         class GemmBench:                                          # the real refusals and SCALE_CACHE, from gemm_macros, on the pack timed
             def run(self, fmt, n, k, *, tm, lane_order, placement="inline", ksplit=1, tg_per_core=1, scale_cache=None, **kw):
                 macros = kernels.gemm_macros(infos[placement], tm=tm, ksplit=ksplit, scale_cache=scale_cache)
-                timed.add(("crew2" if tg_per_core == 2 else "crew") if ksplit == 1 else f"ksplit{ksplit}" + ("nc" if scale_cache is False else ""))
+                timed.add(_mode(ksplit, tg_per_core, scale_cache))
                 return {"ms": 1.0, "gbps": 1.0, "ok": True, "max_ulp_at_rms": 0.0, "macros": macros}
 
-        class Bench:
-            info = SimpleNamespace(apple_family=10, name="fake")
-
-            def run(self, fmt, n, k, t=1, **kw):
-                return {"ms": 0.5 * t, "gbps": 100.0, "ok": True, "unit_bytes": 16}
-
         monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
-        monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+        monkeypatch.setattr(pw.gemv_bench, "Bench", _Bench)
         m = pw.measure(shape=(n, k), formats=[fmt], ts=[1], tms=[tm], attention=None, current_placement=placement, log=lambda s: None)
         if expected is None:
             assert m["tile_refused"] is True and m["tile_ms"] == {}, m.get("tile_error")
@@ -548,8 +527,7 @@ def test_writer_stops_on_a_shader_or_probe_failure_alone(monkeypatch, tmp_path, 
     run included, and the output names it."""
     import tools.profile_writer as pw
 
-    info = SimpleNamespace(name="Apple M5 Pro", gpu_cores=20, apple_family=10, recommended_working_set=19 * 2 ** 30, max_buffer_length=14 * 2 ** 30)
-    monkeypatch.setattr(pw, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info)))
+    _fake_device(monkeypatch, pw)
     m = dict(_measurements(), tile_oracle_fail={"fp8_e4m3": {}, "nvfp4": {}}, oracle_fail=[fail])
     monkeypatch.setattr(pw, "measure", lambda **kw: dict(m))
     out = tmp_path / "p.json"
@@ -595,8 +573,7 @@ def test_writer_main_times_on_the_profiles_current_placement(monkeypatch, tmp_pa
     keeps them."""
     import tools.profile_writer as pw
 
-    info = SimpleNamespace(name="Apple M5 Pro", gpu_cores=20, apple_family=10, recommended_working_set=19 * 2 ** 30, max_buffer_length=14 * 2 ** 30)
-    monkeypatch.setattr(pw, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info)))
+    _fake_device(monkeypatch, pw)
     calls = []
     monkeypatch.setattr(pw, "measure", lambda **kw: calls.append(kw) or dict(_measurements(), tile_oracle_fail={}, oracle_fail=[]))
     out = tmp_path / "p.json"
@@ -612,17 +589,11 @@ def test_a_crew_refusal_names_its_format_and_tm(monkeypatch):
     """A refusal of the unsplit tile, the one tile error a written profile records, names its format and TM."""
     import tools.profile_writer as pw
 
-    class Bench:
-        info = SimpleNamespace(apple_family=10, name="fake")
-
-        def run(self, fmt, n, k, t=1, **kw):
-            return {"ms": 0.5 * t, "gbps": 100.0, "ok": True, "unit_bytes": 16}
-
     class GemmBench:
         def run(self, fmt, n, k, *, tm, **kw):
             raise kernels.GemmRefused("gemm_tile: R=8 must divide the 16-row tile")
 
-    monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+    monkeypatch.setattr(pw.gemv_bench, "Bench", _Bench)
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
     m = pw.measure(formats=["nvfp4"], ts=[1, 2], tms=[16], attention=None, log=lambda s: None)
     assert m["tile_refused"] is True and m["tile_error"] == "nvfp4 TM=16 crew: gemm_tile: R=8 must divide the 16-row tile"
@@ -641,20 +612,14 @@ def test_writer_hints_no_accelerator_only_when_the_unsplit_tile_fails_to_compile
     tile-step error names its geometry without the hint."""
     import tools.profile_writer as pw
 
-    class Bench:
-        info = SimpleNamespace(apple_family=10, name="fake")
-
-        def run(self, fmt, n, k, t=1, **kw):
-            return {"ms": 0.5 * t, "gbps": 100.0, "ok": True, "unit_bytes": 16}
-
     class GemmBench:
         def run(self, fmt, n, k, *, tm, ksplit=1, tg_per_core=1, out_bf16=False, **kw):
-            if (tm, ("crew2" if tg_per_core == 2 else "crew") if ksplit == 1 else f"ksplit{ksplit}") == fault and out_bf16 is bf16:
+            if (tm, _mode(ksplit, tg_per_core)) == fault and out_bf16 is bf16:
                 raise RuntimeError(error)
             return {"ms": 1.0, "gbps": 1.0, "ok": True, "max_ulp_at_rms": 0.0, "max_rel_err": 0.0, "macros": {}}
 
     fault = (tm, mode)
-    monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+    monkeypatch.setattr(pw.gemv_bench, "Bench", _Bench)
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
     m = pw.measure(formats=["nvfp4"], ts=[1, 2], tms=[8, 16], attention=None, log=lambda s: None)
     assert m["tile_refused"] is False and m["tile_error"].startswith(f"nvfp4 TM={tm} {mode}: {error}")
@@ -680,7 +645,7 @@ def test_writer_raises_a_shader_validation_report(monkeypatch, where):
 
     class GemmBench:
         def run(self, fmt, n, k, *, tm, ksplit=1, tg_per_core=1, **kw):
-            if (("crew2" if tg_per_core == 2 else "crew") if ksplit == 1 else f"ksplit{ksplit}") == where:
+            if _mode(ksplit, tg_per_core) == where:
                 raise report
             return {"ms": 1.0, "gbps": 1.0, "ok": True, "max_ulp_at_rms": 0.0, "max_rel_err": 0.0, "macros": {}}
 
@@ -695,12 +660,6 @@ def test_writer_a_crew_failing_only_its_32_bit_check_gets_no_row(monkeypatch):
     failure of the unsplit tile, and the sweep goes on to every other TM and format: no tile error."""
     import tools.profile_writer as pw
 
-    class Bench:
-        info = SimpleNamespace(apple_family=10, name="fake")
-
-        def run(self, fmt, n, k, t=1, **kw):
-            return {"ms": 0.5 * t, "gbps": 100.0, "ok": True, "unit_bytes": 16}
-
     swept = set()
 
     class GemmBench:                                                         # crew only; every other geometry refused
@@ -711,7 +670,7 @@ def test_writer_a_crew_failing_only_its_32_bit_check_gets_no_row(monkeypatch):
             ok = out_bf16 or (fmt, tm) != ("nvfp4", 8)                       # nvfp4 TM 8: only the 32-bit check fails
             return {"ms": 1.0, "gbps": 1.0, "ok": ok, "max_ulp_at_rms": 9.0, "max_rel_err": 2e-3, "macros": {}}
 
-    monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+    monkeypatch.setattr(pw.gemv_bench, "Bench", _Bench)
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
     m = pw.measure(formats=["nvfp4", "fp8_e4m3"], ts=[1, 2], tms=[8, 16], attention=None, log=lambda s: None)
     assert "tile_error" not in m, m.get("tile_error")
@@ -725,21 +684,14 @@ def test_writer_keeps_a_timed_runs_oracle_failure_through_its_checks_error(monke
     lists both the oracle failure and the tile error and writes no profile."""
     import tools.profile_writer as pw
 
-    class Bench:
-        info = SimpleNamespace(apple_family=10, name="fake")
-
-        def run(self, fmt, n, k, t=1, **kw):
-            return {"ms": 0.5 * t, "gbps": 100.0, "ok": True, "unit_bytes": 16}
-
     class GemmBench:                                                         # crew: BF16 output wrong, then its check faults
         def run(self, fmt, n, k, *, tm, out_bf16=False, **kw):
             if not out_bf16:
                 raise RuntimeError("dispatch failed")
             return {"ms": 1.0, "gbps": 1.0, "ok": False, "max_ulp_at_scale": 3.0, "max_ulp_at_rms": 9.0, "max_rel_err": 2e-2, "macros": {}}
 
-    info = SimpleNamespace(name="Apple M5 Pro", gpu_cores=20, apple_family=10, recommended_working_set=19 * 2 ** 30, max_buffer_length=14 * 2 ** 30)
-    monkeypatch.setattr(pw, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info)))
-    monkeypatch.setattr(pw.gemv_bench, "Bench", Bench)
+    _fake_device(monkeypatch, pw)
+    monkeypatch.setattr(pw.gemv_bench, "Bench", _Bench)
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
     out = tmp_path / "p.json"
     assert pw.main(["--attention", "none", "--formats", "fp8_e4m3", "--ts", "1,2", "--tms", "8", "--name", "x-20c", "--out", str(out)]) == 1
@@ -808,22 +760,13 @@ def test_gemm_bench_judges_each_output_by_its_rule(monkeypatch):
 
     gemm_bench = pw.gemm_bench
 
-    class Stub:                                                              # nt.Library / Pipeline / Dispatch: every call chains
-        max_threads_per_threadgroup = 1024
-
-        def __init__(self, *a, **kw):
-            pass
-
-        def __getattr__(self, name):
-            return lambda *a, **kw: self
-
-    class Buf(Stub):
+    class Buf(_Stub):
         def read(self, off, size):
             return bytes(size)
 
     info = SimpleNamespace(gpu_cores=20, apple_family=10, name="fake")
-    monkeypatch.setattr(gemm_bench, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info), Buffer=Buf, Library=Stub,
-                                                          Pipeline=Stub, Dispatch=Stub,
+    monkeypatch.setattr(gemm_bench, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info), Buffer=Buf, Library=_Stub,
+                                                          Pipeline=_Stub, Dispatch=_Stub,
                                                           Queue=lambda dev: SimpleNamespace(run=lambda ds: SimpleNamespace(error=None, gpu_ms=1.0))))
     # within one BF16 rounding (1 ulp at scale, rel 5e-3) but past the strict rule (3 ulp at RMS, rel 5e-3 > 1e-4)
     monkeypatch.setattr(gemm_bench, "check_against_oracle", lambda y, ref: OracleCheck(3.0, 4, 5e-3, 1.0))
