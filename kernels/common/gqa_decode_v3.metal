@@ -37,6 +37,7 @@
 #endif
 // A key an EXACT_SUB row folds among its own pass's cached pairs: k and v from the caches, or, for a key this pass
 // appends, from the projection with k normed and RoPE'd — the bits the caches get (norm_rope rounds to BF16, v is copied).
+// Never from the caches: the kv head's first row appends those keys in this dispatch, unordered with this read.
 static inline void exact_cached_kv(uint key, uint position, uint j, uint lane, device const ushort* qkvg, device const ushort* k_cache,
                                    device const ushort* v_cache, device const ushort* cos_t, device const ushort* sin_t,
                                    device const float* k_norm, constant GqaParams& p, thread float* kf, thread float* vf) {
