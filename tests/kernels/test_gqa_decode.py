@@ -58,8 +58,9 @@ class Harness:
         self.dev, self.cfg = dev, cfg
         def library(source, macros, language_version=0):
             exact = {"EXACT_SUB": f"{cfg.exact_sub}u"} if getattr(cfg, "exact_sub", 0) else {}
-            return nt.Library(dev, source, dict(macros, **exact, QK_NORM=str(int(cfg.qk_norm)),
+            return nt.Library(dev, source, dict(macros, **exact, **getattr(cfg, "extra_macros", {}), QK_NORM=str(int(cfg.qk_norm)),
                 MMA_PROB_FP16=str(int(getattr(cfg, 'prob_fp16', False)))), language_version)
+        self.library = library
         if cfg.mma:
             macros = dict(kernels.gqa_macros(cfg.d, chunk=cfg.chunk, rb_max=16, lm_mode=cfg.lm_mode, chain_i=2 if cfg.lm_mode == 2 else 0), FIXED_CHUNK="1", MMA_SG=str(kernels.gqa_mma_simdgroups(cfg.d, cfg.rep)))
             if cfg.direct:
@@ -141,9 +142,11 @@ class Harness:
                 macros["STEP_STATE"] = "1"
                 source = source.replace(kernels.PRELUDE, kernels.PRELUDE + self.layout.to_msl(), 1)
             source, constants = kernels.specialize_params(source, "gqa", params)
-            lib = nt.Library(self.dev, source, dict(macros, **constants, QK_NORM=str(int(c.qk_norm))), kernels.MSL_TENSOR_OPS if c.mma else 0)
+            lib = self.library(source, dict(macros, **constants), kernels.MSL_TENSOR_OPS if c.mma else 0)
             name = "gqa_decode_mma" if c.mma else "gqa_decode_v3" if c.v3 else "gqa_decode_v2" if c.v2 else "gqa_decode"
             self.p_dec = nt.Pipeline(lib, name)
+            if c.v3:
+                assert self.p_dec.max_threads_per_threadgroup >= c.nsg3 * 32
             self.p_merge = None if c.v3 else nt.Pipeline(lib, "gqa_merge_v2" if c.v2 else "gqa_merge")
             if c.direct:
                 self.p_prepare = nt.Pipeline(lib, "gqa_prepare_mma")
@@ -574,7 +577,8 @@ def test_v3_is_bit_stable_and_t_active(dev, mma, heads):
     assert np.all(kc[pre + 2:] == 0)
 
 
-@pytest.mark.parametrize("single_block", [False, True])
+@pytest.mark.parametrize("emitted", [False, True])   # True: the emitter's form with the accelerator on (one block per threadgroup,
+                                                     # static geometry, o_proj's permute fused into the store)
 @pytest.mark.parametrize("d,heads,kv,qk_norm,gate,sub,position,t,nsg", [
     (32, 8, 2, True, True, 128, 0, 300, None),        # the synthetic hybrid checkpoint's head (8 SIMD-groups), an empty cache
     (128, 32, 8, False, False, 64, 232, 250, None),   # no query or key norms (Llama), 32 SIMD-groups, keys before the pass
@@ -582,14 +586,16 @@ def test_v3_is_bit_stable_and_t_active(dev, mma, heads):
     (64, 32, 8, False, False, 128, 150, 300, None),   # head dim 64 without query or key norms (16 SIMD-groups, 2 dims a lane)
     (32, 8, 2, True, True, 36, 5, 100, 4),            # 4 SIMD-groups and S not a multiple of 2 · 4
 ], ids=["d32_empty_cache", "d128_no_qk_norm", "d256_rep6", "d64_no_qk_norm", "nsg4_odd_sub"])
-def test_v3_exact_sub_reproduces_shorter_passes(dev, d, heads, kv, qk_norm, gate, sub, position, t, nsg, single_block):
+def test_v3_exact_sub_reproduces_shorter_passes(dev, d, heads, kv, qk_norm, gate, sub, position, t, nsg, emitted):
     """EXACT_SUB = S on v3: one pass of T rows equals passes of S rows from its start bit for bit (outputs and appended
     caches). v3 pairs the keys before its pass and folds the rest one at a time, so a row's sums depend on where its pass
     starts; T is not a multiple of S (a short last pass), and the passes over cached keys start in the second half of a
     2 · NSG3-key pair window, where a pair loop bound off by one would pair a sub-pass's first key."""
-    cfg = Cfg(heads, kv, d, d, position + t, t, gate=gate, v3=True, nsg3=nsg, qk_norm=qk_norm, single_block=single_block)
-    ecfg = Cfg(heads, kv, d, d, position + t, t, gate=gate, v3=True, nsg3=nsg, qk_norm=qk_norm, single_block=single_block)
+    cfg = Cfg(heads, kv, d, d, position + t, t, gate=gate, v3=True, nsg3=nsg, qk_norm=qk_norm, single_block=emitted)
+    ecfg = Cfg(heads, kv, d, d, position + t, t, gate=gate, v3=True, nsg3=nsg, qk_norm=qk_norm, single_block=emitted)
     ecfg.exact_sub = sub
+    cfg.specialize = ecfg.specialize = emitted
+    cfg.extra_macros = ecfg.extra_macros = kernels.perm_out_macros(heads * d, 8, 128) if emitted else {}
     rng = np.random.default_rng(d + position)
     qn, kn = _norms(rng, d)
     parts, whole = Harness(dev, cfg, qn, kn), Harness(dev, ecfg, qn, kn)
