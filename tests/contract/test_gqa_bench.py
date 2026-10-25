@@ -1,6 +1,7 @@
-"""tools/bench/gqa_bench.py's check_exact: the EXACT_SUB row counts the bench refuses before it compiles anything."""
+"""tools/bench/gqa_bench.py's refusals: check_exact's EXACT_SUB row counts, and the command line's, before a device opens."""
 import pytest
 
+from tools.bench import gqa_bench
 from tools.bench.gqa_bench import check_exact
 
 
@@ -20,3 +21,15 @@ def test_check_exact_refuses(exact, ts, kw, reason):
 ])
 def test_check_exact_accepts(exact, ts, kw):
     check_exact(exact, ts, **kw)
+
+
+@pytest.mark.parametrize("argv", [
+    ["--exact", "128", "--t", "1,4"],            # every pass inside one sub-pass
+    ["--v2", "--exact", "128", "--t", "512"],    # no exact form
+    ["--v3", "--steal"], ["--v2", "--v3"],       # one kernel at a time
+])
+def test_cli_refuses_before_a_device_opens(argv, monkeypatch):
+    monkeypatch.setattr(gqa_bench, "nt", None)   # a device access is an AttributeError, not a GPU run
+    with pytest.raises(SystemExit) as e:
+        gqa_bench.main(argv)
+    assert e.value.code == 2
