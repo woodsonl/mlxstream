@@ -60,7 +60,7 @@ says whether a subnormal can reach it:
   +inf and the quotient is -0.
 - **The SwiGLU product can.** s · up for a very negative g and a small up (g = -70, up = 1e-10 gives -2.8e-39). The
   port computes it with `ieee_mul`, which rebuilds a subnormal product from the exact integer product of the
-  significands (`kernels/common/basalt_q8_1.metal`) and gives IEEE's NaN or infinity where an infinity or a NaN (from
+  significands (`kernels/common/basalt_ieee.metal`) and gives IEEE's NaN or infinity where an infinity or a NaN (from
   a non-finite fp16 scale in a gate or up row) meets a zero or a subnormal, so that a NaN stays visible as in basalt;
   the q8_1 quantizer after it is the IEEE one of `matvec.md` section 3, which already emulates subnormal values.
 

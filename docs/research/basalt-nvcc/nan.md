@@ -126,6 +126,10 @@ where a page records only an instruction pair and a count, the row says so.
 | `basalt_q5k_proxy_final`: out_prob | `head_proxy.cuh:194`, `:236-238` | the constant 1, or `MUFU.RCP` of `FMNMX.FTZ(sum, one)`, one 0 or 1 (section 4.3) | never: `FMNMX` drops a NaN sum | | | no change |
 | `basalt_s2_gu`, `basalt_s2_swiglu`, `basalt_s2_down`: gate/up, out | `s2_expert_grouped.cu:963-964`, `:170`, `:1022-1023` | `FADD`, `FMUL` (`s2_experts.md`) | `s2_experts.md`, Summary | 0x7fffffff [H] (`FADD`, `FMUL` rows) | 0x7fc00000 | `cuda_nan` (PR #18) |
 | `basalt_quantize_q8_0_scaled`: fp32 scale, fp16 d, codes | `quantize_act.cu:91-100` | `div.rn.f32` under `amax > 0`; `f16_from_f32` (integer); `F2I.TRUNC.NTZ` | scale and d: never, s is 0 for an all-NaN block (`s2_experts.md` section 1); codes: a NaN x, which converts to 0 | codes 0 [S] (`cvt` rule) | codes 0 (`q8_1_code`) | no change |
+| `bs_greedy_top_prob`: probs | `sampler.cu:318` | PTX `rcp.rn.f32`: `MUFU.RCP R0, R19`; `FFMA R2, R0, R19, -1`; `FADD.FTZ R11, -R2, -RZ`; `FFMA R11, R0, R11, R0`, or the slow path (`sampler.md` section 3.3) | a NaN logit (`s += __expf(NaN − m)`); a +inf pick, a row of −inf or of NaN (`l[id] − m` is NaN at the pick) | 0x7fffffff [H] (`rcp.rn.f32` row) | 0x7fc00000 | `cuda_nan` |
+| `bs_coupled_penalize`: the draft row, in place | `sampler.cu:724` | `FADD R3, -R3, R0`, the penalty's last subtraction (`sampler.md` section 3.8) | a NaN logit at a counted id (`div.rn.f32`, then `FADD`); a counted +inf logit less an infinite frequency or presence term (inf − inf) | 0x7fffffff [H] (`FADD` row) | 0x7fc00000 | `cuda_nan` |
+| `bs_split_merge`, `bs_sample_one_block`: qprob; `bs_coupled_merge`: out_prob | `sampler.cu:429`, `:434-436`, `:815` | `F2F.F32.F64` of the binary64 probability `ex[i]` (`sampler.md` section 2.4) | a +inf entry of the kept list (x − max is inf − inf), or an infinite scaled logit | 0x7fffffff [H] (`F2F.F32.F64` of a NaN: not measured) | 0x7fffffff: the software binary64's conversion, `f32_from_f64` | no change |
+| the sampler's block lists (`cand`) and greedy partials (`part`) | `sampler.cu:656-659`, `:772-775`; the cluster exchange, `:226-228` | a listed entry's value bits; an order-preserving key | never: no selection round or argmax takes a NaN | | | no change |
 
 The integer outputs (token ids, the head's and the proxy's `out_id`, the experts' plans) carry no float encoding.
 
@@ -147,4 +151,5 @@ maps a NaN to `sign | 0x7E00`: for the positive canonical NaN sm_120's arithmeti
 
 Each kernel applies them at the stores the table marks, so a finite value is stored as before. `tests/kernels/
 test_basalt_nan.py` plants inputs that make a NaN reach every rewritten store, requires the stored bits to be
-sm_120's, and runs the same kernels without the rewrite as the negative control.
+sm_120's, and runs the same kernels without the rewrite as the negative control. The sampler's two rewritten stores
+have the same check in its own tests (`test_basalt_sampler_greedy_top_prob_nan`, `test_basalt_coupled_penalize_nan`).

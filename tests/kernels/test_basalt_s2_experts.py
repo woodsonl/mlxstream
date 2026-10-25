@@ -623,14 +623,15 @@ static inline float div_plain(float a, float b) { return a / b; }
 static inline float div127_plain(float a) { return a / 127.0f; }
 static inline float rcp_plain(float a) { return 1.0f / a; }
 """
-    return (kernels.PRELUDE + kernels.template("basalt_fp.metal") + kernels.template("basalt_q8_1.metal") + helpers
-            + body)
+    return (kernels.PRELUDE + kernels.template("basalt_fp.metal") + kernels.template("basalt_ieee.metal")
+            + kernels.template("basalt_q8_1.metal") + helpers + body)
 
 
 def hw_nan_source():
     """The drafter kernels storing the hardware's NaN (0x7fc00000 on this GPU) instead of cuda_nan's 0x7fffffff: the
     negative control of the NaN tests."""
-    return (kernels.PRELUDE + kernels.template("basalt_fp.metal") + kernels.template("basalt_q8_1.metal")
+    return (kernels.PRELUDE + kernels.template("basalt_fp.metal") + kernels.template("basalt_ieee.metal")
+            + kernels.template("basalt_q8_1.metal")
             + kernels.template("basalt_s2_experts.metal").replace("cuda_nan(", "("))
 
 
