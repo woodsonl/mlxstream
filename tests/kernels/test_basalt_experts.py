@@ -259,7 +259,7 @@ def test_groups_read_their_blobs_across_buffers(n_embd, n_ff):
 
 
 def test_ieee_mul_keeps_subnormals():
-    """ieee_mul (basalt_q8_1.metal), CUDA's mul.rn.f32 without .ftz, bit for bit against numpy's IEEE float32 product
+    """ieee_mul (basalt_ieee.metal), CUDA's mul.rn.f32 without .ftz, bit for bit against numpy's IEEE float32 product
     on planted pairs: products across the subnormal range, at the 2^-126 boundary (rounding up into it), at ties of
     the subnormal grid, below half the smallest subnormal, signed zeros, subnormal operands, normal products, and
     infinities and NaN against zeros and subnormals (NaN for 0 * inf and a NaN, the signed infinity for a subnormal

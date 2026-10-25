@@ -130,6 +130,11 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `ggml/src/ggml-quants.c`'s `dequantize_row_q2_0` (MIT): the 18-byte block layout (an fp16 scale, then 64 codes two
   bits each) and its code extraction `(qs[m / 4] >> 2 * (m % 4)) & 3`, re-implemented. The `- 1` that centres a code
   reaches the result through basalt's own correction term, not through a dequantization. License: `third_party/GGML-LICENSE`.
+- `kernels/common/basalt_sampler.metal`, `tests/basalt_sampler_ref.py` — through basalt's `src/kernels/cuda/sampler.cu`
+  and `src/kernels/sampler_parity.cpp` (below), whose penalty stage and its host reference transcribe
+  `src/llama-sampler.cpp`'s `llama_sampler_penalties_apply` (MIT): the repeat penalty that multiplies a non-positive
+  logit and divides any other, then subtracts the count times the frequency penalty plus the presence penalty for a
+  counted token (`apply_penalties`, `penal`). License: `third_party/GGML-LICENSE`.
 - `kernels/common/basalt_dequant16.metal` — through basalt's `src/kernels/cuda/dequant_bf16.cu` (below), which
   transcribes `ggml/src/ggml-quants.c`'s `dequantize_row_q2_0`, `_q4_0`, `_q5_0`, `_q8_0`, `_q3_K`, `_q4_K`, `_q5_K`,
   `_q6_K`, `_iq4_nl`, `_iq4_xs` and `get_scale_min_k4`, and `ggml/src/ggml-common.h`'s `kvalues_iq4nl` (MIT): the
@@ -179,6 +184,10 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
 - `kernels/common/basalt_q8_1.metal` — adapted from `src/kernels/cuda/native_mmvq.cu:146-177` (the native and SwiGLU
   quantizers), `src/kernels/cuda/iq_kernels.cu:1880-1900` (the IEEE quantizer) and `include/basalt/kernels/q8_1_finite.hpp`
   (MIT), written in the rounding sequence nvcc compiles for them. License: `third_party/BASALT-LICENSE`.
+- `kernels/common/basalt_ieee.metal` — moved from `kernels/common/basalt_q8_1.metal` (above) with its header: `ieee_add`
+  and `ieee_mul`, CUDA's `add.rn.f32` and `mul.rn.f32` with subnormal operands and results kept, which the IEEE
+  quantizer's warp sum (`src/kernels/cuda/iq_kernels.cu:1880-1900`, MIT), the routed experts' SwiGLU product and the
+  sampler compute with. License: `third_party/BASALT-LICENSE`.
 - `kernels/common/basalt_mmvq.metal` — adapted from `src/kernels/cuda/native_mmvq.cu:179-1172` (MIT): the
   one-column `native_*_mmvq_kernel`s and `native_mmvq_multi_kernel` with the format traits' `load` / `apply` split,
   for Q2_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL, Q4_0, Q5_0 and Q8_0, in the exact and the upstream layouts, written
@@ -214,6 +223,25 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   compiles for them (`docs/research/basalt-nvcc/bf16.md`); `monolith/kernels.py`'s `basalt_mmvf_block`,
   `basalt_mmvf_macros` and `basalt_mmvf_cols` transcribe `mmvf_block_size` and the launchers' routing and checks
   (`native_bf16.cu:124-203`). License: `third_party/BASALT-LICENSE`.
+- `kernels/common/basalt_sampler.metal` — adapted from `src/kernels/cuda/sampler.cu:37-818`,
+  `include/basalt/kernels/sampler.hpp:15-29` and `include/basalt/core/coupled_draft.hpp:68-76` (MIT): Philox
+  (`philox_uniform`), `history_count` and `apply_penalties`, `sampler_greedy_kernel`, `sampler_greedy_cluster_kernel`
+  and `sampler_greedy_top_prob_cluster_kernel` with `am_take` and `am_merge` (each cluster's exchange as a second
+  kernel), `sampled_k`, `take_first`, `warp_first`, `warp_merge_lists`, `sampled_tail_warp`, `sampler_one_block_kernel`,
+  `sampler_split_part_kernel`, `sampler_split_merge_kernel` and the four `coupled_*_kernel`s, on `SamplerParams`' memory
+  image and with `coupled_draft_counter`, `coupled_hist_len` and `coupled_hist_start`, written in the rounding sequence
+  nvcc compiles for them (`docs/research/basalt-nvcc/sampler.md`). License: `third_party/BASALT-LICENSE`.
+- `monolith/compiler/emit.py` — `_basalt_sample` adapted from `src/kernels/cuda/sampler.cu:887-922` and `:991-1019`
+  (MIT): `sample_greedy_cluster`'s and `sample_tokens_probe`'s launches in their order, with their grids (8 threadgroups
+  of 1,024 threads a row for the cluster argmax, 1,024 threads for the one-block kernels, 128 for the split part and 32
+  for its merge). License: `third_party/BASALT-LICENSE`.
+- `monolith/kernels.py` — adapted from `src/kernels/cuda/sampler.cu:172`, `:335`, `:528-530`, `:981-1007` and
+  `:1057-1060`, `include/basalt/kernels/sampler.hpp:15-29` and `src/core/verify.cpp:2496-2498` and `:2659` (MIT): the
+  sampler's sizes (`BS_AM_CTAS`, `BS_SEL_MAX`, `BS_BLOCK`, `BS_SPLIT_MAX_BLOCKS`, `BS_SPLIT_MAX_ROWS`), the verify
+  window's resampling gate and `sample_tokens_probe`'s greedy branch (`basalt_sampler_mode`), its guards
+  (`basalt_sampler_params`' refusals) and its split rule (`basalt_sampler_path`), `coupled_draft_sample`'s guard
+  (`basalt_coupled_node`) and `SamplerParams`' 72-byte image (`basalt_coupled_params`). License:
+  `third_party/BASALT-LICENSE`.
 - `kernels/common/basalt_gr_norm.metal` — adapted from `src/kernels/cuda/native_gr_norm.cu:37-100` (MIT):
   `norm_warp_sum`, `weighted_rms_norm` and `native_gr_rms_norm_weighted`'s block choice, written in the rounding
   sequence nvcc compiles for them (`docs/research/basalt-nvcc/ple.md`). License: `third_party/BASALT-LICENSE`.
@@ -307,6 +335,16 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   `third_party/BASALT-LICENSE`.
 - `tests/kernels/test_basalt_platform.py` — the contraction check's pass criterion of
   `src/kernels/elementwise_parity.cpp` (MIT). License: `third_party/BASALT-LICENSE`.
+- `tests/basalt_sampler_ref.py`, `tests/kernels/test_basalt_sampler.py`, `tests/kernels/test_basalt_sampler_helpers.py`,
+  `tests/kernels/test_basalt_sampler_program.py`, `tests/kernels/test_basalt_coupled.py`,
+  `tests/contract/test_basalt_sampler_refs.py` and `tools/bench/basalt_sampler.py` — adapted from
+  `src/kernels/sampler_parity.cpp` (MIT): its references, fixtures, pre-fills, pass criteria and benchmarks; the reference module also takes `include/basalt/kernels/sampler.hpp:86-97`
+  (`penalty_rows`) and `include/basalt/core/coupled_draft.hpp:65-83` (the `coupled_*` helpers), the program test
+  `src/kernels/decode_cluster_parity.cpp`'s graph case (its argmax side, `:245-306`), and TP.1 the bound of
+  `src/kernels/q5k_head_parity.cpp:145`. License: `third_party/BASALT-LICENSE`.
+- `tests/kernels/test_basalt_decode_cluster.py` — adapted from `src/kernels/decode_cluster_parity.cpp` (MIT): its argmax
+  half (`:174-243`, `:412-421`), with the vocabularies, the twelve patterns, the pre-fills and the gate. License:
+  `third_party/BASALT-LICENSE`.
 - `tests/kernels/basalt_emu.py` — adapted from `src/kernels/cuda/native_mmvq.cu`, `src/kernels/cuda/iq_kernels.cu`,
   `src/kernels/cuda/native_bf16.cu`, `src/kernels/cuda/dense_tc.cu` and `include/basalt/kernels/q8_1_finite.hpp`
   (MIT): the iteration traits, and in numpy the quantizers' and the `native_mmvq` kernels' arithmetic as nvcc
@@ -359,6 +397,14 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
 - `tests/kernels/test_basalt_prompt_gemm.py` — adapted from `src/kernels/hc8_parity.cpp:253-262` and `:269` (MIT): the
   GEMM gate's bound, `expect(ex.rel() < 5e-3, "the product against the copy in double");`, and its use of `Err`
   over the product against double. License: `third_party/BASALT-LICENSE`.
+
+## NVIDIA libdevice (CUDA Toolkit 13.0, NVIDIA Corporation)
+
+- `kernels/common/basalt_libdevice.metal` and `tests/basalt_sampler_ref.py` (`nv_exp`, `nv_logf`) — transcribed from
+  libdevice's `__nv_exp` and `__nv_logf` (NVIDIA Corporation, CUDA Toolkit 13.0) as nvcc 13.0 (V13.0.48,
+  `-arch=sm_120 -lineinfo -O3 -DNDEBUG`) inlined them into basalt's `src/kernels/cuda/sampler.cu`: their constants and
+  their sequences of binary64 and binary32 operations, read from that PTX (`docs/research/basalt-nvcc/sampler.md`
+  sections 2.5-2.6).
 
 ## Test data
 
