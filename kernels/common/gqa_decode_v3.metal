@@ -6,7 +6,8 @@
 // key normed + RoPE'd from the projection and, for the kv head's first row, appended to the caches — writer and
 // reader are the same SIMD-group), scores it (q·k by one simd_sum, bf16(bf16(q·k) · scaling), causal inside the
 // step), and folds it into its running online softmax (m, d, o) with exact FP32 rescaling, p̃ = bf16(exp(s − m))
-// rounded like the reference's P. Cached pairs share their maximum and the rescaling of prior accumulators;
+// rounded like the reference's P. Cached pairs share their maximum and the rescaling of prior accumulators (with
+// EXACT_SUB, a row's pairs run on to the start of its EXACT_SUB-row pass, through keys this pass appends);
 // an unpaired tail and new causal keys are folded individually. The NSG3 partials then meet in threadgroup memory
 // and every SIMD-group folds one
 // slice of D/NSG3 dims (lane ℓ = partial ℓ: one simd_max, one simd_sum per value) and writes it, normalized, rounded
