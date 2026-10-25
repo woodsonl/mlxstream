@@ -574,17 +574,21 @@ def test_v3_is_bit_stable_and_t_active(dev, mma, heads):
     assert np.all(kc[pre + 2:] == 0)
 
 
-@pytest.mark.parametrize("d,heads,kv,qk_norm,gate,sub,position,t", [
-    (32, 8, 2, True, True, 128, 0, 300),           # the synthetic hybrid checkpoint's head (8 SIMD-groups), an empty cache
-    (128, 32, 8, False, False, 64, 200, 250),      # no query or key norms (Llama), 32 SIMD-groups, keys before the pass
-    (256, 24, 4, True, True, 32, 70, 100),         # the 27B's head with the accelerator off (16 SIMD-groups, rep 6)
-], ids=["d32_empty_cache", "d128_no_qk_norm", "d256_rep6"])
-def test_v3_exact_sub_reproduces_shorter_passes(dev, d, heads, kv, qk_norm, gate, sub, position, t):
+@pytest.mark.parametrize("single_block", [False, True])
+@pytest.mark.parametrize("d,heads,kv,qk_norm,gate,sub,position,t,nsg", [
+    (32, 8, 2, True, True, 128, 0, 300, None),        # the synthetic hybrid checkpoint's head (8 SIMD-groups), an empty cache
+    (128, 32, 8, False, False, 64, 232, 250, None),   # no query or key norms (Llama), 32 SIMD-groups, keys before the pass
+    (256, 24, 4, True, True, 32, 90, 100, None),      # the 27B's head with the accelerator off (16 SIMD-groups, rep 6)
+    (64, 32, 8, False, False, 128, 150, 300, None),   # head dim 64 without query or key norms (16 SIMD-groups, 2 dims a lane)
+    (32, 8, 2, True, True, 36, 5, 100, 4),            # 4 SIMD-groups and S not a multiple of 2 · 4
+], ids=["d32_empty_cache", "d128_no_qk_norm", "d256_rep6", "d64_no_qk_norm", "nsg4_odd_sub"])
+def test_v3_exact_sub_reproduces_shorter_passes(dev, d, heads, kv, qk_norm, gate, sub, position, t, nsg, single_block):
     """EXACT_SUB = S on v3: one pass of T rows equals passes of S rows from its start bit for bit (outputs and appended
     caches). v3 pairs the keys before its pass and folds the rest one at a time, so a row's sums depend on where its pass
-    starts; T is not a multiple of S (a short last pass)."""
-    cfg = Cfg(heads, kv, d, d, position + t, t, gate=gate, v3=True, qk_norm=qk_norm)
-    ecfg = Cfg(heads, kv, d, d, position + t, t, gate=gate, v3=True, qk_norm=qk_norm)
+    starts; T is not a multiple of S (a short last pass), and the passes over cached keys start in the second half of a
+    2 · NSG3-key pair window, where a pair loop bound off by one would pair a sub-pass's first key."""
+    cfg = Cfg(heads, kv, d, d, position + t, t, gate=gate, v3=True, nsg3=nsg, qk_norm=qk_norm, single_block=single_block)
+    ecfg = Cfg(heads, kv, d, d, position + t, t, gate=gate, v3=True, nsg3=nsg, qk_norm=qk_norm, single_block=single_block)
     ecfg.exact_sub = sub
     rng = np.random.default_rng(d + position)
     qn, kn = _norms(rng, d)
