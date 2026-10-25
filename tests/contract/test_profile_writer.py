@@ -797,6 +797,28 @@ def test_gemm_bench_judges_each_output_by_its_rule(monkeypatch):
     assert bf16["ok"] is True and strict["ok"] is False and bf16["max_ulp_at_scale"] == strict["max_ulp_at_scale"] == 1.0
 
 
+def test_gemm_bench_refuses_a_geometry_before_allocating(monkeypatch):
+    """GemmBench.run asks gemm_macros for the geometry before it allocates the >= 2 GiB of weight copies, so a refused
+    K-split (the writer's sweep meets dozens per run) costs no allocation."""
+    import tools.profile_writer as pw                                        # puts tools/bench on sys.path
+
+    gemm_bench, allocs = pw.gemm_bench, []
+
+    class Buffer:
+        def __init__(self, dev, arg):
+            allocs.append(arg)
+
+        def __getattr__(self, name):
+            return lambda *a, **kw: None
+
+    monkeypatch.setattr(gemm_bench, "nt", SimpleNamespace(Buffer=Buffer))
+    bench = object.__new__(gemm_bench.GemmBench)
+    bench.dev, bench.info, bench.profile, bench._pipelines = None, SimpleNamespace(gpu_cores=40, name="fake"), None, {}
+    with pytest.raises(kernels.GemmRefused):
+        bench.run("fp8_e4m3", 64, 5120, tm=8, ksplit=16)                     # 20 or 40 K tiles: 16 divides neither
+    assert allocs == []
+
+
 def test_the_tile_row_counts_stay_inside_tile_tms():
     """gemm_tile accepts exactly calibration.TILE_TMS as token rows, and every row count the emitter (gemm_tm) and the
     profile's cost table (tile_rows) ask for is one of them, the same for each T: the writer's --tms guard, the kernel
