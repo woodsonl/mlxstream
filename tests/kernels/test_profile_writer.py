@@ -26,6 +26,7 @@ def test_writer_measures_and_the_profile_loads(tmp_path):
     assert set(m["lane_order_gbps"]) == {"interleaved16", "contiguous"} and set(m["threadgroups_ms"]) == {1, 2}
     assert set(m["shader_ms"]["fp8_e4m3"]) == {1, 2} and set(m["shader_ms"]["nvfp4"]) == {1, 2} and all(v > 0 for v in m["shader_ms"]["nvfp4"].values())
     assert not any("ORACLE FAIL" in l for l in lines), [l for l in lines if "FAIL" in l]
+    assert all(m["attention_ms"][k] for k in ("v1", "v2", "v3")), [l for l in lines if "skipped" in l]   # a failed run only logs
     engine, notes = decide(m, None)
     info = nt.Device().info()
     doc = merge_profile(None, device=device_facts(info, target_gb=21.0), engine=engine, measurements=m, notes=notes, written="2026-09-25", command="test")
