@@ -277,10 +277,10 @@ def main(argv=None) -> int:
     copies, reps = a.copies, a.reps
     if a.quick:
         copies, reps, tms, ctxs = (copies or 4), min(reps, 2), tms[:1], ctxs[:1]
-    compared = [t for t in ts if 2 <= t <= 32]                      # the T the tile is compared at, each against its tile_rows(T) row
+    compared = [t for t in ts if 2 <= t <= max(TILE_TMS)]            # the T the tile is compared at, each against its tile_rows(T) row
     missing = sorted({tile_rows(t) for t in compared} - set(tms))
     if not a.no_accelerator and (not compared or missing):
-        ap.error("the tile is compared at each --ts value from 2 to 32 against its tile row: "
+        ap.error(f"the tile is compared at each --ts value from 2 to {max(TILE_TMS)} against its tile row: "
                  + (f"--tms lacks {', '.join(map(str, missing))} (--quick keeps the first --tms value)" if compared else "--ts has none"))
     info = nt.Device().info()
     name = a.name or profile_name(info.name, info.gpu_cores)

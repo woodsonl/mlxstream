@@ -107,7 +107,7 @@ def accelerator_plan(shader: Mapping[str, Mapping[int, float]], tile: Mapping[st
             continue
         chosen, lost = NEVER, []
         for t in sorted(sh):
-            if t < 2 or t > 32 or tile_rows(t) not in rows:
+            if t < 2 or t > max(TILE_TMS) or tile_rows(t) not in rows:
                 continue                                            # no tile row for this T: not compared
             if rows[tile_rows(t)] <= sh[t] * (1 + NOISE):
                 chosen = t
