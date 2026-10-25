@@ -328,7 +328,8 @@ def test_shipped_kernel_choices_are_valid_geometries(name, tmp_path):
 @pytest.mark.parametrize('name', sorted(n for n, c in load_configs().items() if c.accelerator == 'on'))
 def test_tile_rows_cost_no_more_than_the_shader_passes_they_replace(name):
     # verify_costs prices each T at or above accelerator_min_t at the tile's row; a row above the shader pass it
-    # replaces (the writer's, timed without the K-split) makes the cost rule decline drafts the tile verifies cheaply
+    # replaces makes the cost rule decline drafts the tile verifies cheaply (the 40-core M3 Max's hand-set starts over
+    # the unsplit tile's rows, which the writer wrote before it timed the K-splits, did)
     from monolith.backends.metal.calibration import NOISE
     from monolith.compiler.emit import gemm_tm
     config = load_configs()[name]
@@ -341,9 +342,10 @@ def test_tile_rows_cost_no_more_than_the_shader_passes_they_replace(name):
 
 
 def test_m3_max_40c_keeps_its_hand_set_values():
-    # set by hand from paired A/Bs and the K-split tile's timing (config.json's note); tools/profile_writer.py times the
-    # tile without its K-split and attention at 32 query heads, so a refresh resets them (the October 15 writer run,
-    # 9ce1de5, gives attention v2) and fails here until they are measured again
+    # set by hand from paired A/Bs and the K-split tile's timing (config.json's note); a refresh writes
+    # tools/profile_writer.py's own values over them (FP8's tile from T = 2 in its October 16 and 25 runs, the rows of
+    # its run, and attention timed at 32 query heads, which the October 15 run, 9ce1de5, sets to v2) and fails here
+    # until they are measured again
     config = load_configs()['apple-m3-max-40c']
     assert config.attention == 'auto'
     assert {fmt: config.accelerator_min_t[fmt] for fmt in ('nvfp4', 'fp8', 'bf16')} == {'nvfp4': 2, 'fp8': 4, 'bf16': 2}
