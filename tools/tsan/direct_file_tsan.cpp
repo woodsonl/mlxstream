@@ -25,10 +25,21 @@ namespace {
 
 constexpr int PAGE = 4096, PAGES = 64, ROUNDS = 40, READS = 256;
 
+// `mkstemp` rather than a fixed name: a predictable path under a world-writable `/tmp` is a symlink another
+// local user can pre-create, and `fopen(.., "wb")` would then truncate whatever it points at. `mkstemp` creates
+// the file exclusively and hands back the descriptor, which `fdopen` adopts without ever reopening the name.
 std::string write_fixture() {
-    std::string path = "/tmp/direct_file_tsan.bin";
-    FILE* f = std::fopen(path.c_str(), "wb");
-    if (f == nullptr) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); _exit(2); }
+    char tmpl[] = "/tmp/direct_file_tsan.XXXXXX";
+    const int fd = ::mkstemp(tmpl);
+    if (fd < 0) { std::fprintf(stderr, "cannot create %s\n", tmpl); _exit(2); }
+    std::string path(tmpl);
+    FILE* f = ::fdopen(fd, "wb");
+    if (f == nullptr) {
+        ::close(fd);
+        ::unlink(path.c_str());
+        std::fprintf(stderr, "cannot write %s\n", path.c_str());
+        _exit(2);
+    }
     std::vector<unsigned char> page((size_t) PAGE);
     for (int p = 0; p < PAGES; ++p) {
         for (int i = 0; i < PAGE; ++i) page[(size_t) i] = (unsigned char) ((p * 31 + i) & 0xFF);
