@@ -2,7 +2,7 @@
 the dynamic-T prompt program once, at its chunk bound B, and replays it for every chunk with StepState.t_this_step set
 to the chunk's rows (monolith/generate.py:604); this tier runs the handlers' dispatches (compiler/emit_basalt_prompt.py)
 that way, through Engine, over a synthetic .basalt file (tests/contract/test_basalt_ops.py ``write_file``) and the
-copies pack the hc lane's ``write_pack`` makes of it (monolith/packs/basalt_hc8.py), and checks what the single-kernel
+copies pack ``write_pack`` (monolith/packs/basalt_hc8.py) makes of it, and checks what the single-kernel
 tier (tests/kernels/test_basalt_prompt_gemm.py) cannot see: that the handlers bind what the kernels read, and that a
 program's rows are StepState data (dynamic-T) or its compiled count (static). Each prompt kind joins ``graph``.
 

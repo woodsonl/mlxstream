@@ -303,8 +303,8 @@ def _f16_blocks(g, src, bad, tmp):
 def copy_op(g, name, n, k, rows=T, entry="bf16_w", x_dtype=BF16, q_dtype=DType.U8, s_dtype=F16, s_width=None,
             copy_rows=None, q_format=None, x_rows=None, s_name=None):
     """``basalt_prompt_gemm`` entry ``bf16_w`` (Gemm::bf16_w) of x.<name> [x_rows (default rows), k] BF16 by the int8
-    copy ``name``, its codes ``hc8/<name>/q`` U8 [n, k] and scales ``hc8/<name>/s`` F16 [n, (k / 32 + 7) & ~7] (the hc
-    lane's pack rows, packs/basalt_hc8.py), into y.<name> [rows, n] F32; the other arguments replace one valid part
+    copy ``name``, its codes ``hc8/<name>/q`` U8 [n, k] and scales ``hc8/<name>/s`` F16 [n, (k / 32 + 7) & ~7] (the
+    pack rows packs/basalt_hc8.py writes), into y.<name> [rows, n] F32; the other arguments replace one valid part
     (``q_format``: the codes a weight of that format, U8 as every weight is; ``s_name``: the scales under another
     name). Returns the codes and the scales."""
     copy_rows = n if copy_rows is None else copy_rows

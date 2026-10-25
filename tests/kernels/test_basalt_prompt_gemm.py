@@ -593,7 +593,7 @@ def test_to_bf16_is_the_rounding():
 @functools.lru_cache(maxsize=None)
 def hc8_copies():
     """hc8_parity's three matrices as BF16 bits (tests/basalt_hc_ref.py's hc8_parity_matrices(seed=7)) with their
-    copies (the hc lane's ``quantize``): {name: (w, q, s)} for down, up and inject. Shared by the tests: never
+    copies (packs/basalt_hc8.py's ``quantize``): {name: (w, q, s)} for down, up and inject. Shared by the tests: never
     written."""
     return {name: (w, *quantize(w)) for name, w in zip(("down", "up", "inject"), hc8_parity_matrices(seed=7))}
 
@@ -609,8 +609,8 @@ def host_image(q, s):
 
 
 def special_copy():
-    """GM-DQ8's special copy: the hc lane's ``quantize`` of a 3 x 96 BF16 matrix, three groups a row (srow 8: five
-    padding scales a row; 288 values, so 36 of the image's 256 threads store and 220 return at its bound).
+    """GM-DQ8's special copy: packs/basalt_hc8.py's ``quantize`` of a 3 x 96 BF16 matrix, three groups a row (srow 8:
+    five padding scales a row; 288 values, so 36 of the image's 256 threads store and 220 return at its bound).
     Row 0: all +-0 (the scale 0x0000, codes 0); k 2^-24, k drawn in [-127, 127] with 127, 1 and -1 planted (amax / 127
     = 2^-24: the fp16-subnormal scale 0x0001, codes k, the smallest products +-2^-24); 0.02 N(0, 1) with one 2^24
     (0x4b80: 2^24 / 127 > 65520, so the scale is 0x7c00 and every code 0, hc_fused.cu:1181, :1185).
@@ -638,7 +638,7 @@ def test_hc8_image_bits():
     """GM-DQ8 (hc8_dequant_bf16_kernel, src/kernels/cuda/hc_fused.cu:1229-1244, which hc8_parity calls at
     src/kernels/hc8_parity.cpp:103-105 and Gemm::bf16_w at src/prefill/gemm.cu:150): basalt_hc8_dequant_bf16 bit for
     bit against ``host_image``, into an output of exactly the image's bytes, on the copies of hc8_parity's three
-    matrices (tests/basalt_hc_ref.py, quantized by the hc lane's ``quantize``) whole, on the down copy's rows
+    matrices (tests/basalt_hc_ref.py, quantized by packs/basalt_hc8.py's ``quantize``) whole, on the down copy's rows
     [102, 204) and [306, 320) (a 102-row slice and the 14-row tail of the row slices hc8_parity's 1 Mi-element Gemm
     takes, :214-215), and on ``special_copy`` whole; then on ``special_copy`` with a guard of 2048 values past the
     image (the reach of the threadgroup's 220 idle threads), whose 0xFF bytes must survive. No image value is
