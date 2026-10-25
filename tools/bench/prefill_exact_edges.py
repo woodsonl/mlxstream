@@ -1,10 +1,11 @@
 """Exact prefill at its edges: are large exact prompt chunks bit-identical to 128-row chunks for every prompt length?
 
 Runs the served configuration (serving.setup.prepare + the recipe-selected session) twice per recipe tier — 128-row
-chunks (the reference) and ``--chunk``-row exact chunks — on prompts whose prompt-graph part (prompt - 8 tokens) is
-0, 1, 2 and 127 past a multiple of 128, plus requests split by a prefix-cache checkpoint (unaligned chunk starts,
-a cache hit, one-token chunks made by a boundary). Compares greedy tokens, the bits of the verification graph's
-final logits, and the speculative rounds (accepted / committed per round: the drafter's context).
+exact chunks (the reference, serve's auto-exact without a larger size) and ``--chunk``-row exact chunks — on prompts
+whose prompt-graph part (prompt - 8 tokens) is 0, 1, 2 and 127 past a multiple of 128, plus requests split by a
+prefix-cache checkpoint (unaligned chunk starts, a cache hit, one-token chunks made by a boundary). Compares greedy
+tokens, the bits of the verification graph's final logits, and the speculative rounds (accepted / committed per round:
+the drafter's context).
 
 usage (loads the served model; run nothing else on the GPU meanwhile):
   python tools/bench/prefill_exact_edges.py run --out DIR [--groups 128,cache,4096,8192,16384] [--max-new 32]
@@ -34,7 +35,7 @@ ap.add_argument('--budget-s', type=float, default=1000.0,
                 help='do not start another session after this many seconds (finished halves of earlier runs are kept)')
 a = ap.parse_args()
 if a.chunk <= 128:
-    ap.error('--chunk must exceed 128: the reference half runs 128-row chunks, and exact mode needs larger ones')
+    ap.error('--chunk must exceed 128: the reference half runs 128-row exact chunks, and the exact half the large exact graph')
 OUT = Path(a.out).expanduser()
 
 # prompt-graph tokens (prompt length - 8) per recipe tier: 0, 1, 2 and 127 past a multiple of 128; the first tier
@@ -229,7 +230,7 @@ shared = {}
 
 def session_for(prompt_tokens, exact, cache):
     key, options = assets.options(prompt_tokens)
-    kw = dict(prefill_chunk_size=a.chunk, prefill_exact=True) if exact else dict(prefill_chunk_size=128)
+    kw = dict(prefill_chunk_size=a.chunk if exact else 128, prefill_exact=True)
     if cache:
         kw.update(prefix_cache=True, prefix_cache_min_tokens=128)
     t = time.time()
@@ -238,7 +239,8 @@ def session_for(prompt_tokens, exact, cache):
     if exact and not session.prefill_exact:
         raise SystemExit(f'prefill_exact_edges: --chunk {a.chunk} does not run the exact graph')
     shared.update(device=session.dev, pipeline_cache=session._pipelines)
-    meta['sessions'].append(dict(recipe=key, exact=exact, cache=cache, load_s=round(time.time() - t, 2)))
+    meta['sessions'].append(dict(recipe=key, half='exact' if exact else 'reference', chunk=session.prefill_chunk_size, cache=cache,
+                                 load_s=round(time.time() - t, 2)))
     return key, session
 
 
