@@ -86,7 +86,8 @@ def test_leaf_writer_preserves_layer_fusion_selection():
 
 
 def test_decide_and_merge_produce_a_loadable_profile(tmp_path):
-    engine, notes = decide(_measurements(), {"sibling_order": "alu_first", "max_cb_ms": 16, "lane_order": "contiguous", "attention_rows": 8})
+    engine, notes = decide(_measurements(), {"sibling_order": "alu_first", "max_cb_ms": 16, "lane_order": "contiguous", "attention_rows": 8,
+                                             "accelerator": "on"})   # the switch carries over
     assert engine["attention_rows"] == 8                                                  # not measured: the file's value carries over
     assert decide(_measurements(), {"sibling_order": "alu_first"})[0]["attention_rows"] == 4
     assert engine["family"] == "Apple10" and engine["lane_order"] == "interleaved16" and engine["threadgroups_per_core"] == 1
@@ -112,7 +113,8 @@ def test_decide_and_merge_produce_a_loadable_profile(tmp_path):
     no_tile = dict(_measurements(), tile_ms={}, tile_geometry_ms={}, attention_ms={})
     eng9, notes9 = decide(dict(no_tile, family="Apple9"), None)
     assert eng9["accelerator"] == "off" and eng9["accelerator_min_t"] == {} and eng9["attention"] == "v1" and eng9["sibling_order"] == "either"
-    assert notes9["accelerator"] == "no tile measurement (the tile step was skipped)" and "accelerator_fp8" not in eng9["cost_T"]
+    assert notes9["accelerator"].startswith("no tile measurement (the tile step was skipped); the switch stays off: carried over")
+    assert "accelerator_fp8" not in eng9["cost_T"]
 
 
 class _Bench:                                                               # the shader GEMV harness: 0.5 ms per token row, every check passes
@@ -209,8 +211,8 @@ def test_writer_records_the_autotuners_tile_pick(monkeypatch):
         assert m["tile_ms"] == m["tile_gbps"] == m["tile_mode"] == {} and error in m["tile_error"] and m["tile_refused"] is refused
         engine, notes = decide(m)
         assert m["tile_oracle_fail"] == {"nvfp4": {8: ["crew2", "ksplit2", "ksplit4", "ksplit8"], 32: ["crew"]}} and engine["accelerator_min_t"] == {}
-        assert notes["accelerator"] == (f"no tile rows for any format: one format's unsplit tile refused the measured shape, which ends the tile step: {m['tile_error']}" if refused
-                                        else f"no tile measurement: the tile step ended on an error: {m['tile_error']}")
+        assert notes["accelerator"].startswith((f"no tile rows for any format: one format's unsplit tile refused the measured shape, which ends the tile step: {m['tile_error']}" if refused
+                                                 else f"no tile measurement: the tile step ended on an error: {m['tile_error']}") + "; the switch stays off")
     assert any("TM=16 ksplit2: dispatch failed" in line for line in lines)  # the log names the geometry whose error ended the step
 
 
@@ -241,6 +243,73 @@ def test_writer_prices_the_start_on_the_unsplit_tile(monkeypatch, x2_ms, tgs, st
     engine = decide(m)[0]
     assert engine["threadgroups_per_core"] == tgs and engine["accelerator_min_t"] == {"nvfp4": start}   # crew 2.0 or crew2 1.6 x T1
     assert engine["cost_T"]["accelerator_nvfp4"] == {"8": 1.1}                                          # the pick: ksplit4
+
+
+def test_a_refresh_keeps_the_accelerator_switch():
+    """decide() writes the accelerator switch from the file (off when it has none) whatever the tile rows say: the switch
+    also gates the T = 1 rows GEMVs, MMA attention and the GDN prepared path, which the writer does not time."""
+    lose = dict(_measurements(), tile_ms={"nvfp4": {8: 2.0}}, tile_geometry_ms={"nvfp4": {8: {"crew": 2.0, "crew2": 2.0}}})
+    assert decide(_measurements(), {"accelerator": "off"})[0]["accelerator"] == "off"     # rows that start the tile at 2
+    engine, notes = decide(lose, {"accelerator": "on"})
+    assert engine["accelerator"] == "on" and engine["accelerator_min_t"] == {"nvfp4": NEVER}   # rows that lose at every T
+    assert decide(_measurements())[0]["accelerator"] == "off"                            # no file: off
+    assert all(path in notes["accelerator"] for path in ("rows GEMVs", "MMA kernel", "GDN prepared path", "does not time"))
+
+
+def _held_starts_file(monkeypatch, pw, tmp_path):
+    """A profile for the fake device that holds the tile on and a start for each of four formats, written by main()."""
+    out = tmp_path / "p.json"
+    _fake_device(monkeypatch, pw)
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_oracle_fail={}, oracle_fail=[]))
+    assert pw.main(["--name", "x-20c", "--out", str(out)]) == 0
+    doc = json.loads(out.read_text())
+    doc["engine"].update(accelerator="on", accelerator_min_t={"nvfp4": 2, "fp8": 4, "int4_affine": 8, "bf16": 2})
+    assert Profile.from_dict("x-20c", doc).cost_t["accelerator_fp8"]
+    out.write_text(json.dumps(doc, indent=2) + "\n")
+    return out
+
+
+def test_no_accelerator_refuses_a_file_that_holds_starts(monkeypatch, tmp_path):
+    """--no-accelerator over a file that holds tile starts writes nothing and exits 1: the run prices none of them."""
+    import tools.profile_writer as pw
+
+    out = _held_starts_file(monkeypatch, pw, tmp_path)
+    before = out.read_bytes()
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_ms={}, tile_geometry_ms={}, tile_oracle_fail={}, oracle_fail=[]))
+    assert pw.main(["--no-accelerator", "--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
+
+
+def test_a_subset_refresh_refuses_a_file_that_holds_other_starts(monkeypatch, tmp_path, capsys):
+    """A --formats subset over a file that holds the other formats' starts writes nothing and exits 1, naming them;
+    --dry-run still measures and prints."""
+    import tools.profile_writer as pw
+
+    out = _held_starts_file(monkeypatch, pw, tmp_path)
+    before = out.read_bytes()
+    full = _measurements()
+    m = dict(full, **{key: {"fp8_e4m3": full[key]["fp8_e4m3"]} for key in ("shader_ms", "tile_ms", "tile_geometry_ms")},
+             tile_oracle_fail={}, oracle_fail=[])
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(m))
+    args = ["--formats", "fp8_e4m3", "--name", "x-20c", "--out", str(out)]
+    capsys.readouterr()
+    assert pw.main(args) == 1 and out.read_bytes() == before
+    assert "no tile rows for bf16, int4_affine, nvfp4" in capsys.readouterr().out
+    assert pw.main(args + ["--dry-run"]) == 0 and out.read_bytes() == before
+
+
+def test_a_refusal_refuses_a_file_that_holds_starts(monkeypatch, tmp_path):
+    """One format's unsplit refusal clears every format's rows: over a file that holds starts the writer writes nothing
+    and exits 1; over a new file it writes the profile with the accelerator off, as before."""
+    import tools.profile_writer as pw
+
+    out = _held_starts_file(monkeypatch, pw, tmp_path)
+    before = out.read_bytes()
+    m = dict(_measurements(), tile_ms={}, tile_geometry_ms={}, tile_oracle_fail={}, oracle_fail=[],
+             tile_error="nvfp4 TM=8 crew: gemm_tile: K must be a multiple of 1024 and of 128 for nvfp4 (K=2560)", tile_refused=True)
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(m))
+    assert pw.main(["--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
+    new = tmp_path / "new.json"
+    assert pw.main(["--name", "x-20c", "--out", str(new)]) == 0 and Profile.from_dict("x-20c", json.loads(new.read_text())).accelerator == "off"
 
 
 def test_writer_tile_pick_crew2_unscaled_and_duplicate_formats(monkeypatch):
@@ -278,7 +347,7 @@ def test_writer_tile_pick_crew2_unscaled_and_duplicate_formats(monkeypatch):
     assert {f for f, md, *_ in tried if md.endswith("nc")} == {"nvfp4", "int4_affine"}   # only block-scaled formats get cacheless twins
     # the measured lane order everywhere; the timed runs take the caller's copies and reps and BF16 output, the checks one copy, one rep, 32 bits
     assert {r[2:] for r in tried} == {("contiguous", 4, 2, True), ("contiguous", 1, 1, False)}
-    engine = decide(m)[0]
+    engine = decide(m, {"accelerator": "on"})[0]
     assert engine["accelerator"] == "on" and engine["accelerator_min_t"] == {"fp8": 2, "nvfp4": 2, "int4_affine": 2}
     assert engine["cost_T"]["accelerator_fp8"] == pytest.approx({"8": 1.8}) and engine["cost_T"]["accelerator_nvfp4"] == pytest.approx({"8": 2.0})
     assert engine["cost_T"]["accelerator_int4_affine"] == pytest.approx({"8": 2.0})                    # crew's row: ksplit2 failed
@@ -308,7 +377,7 @@ def test_writer_writes_no_profile_on_a_kernel_failure(monkeypatch, tmp_path, cap
     assert pw.main(args) == 0 and Profile.from_dict("x-20c", json.loads(out.read_text())).accelerator == "off"
     del m["tile_error"], m["tile_refused"]
     m["tile_ms"], m["tile_geometry_ms"] = _measurements()["tile_ms"], _measurements()["tile_geometry_ms"]
-    assert pw.main(args) == 0 and Profile.from_dict("x-20c", json.loads(out.read_text())).accelerator == "on"
+    assert pw.main(args) == 0 and Profile.from_dict("x-20c", json.loads(out.read_text())).accelerator == "off"   # the switch carries over
 
 
 def test_writer_records_shader_and_probe_oracle_failures(monkeypatch):
@@ -666,7 +735,7 @@ def test_a_crew_refusal_names_its_format_and_tm(monkeypatch):
     monkeypatch.setattr(pw.gemm_bench, "GemmBench", GemmBench)
     m = pw.measure(formats=["nvfp4"], ts=[1, 2], tms=[16], attention=None, log=lambda s: None)
     assert m["tile_refused"] is True and m["tile_error"] == "nvfp4 TM=16 crew: gemm_tile: R=8 must divide the 16-row tile"
-    assert decide(m)[1]["accelerator"].endswith("nvfp4 TM=16 crew: gemm_tile: R=8 must divide the 16-row tile")
+    assert "which ends the tile step: nvfp4 TM=16 crew: gemm_tile: R=8 must divide the 16-row tile; the switch stays" in decide(m)[1]["accelerator"]
 
 
 @pytest.mark.parametrize("tm,mode,bf16,error,hint", [(8, "crew", True, "MSL compile failed: no tensor ops", True),

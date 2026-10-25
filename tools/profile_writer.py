@@ -9,13 +9,17 @@
   check (one or two threadgroups per core, the K-splits ``TILE_KSPLITS`` and their cacheless twins; recorded as
   ``tile_mode``; a geometry that fails the oracle is recorded under ``tile_oracle_fail``), each timed with BF16 output
   as the engine compiles the tile and checked once more with 32-bit output under the strict rule; every geometry that
-  passes is recorded under ``tile_geometry_ms``, and from the shader's rows and the unsplit tile's the accelerator switch
-  and ``accelerator_min_t`` per format (the smallest T the tile takes); every run after the probes takes the lane order
-  and scale placement the profile will hold,
+  passes is recorded under ``tile_geometry_ms``, and from the shader's rows and the unsplit tile's ``accelerator_min_t``
+  per format (the smallest T the tile takes); every run after the probes takes the lane order and scale placement the
+  profile will hold,
 * the attention kernel (v1, v2 and v3 over context lengths and T).
 
 A kernel that fails the oracle (a tile or shader GEMV geometry, or a T = 1 probe) or a tile-step error other than a
-refusal stops the writer: it lists each and writes no profile (exit 1). A chip without tensor ops runs ``--no-accelerator``.
+refusal stops the writer: it lists each and writes no profile (exit 1). So does a run that would write and leaves
+unpriced a format whose start the existing file holds (a ``--formats`` subset, ``--no-accelerator``, or a shape one
+format's unsplit tile refuses). The accelerator switch carries over from the file (off in a new one): it also gates paths
+the writer does not time, and changes only by a hand edit backed by an end-to-end A/B. A chip without tensor ops runs
+``--no-accelerator``.
 
 ``accelerator_min_t`` prices the unsplit tile at the profile's ``threadgroups_per_core`` (crew at one per core, crew2 at
 two), the tile serve runs wherever the configuration's kernel choices list no geometry, against the shader's best
@@ -54,7 +58,7 @@ import gqa_bench  # noqa: E402
 
 from monolith.backends.metal import ChipConfig as Profile, config_path, config_for_device, get_backend  # noqa: E402
 from monolith.backends.metal.calibration import (COST_TS, NOISE, TILE_KSPLITS, TILE_TMS, choose_lane_order,  # noqa: E402
-                                                 choose_scale_placement, decide, merge_profile, profile_name, tile_rows)
+                                                 choose_scale_placement, cost_key, decide, merge_profile, profile_name, tile_rows)
 from monolith.bench import RANDOM_FORMATS  # noqa: E402
 from monolith.formats import FORMATS  # noqa: E402
 from monolith.kernels import GemmRefused  # noqa: E402
@@ -263,8 +267,8 @@ def main(argv=None) -> int:
     ap.add_argument("--attention", default=",".join(str(x) for x in DEFAULT_ATTENTION), help="heads,kv,head_dim or 'none'")
     ap.add_argument("--ctx", default="1024,4096", type=int_list)
     ap.add_argument("--attn-ts", default="1,4", type=int_list)
-    ap.add_argument("--no-accelerator", action="store_true", help="skip the tile: the profile's accelerator is off, and so is every engine "
-                    "path gated on it (the T = 1 rows GEMVs and MMA attention among them)")
+    ap.add_argument("--no-accelerator", action="store_true", help="skip the tile, for a chip without tensor ops: a file that holds tile "
+                    "starts is refused, and the accelerator switch carries over (off in a new file)")
     ap.add_argument("--quick", action="store_true", help="a short run: 4 packs per point, 2 reps, the first --tms value only, one context")
     ap.add_argument("--nominal-gbps", type=float, help="the chip's spec bandwidth (kept from an existing profile; else a measured stand-in)")
     ap.add_argument("--target-gb", type=float, default=21.0, help="the target model's resident weight bytes for hosts_target_model")
@@ -312,6 +316,11 @@ def main(argv=None) -> int:
     problems = [f"fails the oracle: {f}" for f in fails + m["oracle_fail"]]
     if "tile_error" in m and not m["tile_refused"]:
         problems.append(f"the tile step failed: {m['tile_error']}")
+    held = (existing or {}).get("engine", {}).get("accelerator_min_t", {})
+    unpriced = sorted(set(held) - {cost_key(f) for f, rows in m["tile_ms"].items() if rows})
+    if unpriced and not a.dry_run:                                  # the file's other starts would not match this run's lane order or units
+        problems.append(f"no tile rows for {', '.join(unpriced)}, whose start {src} holds (a --formats subset, --no-accelerator "
+                        "or a shape one format's tile refuses): refresh every format with the tile, or measure with --dry-run")
     if problems:                                                    # a wrong or failing kernel: no profile until it is fixed
         print("\nno profile written:", *(f"  {p}" for p in problems), sep="\n")
         return 1
