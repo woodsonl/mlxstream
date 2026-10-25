@@ -20,8 +20,9 @@ The tile rows price the autotuner's pick. An autotuning session dispatches it, a
 configuration's kernel choices list; serve runs every other shape on the unsplit tile (the crew). A refresh that moves
 ``accelerator_min_t`` for a format those choices do not cover needs a serve A/B before it ships. The writer and the
 autotuner time crew and crew2 at one and two threadgroups per core; compiler.emit dispatches them at the
-configuration's ``threadgroups_per_core`` times that, so on a chip with two per core a crew or crew2 row prices a
-geometry the engine does not run.
+configuration's ``threadgroups_per_core`` times that, so on a chip with two per core a crew or crew2 pick runs at twice
+the threadgroups its row was timed at, and the writer's crew2 times the engine's crew, the unsplit tile serve runs on the
+shapes the kernel choices do not list, which the writer does not record.
 
 Everything else in a profile is the probes' record (``./probes/run_all.sh``): ``sibling_order`` (p11) and
 ``max_cb_ms`` (p6/p6b) carry over from the existing file, or take the safe defaults on a new chip. Min-of-N over
