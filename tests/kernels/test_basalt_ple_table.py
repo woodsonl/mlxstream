@@ -223,3 +223,28 @@ def test_c3_the_binding_refuses_wrong_lengths():
         _nt.basalt_ple_rows_to_embd(rows, np.zeros(N_EMBD - 1, np.float32))
     with pytest.raises(ValueError, match="90 bytes"):
         _nt.basalt_iq4nl_dequant_row(rows[:89], np.zeros(HEAD_DIM, np.float32))
+
+
+def test_c4_the_input_may_not_be_a_view_of_the_output():
+    """Both of these read bytes and write floats, so the input that aliases is a uint8 view of the float32
+    output array: contiguous, the right dtype and exactly the right length, so every other check in the
+    binding passes it. The first float written then lands on the first four bytes read, which for a row is its
+    leading block's scale, and the answer is finite and wrong rather than a crash. The same hazard the n-gram
+    hash carries on `tokens`, and refused the same way; checked here on both so the pair cannot drift."""
+    out = np.zeros(HEAD_DIM, np.float32)
+    with pytest.raises(ValueError, match="row and out must not share storage"):
+        _nt.basalt_iq4nl_dequant_row(out.view(np.uint8)[:ROW_BYTES], out)
+
+    embd = np.zeros(N_EMBD, np.float32)
+    with pytest.raises(ValueError, match="rows16 and out must not share storage"):
+        _nt.basalt_ple_rows_to_embd(embd.view(np.uint8)[: N_HEADS * ROW_BYTES], embd)
+
+    # Disjoint is allowed, so the refusal is about the ranges and not about uint8 views of float buffers.
+    rng = np.random.default_rng(4)
+    buf = np.zeros(N_EMBD + ROW_BYTES // 4 + 1, np.float32)
+    far = buf[N_EMBD:].view(np.uint8)[:ROW_BYTES]
+    assert np.shares_memory(far, buf) and not np.shares_memory(far, buf[:HEAD_DIM]), \
+        "the disjoint view is not what this case meant to build: one buffer, no overlap with out"
+    far[:] = finite_rows(rng, 1).reshape(-1)
+    _nt.basalt_iq4nl_dequant_row(far, buf[:HEAD_DIM])
+    assert buf[:HEAD_DIM].any(), "the allowed call wrote nothing, so it proves nothing"

@@ -138,6 +138,16 @@ static void no_partial_overlap(const float* in, const float* out, size_t n, cons
   need(in == out || in + n <= out || out + n <= in, what);
 }
 
+// The same hazard where the two arrays hold different types, which is where it is easiest to write by accident:
+// a uint8 view of a float32 output array is contiguous and the right dtype, so every other check in a binding
+// passes it, and the write then lands under the read. Compared in bytes, and exact aliasing is refused too,
+// because none of these ops is in-place.
+static void no_shared_storage(const void* a, size_t a_bytes, const void* b, size_t b_bytes, const char* what) {
+  const auto* p = (const unsigned char*) a;
+  const auto* q = (const unsigned char*) b;
+  need(p + a_bytes <= q || q + b_bytes <= p, what);
+}
+
 NB_MODULE(_native, m) {
   m.doc() = "Metal runtime core (v0): device, buffers, runtime-compiled libraries, pipelines, timed dispatches";
 
@@ -487,13 +497,11 @@ NB_MODULE(_native, m) {
           // a contiguous int32 view of the uint32 out array passes every other check here, and the 16 words
           // written for token 0 sit exactly where tokens 1 through 15 are read from. The same storage check the
           // expert bindings make, against each input in turn.
-          const auto* tp = (const unsigned char*) tokens.data();
-          const auto* pp = (const unsigned char*) prev.data();
-          const auto* op = (const unsigned char*) out.data();
-          const size_t tb = n * sizeof(int32_t), pb = n * (bc::NGRAM_SIZE - 1) * sizeof(int32_t),
-                       ob = n * bc::PLE_N_HEADS * sizeof(uint32_t);
-          need(tp + tb <= op || op + ob <= tp, "basalt_ngram_rows: tokens and out must not share storage");
-          need(pp + pb <= op || op + ob <= pp, "basalt_ngram_rows: prev and out must not share storage");
+          const size_t ob = n * bc::PLE_N_HEADS * sizeof(uint32_t);
+          no_shared_storage(tokens.data(), n * sizeof(int32_t), out.data(), ob,
+                            "basalt_ngram_rows: tokens and out must not share storage");
+          no_shared_storage(prev.data(), n * (bc::NGRAM_SIZE - 1) * sizeof(int32_t), out.data(), ob,
+                            "basalt_ngram_rows: prev and out must not share storage");
           bc::PleConsts c;
           {
             nb::gil_scoped_release unlock;
@@ -527,6 +535,9 @@ NB_MODULE(_native, m) {
   m.def("basalt_iq4nl_dequant_row", [](U8In1 row, F32Out1 out) {
           need(row.shape(0) == (size_t) bc::PLE_ROW_BYTES, "basalt_iq4nl_dequant_row: a row is 90 bytes");
           need(out.shape(0) == (size_t) bc::PLE_HEAD_DIM, "basalt_iq4nl_dequant_row: out holds 160 floats");
+          no_shared_storage(row.data(), (size_t) bc::PLE_ROW_BYTES, out.data(),
+                            (size_t) bc::PLE_HEAD_DIM * sizeof(float),
+                            "basalt_iq4nl_dequant_row: row and out must not share storage");
           nb::gil_scoped_release unlock;
           bc::iq4nl_dequant_row(row.data(), out.data());
         }, nb::arg("row").noconvert(), nb::arg("out").noconvert(), "one 90-byte IQ4_NL row to 160 floats");
@@ -535,6 +546,9 @@ NB_MODULE(_native, m) {
           need(rows16.shape(0) == (size_t) (bc::PLE_N_HEADS * bc::PLE_ROW_BYTES),
                "basalt_ple_rows_to_embd: rows16 must be 16 rows of 90 bytes");
           need(out.shape(0) == (size_t) bc::NG_N_EMBD, "basalt_ple_rows_to_embd: out holds 2560 floats");
+          no_shared_storage(rows16.data(), (size_t) (bc::PLE_N_HEADS * bc::PLE_ROW_BYTES), out.data(),
+                            (size_t) bc::NG_N_EMBD * sizeof(float),
+                            "basalt_ple_rows_to_embd: rows16 and out must not share storage");
           nb::gil_scoped_release unlock;
           bc::ple_rows_to_embd(rows16.data(), out.data());
         }, nb::arg("rows16").noconvert(), nb::arg("out").noconvert(),
