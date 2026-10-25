@@ -113,6 +113,31 @@ def test_large_prefill_shares_state_with_small_decode(tmp_path, draft_kind, acce
             _agree(reference, project_changed, reused.tokens, reference.generate(project_changed, 12).tokens, ties)
 
 
+@pytest.mark.parametrize('accelerator', ['off', 'on'])
+@pytest.mark.parametrize('attention', ['v1', 'auto'])
+def test_exact_prompt_passes_give_the_scores_of_128_row_passes(tmp_path, attention, accelerator):
+    # 512-row exact passes against 128-row passes, the last prompt row's scores bit for bit; the synthetic checkpoint's
+    # head dim is 32, so auto runs v3 in both programs, with the projections on the tile when the accelerator is on
+    _checkpoint(tmp_path)
+    pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
+               PackLayout(rows=16))
+
+    def session(**options):
+        return Session(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path / 'pack'), eos=-1,
+                       autotune=False, attention=attention, accelerator=accelerator, **options)
+    reference, exact = session(prefill_chunk_size=128), session(prefill_chunk_size=512, prefill_exact=True)
+    for count in (260, 300, 400, 700):                     # 700: a second 512-row pass, from position 512
+        ids = np.random.default_rng(count).integers(0, 50, count).tolist()
+        tokens = reference.generate(ids, 12).tokens
+        assert exact.generate(ids, 12).tokens == tokens, count
+        rows = [score_row(s, ids, 0) for s in (reference, exact)]
+        assert exact._last_engine is exact.engines['prefill.512']
+        assert rows[0][tokens[0]] == rows[0].max()
+        assert np.array_equal(rows[1].view(np.uint32), rows[0].view(np.uint32)), (count, int((rows[1] != rows[0]).sum()))
+    core = 'gqa_decode_v3' if attention == 'auto' else 'gqa_decode'
+    assert [k.macros.get('EXACT_SUB') for k in exact.engines['prefill.512'].program.kernels.values() if k.function == core] == ['128u']
+
+
 def test_tie_rows_hold_the_scores_the_reference_chose_by(tmp_path):
     # greedy_ties.score_row, the scores agree reads: the prompt pass's row for token 0 and the decode step's row 0 for a
     # later token, with the steps queued past the last leaving that row alone
