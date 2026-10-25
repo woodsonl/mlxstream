@@ -255,9 +255,9 @@ def main(argv=None) -> int:
     ap.add_argument("--attention", default=",".join(str(x) for x in DEFAULT_ATTENTION), help="heads,kv,head_dim or 'none'")
     ap.add_argument("--ctx", default="1024,4096", type=int_list)
     ap.add_argument("--attn-ts", default="1,4", type=int_list)
-    ap.add_argument("--no-accelerator", action="store_true", help="skip the tile: the profile's accelerator is off, which also turns off the "
-                    "T = 1 rows GEMVs, MMA attention, the GDN mixer's prepared path and the M5 Max direct-cache attention")
-    ap.add_argument("--quick", action="store_true", help="~1 minute: 4 packs per point, 2 reps, the first --tms value only, one context")
+    ap.add_argument("--no-accelerator", action="store_true", help="skip the tile: the profile's accelerator is off, and so is every engine "
+                    "path gated on it (the T = 1 rows GEMVs and MMA attention among them)")
+    ap.add_argument("--quick", action="store_true", help="a short run: 4 packs per point, 2 reps, the first --tms value only, one context")
     ap.add_argument("--nominal-gbps", type=float, help="the chip's spec bandwidth (kept from an existing profile; else a measured stand-in)")
     ap.add_argument("--target-gb", type=float, default=21.0, help="the target model's resident weight bytes for hosts_target_model")
     ap.add_argument("--name", help="the profile name (default <chip>-<cores>c)")
