@@ -18,6 +18,10 @@
 #include <tuple>
 #include "basalt_cpu.h"
 #include "basalt_cpu_experts.h"
+#include "basalt_ngram.h"
+#include "basalt_ple_table.h"
+#include "basalt_row_cache.h"
+#include "basalt_direct_file.h"
 #include "basalt_pool.h"
 #include "basalt_cpu_expf.h"
 #include "metal_core.h"
@@ -119,6 +123,8 @@ using U8In2 = nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::
 using I32In1 = nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using I32In2 = nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using F32Out3 = nb::ndarray<float, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
+using U32Out2 = nb::ndarray<uint32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+using U8Out1 = nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
 static void need(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(what);
@@ -130,6 +136,16 @@ static void need(bool ok, const char* what) {
 // quietly give a different answer than the docstring states where the caller meant the arrays to be distinct.
 static void no_partial_overlap(const float* in, const float* out, size_t n, const char* what) {
   need(in == out || in + n <= out || out + n <= in, what);
+}
+
+// The same hazard where the two arrays hold different types, which is where it is easiest to write by accident:
+// a uint8 view of a float32 output array is contiguous and the right dtype, so every other check in a binding
+// passes it, and the write then lands under the read. Compared in bytes, and exact aliasing is refused too,
+// because none of these ops is in-place.
+static void no_shared_storage(const void* a, size_t a_bytes, const void* b, size_t b_bytes, const char* what) {
+  const auto* p = (const unsigned char*) a;
+  const auto* q = (const unsigned char*) b;
+  need(p + a_bytes <= q || q + b_bytes <= p, what);
 }
 
 NB_MODULE(_native, m) {
@@ -463,6 +479,249 @@ NB_MODULE(_native, m) {
              }
              return nb::make_tuple(ok, err);
            }, nb::arg("hold_s"), "run one job that sleeps hold_s seconds, so a wait can be made to stall");
+
+  // ---- the PLE n-gram hash (basalt_ngram.h) ---------------------------------------------------------------
+  // Sixteen row indices per token. Host-side by construction, so this is the whole kernel: the GPU only gathers
+  // the rows it names. The bounds divide rather than multiply, as the other array bindings here do.
+  m.def("basalt_ngram_rows", [](I32In1 tokens, I32In2 prev, U32Out2 out) {
+          const size_t n = tokens.shape(0);
+          need(prev.shape(0) == n && out.shape(0) == n,
+               "basalt_ngram_rows: tokens, prev and out must have one row per token");
+          need(prev.shape(1) == (size_t) (bc::NGRAM_SIZE - 1), "basalt_ngram_rows: prev rows hold 2 predecessors");
+          need(out.shape(1) == (size_t) bc::PLE_N_HEADS, "basalt_ngram_rows: out rows hold 16 head indices");
+          // A decode window is tens of tokens; this bound exists so the row count cannot approach the
+          // arithmetic's limits, not because a larger batch is meaningful.
+          need(n <= (size_t) (1 << 20), "basalt_ngram_rows: at most 1,048,576 tokens");
+          // Separate arrays, not views of one: out is written while BOTH inputs are read, and a view of out's
+          // own storage would let the write land under the read. tokens aliases just as easily as prev, because
+          // a contiguous int32 view of the uint32 out array passes every other check here, and the 16 words
+          // written for token 0 sit exactly where tokens 1 through 15 are read from. The same storage check the
+          // expert bindings make, against each input in turn.
+          const size_t ob = n * bc::PLE_N_HEADS * sizeof(uint32_t);
+          no_shared_storage(tokens.data(), n * sizeof(int32_t), out.data(), ob,
+                            "basalt_ngram_rows: tokens and out must not share storage");
+          no_shared_storage(prev.data(), n * (bc::NGRAM_SIZE - 1) * sizeof(int32_t), out.data(), ob,
+                            "basalt_ngram_rows: prev and out must not share storage");
+          bc::PleConsts c;
+          {
+            nb::gil_scoped_release unlock;
+            bc::ngram_rows(tokens.data(), prev.data(), (int) n, c, out.data());
+          }
+        }, nb::arg("tokens").noconvert(), nb::arg("prev").noconvert(), nb::arg("out").noconvert(),
+        "sixteen PLE table row indices per token, from the token and its two predecessors (oldest first)");
+
+  // The hash constants, so a test can check the offsets are the running sum of the vocabulary sizes. basalt keeps
+  // both arrays in the GGUF metadata and writes both out rather than deriving one, so that a mismatch between
+  // them surfaces instead of hiding; this exposes them for exactly that check.
+  m.def("basalt_ngram_consts", []() {
+          bc::PleConsts c;
+          std::vector<uint64_t> mult(c.mult, c.mult + bc::NGRAM_SIZE);
+          std::vector<uint64_t> vocab(c.vocab, c.vocab + bc::PLE_N_HEADS);
+          std::vector<uint64_t> offset(c.offset, c.offset + bc::PLE_N_HEADS);
+          return nb::make_tuple(mult, vocab, offset);
+        }, "the n-gram hash constants as (mult, vocab, offset)");
+
+  // ---- the PLE table decode (basalt_ple_table.h) ----------------------------------------------------------
+  // Every one of the 65,536 fp16 bit patterns widened exactly, so a test can hold the whole domain at once
+  // rather than sampling it. Subnormals are the half that matters: a hardware convert with FZ16 set flushes
+  // them, and 0x0001 would come back 0.0 instead of 2^-24.
+  m.def("basalt_f16_widen_all", [](F32Out1 out) {
+          need(out.shape(0) == 65536, "basalt_f16_widen_all: out must hold 65536 floats");
+          float* o = out.data();
+          nb::gil_scoped_release unlock;
+          for (uint32_t h = 0; h < 65536u; ++h) o[h] = bc::f32_from_f16((uint16_t) h);
+        }, nb::arg("out").noconvert(), "widen every fp16 bit pattern to f32, in bit-pattern order");
+
+  m.def("basalt_iq4nl_dequant_row", [](U8In1 row, F32Out1 out) {
+          need(row.shape(0) == (size_t) bc::PLE_ROW_BYTES, "basalt_iq4nl_dequant_row: a row is 90 bytes");
+          need(out.shape(0) == (size_t) bc::PLE_HEAD_DIM, "basalt_iq4nl_dequant_row: out holds 160 floats");
+          no_shared_storage(row.data(), (size_t) bc::PLE_ROW_BYTES, out.data(),
+                            (size_t) bc::PLE_HEAD_DIM * sizeof(float),
+                            "basalt_iq4nl_dequant_row: row and out must not share storage");
+          nb::gil_scoped_release unlock;
+          bc::iq4nl_dequant_row(row.data(), out.data());
+        }, nb::arg("row").noconvert(), nb::arg("out").noconvert(), "one 90-byte IQ4_NL row to 160 floats");
+
+  m.def("basalt_ple_rows_to_embd", [](U8In1 rows16, F32Out1 out) {
+          need(rows16.shape(0) == (size_t) (bc::PLE_N_HEADS * bc::PLE_ROW_BYTES),
+               "basalt_ple_rows_to_embd: rows16 must be 16 rows of 90 bytes");
+          need(out.shape(0) == (size_t) bc::NG_N_EMBD, "basalt_ple_rows_to_embd: out holds 2560 floats");
+          no_shared_storage(rows16.data(), (size_t) (bc::PLE_N_HEADS * bc::PLE_ROW_BYTES), out.data(),
+                            (size_t) bc::NG_N_EMBD * sizeof(float),
+                            "basalt_ple_rows_to_embd: rows16 and out must not share storage");
+          nb::gil_scoped_release unlock;
+          bc::ple_rows_to_embd(rows16.data(), out.data());
+        }, nb::arg("rows16").noconvert(), nb::arg("out").noconvert(),
+        "sixteen decoded rows flattened head-slowest into one 2560-wide embedding");
+
+  m.def("basalt_iq4nl_codebook", []() {
+          return std::vector<int>(bc::kIq4Nl, bc::kIq4Nl + 16);
+        }, "IQ4_NL's codebook at the ported commit");
+
+  // ---- the PLE row cache (basalt_row_cache.h) ------------------------------------------------------------
+  // Bound as a class because its behaviour IS its state: the structural properties worth testing (round robin
+  // rather than least-recently-used, the modulo set index, the fill counter) are only visible across a sequence
+  // of inserts and lookups.
+  nb::class_<bc::RowCache>(m, "RowCache")
+      .def("__init__", [](bc::RowCache* self, uint64_t rows, uint32_t row_bytes) {
+             need(row_bytes >= 1 && row_bytes <= 4096, "RowCache: row_bytes must be 1 to 4096");
+             need(rows <= (uint64_t) 1 << 24, "RowCache: rows must be at most 16,777,216");
+             new (self) bc::RowCache();
+             self->init(rows, row_bytes);
+           }, nb::arg("rows"), nb::arg("row_bytes"))
+      .def_prop_ro("capacity", &bc::RowCache::capacity)
+      .def_prop_ro("size", &bc::RowCache::size)
+      .def_prop_ro("sets", &bc::RowCache::sets)
+      .def_static("mix", &bc::RowCache::mix, nb::arg("row"))
+      .def("set_of", &bc::RowCache::set_of, nb::arg("row"))
+      .def("insert", [](bc::RowCache& c, uint32_t row, U8In1 bytes) {
+             // insert copies row_bytes from this pointer, so a shorter array would be read past its end.
+             need(bytes.shape(0) == (size_t) c.row_bytes(), "RowCache.insert: bytes must be row_bytes long");
+             c.insert(row, bytes.data());
+           }, nb::arg("row"), nb::arg("bytes").noconvert())
+      .def("get", [](bc::RowCache& c, uint32_t row, U8Out1 out) {
+             // A slot holds exactly row_bytes, so a longer `out` would read past it, and past the whole data
+             // array on the last slot.
+             need(out.shape(0) == (size_t) c.row_bytes(), "RowCache.get: out must be row_bytes long");
+             const uint8_t* p = c.find(row);
+             if (p == nullptr) return false;
+             std::memcpy(out.data(), p, out.shape(0));
+             return true;
+           }, nb::arg("row"), nb::arg("out").noconvert(),
+           "copy the row's bytes into out and return true, or return false when the row is absent");
+
+  // ---- the unbuffered reader (basalt_direct_file.h) -------------------------------------------------------
+  // Bound so a test can hold the properties that matter and that no amount of reading the code establishes: the
+  // alignment refusal, the short read at the end of the file, and that completions are keyed by tag rather than
+  // ordered by submission.
+  nb::class_<bc::DirectFile>(m, "DirectFile")
+      .def(nb::init<>())
+      // Both take the drive lock, for the same reason the reads do. `close` sets `stop_`, joins every worker,
+      // and THEN clears `done_`, so a close landing while a driver waits wipes the completion that driver is
+      // blocked on and leaves no worker to post another: `wait` with a negative timeout then never returns.
+      // `open` calls `close` first, so it carries the same hazard. The GIL is released before the lock is
+      // taken, never after: a driver holds the lock while it waits, and needs the GIL back to return.
+      .def("open", [](bc::DirectFile& f, const std::string& path, int threads) {
+             std::string err;
+             nb::gil_scoped_release unlock;
+             std::lock_guard<std::mutex> drive(f.drive_mutex());
+             if (!f.open(path, err, threads)) throw std::invalid_argument(err);
+           }, nb::arg("path"), nb::arg("threads") = bc::DIRECT_IO_THREADS)
+      .def("close", [](bc::DirectFile& f) {
+             nb::gil_scoped_release unlock;
+             std::lock_guard<std::mutex> drive(f.drive_mutex());
+             f.close();
+           })
+      // Under the drive lock as well. `close` writes `size_`, `fd_` and `pool_` outside the class's own short
+      // `mu_`, so an unsynchronised read of any of them beside a close is a data race: undefined, whatever an
+      // aligned word load happens to do on this chip. The cost is that a property read waits out a read round,
+      // which is the serialisation the reads themselves already accept, and nothing reads these in a hot path.
+      .def_prop_ro("size", [](bc::DirectFile& f) {
+             nb::gil_scoped_release unlock;
+             std::lock_guard<std::mutex> drive(f.drive_mutex());
+             return f.size();
+           })
+      .def_prop_ro("threads", [](bc::DirectFile& f) {
+             nb::gil_scoped_release unlock;
+             std::lock_guard<std::mutex> drive(f.drive_mutex());
+             return f.threads();
+           })
+      .def_prop_ro("is_open", [](bc::DirectFile& f) {
+             nb::gil_scoped_release unlock;
+             std::lock_guard<std::mutex> drive(f.drive_mutex());
+             return f.is_open();
+           })
+      // Reads `length` bytes at `offset` into a fresh aligned buffer and returns them, so the Python side never
+      // has to produce a 4096-aligned array of its own. One read per call, waited on here.
+      .def("read_at", [](bc::DirectFile& f, uint64_t offset, uint32_t length, uint64_t tag) {
+             need(length > 0 && length % bc::DIRECT_ALIGNMENT == 0,
+                  "read_at: length must be a nonzero multiple of 4096");
+             // The wake tag is the reader's own. A read submitted under it matches the completion `wake` posts,
+             // so the wait returns before the read has run and the buffer is freed while a pool thread is still
+             // writing into it: a write to freed memory, reachable from one thread with a wake already queued.
+             need(tag != bc::DIRECT_WAKE_TAG, "read_at: tag 0xFFFFFFFFFFFFFFFF is the wake tag, not a read's");
+             std::vector<uint8_t> bytes;
+             uint32_t got = 0;
+             bool ok = false;
+             {
+               nb::gil_scoped_release unlock;
+               // Held across the whole submit-and-collect cycle: the completion queue is shared, so a second
+               // driver would take this read's completion and then wait forever for one already consumed.
+               std::lock_guard<std::mutex> drive(f.drive_mutex());
+               void* buf = bc::DirectFile::alloc_aligned(length);
+               if (buf == nullptr) throw std::bad_alloc();
+               std::string err;
+               if (!f.submit(offset, buf, length, tag, err)) {
+                 bc::DirectFile::free_aligned(buf);     // nothing was queued, so nothing can still write to it
+                 throw std::invalid_argument(err);
+               }
+               // Keyed by tag, never by arrival: a wake posted earlier, or any other completion still
+               // queued, arrives first and is not this read. Taking the front completion is the exact mistake
+               // this class's contract warns about.
+               bc::Completion c{};
+               for (bool mine = false; !mine;) {
+                 bc::Completion batch[64];
+                 const int n = f.wait(batch, 64, -1);
+                 for (int k = 0; k < n; ++k) {
+                   if (batch[k].tag != tag) continue;       // a wake, or another caller's read
+                   c = batch[k];
+                   mine = true;
+                 }
+               }
+               ok = c.ok;
+               got = c.bytes;
+               bytes.assign((const uint8_t*) buf, (const uint8_t*) buf + (ok ? got : 0u));
+               bc::DirectFile::free_aligned(buf);
+             }
+             return nb::make_tuple(ok, got, nb::bytes((const char*) bytes.data(), bytes.size()));
+           }, nb::arg("offset"), nb::arg("length"), nb::arg("tag") = 0,
+           "one aligned read; returns (ok, bytes_read, data)")
+      // Submits every request before waiting, so a test can see that completions come back keyed by tag rather
+      // than in submission order.
+      .def("read_many", [](bc::DirectFile& f, std::vector<uint64_t> offsets, uint32_t length) {
+             need(length > 0 && length % bc::DIRECT_ALIGNMENT == 0,
+                  "read_many: length must be a nonzero multiple of 4096");
+             need(!offsets.empty() && offsets.size() <= 4096, "read_many: 1 to 4096 offsets");
+             // Every offset checked BEFORE anything is submitted, so a bad one later in the list cannot
+             // leave earlier reads queued against buffers this call is about to free.
+             for (uint64_t off : offsets)
+               need(off % bc::DIRECT_ALIGNMENT == 0, "read_many: every offset must be a multiple of 4096");
+
+             std::vector<std::pair<uint64_t, uint32_t>> order;
+             {
+               nb::gil_scoped_release unlock;
+               std::lock_guard<std::mutex> drive(f.drive_mutex());
+               std::vector<void*> bufs(offsets.size(), nullptr);
+               size_t submitted = 0;
+               std::string err;
+               bool failed = false, oom = false;
+               for (size_t i = 0; i < offsets.size() && !failed; ++i) {
+                 bufs[i] = bc::DirectFile::alloc_aligned(length);
+                 if (bufs[i] == nullptr) { failed = oom = true; break; }
+                 if (!f.submit(offsets[i], bufs[i], length, (uint64_t) i, err)) { failed = true; break; }
+                 ++submitted;
+               }
+               // Collect every read that WAS submitted before any buffer is freed, whether or not the rest
+               // failed: a worker thread still holds a pointer into one of these and writes through it, so
+               // freeing early is a write to freed memory rather than a leak.
+               size_t seen = 0;
+               while (seen < submitted) {
+                 bc::Completion got[64];
+                 const int n = f.wait(got, 64, -1);
+                 for (int k = 0; k < n; ++k) {
+                   if (got[k].tag >= submitted) continue;        // a wake, or a tag this call never issued
+                   if (!failed) order.emplace_back(got[k].tag, got[k].bytes);
+                   ++seen;
+                 }
+               }
+               for (void* b : bufs) bc::DirectFile::free_aligned(b);
+               if (oom) throw std::bad_alloc();
+               if (failed) throw std::invalid_argument(err);
+             }
+             return order;
+           }, nb::arg("offsets"), nb::arg("length"),
+           "submit every offset, then collect; returns (tag, bytes) in completion order")
+      .def("wake", &bc::DirectFile::wake);
 
   m.def("basalt_expf_digest", [](uint32_t first_bits, uint32_t count) {
     // Refused rather than wrapped: a range that runs off the end of the bit patterns would silently digest a
