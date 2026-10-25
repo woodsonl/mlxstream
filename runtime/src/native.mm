@@ -19,6 +19,7 @@
 #include "basalt_cpu.h"
 #include "basalt_cpu_experts.h"
 #include "basalt_ngram.h"
+#include "basalt_ple_table.h"
 #include "basalt_pool.h"
 #include "basalt_cpu_expf.h"
 #include "metal_core.h"
@@ -500,6 +501,37 @@ NB_MODULE(_native, m) {
           std::vector<uint64_t> offset(c.offset, c.offset + bc::PLE_N_HEADS);
           return nb::make_tuple(mult, vocab, offset);
         }, "the n-gram hash constants as (mult, vocab, offset)");
+
+  // ---- the PLE table decode (basalt_ple_table.h) ----------------------------------------------------------
+  // Every one of the 65,536 fp16 bit patterns widened exactly, so a test can hold the whole domain at once
+  // rather than sampling it. Subnormals are the half that matters: a hardware convert with FZ16 set flushes
+  // them, and 0x0001 would come back 0.0 instead of 2^-24.
+  m.def("basalt_f16_widen_all", [](F32Out1 out) {
+          need(out.shape(0) == 65536, "basalt_f16_widen_all: out must hold 65536 floats");
+          float* o = out.data();
+          nb::gil_scoped_release unlock;
+          for (uint32_t h = 0; h < 65536u; ++h) o[h] = bc::f32_from_f16((uint16_t) h);
+        }, nb::arg("out").noconvert(), "widen every fp16 bit pattern to f32, in bit-pattern order");
+
+  m.def("basalt_iq4nl_dequant_row", [](U8In1 row, F32Out1 out) {
+          need(row.shape(0) == (size_t) bc::PLE_ROW_BYTES, "basalt_iq4nl_dequant_row: a row is 90 bytes");
+          need(out.shape(0) == (size_t) bc::PLE_HEAD_DIM, "basalt_iq4nl_dequant_row: out holds 160 floats");
+          nb::gil_scoped_release unlock;
+          bc::iq4nl_dequant_row(row.data(), out.data());
+        }, nb::arg("row").noconvert(), nb::arg("out").noconvert(), "one 90-byte IQ4_NL row to 160 floats");
+
+  m.def("basalt_ple_rows_to_embd", [](U8In1 rows16, F32Out1 out) {
+          need(rows16.shape(0) == (size_t) (bc::PLE_N_HEADS * bc::PLE_ROW_BYTES),
+               "basalt_ple_rows_to_embd: rows16 must be 16 rows of 90 bytes");
+          need(out.shape(0) == (size_t) bc::NG_N_EMBD, "basalt_ple_rows_to_embd: out holds 2560 floats");
+          nb::gil_scoped_release unlock;
+          bc::ple_rows_to_embd(rows16.data(), out.data());
+        }, nb::arg("rows16").noconvert(), nb::arg("out").noconvert(),
+        "sixteen decoded rows flattened head-slowest into one 2560-wide embedding");
+
+  m.def("basalt_iq4nl_codebook", []() {
+          return std::vector<int>(bc::kIq4Nl, bc::kIq4Nl + 16);
+        }, "IQ4_NL's codebook at the ported commit");
 
   m.def("basalt_expf_digest", [](uint32_t first_bits, uint32_t count) {
     // Refused rather than wrapped: a range that runs off the end of the bit patterns would silently digest a
