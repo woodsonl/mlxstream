@@ -678,3 +678,20 @@ Both acceptance runs pin it off, and with every expert resident no swap would ha
    layer windows and the pack's residency flag and fills `Program.host_points` with what it returns, rather than
    constructing `HostPoint`s itself. Until that builder lands the helper has no caller, and a program built
    without it carries no host points, which is the zero-doorbell form the identity tests need.
+
+   **The n-gram tier takes one host point per step, not one per layer.** Its hash and its row gather are both
+   host work: the hash because it is a 64-bit multiply and xor, and the gather because the table is a file the
+   host reads. A program is encoded once and replayed, so host work placed inside it runs once at encode time
+   and replays that one token's rows forever, which is a finite, stable, wrong answer rather than a crash
+   (`src/core/layer.cpp:1203-1211`). The PLE block runs at layer 1 and nowhere else (`:1197-1201`), so the step
+   carries exactly one point: `publish` after the embedding op, which is the earliest the token id is known,
+   and `wait` at the block, which is the latest the rows can arrive. The ops between are layer 0's, and they
+   are the only work there is to hide sixteen reads on sixteen pages behind. `monolith/compiler/ple_tier.py`
+   builds it. One handoff is about 0.14 ms of GPU idle, against 1,440 bytes of table traffic per token.
+
+   The ordering basalt gets from a store fence before raising its flag, and a device fence after the wait
+   (`src/core/verify.cpp:2521-2523`, `src/kernels/cuda/verify_kernels.cu:919-922`), is carried here by the
+   host-point machinery instead: the task writes the staging buffer, the point returns, and only then does the
+   pump commit the command buffer that reads it. Naming that buffer in the point's `writes` is what makes
+   `Program.check_host_points` refuse any op of the window that reads it. Dropping either half is the one
+   substitution in this tier that can change produced values rather than timing.
