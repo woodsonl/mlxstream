@@ -506,8 +506,9 @@ def exact_attention(program, rows):
     """Make a prompt program's attention reproduce passes of ``rows`` rows bit for bit (``EXACT_SUB``): the run-time
     chunk rule (``pick_chunk``) depends on the pass's context, so the cores and folds of the chunked attention take each
     row's chunking from the ``rows``-row pass that row would be in, and v3 pairs the keys cached before a pass, so its
-    rows pair the keys before their ``rows``-row pass. Fixed-chunk kernels (v2, the matrix attention) already sum every
-    row the same way; a workspace shared with any other core is left alone."""
+    rows pair the keys before the ``rows``-row pass from token 0 that holds them, wherever the pass starts. Fixed-chunk
+    kernels (v2, the matrix attention) already sum every row the same way; a workspace shared with any other core is
+    left alone."""
     cores, merges, v3 = {}, {}, []
     for op in program.ops:
         k = program.kernels[op.kernel]

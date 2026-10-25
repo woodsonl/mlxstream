@@ -7,9 +7,9 @@
 // reader are the same SIMD-group), scores it (q·k by one simd_sum, bf16(bf16(q·k) · scaling), causal inside the
 // step), and folds it into its running online softmax (m, d, o) with exact FP32 rescaling, p̃ = bf16(exp(s − m))
 // rounded like the reference's P. Cached pairs share their maximum and the rescaling of prior accumulators (with
-// EXACT_SUB, a row's pairs run on to the start of its EXACT_SUB-row pass, through keys this pass appends);
-// an unpaired tail and new causal keys are folded individually. The NSG3 partials then meet in threadgroup memory
-// and every SIMD-group folds one
+// EXACT_SUB, a row pairs the keys before the start of the EXACT_SUB-row pass from token 0 that holds it, cached or
+// appended by this pass, whatever this pass's start); an unpaired tail and new causal keys are folded individually.
+// The NSG3 partials then meet in threadgroup memory and every SIMD-group folds one
 // slice of D/NSG3 dims (lane ℓ = partial ℓ: one simd_max, one simd_sum per value) and writes it, normalized, rounded
 // to BF16 and times bf16(σ(gate)) when the projection carries the gate — no partial workspace, no second dispatch.
 //
@@ -21,7 +21,7 @@
 //
 // Macros: D (head dim, multiple of 32), NSG3 (SIMD-groups per threadgroup, D / (4·NSG3) slices per SIMD-group in the
 // fold: 32 → 1024 threads), STEP_STATE, LM_MODE / CHAIN_I as v1, PERM_OUT (the consumer tile's order), EXACT_SUB (a
-// prompt pass reproducing passes of EXACT_SUB rows, as v1's). Params as v1
+// prompt pass giving every row the bits of EXACT_SUB-row passes from token 0, wherever it starts). Params as v1
 // with n_sg = the threadgroups dispatched and pad1 = the gate rows' stride (0: out_stride). Buffers: 0 projection,
 // 1–2 caches, 3–4 RoPE tables, 5–6 norms, 7 out, 9 params, 10 the gate value [T, heads·D] (read when has_gate),
 // 15 StepState.
@@ -35,7 +35,7 @@
 #if LM_MODE
 #error "EXACT_SUB: the target's prompt passes only"
 #endif
-// A key an EXACT_SUB row folds among its own pass's cached pairs: k and v from the caches, or, for a key this pass
+// A key of an EXACT_SUB row's pairs that reach past this pass's start: k and v from the caches, or, for a key this pass
 // appends, from the projection with k normed and RoPE'd — the bits the caches get (norm_rope rounds to BF16, v is copied).
 // Never from the caches: the kv head's first row appends those keys in this dispatch, unordered with this read.
 static inline void exact_cached_kv(uint key, uint position, uint j, uint lane, device const ushort* qkvg, device const ushort* k_cache,
@@ -107,10 +107,18 @@ kernel void gqa_decode_v3(device const ushort* qkvg [[buffer(0)]], device ushort
     float m_run = -INFINITY, d_run = 0.0f, o_run[DL];
     for (uint e = 0; e < DL; e++) o_run[e] = 0.0f;
     uint key = sgi;
+#if EXACT_SUB
+    // The row sums its keys as the EXACT_SUB-row pass from token 0 that holds it would (a run from scratch), wherever
+    // this pass starts (a prefix restore starts it anywhere): it pairs the keys before that pass's start, the cached
+    // ones here and the ones this pass appends in the loop below, and folds the rest one at a time.
+    const uint start = (position + t) / EXACT_SUB * EXACT_SUB, paired = min(start, position);
+#else
+    const uint paired = position;
+#endif
 
     // Two cached keys share one rescaling of the previous softmax state. Keep
     // score/probability BF16 boundaries; the tail and new causal keys follow below.
-    for (; key + NSG3 < position; key += 2u * NSG3) {
+    for (; key + NSG3 < paired; key += 2u * NSG3) {
       float scores[2u];
       float m_new = m_run;
 #pragma clang loop unroll(full)
@@ -137,10 +145,8 @@ kernel void gqa_decode_v3(device const ushort* qkvg [[buffer(0)]], device ushort
       m_run = m_new;
     }
 #if EXACT_SUB
-    // The row sums its keys as the EXACT_SUB-row pass it would be in, which starts at token t / EXACT_SUB · EXACT_SUB of
-    // this one (the session's exact passes start on those passes' boundaries): its cached pairs go on to that start,
-    // into keys this pass appends — the same fold as above.
-    for (const uint cached = position + t / EXACT_SUB * EXACT_SUB; key + NSG3 < cached; key += 2u * NSG3) {
+    // Pairs reaching into keys this pass appends, up to the start of the row's pass from token 0: the same fold as above.
+    for (; key + NSG3 < start; key += 2u * NSG3) {
       float scores[2u], vf[2u][DL];
       float m_new = m_run;
 #pragma clang loop unroll(full)
