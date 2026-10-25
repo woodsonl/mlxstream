@@ -20,6 +20,7 @@
 #include "basalt_cpu_experts.h"
 #include "basalt_ngram.h"
 #include "basalt_ple_table.h"
+#include "basalt_row_cache.h"
 #include "basalt_pool.h"
 #include "basalt_cpu_expf.h"
 #include "metal_core.h"
@@ -122,6 +123,7 @@ using I32In1 = nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device:
 using I32In2 = nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using F32Out3 = nb::ndarray<float, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
 using U32Out2 = nb::ndarray<uint32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+using U8Out1 = nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
 static void need(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(what);
@@ -532,6 +534,33 @@ NB_MODULE(_native, m) {
   m.def("basalt_iq4nl_codebook", []() {
           return std::vector<int>(bc::kIq4Nl, bc::kIq4Nl + 16);
         }, "IQ4_NL's codebook at the ported commit");
+
+  // ---- the PLE row cache (basalt_row_cache.h) ------------------------------------------------------------
+  // Bound as a class because its behaviour IS its state: the structural properties worth testing (round robin
+  // rather than least-recently-used, the modulo set index, the fill counter) are only visible across a sequence
+  // of inserts and lookups.
+  nb::class_<bc::RowCache>(m, "RowCache")
+      .def("__init__", [](bc::RowCache* self, uint64_t rows, uint32_t row_bytes) {
+             need(row_bytes >= 1 && row_bytes <= 4096, "RowCache: row_bytes must be 1 to 4096");
+             need(rows <= (uint64_t) 1 << 24, "RowCache: rows must be at most 16,777,216");
+             new (self) bc::RowCache();
+             self->init(rows, row_bytes);
+           }, nb::arg("rows"), nb::arg("row_bytes"))
+      .def_prop_ro("capacity", &bc::RowCache::capacity)
+      .def_prop_ro("size", &bc::RowCache::size)
+      .def_prop_ro("sets", &bc::RowCache::sets)
+      .def_static("mix", &bc::RowCache::mix, nb::arg("row"))
+      .def("set_of", &bc::RowCache::set_of, nb::arg("row"))
+      .def("insert", [](bc::RowCache& c, uint32_t row, U8In1 bytes) {
+             c.insert(row, bytes.data());
+           }, nb::arg("row"), nb::arg("bytes").noconvert())
+      .def("get", [](bc::RowCache& c, uint32_t row, U8Out1 out) {
+             const uint8_t* p = c.find(row);
+             if (p == nullptr) return false;
+             std::memcpy(out.data(), p, out.shape(0));
+             return true;
+           }, nb::arg("row"), nb::arg("out").noconvert(),
+           "copy the row's bytes into out and return true, or return false when the row is absent");
 
   m.def("basalt_expf_digest", [](uint32_t first_bits, uint32_t count) {
     // Refused rather than wrapped: a range that runs off the end of the bit patterns would silently digest a

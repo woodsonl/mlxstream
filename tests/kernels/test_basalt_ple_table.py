@@ -148,7 +148,8 @@ def test_b1_every_fp16_bit_pattern_widens_exactly():
     ex, man = (bits >> 10) & 0x1F, bits & 0x3FF
     is_nan = (ex == 31) & (man != 0)
 
-    want = np.arange(65536, dtype=np.uint16).view(np.float16).astype(np.float32)
+    with np.errstate(invalid="ignore"):          # the NaN patterns are exactly what numpy objects to casting
+        want = np.arange(65536, dtype=np.uint16).view(np.float16).astype(np.float32)
     assert np.array_equal(got.view(np.uint32)[~is_nan], want.view(np.uint32)[~is_nan])
 
     # sign | 0x7F800000 | (mantissa << 13), the exponent-31 branch written out
