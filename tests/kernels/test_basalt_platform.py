@@ -237,7 +237,9 @@ def test_compares_read_subnormals_as_zero():
     subnormal and a zero, compare equal; NaN is unordered and -0 equals +0, as IEEE says. The model is IEEE's compare
     of the flushed operands, on every row. That is CUDA's setp with .ftz, so a --use_fast_math file's compares are
     ported as plain ones (the n-gram gate's sign, src/kernels/cuda/native_ple_postops.cu:64: setp.gt.ftz and
-    setp.lt.ftz; docs/research/basalt-nvcc/ple.md section 2); setp without .ftz orders subnormals exactly."""
+    setp.lt.ftz; docs/research/basalt-nvcc/ple.md section 2); setp without .ftz orders subnormals exactly, so an
+    IEEE-built basalt kernel's compares are ported on order-preserving keys of the bits
+    (kernels/common/basalt_sampler.metal's okey, f_gt, f_lt)."""
     dev = nt.Device()
     src = kernels.PRELUDE + kernels.template("basalt_fp.metal") + """
 kernel void cmp(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],

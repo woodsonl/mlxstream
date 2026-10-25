@@ -4,7 +4,7 @@ What NVIDIA's compiler emits at every rounding site of the kernels in basalt's `
 element-wise, normalization, GDN, routing and KV-append kernels of batched prompt processing), read from the sm_120
 SASS, and the Metal form the port writes at each site. This page is the authority the Metal kernels follow
 (`docs/design/flash-next.md`, invariant 5, and its note that the prompt path's port lists the approximate operations
-this pack runs: `flash-next.md:80-82`).
+this pack runs: `flash-next.md:84-86`).
 
 Basalt paths are relative to commit `b4c63b55754637f4c72ad53a0f791d425f71eb36`; `path:a-b` means lines a to b there,
 and a bare `:N` is a line of `src/prefill/kernels.cu` unless another file is named.
@@ -97,14 +97,14 @@ The sequences shared by many sites:
   `__cuda_sm20_rcp_rn_f32_slowpath` (t ≥ 2^126, infinite or NaN). The result is the correctly rounded 1/t, IEEE's.
   t ≥ 1, so 1/t ≤ 1, but 1/t is subnormal for t > 2^126, which is x below about −87.3 (e ≥ 2^126 once
   −x·log2 e ≥ 126); below about −88.7, e and t are +inf and sigm is +0. Metal's `1.0f / t` flushes that subnormal,
-  so Metal writes `ieee_div(1.0f, 1.0f + expf_ieee(sign_flip(x)))` (main's `ieee_div`, `basalt_q8_1.metal:181`, for
+  so Metal writes `ieee_div(1.0f, 1.0f + expf_ieee(sign_flip(x)))` (main's `ieee_div`, `basalt_q8_1.metal:121`, for
   a divisor of at least 1: rcp.rn(t) is div.rn(1, t)). Each section follows a subnormal sigm into the operation that
   uses it.
 - **Q(a, b), IEEE `a / b`.** PTX `div.rn.f32`. SASS: `MUFU.RCP r, b`; `FCHK P0, a, b`; `FFMA d, -b, r, 1`;
   `FFMA r, r, d, r`; `FFMA q, a, r, RZ`; `FFMA d, -b, q, a`; `FFMA q, r, d, q`, with `@P0` calling
   `__cuda_sm3x_div_rn_noftz_f32_slowpath`. The quotient is correctly rounded and keeps subnormals. Metal: `a / b`
   where no operand or quotient can be subnormal; where one can, `ieee_div(a, b)` (divisor at least 1) or the general
-  IEEE division (`ieee_div_any(a, b)` on `origin/woodsonl/basalt-sampler`).
+  IEEE division (`ieee_div_any(a, b)`, `kernels/common/basalt_sampler.metal:70`).
 - **Division by the constant N = 2560.** The reciprocal is refined from the immediate 0x39CCCCCD (loaded as `HFMA2
   R7, -RZ, RZ, 0.724609375, -19.203125`): `FFMA r0, R7, -2560, 1` (shown as `FFMA R4, R7, -R4, 1`) and `FFMA r, r0,
   R7, 0.00039062500582076609135`. Then `FCHK P0, a, 2560`; `FFMA q, a, r, RZ`; `FFMA d, q, -2560, a`; `FFMA q, r, d,
@@ -133,9 +133,9 @@ The sequences shared by many sites:
   some f below 2^-102, and f itself may be subnormal; CUDA keeps both, while Metal's `-` reads and writes them as
   zero. For a NaN f, h is −0 (bf's 0x8000) and f − h is CUDA's 0x7fffffff, so the low image is 0x8000 too. Metal:
   `bf(cuda_nan(ieee_add(f, -h)))` with f the value already passed through `cuda_nan` (`ieee_add`,
-  `basalt_q8_1.metal:95`, is exact here: the difference is representable).
+  `basalt_ieee.metal:32`, is exact here: the difference is representable).
 - **warp_sum (`:21-25`).** `SHFL.BFLY` and `FADD` with offsets 16, 8, 4, 2, 1; v = fl(v + shfl). Metal: `warp_sum`
-  (`basalt_fp.metal:102`), or `warp_sum_ieee` (`basalt_q8_1.metal:206`) where a subnormal sum can occur.
+  (`basalt_fp.metal:102`), or `warp_sum_ieee` (`basalt_q8_1.metal:146`) where a subnormal sum can occur.
 - **block_sum (`:46-58`).** warp_sum in every warp; warp w's sum to `sh[w]`; warp 0 sums `sh[0..nw)` (zeros past nw)
   with warp_sum again, and `sh[0]` is broadcast. Metal: the same two butterflies through threadgroup memory, with a
   barrier at each `__syncthreads`.
@@ -148,7 +148,7 @@ The sequences shared by many sites:
   `route_count`, `swiglu_pair`, `moe_combine` (section 3); `rms_rows`, `rope_kernel<false>`, `split_q`, `gate_attn`,
   `kv_append`'s fp16 branch (section 4); `to_f16`, `to_bf16` without `ylo`, `copy_i32` (section 5). Section 6
   records `gdn_rec_parity`'s reference kernel, section 7 the kernels that do not run. `gemm.cu` has no device code.
-- **The approximate operations this pack's prompt path runs in `kernels.cu`** (the list `flash-next.md:80-82` asks
+- **The approximate operations this pack's prompt path runs in `kernels.cu`** (the list `flash-next.md:84-86` asks
   for); everything else is a correctly rounded fp32 operation, an exact sequence, or integer arithmetic:
   1. `__expf` (`ex2.approx.f32`: `MUFU.EX2` with the −126 scaling, Notation's E(x)) in sigm and the SiLU and SwiGLU
      terms of sections 1 to 3, in `gdn_gates` (`:214`) and in the decay of `gdn_rec_wl` (`:551`). Metal:
@@ -157,7 +157,7 @@ The sequences shared by many sites:
      `rms_rows`. Metal: `fast::rsqrt`; no argument reaches the subnormal wrapper.
   3. The library `expf`, libdevice's `__nv_expf` inlined, whose one approximate step is `ex2.approx.ftz.f32`, in
      `route_kernel` (`:642`) and `gate_attn` (`:770`). Metal: `nv_expf`, every other step transcribed
-     (`flash-next.md:153-154`; section 3).
+     (`flash-next.md:161-162`; section 3).
   4. `powf`, libdevice's `__nv_powf` inlined, whose one approximate step is `rcp.approx.ftz.f32`, in `rope` (`:751`).
      Metal: `nv_powf` with `1.0f / x` there; for this pack's theta_scale no result depends on that reciprocal's last
      bits [M] (section 4).
@@ -170,10 +170,10 @@ The sequences shared by many sites:
   sum and quotient can be subnormal: the tables use `ieee_mul`, `ieee_add`, `warp_sum_ieee`, `ieee_div` (main), a
   general `ieee_fma_any` and `ieee_div_any`, and every fp32 store of an arithmetic result writes `cuda_nan(x)`.
   Plain Metal arithmetic stands only where a section shows that no subnormal can change a bit.
-- **Helpers main lacks.** `ieee_fma_any` (general IEEE fma), `ieee_div_any` (`origin/woodsonl/basalt-sampler`),
-  `expf_ieee` with `sign_flip`, `log1pf_cuda`, `nv_expf`, `nv_powf`, `nv_cosf` and `nv_sinf` (with the sampler
-  branch's `f64_round`, `f64_mul` and `f32_from_f64` for the Payne-Hanek path), and the sampler branch's float keys
-  `okey`, `f_gt`, `fmaxf_bits`. One shared copy each, beside the existing `ieee_*` and libdevice helpers.
+- **Helpers main lacks.** `ieee_fma_any` (general IEEE fma), `expf_ieee` with `sign_flip`, `log1pf_cuda`, `nv_expf`,
+  `nv_powf`, `nv_cosf` and `nv_sinf` (with `basalt_f64.metal`'s `f64_round`, `f64_mul` and `f32_from_f64` for the
+  Payne-Hanek path). One shared copy each, beside the existing `ieee_*` and libdevice helpers; `ieee_div_any` and the
+  float keys `okey`, `f_gt`, `fmaxf_bits` are `basalt_sampler.metal`'s (`:70`, `:37`, `:43`, `:48`).
 - **Invariance.** No kernel's output for a token depends on the chunk length T or on the token's place in the chunk
   (each section's note); T, `pos0`, the element counts and the page table are per-step values the port reads from the
   step's state or a buffer (invariant 4). The prompt path's routing weights, rotated keys and GDN row sums are not
@@ -194,7 +194,7 @@ sigm(x) is subnormal for x below about −87.3 (Notation), so `x · sigm` and th
 `fma(bo, sc, r)` can produce or read one. CUDA keeps all of these and the BF16, fp16 and fp32 images carry them, so
 every product and sum below uses an IEEE helper: `ieee_mul`, `ieee_add` and `warp_sum_ieee` (main), `ieee_div` for
 a divisor of at least 1 (main), and a general IEEE fma, here `ieee_fma_any(a, b, c)` (main's `ieee_fma` takes only
-an integer multiplier, `basalt_q8_1.metal:167`; the prompt path's GDN plan defines the general one). With them every
+an integer multiplier, `basalt_q8_1.metal:107`; the prompt path's GDN plan defines the general one). With them every
 product, sum and conversion gives CUDA's bits for every input; only `rsqrtf` and `__expf` follow the contract's
 approximate mappings. Every fp32 store of an arithmetic result (`rs_out`, `mixed`, `R`) writes `cuda_nan(x)`.
 
@@ -412,7 +412,7 @@ shared expert: its gate and up projections (`prefill.cpp:1702-1703`), `swiglu_pa
 640) and its down projection (`prefill.cpp:1705`), all three on `Gemm::native`, and its gate logit `sg`, one BF16
 column (`prefill.cpp:1707`). After the routed experts, `moe_combine` (`prefill.cpp:2361`) sums their rows `Dm` with
 the shared expert's output; its result `bo` feeds `gr_write_norm_rs` or `gr_write` (section 1). `route` (`:929-937`) launches `route_kernel<16>` for `n_expert == 512`, this pack's count
-(`flash-next.md:228`); `route_kernel<8>` (256 experts) and `basalt::kernels::router_top10` (any other count) do not
+(`flash-next.md:239`); `route_kernel<8>` (256 experts) and `basalt::kernels::router_top10` (any other count) do not
 run here (section 7). The decode step's router is a different kernel (`hc_top10`, the hc lane's), so a token's
 expert weights from the prompt path and from decode need not share bits.
 
@@ -427,7 +427,7 @@ sums and the tie rule below depend on it.
 below, so the probabilities, the lanes' sums, the selected sums and the stored quotients can be subnormal too. In
 `moe_combine` the routing weights `w` and every partial sum can be, and so can sigm (Notation). The sites below use
 the IEEE helpers, and every compare that orders probabilities runs on integer keys: `okey`, `f_gt` and
-`fmaxf_bits` (`origin/woodsonl/basalt-sampler:kernels/common/basalt_sampler.metal:37`, `:43`, `:48`), with −0 and +0
+`fmaxf_bits` (`kernels/common/basalt_sampler.metal:37`, `:43`, `:48`), with −0 and +0
 equal.
 
 **The library `expf` (`:642`).** This file is built without fast math, so `expf` is libdevice's `__nv_expf`,
@@ -457,7 +457,7 @@ passes −q, of either sign) t saturates at 1 above about 87.34, where k = 252 a
 with d, every fma step stays normal, and from about 88.72 the scale multiply overflows to +inf on both machines
 (`ex2.approx.ftz` and `fast::exp2` themselves return +inf once f reaches 128).
 
-Metal: `nv_expf(d)`, the transcription the contract asks for (`flash-next.md:153-154`), explained after the code:
+Metal: `nv_expf(d)`, the transcription the contract asks for (`flash-next.md:161-162`), explained after the code:
 
 ```
 float t = saturate(fma(d, as_type<float>(0x3BBB989Du), 0.5f));
@@ -508,7 +508,7 @@ operand.
 | `:702` | `a = g[i]` | `LDG` | the same |
 | `:703` | `__expf(-a)` | E(−a): `FMUL t, a, -1.4426950216293334961`; `FSETP.GEU.AND P0, PT, t, -126, PT`; `@!P0 FMUL t, t, 0.5`; `MUFU.EX2 e, t`; `@!P0 FMUL e, e, e` | `expf_ieee(sign_flip(a))`: e only feeds `1.0f + e` (Notation) |
 | `:703` | `1.0f + e` | `FADD den, e, 1` | `1.0f + e`: den is at least 1, +inf for a below about −88.7, NaN for a NaN a |
-| `:703` | `a / den` | Q(a, den): `MUFU.RCP`; `FCHK P0, a, den`; five `FFMA`s; `@P0` `__cuda_sm3x_div_rn_noftz_f32_slowpath` | `ieee_div(a, den)` (`basalt_q8_1.metal:181`, divisor at least 1): the quotient is subnormal for \|a\| below 2^-125 (den = 2 there) and a subnormal a must not read as zero |
+| `:703` | `a / den` | Q(a, den): `MUFU.RCP`; `FCHK P0, a, den`; five `FFMA`s; `@P0` `__cuda_sm3x_div_rn_noftz_f32_slowpath` | `ieee_div(a, den)` (`basalt_q8_1.metal:121`, divisor at least 1): the quotient is subnormal for \|a\| below 2^-125 (den = 2 there) and a subnormal a must not read as zero |
 | `:703` | `... * u[i]` | `FMUL p, u, q` | `ieee_mul(q, u)`: a subnormal q times an infinite u is ±inf in CUDA (clamped to ±65504 next) but 0 · inf = NaN in Metal, and times a finite u above 2^100 it can reach fp16's range. A product below 2^-126 from normal operands rounds to an fp16 zero of the same sign either way |
 | `:44` | hf_sat: `isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f)` | `FSETP.NAN.AND P0, PT, \|p\|, \|p\|, PT` (`cmath:1176`); `FMNMX m, p, -65504, !PT` (max); `@!P0 FMNMX p, m, 65504, PT` (min) | `isnan(p) ? p : min(max(p, -65504.0f), 65504.0f)`: both bounds are normal, so Metal's `max` and `min` choose as CUDA's do and return a subnormal p with its bits |
 | `:40`, `:703` | `h16[i] = hf(...)` | `F2FP.F16.F32.PACK_AB d, RZ, p` (`cuda_fp16.hpp:566`) | `cuda_nan_f16(f16_bits(p))`: a NaN stores 0x7fff; no infinity reaches the conversion |
@@ -723,8 +723,8 @@ static inline float nv_trig(float x, int add) {
 
 The PTX's own case for an infinite θ (r = θ · 0, j = 0) is left out: θ is at most 2^24 here. The slow path runs only
 for θ of at least 105615, which pair 0 reaches at position 105615 (θ = pos there) and pair 1 at about 174770; it needs
-`f64_round`, `f64_mul` and `f32_from_f64` from the soft binary64 (`origin/woodsonl/basalt-sampler:
-kernels/common/basalt_f64.metal:48`, `:234`, `:112`): CUDA rounds the 63-bit integer to binary64, the product to
+`f64_round`, `f64_mul` and `f32_from_f64` from the soft binary64 (`kernels/common/basalt_f64.metal:48`, `:234`,
+`:112`): CUDA rounds the 63-bit integer to binary64, the product to
 binary64 and that to binary32, and only the same three roundings give its bits.
 
 ### `split_q_kernel` (`:759-764`)
@@ -746,7 +746,7 @@ constants, and ptxas fuses `__nv_expf`'s last multiply with the `1.0f +`.
 |---|---|---|---|
 | `:770` | `expf(-q)`, q = `qf[t * 24 * 512 + h * 512 + 256 + d]` | `FFMA.SAT t, q, -R9, 0.5` (R9 = 0x3BBB989D); `FFMA.RM j, t, R11, 12582913` (R11 = 252); `FADD n, j, -12583039`; `IMAD.SHL.U32 s, j, 0x800000`; `FFMA f, q, -1.4426950216293334961, -n`; `FFMA f, q, -1.925963033500011079e-08, f`; `MUFU.EX2 x, f` | `e = nv_expf(-q)` (section 3): fma(q, −c, 0.5) and fma(−q, c, 0.5) are the same exact value, so the folded negation changes no bit |
 | `:770` | `1.0f + e` | `FFMA den, s, x, 1`: the scale multiply s · x and the add in one rounding | `1.0f + e`. s is a power of two, so s · x is exact whenever it is normal and `nv_expf` returns it unrounded; when it is below 2^-126, 1 + it rounds to 1 whichever way it was formed. A product above `FLT_MAX` is +inf on both. So the fused and the unfused forms give the same den, at least 1 |
-| `:770` | `1.0f / den` | rcp.rn: the range test `IADD3`, `LOP3.LUT`, `ISETP.GT.U32`; `MUFU.RCP r, den`; `FFMA d, den, r, -1`; `FADD.FTZ d, -d, -RZ`; `FFMA r, r, d, r`; else `__cuda_sm20_rcp_rn_f32_slowpath` | `ieee_div(1.0f, den)` (`basalt_q8_1.metal:181`, divisor at least 1): r is subnormal for den above 2^126, q below about −87.3, and +0 once den is +inf |
+| `:770` | `1.0f / den` | rcp.rn: the range test `IADD3`, `LOP3.LUT`, `ISETP.GT.U32`; `MUFU.RCP r, den`; `FFMA d, den, r, -1`; `FADD.FTZ d, -d, -RZ`; `FFMA r, r, d, r`; else `__cuda_sm20_rcp_rn_f32_slowpath` | `ieee_div(1.0f, den)` (`basalt_q8_1.metal:121`, divisor at least 1): r is subnormal for den above 2^126, q below about −87.3, and +0 once den is +inf |
 | `:770` | `a[i] * r` | `FMUL p, a, r` | `ieee_mul(a, r)`: a subnormal r times an infinite a is ±inf in CUDA (stored as fp16 ±inf) but 0 · inf = NaN in Metal. For a finite a (an attention output, at most 65504 in magnitude when V is finite) and any subnormal operand, the product is below 2^-110 and rounds to the fp16 zero of its sign either way |
 | `:40`, `:770` | `o16[i] = hf(p)` | `F2FP.F16.F32.PACK_AB d, RZ, p` (`cuda_fp16.hpp:566`) | `cuda_nan_f16(f16_bits(p))` (Notation); no clamp here, so a product beyond fp16's range stores ±inf |
 
@@ -755,7 +755,7 @@ A NaN gate gives a NaN e (`FFMA.SAT` sends the NaN to 0, but f is NaN), a NaN de
 ### `kv_append_kernel` (`:775-817`), the fp16 branch
 
 One threadgroup of 64 threads per (token, KV head, 64-value group, K or V) (`dim3(T, 2, 8)`, `:841`); thread d
-converts one value. The contract keeps fp16 KV fully resident (`flash-next.md:434-435`): the call passes the fp16
+converts one value. The contract keeps fp16 KV fully resident (`flash-next.md:445-446`): the call passes the fp16
 pools whenever `kv_int8` is off (`prefill.cpp:1636-1638`), and the host copy (`host`) and the prompt path's staging
 pool (`stage`) belong to KV streaming, outside the contract. The int8 branch (`:795-816`) does not run on this pack
 (section 7).
@@ -768,7 +768,7 @@ pool (`stage`) belong to KV streaming, outside the contract. The int8 branch (`:
 | `:790` | `if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = h` | `STG.E.U16` | the same store; a negative page (a block not resident) writes nothing, and every store stays inside the pool's binding |
 
 The rows written here are the pool rows decode's attention reads, so `hf`'s bits are the format's: the qsa lane's
-decode append (`kv_append_step`, `f16_from_f32`, `flash-next.md:376`) writes the same fp16 encoding of its own
+decode append (`kv_append_step`, `f16_from_f32`, `flash-next.md:387`) writes the same fp16 encoding of its own
 keys, which are computed by a different kernel (section intro).
 
 ## 5. Conversions and copies
@@ -881,7 +881,7 @@ them. The port leaves them out; a later pack that needs one adds it with its own
 | `swiglu_il_kernel` | `:691-697` | the same FP16 expert path (`prefill.cpp:2280`) | section 3's SwiGLU on interleaved gate and up rows |
 | `gather_rows16_kernel` | `:705-712` | the same path, the `else` of `use_mmq` (`prefill.cpp:2009-2010`) | a copy of fp16 rows by index |
 | `rope_kernel<true>` | `:738-758` | `rope_table_for` returns no table (`src/kernels/cuda/native_rope.cu:99`; section 4) | the RoPE angle from a table instead of `powf`, `cosf` and `sinf` |
-| `kv_append_kernel`'s int8 branch | `:795-816` | the contract keeps fp16 KV (`flash-next.md:434-435`; section 4) | `fabsf`, an `fmaxf` butterfly over 64 values, `hf(amax / 127.0f)`, `__float2int_rn(x / sf)` clamped to ±127 |
+| `kv_append_kernel`'s int8 branch | `:795-816` | the contract keeps fp16 KV (`flash-next.md:445-446`; section 4) | `fabsf`, an `fmaxf` butterfly over 64 values, `hf(amax / 127.0f)`, `__float2int_rn(x / sf)` clamped to ±127 |
 | `to_bf16_kernel`'s `ylo` loop | `:831` | no prompt-path call passes `ylo` (section 5) | bf_lo of each element |
 | `round_f16_kernel` | `:822-825` | no caller outside `kernels.cu` (declared at `include/basalt/prefill/kernels.hpp:98`) | `__half2float(__float2half_rn(x))` |
 | `copy_f4_kernel` (`copy_f32_wide`, `:977-983`) | `:972-975` | no caller outside `kernels.cu` (declared at `kernels.hpp:67`) | a float4 copy |
