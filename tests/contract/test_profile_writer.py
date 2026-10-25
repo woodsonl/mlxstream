@@ -432,7 +432,7 @@ def test_the_tile_kernel_accepts_exactly_the_shared_splits(monkeypatch):
 def test_writer_sweep_is_tune_gemms_candidate_set(monkeypatch, fmt, k, tm, placement, backend):
     """Value: protects=the writer times exactly tune_gemm's tile candidates; fails_when=the twin rule, the splits or
     the crew modes change on one side only; why_new=the only tie is GPU-tier at one point, and without a pinned backend the contract tier checks the
-    host's tile layout alone (Apple9 here, Apple10 without Metal); seam=using_backend."""
+    host's tile layout alone (Apple9 on an M3 or M4 host, Apple10 on an M5 or without Metal); seam=using_backend."""
     import numpy as np
     import tools.profile_writer as pw
     from monolith.bench import pack_spec, random_spec
