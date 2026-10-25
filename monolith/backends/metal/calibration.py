@@ -18,7 +18,7 @@ TILE_TMS = (8, 16, 32)          # the accelerator tile's token rows
 TILE_KSPLITS = (2, 4, 8, 16)    # the tile's K-splits (SIMD-groups sharing a row tile's K): the autotuner tries them and the writer
                                 # times them; gemm_tile accepts only these and 1, so the splits the shipped kernel-choices files
                                 # cache and compiler.emit's small-BF16 splits must stay inside them
-NEVER = 33                      # accelerator_min_t of a format the tile loses at every compared T: above every T a decode tile covers
+NEVER = max(TILE_TMS) + 1       # accelerator_min_t of a format the tile loses at every compared T: above every T a decode tile covers
 DEFAULT_LANE_ORDER = "interleaved16"
 
 
@@ -158,6 +158,7 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
     """The ``engine`` block from the writer's measurements (``tools/profile_writer.py`` builds the mapping:
     ``family``, ``lane_order_gbps`` {order: GB/s}, ``threadgroups_ms`` {count: ms}, ``shader_ms`` {format: {T: ms}},
     ``tile_ms`` {format: {TM: ms}} (the geometry the autotuner picks, in the same T = 1 unit), ``tile_error``,
+    ``tile_refused`` (the unsplit tile refused the shape: the error is that refusal),
     ``attention_ms`` {"v1": {(ctx, T): ms}, "v2": …}) and the current engine block (the values the measurement does
     not cover — sibling order, max_cb_ms, attention_rows — carry over). Returns ``(engine, notes)``."""
     cur = dict(current or {})
