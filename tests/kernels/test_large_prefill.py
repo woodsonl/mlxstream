@@ -138,6 +138,57 @@ def test_exact_prompt_passes_give_the_scores_of_128_row_passes(tmp_path, attenti
     assert [k.macros.get('EXACT_SUB') for k in exact.engines['prefill.512'].program.kernels.values() if k.function == core] == ['128u']
 
 
+@pytest.mark.parametrize('accelerator', ['off', 'on'])
+@pytest.mark.parametrize('chunk', [512])
+def test_exact_requests_restored_off_the_grid_give_the_bits_of_cold_runs(tmp_path, chunk, accelerator):
+    # A request restored from a checkpoint off the 128-row grid gives its last prompt row's scores and its tokens as the
+    # same request run cold, bit for bit. auto runs v3 at the synthetic checkpoint's head dim 32, and v3 pairs the keys
+    # cached before a pass, so a row depends on where its pass starts unless the exact form anchors it at the 128-row
+    # passes from token 0. The checkpoint's one attention layer is its last, so the last row's own pass must start
+    # elsewhere warm than cold: turn 1 checkpoints its first 300 tokens; turn 2 keeps a shorter message prefix (250, as
+    # serve keeps a system prompt's) and restores 300, where the cold run splits at 250. A pair and two single folds
+    # sum alike unless the running maximum moves between them, so the starts lie far apart: at 428 tokens the last row's
+    # pass starts at 300 warm and 378 cold (384 from token 0), both on the large graph; at 429 the warm run's one-token
+    # chunk sends it to the 128-row graph and the cold run stays on the large one. A cold run whose passes all start on
+    # the grid gives what plain 128-row passes give.
+    _checkpoint(tmp_path)
+    pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
+               PackLayout(rows=16))
+
+    def session(**options):
+        return Session(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path / 'pack'), eos=-1,
+                       autotune=False, attention='auto', accelerator=accelerator, **options)
+    exact = session(prefill_chunk_size=chunk, prefill_exact=True, prefix_cache=True, prefix_cache_min_tokens=128)
+    plain = session(prefill_chunk_size=128)
+    ids = np.random.default_rng(81).integers(0, 50, 800).tolist()
+    exact.generate(ids[:300] + ids[700:], 1, cache_prefix_tokens=300)
+    turn1 = list(exact.prefix_cache.items)
+    assert [len(item.tokens) for item in turn1] == [300]
+
+    def last_row(s, n, prefix, restore=False):
+        """The last prompt row's scores and 12 greedy tokens, each from its own request with the same cache."""
+        outputs = []
+        for steps in (1, 12):
+            if s.prefix_cache is not None:
+                s.prefix_cache.items = list(turn1) if restore else []
+            g = s.generate(ids[:n], steps, cache_prefix_tokens=prefix)
+            assert g.cached_prompt_tokens == g.prefill_timings[0]['position'] == (300 if restore else 0)
+            if steps > 1:
+                return outputs + [g.tokens]
+            logits = np.frombuffer(s.read('logits'), dtype=np.uint16).reshape(-1, s.model.config.vocab_size)
+            outputs.append(logits[g.prefill_timings[-1]['tokens'] - 1].copy())
+
+    for n in (428, 429):
+        (warm, warm_tokens), (cold, cold_tokens) = last_row(exact, n, 250, restore=True), last_row(exact, n, 250)
+        assert warm_tokens == cold_tokens, n
+        assert np.array_equal(warm, cold), (n, int((warm != cold).sum()))
+    (grid, grid_tokens), (ref, ref_tokens) = last_row(exact, 700, 256), last_row(plain, 700, 256)
+    assert grid_tokens == ref_tokens and np.array_equal(grid, ref), int((grid != ref).sum())
+    for key in {f'prefill.{chunk}', 'prefill.128'}:
+        v3 = [k for k in exact._programs[key].kernels.values() if k.function == 'gqa_decode_v3']
+        assert [k.macros.get('EXACT_SUB') for k in v3] == ['128u'], key
+
+
 def test_tie_rows_hold_the_scores_the_reference_chose_by(tmp_path):
     # greedy_ties.score_row, the scores agree reads: the prompt pass's row for token 0 and the decode step's row 0 for a
     # later token, with the steps queued past the last leaving that row alone

@@ -422,7 +422,9 @@ class Session:
             with using_backend(self.profile.backend) as backend:
                 prog = backend.optimize_prefill(prog, exact=exact)
             reuse_arenas(prog, barriers=self.barriers)
-        if exact:
+        if prefill and self.prefill_exact:
+            # the EXACT_ROWS-row graph too: a request with a one-token chunk runs there, and v3's rows must not depend on
+            # where its passes start
             from .compiler.prefill import exact_attention
             prog = exact_attention(prog, self.EXACT_ROWS)
         if shared:
