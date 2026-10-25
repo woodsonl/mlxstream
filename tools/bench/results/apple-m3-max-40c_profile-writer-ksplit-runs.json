@@ -2,7 +2,7 @@
  "chip": "Apple M3 Max, 40 cores, Apple9 (threadgroups_per_core 2)",
  "tool": "tools/profile_writer.py --dry-run (shape 17408x5120, default formats, ts 1,2,4,8, tms 8,16,32)",
  "unit": "shader x = the pass cost relative to the run's T = 1 shader pass; tile x = the picked geometry's time in the same unit",
- "note": "the writer times every geometry tune_gemm tries and records only the pick per TM; crew and crew2 are timed at one and two threadgroups per core",
+ "note": "the writer times every geometry tune_gemm tries; the runs of October 16 and 25 (a, b) recorded only the pick per TM, and the dry run 2026-10-25c, after the writer began pricing accelerator_min_t on the unsplit tile, adds that tile's rows; crew and crew2 are timed at one and two threadgroups per core",
  "runs": [
   {
    "run": "2026-10-16a",
@@ -787,6 +787,255 @@
     "int4_affine": 2,
     "bf16": 2
    }
+  },
+  {
+   "run": "2026-10-25c",
+   "started": "2026-10-25T21:03:49Z",
+   "ended": "2026-10-25T21:05:44Z",
+   "command": "python tools/profile_writer.py --dry-run",
+   "source": "af444d0 (the writer prices accelerator_min_t on the unsplit tile and records every geometry)",
+   "status": "used",
+   "status_note": "run under the shared GPU lock; no other GPU pytest at its start or end",
+   "threadgroups_per_core": 2,
+   "shader": {
+    "nvfp4": {
+     "1": {
+      "ms": 0.187,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.231,
+      "x": 1.24,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.358,
+      "x": 1.92,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.147,
+      "x": 6.14,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "fp8_e4m3": {
+     "1": {
+      "ms": 0.24,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.284,
+      "x": 1.19,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.433,
+      "x": 1.81,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 0.703,
+      "x": 2.94,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "int4_affine": {
+     "1": {
+      "ms": 0.195,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.26,
+      "x": 1.33,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.432,
+      "x": 2.22,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.267,
+      "x": 6.51,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "bf16": {
+     "1": {
+      "ms": 0.467,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.494,
+      "x": 1.06,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.568,
+      "x": 1.22,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.088,
+      "x": 2.33,
+      "geometry": "1blk/SG tg64"
+     }
+    }
+   },
+   "tile": {
+    "nvfp4": {
+     "8": {
+      "ms": 0.163,
+      "x": 0.87,
+      "mode": "ksplit8"
+     },
+     "16": {
+      "ms": 0.266,
+      "x": 1.42,
+      "mode": "ksplit4nc"
+     },
+     "32": {
+      "ms": 0.514,
+      "x": 2.75,
+      "mode": "ksplit4"
+     }
+    },
+    "fp8_e4m3": {
+     "8": {
+      "ms": 0.243,
+      "x": 1.02,
+      "mode": "ksplit4"
+     },
+     "16": {
+      "ms": 0.271,
+      "x": 1.13,
+      "mode": "ksplit4"
+     },
+     "32": {
+      "ms": 0.513,
+      "x": 2.14,
+      "mode": "ksplit4"
+     }
+    },
+    "int4_affine": {
+     "8": {
+      "ms": 0.249,
+      "x": 1.28,
+      "mode": "ksplit2nc"
+     },
+     "16": {
+      "ms": 0.364,
+      "x": 1.87,
+      "mode": "ksplit2nc"
+     },
+     "32": {
+      "ms": 0.656,
+      "x": 3.37,
+      "mode": "ksplit8"
+     }
+    },
+    "bf16": {
+     "8": {
+      "ms": 0.51,
+      "x": 1.09,
+      "mode": "ksplit2"
+     },
+     "16": {
+      "ms": 0.503,
+      "x": 1.08,
+      "mode": "ksplit2"
+     },
+     "32": {
+      "ms": 0.615,
+      "x": 1.32,
+      "mode": "ksplit4"
+     }
+    }
+   },
+   "unsplit": {
+    "geometry": "crew2 (the unsplit tile at two threadgroups per core, serve's tile on unlisted shapes)",
+    "x": {
+     "nvfp4": {
+      "8": 1.5,
+      "16": 2.47,
+      "32": 4.89
+     },
+     "fp8": {
+      "8": 1.34,
+      "16": 1.91,
+      "32": 3.75
+     },
+     "int4_affine": {
+      "8": 1.94,
+      "16": 2.99,
+      "32": 5.75
+     },
+     "bf16": {
+      "8": 1.24,
+      "16": 1.56,
+      "32": 1.86
+     }
+    }
+   },
+   "cost_T": {
+    "nvfp4": {
+     "1": 1.0,
+     "2": 1.237,
+     "4": 1.919,
+     "8": 6.139
+    },
+    "fp8": {
+     "1": 1.0,
+     "2": 1.187,
+     "4": 1.807,
+     "8": 2.935
+    },
+    "int4_affine": {
+     "1": 1.0,
+     "2": 1.334,
+     "4": 2.222,
+     "8": 6.513
+    },
+    "bf16": {
+     "1": 1.0,
+     "2": 1.058,
+     "4": 1.215,
+     "8": 2.329
+    },
+    "accelerator_nvfp4": {
+     "8": 0.874,
+     "16": 1.424,
+     "32": 2.749
+    },
+    "accelerator_fp8": {
+     "8": 1.015,
+     "16": 1.132,
+     "32": 2.141
+    },
+    "accelerator_int4_affine": {
+     "8": 1.283,
+     "16": 1.872,
+     "32": 3.374
+    },
+    "accelerator_bf16": {
+     "8": 1.093,
+     "16": 1.077,
+     "32": 1.317
+    }
+   },
+   "accelerator_min_t": {
+    "nvfp4": 4,
+    "fp8": 4,
+    "int4_affine": 4,
+    "bf16": 4
+   },
+   "accelerator_decision": "nvfp4: the tile from T = 4 (tile TM8 1.50, TM16 2.47, TM32 4.89 vs shader T2 1.24, T4 1.92, T8 6.14); fp8: the tile from T = 4 (tile TM8 1.34, TM16 1.91, TM32 3.75 vs shader T2 1.19, T4 1.81, T8 2.94); int4_affine: the tile from T = 4 (tile TM8 1.94, TM16 2.99, TM32 5.75 vs shader T2 1.33, T4 2.22, T8 6.51); bf16: the tile from T = 4 (tile TM8 1.24, TM16 1.56, TM32 1.86 vs shader T2 1.06, T4 1.22, T8 2.33); the autotuner's pick would start the tile at T = 2 for nvfp4, T = 2 for fp8, T = 2 for int4_affine, T = 4 for bf16; the switch stays on: carried over from the file, because it also gates the T = 1 rows GEMVs, auto attention's MMA kernel at T >= 4, the drafter's MMA attention and the GDN prepared path (and m5_max_40c's attention, MLP and GDN-fusion recipes), which the writer does not time",
+   "measured_s": 114
   }
  ]
 }
