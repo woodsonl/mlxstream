@@ -1,0 +1,792 @@
+{
+ "chip": "Apple M3 Max, 40 cores, Apple9 (threadgroups_per_core 2)",
+ "tool": "tools/profile_writer.py --dry-run (shape 17408x5120, default formats, ts 1,2,4,8, tms 8,16,32)",
+ "unit": "shader x = the pass cost relative to the run's T = 1 shader pass; tile x = the picked geometry's time in the same unit",
+ "note": "the writer times every geometry tune_gemm tries and records only the pick per TM; crew and crew2 are timed at one and two threadgroups per core",
+ "runs": [
+  {
+   "run": "2026-10-16a",
+   "started": "2026-10-16 01:32:54 -0500",
+   "command": "python tools/profile_writer.py --dry-run",
+   "source": "the branch before its rebase onto ae7e0a4 (gemm_tile, the GEMV kernels and the format code are the same at ae7e0a4)",
+   "status": "used",
+   "shader": {
+    "nvfp4": {
+     "1": {
+      "ms": 0.179,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.233,
+      "x": 1.3,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.361,
+      "x": 2.02,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.121,
+      "x": 6.26,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "fp8_e4m3": {
+     "1": {
+      "ms": 0.233,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.291,
+      "x": 1.25,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.439,
+      "x": 1.89,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 0.707,
+      "x": 3.03,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "int4_affine": {
+     "1": {
+      "ms": 0.174,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.256,
+      "x": 1.47,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.432,
+      "x": 2.48,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.224,
+      "x": 7.02,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "bf16": {
+     "1": {
+      "ms": 0.46,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.498,
+      "x": 1.08,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.57,
+      "x": 1.24,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.084,
+      "x": 2.35,
+      "geometry": "1blk/SG tg64"
+     }
+    }
+   },
+   "tile": {
+    "nvfp4": {
+     "8": {
+      "ms": 0.164,
+      "x": 0.92,
+      "mode": "ksplit8"
+     },
+     "16": {
+      "ms": 0.265,
+      "x": 1.48,
+      "mode": "ksplit4nc"
+     },
+     "32": {
+      "ms": 0.515,
+      "x": 2.88,
+      "mode": "ksplit4"
+     }
+    },
+    "fp8_e4m3": {
+     "8": {
+      "ms": 0.243,
+      "x": 1.04,
+      "mode": "ksplit4"
+     },
+     "16": {
+      "ms": 0.27,
+      "x": 1.16,
+      "mode": "ksplit4"
+     },
+     "32": {
+      "ms": 0.512,
+      "x": 2.2,
+      "mode": "ksplit4"
+     }
+    },
+    "int4_affine": {
+     "8": {
+      "ms": 0.251,
+      "x": 1.44,
+      "mode": "ksplit2nc"
+     },
+     "16": {
+      "ms": 0.364,
+      "x": 2.09,
+      "mode": "ksplit2nc"
+     },
+     "32": {
+      "ms": 0.66,
+      "x": 3.79,
+      "mode": "ksplit8"
+     }
+    },
+    "bf16": {
+     "8": {
+      "ms": 0.493,
+      "x": 1.07,
+      "mode": "ksplit4"
+     },
+     "16": {
+      "ms": 0.505,
+      "x": 1.1,
+      "mode": "ksplit2"
+     },
+     "32": {
+      "ms": 0.592,
+      "x": 1.29,
+      "mode": "ksplit8"
+     }
+    }
+   },
+   "accelerator_decision": "nvfp4: the tile from T = 2 (tile TM8 0.92, TM16 1.48, TM32 2.88 vs shader T2 1.30, T4 2.02, T8 6.26); fp8: the tile from T = 2 (tile TM8 1.04, TM16 1.16, TM32 2.20 vs shader T2 1.25, T4 1.89, T8 3.03); int4_affine: the tile from T = 2 (tile TM8 1.44, TM16 2.09, TM32 3.79 vs shader T2 1.47, T4 2.48, T8 7.03); bf16: the tile from T = 2 (tile TM8 1.07, TM16 1.10, TM32 1.29 vs shader T2 1.08, T4 1.24, T8 2.35)",
+   "measured_s": 119
+  },
+  {
+   "run": "2026-10-16b",
+   "started": "2026-10-16 02:33:29 -0500",
+   "command": "python tools/profile_writer.py --dry-run",
+   "source": "the branch before its rebase onto ae7e0a4 (gemm_tile, the GEMV kernels and the format code are the same at ae7e0a4)",
+   "status": "used",
+   "shader": {
+    "nvfp4": {
+     "1": {
+      "ms": 0.18,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.239,
+      "x": 1.33,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.359,
+      "x": 1.99,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.15,
+      "x": 6.38,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "fp8_e4m3": {
+     "1": {
+      "ms": 0.235,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.295,
+      "x": 1.26,
+      "geometry": "crew x2"
+     },
+     "4": {
+      "ms": 0.429,
+      "x": 1.83,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 0.707,
+      "x": 3.01,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "int4_affine": {
+     "1": {
+      "ms": 0.176,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.256,
+      "x": 1.46,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.431,
+      "x": 2.45,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.254,
+      "x": 7.12,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "bf16": {
+     "1": {
+      "ms": 0.465,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.508,
+      "x": 1.09,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.558,
+      "x": 1.2,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.086,
+      "x": 2.34,
+      "geometry": "1blk/SG tg64"
+     }
+    }
+   },
+   "tile": {
+    "nvfp4": {
+     "8": {
+      "ms": 0.165,
+      "x": 0.92,
+      "mode": "ksplit8"
+     },
+     "16": {
+      "ms": 0.265,
+      "x": 1.47,
+      "mode": "ksplit4nc"
+     },
+     "32": {
+      "ms": 0.513,
+      "x": 2.85,
+      "mode": "ksplit4"
+     }
+    },
+    "fp8_e4m3": {
+     "8": {
+      "ms": 0.239,
+      "x": 1.02,
+      "mode": "ksplit4"
+     },
+     "16": {
+      "ms": 0.27,
+      "x": 1.15,
+      "mode": "ksplit4"
+     },
+     "32": {
+      "ms": 0.517,
+      "x": 2.21,
+      "mode": "ksplit4"
+     }
+    },
+    "int4_affine": {
+     "8": {
+      "ms": 0.253,
+      "x": 1.44,
+      "mode": "ksplit2nc"
+     },
+     "16": {
+      "ms": 0.367,
+      "x": 2.08,
+      "mode": "ksplit2nc"
+     },
+     "32": {
+      "ms": 0.656,
+      "x": 3.72,
+      "mode": "ksplit8"
+     }
+    },
+    "bf16": {
+     "8": {
+      "ms": 0.509,
+      "x": 1.1,
+      "mode": "ksplit4"
+     },
+     "16": {
+      "ms": 0.511,
+      "x": 1.1,
+      "mode": "ksplit2"
+     },
+     "32": {
+      "ms": 0.589,
+      "x": 1.27,
+      "mode": "ksplit8"
+     }
+    }
+   },
+   "accelerator_decision": "nvfp4: the tile from T = 2 (tile TM8 0.92, TM16 1.47, TM32 2.85 vs shader T2 1.32, T4 1.99, T8 6.38); fp8: the tile from T = 2 (tile TM8 1.02, TM16 1.15, TM32 2.21 vs shader T2 1.26, T4 1.83, T8 3.01); int4_affine: the tile from T = 2 (tile TM8 1.44, TM16 2.08, TM32 3.73 vs shader T2 1.46, T4 2.45, T8 7.12); bf16: the tile from T = 2 (tile TM8 1.10, TM16 1.10, TM32 1.27 vs shader T2 1.09, T4 1.20, T8 2.34)",
+   "measured_s": 122
+  },
+  {
+   "run": "2026-10-25a",
+   "started": "2026-10-25T07:21:23Z",
+   "command": "python tools/profile_writer.py --out <a scratch file> (under the shared GPU lock)",
+   "source": "bbca60c",
+   "status": "used",
+   "shader": {
+    "nvfp4": {
+     "1": {
+      "ms": 0.192,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.234,
+      "x": 1.21,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.36,
+      "x": 1.87,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.075,
+      "x": 5.59,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "fp8_e4m3": {
+     "1": {
+      "ms": 0.243,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.283,
+      "x": 1.16,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.439,
+      "x": 1.8,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 0.708,
+      "x": 2.91,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "int4_affine": {
+     "1": {
+      "ms": 0.183,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.261,
+      "x": 1.42,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.432,
+      "x": 2.36,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.218,
+      "x": 6.64,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "bf16": {
+     "1": {
+      "ms": 0.492,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.509,
+      "x": 1.04,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.582,
+      "x": 1.18,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.134,
+      "x": 2.31,
+      "geometry": "1blk/SG tg64"
+     }
+    }
+   },
+   "tile": {
+    "nvfp4": {
+     "8": {
+      "ms": 0.166,
+      "x": 0.86,
+      "mode": "ksplit8"
+     },
+     "16": {
+      "ms": 0.264,
+      "x": 1.37,
+      "mode": "ksplit4nc"
+     },
+     "32": {
+      "ms": 0.514,
+      "x": 2.67,
+      "mode": "ksplit4"
+     }
+    },
+    "fp8_e4m3": {
+     "8": {
+      "ms": 0.249,
+      "x": 1.02,
+      "mode": "ksplit4"
+     },
+     "16": {
+      "ms": 0.274,
+      "x": 1.13,
+      "mode": "ksplit4"
+     },
+     "32": {
+      "ms": 0.514,
+      "x": 2.11,
+      "mode": "ksplit4"
+     }
+    },
+    "int4_affine": {
+     "8": {
+      "ms": 0.261,
+      "x": 1.42,
+      "mode": "ksplit2nc"
+     },
+     "16": {
+      "ms": 0.373,
+      "x": 2.03,
+      "mode": "ksplit2nc"
+     },
+     "32": {
+      "ms": 0.663,
+      "x": 3.62,
+      "mode": "ksplit8"
+     }
+    },
+    "bf16": {
+     "8": {
+      "ms": 0.501,
+      "x": 1.02,
+      "mode": "ksplit2"
+     },
+     "16": {
+      "ms": 0.571,
+      "x": 1.16,
+      "mode": "ksplit2"
+     },
+     "32": {
+      "ms": 0.612,
+      "x": 1.24,
+      "mode": "ksplit8"
+     }
+    }
+   },
+   "accelerator_decision": "nvfp4: the tile from T = 2 (tile TM8 0.86, TM16 1.37, TM32 2.67 vs shader T2 1.21, T4 1.87, T8 5.59); fp8: the tile from T = 2 (tile TM8 1.02, TM16 1.13, TM32 2.11 vs shader T2 1.16, T4 1.80, T8 2.91); int4_affine: the tile from T = 2 (tile TM8 1.42, TM16 2.03, TM32 3.62 vs shader T2 1.42, T4 2.36, T8 6.64); bf16: the tile from T = 2 (tile TM8 1.02, TM16 1.16, TM32 1.24 vs shader T2 1.03, T4 1.18, T8 2.31)",
+   "measured_s": 143,
+   "status_note": "another workspace's GPU tests started in its last ~30 s, during the attention step; the GEMV and tile steps ran alone",
+   "ended": "2026-10-25T07:23:46Z",
+   "cost_T": {
+    "nvfp4": {
+     "1": 1.0,
+     "2": 1.214,
+     "4": 1.874,
+     "8": 5.586
+    },
+    "fp8": {
+     "1": 1.0,
+     "2": 1.161,
+     "4": 1.803,
+     "8": 2.908
+    },
+    "int4_affine": {
+     "1": 1.0,
+     "2": 1.424,
+     "4": 2.356,
+     "8": 6.64
+    },
+    "bf16": {
+     "1": 1.0,
+     "2": 1.035,
+     "4": 1.183,
+     "8": 2.306
+    },
+    "accelerator_nvfp4": {
+     "8": 0.865,
+     "16": 1.374,
+     "32": 2.673
+    },
+    "accelerator_fp8": {
+     "8": 1.024,
+     "16": 1.126,
+     "32": 2.113
+    },
+    "accelerator_int4_affine": {
+     "8": 1.421,
+     "16": 2.032,
+     "32": 3.618
+    },
+    "accelerator_bf16": {
+     "8": 1.019,
+     "16": 1.16,
+     "32": 1.244
+    }
+   },
+   "accelerator_min_t": {
+    "nvfp4": 2,
+    "fp8": 2,
+    "int4_affine": 2,
+    "bf16": 2
+   }
+  },
+  {
+   "run": "2026-10-25b",
+   "started": "2026-10-25T07:23:46Z",
+   "command": "python tools/profile_writer.py --out <a scratch file> (under the shared GPU lock)",
+   "source": "bbca60c",
+   "status": "discarded",
+   "shader": {
+    "nvfp4": {
+     "1": {
+      "ms": 0.205,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.234,
+      "x": 1.14,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.365,
+      "x": 1.78,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.046,
+      "x": 5.11,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "fp8_e4m3": {
+     "1": {
+      "ms": 0.27,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.314,
+      "x": 1.16,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.456,
+      "x": 1.69,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 0.724,
+      "x": 2.68,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "int4_affine": {
+     "1": {
+      "ms": 0.176,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.257,
+      "x": 1.46,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.44,
+      "x": 2.5,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.197,
+      "x": 6.8,
+      "geometry": "1blk/SG tg64"
+     }
+    },
+    "bf16": {
+     "1": {
+      "ms": 0.471,
+      "x": 1.0,
+      "geometry": "1blk/SG tg64"
+     },
+     "2": {
+      "ms": 0.516,
+      "x": 1.1,
+      "geometry": "1blk/SG tg64"
+     },
+     "4": {
+      "ms": 0.565,
+      "x": 1.2,
+      "geometry": "1blk/SG tg64"
+     },
+     "8": {
+      "ms": 1.085,
+      "x": 2.31,
+      "geometry": "1blk/SG tg64"
+     }
+    }
+   },
+   "tile": {
+    "nvfp4": {
+     "8": {
+      "ms": 0.163,
+      "x": 0.8,
+      "mode": "ksplit8"
+     },
+     "16": {
+      "ms": 0.265,
+      "x": 1.29,
+      "mode": "ksplit4nc"
+     },
+     "32": {
+      "ms": 0.513,
+      "x": 2.5,
+      "mode": "ksplit4"
+     }
+    },
+    "fp8_e4m3": {
+     "8": {
+      "ms": 0.246,
+      "x": 0.91,
+      "mode": "ksplit2"
+     },
+     "16": {
+      "ms": 0.268,
+      "x": 0.99,
+      "mode": "ksplit4"
+     },
+     "32": {
+      "ms": 0.512,
+      "x": 1.89,
+      "mode": "ksplit4"
+     }
+    },
+    "int4_affine": {
+     "8": {
+      "ms": 0.25,
+      "x": 1.42,
+      "mode": "ksplit2nc"
+     },
+     "16": {
+      "ms": 0.361,
+      "x": 2.05,
+      "mode": "ksplit2nc"
+     },
+     "32": {
+      "ms": 0.654,
+      "x": 3.72,
+      "mode": "ksplit8"
+     }
+    },
+    "bf16": {
+     "8": {
+      "ms": 0.48,
+      "x": 1.02,
+      "mode": "ksplit2"
+     },
+     "16": {
+      "ms": 0.503,
+      "x": 1.07,
+      "mode": "ksplit4"
+     },
+     "32": {
+      "ms": 0.6,
+      "x": 1.27,
+      "mode": "ksplit4"
+     }
+    }
+   },
+   "accelerator_decision": "nvfp4: the tile from T = 2 (tile TM8 0.80, TM16 1.29, TM32 2.50 vs shader T2 1.14, T4 1.78, T8 5.11); fp8: the tile from T = 2 (tile TM8 0.91, TM16 0.99, TM32 1.89 vs shader T2 1.16, T4 1.69, T8 2.68); int4_affine: the tile from T = 2 (tile TM8 1.42, TM16 2.05, TM32 3.72 vs shader T2 1.46, T4 2.50, T8 6.80); bf16: the tile from T = 2 (tile TM8 1.02, TM16 1.07, TM32 1.27 vs shader T2 1.10, T4 1.20, T8 2.31)",
+   "measured_s": 113,
+   "status_note": "overlapped another workspace's GPU tests for its whole run (its T = 1 shader passes ran 7-13 % slower)",
+   "ended": "2026-10-25T07:25:39Z",
+   "cost_T": {
+    "nvfp4": {
+     "1": 1.0,
+     "2": 1.143,
+     "4": 1.781,
+     "8": 5.105
+    },
+    "fp8": {
+     "1": 1.0,
+     "2": 1.162,
+     "4": 1.687,
+     "8": 2.676
+    },
+    "int4_affine": {
+     "1": 1.0,
+     "2": 1.46,
+     "4": 2.499,
+     "8": 6.796
+    },
+    "bf16": {
+     "1": 1.0,
+     "2": 1.096,
+     "4": 1.201,
+     "8": 2.305
+    },
+    "accelerator_nvfp4": {
+     "8": 0.796,
+     "16": 1.291,
+     "32": 2.503
+    },
+    "accelerator_fp8": {
+     "8": 0.91,
+     "16": 0.99,
+     "32": 1.893
+    },
+    "accelerator_int4_affine": {
+     "8": 1.418,
+     "16": 2.048,
+     "32": 3.716
+    },
+    "accelerator_bf16": {
+     "8": 1.02,
+     "16": 1.07,
+     "32": 1.275
+    }
+   },
+   "accelerator_min_t": {
+    "nvfp4": 2,
+    "fp8": 2,
+    "int4_affine": 2,
+    "bf16": 2
+   }
+  }
+ ]
+}
