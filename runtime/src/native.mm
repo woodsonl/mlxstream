@@ -18,6 +18,7 @@
 #include <tuple>
 #include "basalt_cpu.h"
 #include "basalt_cpu_experts.h"
+#include "basalt_ngram.h"
 #include "basalt_pool.h"
 #include "basalt_cpu_expf.h"
 #include "metal_core.h"
@@ -119,6 +120,7 @@ using U8In2 = nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::
 using I32In1 = nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using I32In2 = nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using F32Out3 = nb::ndarray<float, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
+using U32Out2 = nb::ndarray<uint32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 
 static void need(bool ok, const char* what) {
   if (!ok) throw std::invalid_argument(what);
@@ -463,6 +465,41 @@ NB_MODULE(_native, m) {
              }
              return nb::make_tuple(ok, err);
            }, nb::arg("hold_s"), "run one job that sleeps hold_s seconds, so a wait can be made to stall");
+
+  // ---- the PLE n-gram hash (basalt_ngram.h) ---------------------------------------------------------------
+  // Sixteen row indices per token. Host-side by construction, so this is the whole kernel: the GPU only gathers
+  // the rows it names. The bounds divide rather than multiply, as the other array bindings here do.
+  m.def("basalt_ngram_rows", [](I32In1 tokens, I32In2 prev, U32Out2 out) {
+          const size_t n = tokens.shape(0);
+          need(prev.shape(0) == n && out.shape(0) == n,
+               "basalt_ngram_rows: tokens, prev and out must have one row per token");
+          need(prev.shape(1) == (size_t) (bc::NGRAM_SIZE - 1), "basalt_ngram_rows: prev rows hold 2 predecessors");
+          need(out.shape(1) == (size_t) bc::PLE_N_HEADS, "basalt_ngram_rows: out rows hold 16 head indices");
+          need(n <= (size_t) INT32_MAX, "basalt_ngram_rows: too many tokens");
+          // Two separate arrays, not two views of one: out is written while prev is read, and a shifted view
+          // would let the write land under the read. The same storage check the expert bindings make.
+          const auto* pp = (const unsigned char*) prev.data();
+          const auto* op = (const unsigned char*) out.data();
+          const size_t pb = n * (bc::NGRAM_SIZE - 1) * sizeof(int32_t), ob = n * bc::PLE_N_HEADS * sizeof(uint32_t);
+          need(pp + pb <= op || op + ob <= pp, "basalt_ngram_rows: prev and out must not share storage");
+          bc::PleConsts c;
+          {
+            nb::gil_scoped_release unlock;
+            bc::ngram_rows(tokens.data(), prev.data(), (int) n, c, out.data());
+          }
+        }, nb::arg("tokens").noconvert(), nb::arg("prev").noconvert(), nb::arg("out").noconvert(),
+        "sixteen PLE table row indices per token, from the token and its two predecessors (oldest first)");
+
+  // The hash constants, so a test can check the offsets are the running sum of the vocabulary sizes. basalt keeps
+  // both arrays in the GGUF metadata and writes both out rather than deriving one, so that a mismatch between
+  // them surfaces instead of hiding; this exposes them for exactly that check.
+  m.def("basalt_ngram_consts", []() {
+          bc::PleConsts c;
+          std::vector<uint64_t> mult(c.mult, c.mult + bc::NGRAM_SIZE);
+          std::vector<uint64_t> vocab(c.vocab, c.vocab + bc::PLE_N_HEADS);
+          std::vector<uint64_t> offset(c.offset, c.offset + bc::PLE_N_HEADS);
+          return nb::make_tuple(mult, vocab, offset);
+        }, "the n-gram hash constants as (mult, vocab, offset)");
 
   m.def("basalt_expf_digest", [](uint32_t first_bits, uint32_t count) {
     // Refused rather than wrapped: a range that runs off the end of the bit patterns would silently digest a
