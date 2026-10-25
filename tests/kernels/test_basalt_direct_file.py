@@ -221,6 +221,18 @@ def test_d3_a_wake_posts_a_synthetic_completion(reader):
     assert ok and got == PAGE
 
 
+def test_d8_the_wake_tag_is_refused_as_a_reads_tag(reader):
+    """`wake` posts a completion carrying `~0`, and `read_at` returns on the first completion whose tag matches
+    its own. A read submitted under that tag therefore matches the WAKE and returns before the read has run, so
+    the buffer is freed while a pool thread is still writing into it. One thread reaches it: queue a wake, then
+    read with that tag. Refused at the binding, because the tag is the reader's own."""
+    reader.wake()
+    with pytest.raises(ValueError, match="wake tag"):
+        reader.read_at(0, PAGE, (1 << 64) - 1)
+    ok, got, _ = reader.read_at(0, PAGE)       # the queued wake must not disturb an ordinary read either
+    assert ok and got == PAGE
+
+
 def test_d4_the_pool_runs_the_thread_count_it_was_given(table):
     for asked, want in ((1, 1), (16, 16), (64, 64), (100, 64), (0, 1)):
         f = _nt.DirectFile()

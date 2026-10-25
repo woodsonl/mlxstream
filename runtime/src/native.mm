@@ -482,11 +482,17 @@ NB_MODULE(_native, m) {
           // A decode window is tens of tokens; this bound exists so the row count cannot approach the
           // arithmetic's limits, not because a larger batch is meaningful.
           need(n <= (size_t) (1 << 20), "basalt_ngram_rows: at most 1,048,576 tokens");
-          // Two separate arrays, not two views of one: out is written while prev is read, and a shifted view
-          // would let the write land under the read. The same storage check the expert bindings make.
+          // Separate arrays, not views of one: out is written while BOTH inputs are read, and a view of out's
+          // own storage would let the write land under the read. tokens aliases just as easily as prev, because
+          // a contiguous int32 view of the uint32 out array passes every other check here, and the 16 words
+          // written for token 0 sit exactly where tokens 1 through 15 are read from. The same storage check the
+          // expert bindings make, against each input in turn.
+          const auto* tp = (const unsigned char*) tokens.data();
           const auto* pp = (const unsigned char*) prev.data();
           const auto* op = (const unsigned char*) out.data();
-          const size_t pb = n * (bc::NGRAM_SIZE - 1) * sizeof(int32_t), ob = n * bc::PLE_N_HEADS * sizeof(uint32_t);
+          const size_t tb = n * sizeof(int32_t), pb = n * (bc::NGRAM_SIZE - 1) * sizeof(int32_t),
+                       ob = n * bc::PLE_N_HEADS * sizeof(uint32_t);
+          need(tp + tb <= op || op + ob <= tp, "basalt_ngram_rows: tokens and out must not share storage");
           need(pp + pb <= op || op + ob <= pp, "basalt_ngram_rows: prev and out must not share storage");
           bc::PleConsts c;
           {
@@ -590,6 +596,10 @@ NB_MODULE(_native, m) {
       .def("read_at", [](bc::DirectFile& f, uint64_t offset, uint32_t length, uint64_t tag) {
              need(length > 0 && length % bc::DIRECT_ALIGNMENT == 0,
                   "read_at: length must be a nonzero multiple of 4096");
+             // The wake tag is the reader's own. A read submitted under it matches the completion `wake` posts,
+             // so the wait returns before the read has run and the buffer is freed while a pool thread is still
+             // writing into it: a write to freed memory, reachable from one thread with a wake already queued.
+             need(tag != bc::DIRECT_WAKE_TAG, "read_at: tag 0xFFFFFFFFFFFFFFFF is the wake tag, not a read's");
              std::vector<uint8_t> bytes;
              uint32_t got = 0;
              bool ok = false;

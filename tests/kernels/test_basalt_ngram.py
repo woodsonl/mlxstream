@@ -172,5 +172,31 @@ def test_c2_the_binding_refuses_shared_storage():
     buf = np.zeros(2 * N_HEADS, np.uint32)
     prev = buf[: 2 * N_PREV].view(np.int32).reshape(2, N_PREV)
     out = buf.reshape(2, N_HEADS)
-    with pytest.raises(ValueError, match="share storage"):
+    with pytest.raises(ValueError, match="prev and out must not share storage"):
         _nt.basalt_ngram_rows(np.array([1, 2], np.int32), prev, out)
+
+
+def test_c3_tokens_can_alias_out_as_easily_as_prev_can():
+    """The same hazard on the other input, and the easier one to write by accident: a contiguous int32 view of
+    the uint32 `out` array is the right dtype, the right shape and contiguous, so it passes every other check
+    here. The 16 words written for token 0 land exactly where tokens 1 through 15 are read from, so the first
+    row's output decides the rest of the input. The result is finite and wrong, never a crash, which is what
+    makes the refusal worth more than a copy."""
+    n = 32
+    buf = np.zeros(n * N_HEADS + n, np.uint32)
+    out = buf[: n * N_HEADS].reshape(n, N_HEADS)
+    prev = np.zeros((n, N_PREV), np.int32)
+
+    alias = out.reshape(-1).view(np.int32)[:n]             # the write lands under the read
+    alias[:] = np.arange(1, n + 1, dtype=np.int32)
+    with pytest.raises(ValueError, match="tokens and out must not share storage"):
+        _nt.basalt_ngram_rows(alias, prev, out)
+
+    # The same buffer, past every word `out` covers. The check is about the ranges, not about the allocation,
+    # so this one runs: without the second arm a guard that refused every int32 view would pass the first.
+    far = buf[n * N_HEADS :].view(np.int32)
+    assert far.shape == (n,) and np.shares_memory(far, buf) and not np.shares_memory(far, out), \
+        "the disjoint view is not what this case meant to build: one buffer, no overlap with out"
+    far[:] = np.arange(1, n + 1, dtype=np.int32)
+    _nt.basalt_ngram_rows(far, prev, out)
+    assert out.any(), "the allowed call wrote nothing, so it proves nothing"
