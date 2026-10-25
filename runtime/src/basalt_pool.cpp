@@ -4,7 +4,7 @@
 // (MIT; third_party/NOTICE): the constructor, `publish`, `worker`, `claim`, `begin_batch`, `wait_parked`,
 // `wait_done` and `run_phase`, transcribed with the memory orders as written.
 //
-// The memory orders are the specification, not a detail. docs/research/basalt-cpu-pool.md section 1.9 lists every
+// The memory orders are the specification, not a detail. docs/research/basalt-cpu-pool.md section 1.5 lists every
 // one against its line in basalt, and two of them carry arguments that break if weakened:
 //
 //   * `publish` and the sleep path are BOTH seq_cst, and that is the whole lost-wakeup argument: a worker going to
@@ -21,7 +21,6 @@
 
 #include <chrono>
 #include <cstdio>
-#include <vector>
 
 namespace monolith::basalt_cpu {
 
@@ -234,6 +233,19 @@ bool ExpertPool::run_phase(int n_tasks, const std::function<void(int, int)>& bod
         error = "a pool batch holds 0 to 65535 jobs, not " + std::to_string(n_tasks);
         return false;
     }
+    // One driver at a time, and refused here rather than left to block: a second driver that passes the park
+    // barrier before the first publishes overwrites `body_` and resets `done_` and `head_` under it, so the first
+    // waits on a count the second is filling and runs a body it did not publish. ThreadSanitizer names the race
+    // on `body_` (tools/tsan/pool_tsan.cpp). `claim_owner` cannot serve here: an owner holds its claim across
+    // calls, so it is the wrong grain.
+    if (driving_.exchange(true, std::memory_order_acq_rel)) {
+        error = "the CPU expert pool is already running a phase on another thread";
+        return false;
+    }
+    struct Driving {                              // cleared on every exit, the stall returns included
+        std::atomic<bool>& flag;
+        ~Driving() { flag.store(false, std::memory_order_release); }
+    } driving_guard{driving_};
 
     const auto t_before = std::chrono::steady_clock::now();
     if (!wait_parked("before a phase", error)) return false;
@@ -291,11 +303,15 @@ void PoolTask::abandon(std::unique_ptr<std::function<void(int, int)>> body) {
     // way to interrupt them. Both the body and one reference to the pool are leaked on purpose, for the process's
     // life: the destructor would join a worker that never returns, and freeing the body under a running one is a
     // use-after-free. This is what basalt's abort() buys for free.
-    static std::vector<std::unique_ptr<std::function<void(int, int)>>> abandoned_bodies;
-    static std::vector<std::shared_ptr<ExpertPool>> abandoned_pools;
-    abandoned_bodies.push_back(std::move(body));
-    abandoned_pools.push_back(pool_);
-    pool_.reset();                                                // this task no longer reaches it
+    //
+    // Leaked with `new`, never parked in a function-local static container: such a container is destroyed at exit,
+    // and dropping the last reference to the pool there runs ~ExpertPool, which joins the worker that never
+    // returns. That is the hang this leak exists to prevent. Nothing here is ever freed, so there is also no
+    // container for two abandoning tasks to race on.
+    (void) body.release();                                        // never freed: a worker may still call it
+    (void) new std::shared_ptr<ExpertPool>(std::move(pool_));     // never released: ~ExpertPool must not run
+                                                                  // the move leaves pool_ empty: this task no
+                                                                  // longer reaches it
 }
 
 }  // namespace monolith::basalt_cpu

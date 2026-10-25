@@ -360,10 +360,10 @@ NB_MODULE(_native, m) {
              need(std::isfinite(hold_s) && hold_s >= 0.0 && hold_s <= 24.0 * 60.0 * 60.0,
                   "stall_phase: hold_s must be finite and 0 to 86,400");
              // One job that outlives kStall, so the stall path and the poisoning can be tested. A poisoned pool's
-             // worker is still inside this body, so neither the body nor the pool may be freed. The body is
-             // function-local static and the pool is held through a non-owning reference the binding cannot free,
-             // but the Python object CAN still be collected, so the test keeps its own reference and this leaks
-             // the body on the poisoning path, which is the same bargain PoolTask::abandon makes.
+             // worker is still inside this body, so neither the body nor the pool may be freed. The body is on the
+             // heap and is leaked on the poisoning path, and the pool is held through a non-owning reference the
+             // binding cannot free, but the Python object CAN still be collected, so the test keeps its own
+             // reference. That is the same bargain PoolTask::abandon makes.
              std::string err;
              bool ok;
              {

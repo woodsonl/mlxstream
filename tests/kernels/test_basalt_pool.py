@@ -21,7 +21,7 @@ phase with more jobs than workers. **B**, the claim protocol across batches, whi
 word exists for: B1 many phases back to back, B2 phases spaced so the workers sleep between them, B3 phases spaced
 so some workers sleep and some do not, which is the schedule the header says "comes round constantly". **C**, the
 pool's own guards: C1 the owner claim, C2 the batch-size refusal, C3 a stalled pool poisons itself and refuses
-reuse. **D**, shapes: D1 a single worker, D2 without the host working, D3 the phase timers.
+reuse, C4 a second concurrent driver is refused. **D**, shapes: D1 a single worker, D2 without the host working, D3 the phase timers.
 
 **The sleep boundary is the point.** A worker that went to sleep is still counted as parked when it wakes, so for a
 moment after it has seen a new epoch the host believes it is idle. Group B spaces its phases around
@@ -183,8 +183,13 @@ def test_c3_a_stalled_pool_poisons_itself():
     The stall limit is 60 seconds, so this case costs the kernels tier about 70 of them. It carries the ``slow``
     marker for a run that wants to deselect it, and the tier does not: it runs, and it is the only case that
     proves the limit is armed at all, which matters because the transcribed spin wraps its clock every 1.8 s if
-    armed as basalt arms it."""
-    p = pool()
+    armed as basalt arms it.
+
+    ``host_works=False`` is the point of the shape: with the host working it drains the moment it has published,
+    so it can win the claim for the one job, sleep the 70 seconds inline and then find ``done`` already at 1. No
+    wait would stall and the case would pass or fail on which thread won. With the host not working only a worker
+    can claim, so the host always waits and always hits the limit."""
+    p = pool(host_works=False)
     ok, err = p.stall_phase(70.0)
     assert not ok and "stalled" in err
     assert p.poisoned
@@ -192,6 +197,37 @@ def test_c3_a_stalled_pool_poisons_itself():
     with pytest.raises(ValueError, match="cannot be reused"):
         p.count_phase(out, who)
     globals().setdefault("_poisoned_pools", []).append(p)   # never destroyed: a worker still holds its body
+
+
+def test_c4_a_second_driver_is_refused():
+    """C4. ``run_phase`` is not reentrant. A second driver that passes the park barrier before the first publishes
+    overwrites the batch description and resets ``done`` and ``head`` under it, so the first waits on a count the
+    second is filling and runs a body it did not publish. ``claim_owner`` answers a different question, which task
+    OWNS the pool, and an owner holds its claim across calls, so it is the wrong grain for a phase.
+
+    ThreadSanitizer names that race directly on two native drivers (``tools/tsan/pool_tsan.cpp``); the GIL makes
+    the window unreachable from Python, so what this case asserts is the refusal a caller sees."""
+    p = pool(n_workers=3)
+    out, who = np.zeros(8, I32), np.full(8, -7, I32)
+    second = {}
+
+    def drive_second():
+        time.sleep(0.3)                         # the first driver is 0.3 s into a 2 s phase
+        try:
+            p.count_phase(out, who)
+            second["err"] = None
+        except ValueError as e:
+            second["err"] = str(e)
+
+    t = threading.Thread(target=drive_second)
+    t.start()
+    ok, err = p.stall_phase(2.0)                # 2 s is under kStall, so this finishes and does not poison
+    t.join()
+    assert ok, f"the first driver should finish its own phase: {err}"
+    assert second["err"] is not None, "the second driver ran a phase while the first held one"
+    assert "another thread" in second["err"], second["err"]
+    assert not p.poisoned
+    assert list(out) == [0] * 8, "the refused phase must not have run any job"
 
 
 # ---- D: shapes --------------------------------------------------------------------------------------------------
