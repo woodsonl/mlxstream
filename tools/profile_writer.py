@@ -159,13 +159,8 @@ def measure(*, shape: Tuple[int, int] = (17408, 5120), formats: Sequence[str] = 
             m["shader_ms"][fmt][t], m["shader_geometry"][fmt][t], m["shader_gbps"][fmt][t] = best
             base = m["shader_ms"][fmt].get(ts[0])
             log(f"shader {fmt:12s} T={t}: {best[0]:.3f} ms ({best[1]}, {best[2]:.0f} GB/s)" + (f" = {best[0] / base:.2f}x T={ts[0]}" if base else ""))
-    # 4. the tensor-ops tile (MSL 4.0; a refused crew2 or K-split is skipped, any other error leaves no tile measurement) in each geometry the engine's
-    # autotuner tries (compiler.autotune.tune_gemm): the crew of one or two threadgroups per core, the K-splits
-    # TILE_KSPLITS and their cacheless twins; per TM its pick among those that pass the oracle (the fastest, but crew
-    # unless that wins by at least the noise margin), under its name for the geometry; a geometry that fails the oracle
-    # is recorded (tile_oracle_fail, kept through an error), every geometry of its TM still timed, and main() writes no profile;
-    # every timed run takes BF16 output (the engine's tile) and is followed by one untimed run with 32-bit output under the
-    # strict rule (OracleCheck.ok); an error other than a refusal names its geometry and stops main() too
+    # 4. the tensor-ops tile in each geometry compiler.autotune.tune_gemm tries, and per TM its pick (the module docstring): a
+    # refused crew2 or K-split is skipped; a refused crew or any other error ends the step (tile_error), tile_oracle_fail kept
     m["tile_ms"], m["tile_gbps"], m["tile_mode"], m["tile_oracle_fail"] = {}, {}, {}, {}
     if accelerator:
         ran = False                                                 # a tile variant ran: the tensor ops build on this chip
