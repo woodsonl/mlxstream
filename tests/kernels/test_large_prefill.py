@@ -141,16 +141,18 @@ def test_exact_prompt_passes_give_the_scores_of_128_row_passes(tmp_path, attenti
 @pytest.mark.parametrize('accelerator', ['off', 'on'])
 @pytest.mark.parametrize('chunk', [512, 128])            # 128: serve's auto-exact where the chip measured no larger size
 def test_exact_requests_restored_off_the_grid_give_the_bits_of_cold_runs(tmp_path, chunk, accelerator):
-    # A request restored from a checkpoint off the 128-row grid gives its last prompt row's scores and its tokens as the
-    # same request run cold, bit for bit. auto runs v3 at the synthetic checkpoint's head dim 32, and v3 pairs the keys
-    # cached before a pass, so a row depends on where its pass starts unless the exact form anchors it at the 128-row
-    # passes from token 0. The checkpoint's one attention layer is its last, so the last row's own pass must start
-    # elsewhere warm than cold: turn 1 checkpoints its first 300 tokens; turn 2 keeps a shorter message prefix (250, as
-    # serve keeps a system prompt's) and restores 300, where the cold run splits at 250. A pair and two single folds
-    # sum alike unless the running maximum moves between them, so the starts lie far apart: at 428 tokens the last row's
-    # pass starts at 300 warm and 378 cold (384 from token 0); at 429 the warm run's one-token chunk sends a 512-row
-    # session to its 128-row graph while the cold run stays on the large one. A cold run whose passes all start on the
-    # grid gives what plain 128-row passes give.
+    # A request restored from a checkpoint off the 128-row grid gives the scores of its last pass's rows and its tokens
+    # as the same request run cold, bit for bit. auto runs v3 at the synthetic checkpoint's head dim 32, and v3 pairs the
+    # keys cached before a pass, so a row depends on where its pass starts unless the exact form anchors it at the
+    # 128-row passes from token 0. The checkpoint's one attention layer is its last, so only a row's own fold reaches its
+    # scores, and the rows compared must start their passes elsewhere warm than cold: turn 1 checkpoints its first 300
+    # tokens; turn 2 keeps a shorter message prefix (250, as serve keeps a system prompt's) and restores 300, where the
+    # cold run splits at 250. A pair and two single folds sum alike unless the running maximum moves between them, so the
+    # starts lie far apart: at 428 tokens the last row's 128-row pass, counted from each run's pass start, begins at 300
+    # warm and 378 cold (384 from token 0); at 429 the warm run's one-token chunk sends a 512-row session to its 128-row
+    # graph while the cold run stays on the large one, as does a cold run's one-token chunk from the default checkpoint
+    # at p - 1. A cold run whose passes all start on the grid gives what plain 128-row passes give, and only the exact
+    # session's prompt programs take the exact form.
     _checkpoint(tmp_path)
     pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
                PackLayout(rows=16))
@@ -165,8 +167,9 @@ def test_exact_requests_restored_off_the_grid_give_the_bits_of_cold_runs(tmp_pat
     turn1 = list(exact.prefix_cache.items)
     assert [len(item.tokens) for item in turn1] == [300]
 
-    def last_row(s, n, prefix, restore=False):
-        """The last prompt row's scores and 12 greedy tokens, each from its own request with the same cache."""
+    def last_pass(s, n, prefix, restore=False):
+        """The first position and the scores of the last pass's rows, and 12 greedy tokens, each from its own request
+        with the same cache."""
         outputs = []
         for steps in (1, 12):
             if s.prefix_cache is not None:
@@ -175,24 +178,38 @@ def test_exact_requests_restored_off_the_grid_give_the_bits_of_cold_runs(tmp_pat
             assert g.cached_prompt_tokens == g.prefill_timings[0]['position'] == (300 if restore else 0)
             if steps > 1:
                 return outputs + [g.tokens]
+            last = g.prefill_timings[-1]
             logits = np.frombuffer(s.read('logits'), dtype=np.uint16).reshape(-1, s.model.config.vocab_size)
-            outputs.append(logits[g.prefill_timings[-1]['tokens'] - 1].copy())
+            outputs.append((last['position'], logits[:last['tokens']].copy()))
 
-    for n in (428, 429):
-        (warm, warm_tokens), (cold, cold_tokens) = last_row(exact, n, 250, restore=True), last_row(exact, n, 250)
-        assert warm_tokens == cold_tokens, n
-        assert np.array_equal(warm, cold), (n, int((warm != cold).sum()))
-    (grid, grid_tokens), (ref, ref_tokens) = last_row(exact, 700, 256), last_row(plain, 700, 256)
-    assert grid_tokens == ref_tokens and np.array_equal(grid, ref), int((grid != ref).sum())
-    for key in {f'prefill.{chunk}', 'prefill.128'}:
-        v3 = [k for k in exact._programs[key].kernels.values() if k.function == 'gqa_decode_v3']
-        assert [k.macros.get('EXACT_SUB') for k in v3] == ['128u'], key
+    def agree(a, b, n, passes):
+        """Two requests' last passes (first position, rows) as expected, their tokens, and the scores of every row both
+        last passes hold."""
+        ((pa, rows_a), tokens_a), ((pb, rows_b), tokens_b) = a, b
+        assert [(pa, len(rows_a)), (pb, len(rows_b))] == passes, n
+        lo = max(pa, pb)
+        rows_a, rows_b = rows_a[lo - pa:n - pa], rows_b[lo - pb:n - pb]
+        assert tokens_a == tokens_b, n
+        assert np.array_equal(rows_a, rows_b), (n, lo, int((rows_a != rows_b).sum()))
+
+    big = chunk == 512
+    agree(last_pass(exact, 428, 250, restore=True), last_pass(exact, 428, 250), 428, [(300, 128), (250, 178) if big else (378, 50)])
+    agree(last_pass(exact, 429, 250, restore=True), last_pass(exact, 429, 250), 429, [(428, 1), (250, 179) if big else (378, 51)])
+    # the default checkpoint at p - 1 makes a one-token chunk; 100 is below the cache's minimum, no checkpoint
+    agree(last_pass(exact, 429, 0), last_pass(exact, 429, [100]), 429, [(428, 1), (0, 429) if big else (384, 45)])
+    agree(last_pass(exact, 700, 256), last_pass(plain, 700, 256), 700, [(256, 444) if big else (640, 60), (640, 60)])
+    assert 'prefill.128' in exact._programs
+    for s in (exact, plain):
+        for key, prog in s._programs.items():
+            forms = {k.macros.get('EXACT_SUB') for k in prog.kernels.values() if k.function == 'gqa_decode_v3'}
+            assert forms == ({'128u'} if s is exact and str(key).startswith('prefill.') else {None}), (s is exact, key)
 
 
 def test_exact_128_row_sessions_give_v1_its_plain_bits(tmp_path):
     # An exact 128-row session compiles its prompt programs with exact_attention, v1's included: over at most 128 rows
     # v1's EXACT_SUB form is one sub-pass, the plain kernel's work, so the same request restored off the grid (a pass of
-    # 128 rows from 300) gives a plain and an exact session the same last prompt row's scores, bit for bit.
+    # 128 rows from 300) gives a plain and an exact session the same last prompt row's scores, bit for bit. pick_chunk
+    # picks 16-key chunks at every context here, so this checks the form's blocks and fold, not v1's chunk choice.
     _checkpoint(tmp_path)
     pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
                PackLayout(rows=16))

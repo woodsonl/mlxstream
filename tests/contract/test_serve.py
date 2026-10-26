@@ -285,6 +285,21 @@ def test_the_session_cache_keeps_its_bound(monkeypatch):
     assert set(backend._sessions) == {(True, '128'), (False, '4096'), (True, '4096')}
 
 
+def test_exact_servers_ask_for_exact_sessions_at_128_rows(monkeypatch):
+    # auto-exact without a measured size: main() builds Backend(..., 128, prefill_exact=True), and a 128-row session
+    # compiles v3's exact form only when prefill_exact reaches it (Session.prefill_exact_attention)
+    from monolith import generate
+    calls = []
+    monkeypatch.setattr(generate, 'load_session', lambda *args, **kwargs: calls.append(kwargs) or SimpleNamespace())
+    for exact in (True, False):
+        backend = Backend.__new__(Backend)
+        backend.model_dir, backend.pack_dir, backend.prefill_chunk_size, backend.prefill_exact = 'm', 'p', 128, exact
+        backend.session, backend.sampling = None, None
+        backend.assets = SimpleNamespace(options=lambda tokens: (str(tokens), {}))
+        backend.select_session(SimpleNamespace(temperature=0.0, top_p=1.0, top_k=0, seed=0), 1000)
+        assert (calls[-1]['prefill_exact'], calls[-1]['prefill_chunk_size']) == (exact, 128)
+
+
 def test_warmup_cuts_the_long_prompt_to_the_context():
     # exact chunks: the decoder ingests up to 128 prompt tokens itself
     for max_context, words in ((600, 589), (130, 119), (129, None), (12, None)):

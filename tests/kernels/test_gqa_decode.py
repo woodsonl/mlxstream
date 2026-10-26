@@ -583,18 +583,19 @@ def test_v3_is_bit_stable_and_t_active(dev, mma, heads):
     (32, 8, 2, True, True, 128, 0, 300, None),        # the synthetic hybrid checkpoint's head (8 SIMD-groups), from token 0
     (32, 8, 2, True, True, 128, 300, 400, None),      # restored at 300: rows in four 128-row passes, the first begun at 256
     (32, 8, 2, True, True, 128, 600, 1, None),        # one row restored at 600 (the 128-row graph's one-token chunk)
-    (128, 32, 8, False, False, 96, 232, 250, None),   # no query or key norms (Llama), 32 SIMD-groups
+    (128, 32, 8, False, False, 96, 232, 250, None),   # no query or key norms (Llama), 32 SIMD-groups; grid starts 288, 480 32 mod 64
     (256, 24, 4, True, True, 32, 90, 100, None),      # the 27B's head with the accelerator off (16 SIMD-groups, rep 6)
     (64, 32, 8, False, False, 128, 150, 300, None),   # head dim 64 without query or key norms (16 SIMD-groups, 2 dims a lane)
-    (32, 8, 2, True, True, 36, 5, 100, 4),            # 4 SIMD-groups and S not a multiple of 2 · 4
+    (32, 8, 2, True, True, 36, 5, 100, 4),            # 4 SIMD-groups and S not a multiple of 2 · 4: grid start 36 is 4 mod 8
 ], ids=["d32_from_token_0", "d32_restored_300", "d32_one_row", "d128_no_qk_norm", "d256_rep6", "d64_no_qk_norm", "nsg4_odd_sub"])
 def test_v3_exact_sub_gives_the_bits_of_passes_from_token_0(dev, d, heads, kv, qk_norm, gate, sub, position, t, nsg, emitted):
     """EXACT_SUB = S on v3: a pass of T rows from any position gives every row the bits S-row passes from token 0 give it
     (a run from scratch), outputs and appended caches. v3 pairs the keys cached before its pass and folds the rest one at
     a time, so a plain pass's rows depend on where it starts, and a prefix restore starts it anywhere. The pass starts
     off the S grid (its first rows' S-row pass began before it, at cached keys) and runs across grid lines (later rows
-    pair keys it appends); T is not a multiple of S; and the pass and grid starts fall in the second half of a
-    2 · NSG3-key pair window, where a pair loop bound off by one would pair a pass's first key."""
+    pair keys it appends); T is not a multiple of S; and the pass starts, and in the S = 96 and S = 36 cases every
+    other grid start past the pass start (288 and 480; 36), fall in the second half of a 2 · NSG3-key pair window, where
+    a pair loop bound off by one would pair a pass's first key."""
     n = position + t
     cfg = Cfg(heads, kv, d, d, n, max(t, sub), gate=gate, v3=True, nsg3=nsg, qk_norm=qk_norm, single_block=emitted)
     ecfg = Cfg(heads, kv, d, d, n, max(t, sub), gate=gate, v3=True, nsg3=nsg, qk_norm=qk_norm, single_block=emitted)
