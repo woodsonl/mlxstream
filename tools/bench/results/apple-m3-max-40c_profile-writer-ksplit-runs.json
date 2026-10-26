@@ -1,6 +1,6 @@
 {
  "chip": "Apple M3 Max, 40 cores, Apple9 (threadgroups_per_core 2)",
- "tool": "tools/profile_writer.py --dry-run (shape 17408x5120, default formats, ts 1,2,4,8, tms 8,16,32)",
+ "tool": "tools/profile_writer.py, --dry-run or --out a scratch file (each run's command field; shape 17408x5120, default formats, ts 1,2,4,8, tms 8,16,32)",
  "unit": "shader x = the pass cost relative to the run's T = 1 shader pass; tile x = the picked geometry's time in the same unit",
  "note": "the writer times every geometry tune_gemm tries; the runs of October 16 and 25 (a, b) recorded only the pick per TM, and the dry run 2026-10-25c, after the writer began pricing accelerator_min_t on the unsplit tile, adds that tile's rows; crew and crew2 are timed at one and two threadgroups per core",
  "runs": [
@@ -797,7 +797,13 @@
    "status": "used",
    "status_note": "run under the shared GPU lock; no other GPU pytest at its start or end",
    "threadgroups_per_core": 2,
-   "threadgroups_probe": "a tie (x1 0.294 ms, x2 0.285 ms, fp8_e4m3 T = 1): keeps 2",
+   "threadgroups_probe": {
+    "format": "fp8_e4m3",
+    "t": 1,
+    "x1_ms": 0.294,
+    "x2_ms": 0.285,
+    "kept": 2
+   },
    "shader": {
     "nvfp4": {
      "1": {
