@@ -76,7 +76,7 @@ class Session:
     sampling mode of its own."""
 
     EXACT_ROWS = 128                 # prefill_exact reproduces prompt chunks of this many rows
-    prefill_exact = False
+    prefill_exact = False            # the large exact graph: exact requested with chunks above EXACT_ROWS rows
     prefill_exact_attention = False  # prompt programs take exact_attention: v3's rows get EXACT_ROWS-row passes from token 0
 
     def __init__(self, model: Model, pack_dir: str, profile: Optional[Profile] = None, *, layout: Optional[StepStateLayout] = None,
