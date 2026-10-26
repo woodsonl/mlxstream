@@ -54,6 +54,8 @@ def test_exact_attention_marks_v3_target_attention():
     assert [p.kernels[op.kernel].macros.get('EXACT_SUB') for op in p.ops] == ['128u'] * 3
     p = exact_attention(attention({'LM_MODE': '1'}), 128)       # an LM drafter's ingest is not a target prompt pass
     assert [p.kernels[op.kernel].macros.get('EXACT_SUB') for op in p.ops] == [None, '128u', '128u']
+    p = exact_attention(attention({}), 128, v1=False)           # passes of at most 128 rows: v1's exact form is plain v1
+    assert [p.kernels[op.kernel].macros.get('EXACT_SUB') for op in p.ops] == ['128u', None, None]
 
 
 def test_large_projection_policy_is_chip_and_shape_specific(monkeypatch):

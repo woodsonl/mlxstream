@@ -206,10 +206,9 @@ def test_exact_requests_restored_off_the_grid_give_the_bits_of_cold_runs(tmp_pat
 
 
 def test_exact_128_row_sessions_give_v1_its_plain_bits(tmp_path):
-    # An exact 128-row session compiles its prompt programs with exact_attention, v1's included: over at most 128 rows
-    # v1's EXACT_SUB form is one sub-pass, the plain kernel's work, so the same request restored off the grid (a pass of
-    # 128 rows from 300) gives a plain and an exact session the same last prompt row's scores, bit for bit. pick_chunk
-    # picks 16-key chunks at every context here, so this checks the form's blocks and fold, not v1's chunk choice.
+    # An exact 128-row session compiles its prompt programs with exact_attention but leaves v1 plain: over at most 128
+    # rows v1's EXACT_SUB form is one sub-pass, the plain kernel's work, so the same request restored off the grid (a
+    # pass of 128 rows from 300) gives a plain and an exact session the same last prompt row's scores, bit for bit.
     _checkpoint(tmp_path)
     pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
                PackLayout(rows=16))
@@ -225,7 +224,7 @@ def test_exact_128_row_sessions_give_v1_its_plain_bits(tmp_path):
         rows.append(np.frombuffer(s.read('logits'), dtype=np.uint16).reshape(-1, s.model.config.vocab_size)[127].copy())
     assert np.array_equal(*rows), int((rows[0] != rows[1]).sum())
     v1 = [k for k in s._programs['prefill.128'].kernels.values() if k.function in ('gqa_decode', 'gqa_merge')]
-    assert [k.macros.get('EXACT_SUB') for k in v1] == ['128u', '128u']
+    assert [k.macros.get('EXACT_SUB') for k in v1] == [None, None]
 
 
 def test_tie_rows_hold_the_scores_the_reference_chose_by(tmp_path):

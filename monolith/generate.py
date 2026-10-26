@@ -427,9 +427,10 @@ class Session:
             reuse_arenas(prog, barriers=self.barriers)
         if prefill and self.prefill_exact_attention:
             # every prompt program of an exact session, its EXACT_ROWS-row graph included (a large session's one-token
-            # chunks run there): v3's rows must not depend on where a prefix restore starts their pass
+            # chunks run there): v3's rows must not depend on where a prefix restore starts their pass; v1 only above
+            # EXACT_ROWS rows, where a pass holds more than one of its sub-passes
             from .compiler.prefill import exact_attention
-            prog = exact_attention(prog, self.EXACT_ROWS)
+            prog = exact_attention(prog, self.EXACT_ROWS, v1=bound > self.EXACT_ROWS)
         if shared:
             prog = self._alias_weights(prog)
         if self.tuner is not None:

@@ -502,13 +502,14 @@ def device_attention_tiles(program, *, qm=32, kn=128, ks=None, score_bf16=False)
     return program
 
 
-def exact_attention(program, rows):
+def exact_attention(program, rows, v1=True):
     """Make a prompt program's attention reproduce passes of ``rows`` rows bit for bit (``EXACT_SUB``): the run-time
     chunk rule (``pick_chunk``) depends on the pass's context, so the cores and folds of the chunked attention take each
     row's chunking from the ``rows``-row pass that row would be in, and v3 pairs the keys cached before a pass, so its
     rows pair the keys before the ``rows``-row pass from token 0 that holds them, wherever the pass starts. Fixed-chunk
     kernels (v2, the matrix attention) already sum every row the same way; a workspace shared with any other core is
-    left alone."""
+    left alone. ``v1`` False leaves the chunked attention plain, for a program whose passes hold at most ``rows`` rows:
+    such a pass is one sub-pass, the plain kernel's work."""
     cores, merges, v3 = {}, {}, []
     for op in program.ops:
         k = program.kernels[op.kernel]
@@ -525,7 +526,7 @@ def exact_attention(program, rows):
                 and all(m.get(f, '0') == '0' for f in ('DRAFT', 'LM_MODE', 'STEAL', 'FIXED_CHUNK', 'ADAPTIVE_CHUNK')))
 
     marked = [op for op in v3 if has_exact_form(op, 'gqa_decode_v3')]
-    for workspace, ops in cores.items():
+    for workspace, ops in cores.items() if v1 else ():
         folds = merges.get(workspace, [])
         if not all(has_exact_form(op, 'gqa_decode') for op in ops) or not all(has_exact_form(op, 'gqa_merge') for op in folds):
             continue
