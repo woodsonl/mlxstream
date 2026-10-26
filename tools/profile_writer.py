@@ -86,8 +86,9 @@ def device_facts(info: Any, *, target_gb: float = 21.0, nominal_gbps: Optional[f
 
 
 def int_list(s: str) -> List[int]:
-    """An argparse type: comma-separated integers (a malformed list is a usage error)."""
-    return [int(x) for x in s.split(",")]
+    """An argparse type: comma-separated integers, each once (a second sweep of a value would reset the first's record;
+    a malformed list is a usage error)."""
+    return list(dict.fromkeys(int(x) for x in s.split(",")))
 
 
 def _failed_checks(bf16: Dict[str, Any], strict: Optional[Dict[str, Any]]) -> str:

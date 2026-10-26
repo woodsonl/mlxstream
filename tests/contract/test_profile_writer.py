@@ -698,6 +698,14 @@ def test_writer_rejects_bad_arguments_before_measuring(monkeypatch, args):
     assert e.value.code == 2
 
 
+def test_writer_sweeps_each_listed_value_once():
+    """A repeated --ts, --tms, --ctx or --attn-ts value is swept once, as a repeated format is: a second sweep would
+    overwrite the first's record (the last sweep would win, not the faster)."""
+    import tools.profile_writer as pw
+
+    assert pw.int_list("8,8,16") == [8, 16] and pw.int_list("1,2,2,1") == [1, 2]
+
+
 @pytest.mark.parametrize("formats", [["nvfp4", "q4_0"], ["q4_0"], []])
 def test_measure_refuses_formats_the_harnesses_cannot_build(monkeypatch, formats):
     """measure() refuses a format outside monolith.bench.RANDOM_FORMATS, or none, before it builds a harness, as main()
