@@ -1066,7 +1066,7 @@ def test_gemm_bench_judges_each_output_by_its_rule(monkeypatch, at_scale, rel, b
 
 def test_gemm_bench_refuses_a_geometry_before_allocating(monkeypatch):
     """GemmBench.run asks gemm_macros for the geometry before it allocates the >= 2 GiB of weight copies, so a refused
-    K-split (the writer's sweep meets dozens per run) costs no allocation."""
+    K-split (the writer's sweep meets dozens per run) allocates no weight copies."""
     import tools.profile_writer as pw                                        # puts tools/bench on sys.path
 
     gemm_bench, allocs = pw.gemm_bench, []
