@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("fastapi")                # main() imports monolith.serve, which needs the serve extra
 from tools.bench import prefill_profile
 
 
