@@ -259,6 +259,7 @@ def test_a_refresh_keeps_the_accelerator_switch():
     assert decide(_measurements(), {"accelerator": "off"})[0]["accelerator"] == "off"     # rows that start the tile at 2
     engine, notes = decide(lose, {"accelerator": "on"})
     assert engine["accelerator"] == "on" and engine["accelerator_min_t"] == {"nvfp4": NEVER}   # rows that lose at every T
+    assert "the autotuner's pick would start the tile at no T for nvfp4" in notes["accelerator"]
     assert decide(_measurements())[0]["accelerator"] == "off"                            # no file: off
     assert decide(_measurements(), {"sibling_order": "alu_first"})[0]["accelerator"] == "off"   # a file without the switch (m3_pro)
     assert all(path in notes["accelerator"] for path in ("rows GEMVs", "MMA kernel", "GDN prepared path", "does not time"))
@@ -960,9 +961,11 @@ def test_writer_times_on_the_lane_order_it_writes(monkeypatch, gbps, current, ti
     assert decide(m, {"lane_order": current} if current else None)[0]["lane_order"] == timed
 
 
-def test_gemm_bench_judges_each_output_by_its_rule(monkeypatch):
+@pytest.mark.parametrize("at_scale, rel, bf16_ok", [(1.0, 5e-3, True), (2.5, 5e-3, False), (1.0, 2e-2, False)])
+def test_gemm_bench_judges_each_output_by_its_rule(monkeypatch, at_scale, rel, bf16_ok):
     """GemmBench.run judges 32-bit output by OracleCheck.ok (the writer's strict check) and BF16 output by
-    ok_rounded (one rounding of the FP32 result, the timed run), and reports the metric each rule reads."""
+    ok_rounded (one rounding of the FP32 result, the timed run), which fails past 2.5 ulp at scale or a relative
+    error of 2e-2, and reports the metric each rule reads."""
     import tools.profile_writer as pw                                        # puts tools/bench on sys.path
     from monolith.bench import OracleCheck
 
@@ -976,12 +979,12 @@ def test_gemm_bench_judges_each_output_by_its_rule(monkeypatch):
     monkeypatch.setattr(gemm_bench, "nt", SimpleNamespace(Device=lambda: SimpleNamespace(info=lambda: info), Buffer=Buf, Library=_Stub,
                                                           Pipeline=_Stub, Dispatch=_Stub,
                                                           Queue=lambda dev: SimpleNamespace(run=lambda ds: SimpleNamespace(error=None, gpu_ms=1.0))))
-    # within one BF16 rounding (1 ulp at scale, rel 5e-3) but past the strict rule (3 ulp at RMS, rel 5e-3 > 1e-4)
-    monkeypatch.setattr(gemm_bench, "check_against_oracle", lambda y, ref: OracleCheck(3.0, 4, 5e-3, 1.0))
+    # past the strict rule (3 ulp at RMS) at every point; within one BF16 rounding at (1 ulp at scale, rel 5e-3) only
+    monkeypatch.setattr(gemm_bench, "check_against_oracle", lambda y, ref: OracleCheck(3.0, 4, rel, at_scale))
     gb = gemm_bench.GemmBench()
     bf16 = gb.run("fp8_e4m3", 64, 1024, tm=8, copies=1, reps=1, out_bf16=True)
     strict = gb.run("fp8_e4m3", 64, 1024, tm=8, copies=1, reps=1)
-    assert bf16["ok"] is True and strict["ok"] is False and bf16["max_ulp_at_scale"] == strict["max_ulp_at_scale"] == 1.0
+    assert bf16["ok"] is bf16_ok and strict["ok"] is False and bf16["max_ulp_at_scale"] == strict["max_ulp_at_scale"] == at_scale
 
 
 def test_gemm_bench_refuses_a_geometry_before_allocating(monkeypatch):
