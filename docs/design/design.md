@@ -123,7 +123,7 @@ Short prompt tails can use the resident decoder when their row count and recipe 
 
 Prefill scratch is planned by lifetime. Derived packed layouts preserve checkpoint codes and scales unless
 quantization is explicitly requested. Layout caches are distinct from the original checkpoint and packs.
-Exact prefill can process larger chunks while preserving the reduction orders of the 128-row reference graph.
+Exact prefill can process larger chunks while preserving the reduction orders of the exact 128-row graph.
 Compatible prompt and verification kernels share packed weight mappings, reducing duplicate residency.
 The backend selects the qualified geometry and the session handles reference-path fallbacks;
 see [prefill policy](serving.md#prefill-policy).
