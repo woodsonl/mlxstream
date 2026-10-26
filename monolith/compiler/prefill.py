@@ -531,7 +531,7 @@ def exact_attention(program, rows):
             continue
         marked += ops + folds
     for op in marked:
-        key = op.kernel+f'.exact{rows}'
+        key = op.kernel + f'.exact{rows}'
         if key not in program.kernels:
             kernel = copy.deepcopy(program.kernels[op.kernel])
             kernel.macros['EXACT_SUB'] = f'{rows}u'
