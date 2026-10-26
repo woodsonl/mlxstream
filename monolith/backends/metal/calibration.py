@@ -178,12 +178,11 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
     unsplit = {cost_key(f): {int(tm): round(g[unsplit_mode] / measurements["shader_ms"][f][1], 3) for tm, g in rows.items() if unsplit_mode in g}
                for f, rows in measurements.get("tile_geometry_ms", {}).items() if f in measurements["shader_ms"] and rows}
     _, min_t, why = accelerator_plan(shader, unsplit)
-    if unsplit:
-        why = f"the unsplit tile ({unsplit_mode}): {why}"
+    why = f"the unsplit tile ({unsplit_mode}): {why}" if min_t else ("" if tile else why)   # no unsplit row at all: the clause below
     missing = sorted(set(tile) - set(min_t))                   # the pick's rows but no unsplit row: unpriced, so never (emit reads a gap as 2)
     if missing:
         min_t.update(dict.fromkeys(missing, NEVER))
-        why += f"; no {unsplit_mode} row for {', '.join(missing)}: the tile never takes {'them' if len(missing) > 1 else 'it'}"
+        why += f"{'; ' if why else ''}no {unsplit_mode} row for {', '.join(missing)}: the tile never takes {'them' if len(missing) > 1 else 'it'}"
     notes["accelerator"] = why
     _, pick_t, _ = accelerator_plan(shader, tile)
     if pick_t:

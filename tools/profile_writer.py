@@ -16,8 +16,10 @@
 
 A kernel that fails the oracle (a tile or shader GEMV geometry, or a T = 1 probe) or a tile-step error other than a
 refusal stops the writer: it lists each and writes no profile (exit 1). So does a run that would write and leaves
-unpriced a format whose start the existing file holds (a ``--formats`` subset, ``--no-accelerator``, or a shape one
-format's unsplit tile refuses). The accelerator switch carries over from the file (off in a new one): it also gates paths
+unpriced a format whose start the existing file holds or, with the switch the file holds on, any format it measures
+(compiler.emit starts a format without a start at T = 2): a ``--formats`` subset that leaves out a held format and
+``--no-accelerator`` over a file that holds starts or the switch on are refused before measuring, a shape one format's
+unsplit tile refuses after. The accelerator switch carries over from the file (off in a new one): it also gates paths
 the writer does not time, and changes only by a hand edit backed by an end-to-end A/B. A chip without tensor ops runs
 ``--no-accelerator``.
 
@@ -205,7 +207,7 @@ def measure(*, shape: Tuple[int, int] = (17408, 5120), formats: Sequence[str] = 
                                 m["tile_oracle_fail"][fmt].setdefault(tm, []).append(mode)
                                 log(f"tile {fmt} TM={tm} {mode}: ORACLE FAIL ({_failed_checks(r, None)}) — recorded; no profile is written")
                             unbuilt = not ran and str(e).startswith(("MSL compile failed", "pipeline failed"))   # the first tile kernel
-                            raise RuntimeError(f"{fmt} TM={tm} {mode}: {e}" + (" (a chip without tensor ops runs --no-accelerator, which a file holding tile starts refuses)" if unbuilt else "")) from e
+                            raise RuntimeError(f"{fmt} TM={tm} {mode}: {e}" + (" (a chip without tensor ops runs --no-accelerator, refused over a file that holds tile starts or the switch on)" if unbuilt else "")) from e
                         if r["ok"] is False or strict["ok"] is False:
                             m["tile_oracle_fail"][fmt].setdefault(tm, []).append(mode)
                             log(f"tile {fmt} TM={tm} {mode}: ORACLE FAIL ({_failed_checks(r, strict)}) — recorded; no profile is written")
@@ -268,8 +270,8 @@ def main(argv=None) -> int:
     ap.add_argument("--attention", default=",".join(str(x) for x in DEFAULT_ATTENTION), help="heads,kv,head_dim or 'none'")
     ap.add_argument("--ctx", default="1024,4096", type=int_list)
     ap.add_argument("--attn-ts", default="1,4", type=int_list)
-    ap.add_argument("--no-accelerator", action="store_true", help="skip the tile, for a chip without tensor ops: a file that holds tile "
-                    "starts is refused, and the accelerator switch carries over (off in a new file)")
+    ap.add_argument("--no-accelerator", action="store_true", help="skip the tile, for a chip without tensor ops: refused over a file that "
+                    "holds tile starts or the accelerator switch on")
     ap.add_argument("--quick", action="store_true", help="a short run: 4 packs per point, 2 reps, the first --tms value only, one context")
     ap.add_argument("--nominal-gbps", type=float, help="the chip's spec bandwidth (kept from an existing profile; else a measured stand-in)")
     ap.add_argument("--target-gb", type=float, default=21.0, help="the target model's resident weight bytes for hosts_target_model")
@@ -282,8 +284,8 @@ def main(argv=None) -> int:
     ts, tms, ctxs, attn_ts = a.ts, a.tms, a.ctx, a.attn_ts
     if not formats or set(formats) - set(RANDOM_FORMATS):
         ap.error(f"--formats takes names from {', '.join(RANDOM_FORMATS)}: the formats the harnesses build")
-    if 1 not in ts or min(ts) < 1:
-        ap.error("--ts takes token counts of 1 or more and must include 1: the costs are relative to the T = 1 pass")
+    if 1 not in ts or min(ts) < 1 or max(ts) > max(TILE_TMS):
+        ap.error(f"--ts takes token counts from 1 to {max(TILE_TMS)} and must include 1: the costs are relative to the T = 1 pass")
     if set(tms) - set(TILE_TMS):
         ap.error(f"--tms takes {', '.join(map(str, TILE_TMS))}: the tile's token rows")
     attention = None if a.attention.strip().lower() == "none" else tuple(int(x) for x in a.attention.split(","))
@@ -309,16 +311,32 @@ def main(argv=None) -> int:
         get_backend(existing.get("backend", "common")).validate_device(Profile.from_dict(name, existing), info)
     print(f"{info.name}: {info.gpu_cores} cores, Apple{info.apple_family}; profile {name} ({'merging ' + str(src) if existing else 'new'}) -> {path}", flush=True)
     selected = config_for_device(info.gpu_cores, info.apple_family, info.name)
-    held = ((existing or {}).get("engine") or {}).get("accelerator_min_t") or {}     # a refresh must price every one of them
-    early = sorted(set(held) - (set() if a.no_accelerator else {cost_key(f) for f in formats}))
+    # compiler.emit starts a format without a start at T = 2: a refresh must price every start the file holds and, with
+    # the switch the file holds on (decide() carries it), every format it measures
+    prior = (existing or {}).get("engine") or {}
+    held, switch_on = prior.get("accelerator_min_t") or {}, prior.get("accelerator") == "on"
+
+    def unpriced(priced, measured):
+        return sorted((set(held) | ({cost_key(f) for f in measured} if switch_on else set())) - set(priced))
+
+    def refusal(starts, m=None):
+        kept, implicit = [k for k in starts if k in held], [k for k in starts if k not in held]
+        whose = "; ".join(([f"{', '.join(kept)}, whose start {src} holds"] if kept else []) +
+                          ([f"{', '.join(implicit)}, which the switch {src} holds on starts at T = 2"] if implicit else []))
+        cause = ("--no-accelerator prices none" if a.no_accelerator else
+                 "the tile refused the measured shape: measure one every format's tile takes" if m and m.get("tile_refused") else
+                 "refresh every format with the tile")
+        odd = [k for k in starts if k not in {cost_key(f) for f in RANDOM_FORMATS}]
+        return f"no tile start for {whose}: {cause}" + (f"; no format the writer measures prices {', '.join(odd)}: edit it by hand" if odd else "")
+
+    early = unpriced(set() if a.no_accelerator else {cost_key(f) for f in formats}, formats)
     if early and not a.dry_run:                                     # decided by the arguments: refuse before measuring
-        print(f"no profile written: no tile rows for {', '.join(early)}, whose start {src} holds (a --formats subset or "
-              "--no-accelerator): refresh every format with the tile, or measure with --dry-run", flush=True)
+        print(f"no profile written: {refusal(early)}, or measure with --dry-run", flush=True)
         return 1
     t0 = time.time()
     m = measure(shape=(n, k), formats=formats, ts=ts, tms=tms, copies=copies, reps=reps, accelerator=not a.no_accelerator,
-                attention=attention, ctxs=ctxs, attn_ts=attn_ts, current_lane_order=(existing or {}).get("engine", {}).get("lane_order"),
-                current_placement=(existing or {}).get("engine", {}).get("scale_placement"), log=lambda s: print(s, flush=True))
+                attention=attention, ctxs=ctxs, attn_ts=attn_ts, current_lane_order=prior.get("lane_order"),
+                current_placement=prior.get("scale_placement"), log=lambda s: print(s, flush=True))
     fails = [f"tile {fmt} TM={tm}: {', '.join(modes)}" for fmt, rows in m["tile_oracle_fail"].items() for tm, modes in sorted(rows.items())]
     problems = [f"fails the oracle: {f}" for f in fails + m["oracle_fail"]]
     if "tile_error" in m and not m["tile_refused"]:
@@ -337,14 +355,9 @@ def main(argv=None) -> int:
     print(f"\nmeasured in {time.time() - t0:.0f} s\nengine: {json.dumps(engine, indent=2)}\ndecisions:")
     for key, why in notes.items():
         print(f"  {key}: {why}")
-    # compiler.emit starts a format missing from accelerator_min_t at T = 2: every start the file holds, and with the
-    # switch on every format this run measured, must be priced (a refusal or no tile leaves them unpriced)
-    want = set(held) | ({cost_key(f) for f in m["shader_ms"]} if engine["accelerator"] == "on" else set())
-    unpriced = sorted(want - set(engine["accelerator_min_t"]))
-    if unpriced:
-        why = (f"no tile start for {', '.join(unpriced)}, which {src} holds a start for or the switch it carries on would start "
-               "at T = 2: refresh every format with the tile")
-        print(f"\na write would be refused: {why}" if a.dry_run else f"\nno profile written: {why}")
+    late = unpriced(engine["accelerator_min_t"], m["shader_ms"])   # a refusal or no tile leaves them unpriced
+    if late:
+        print(f"\na write would be refused: {refusal(late, m)}" if a.dry_run else f"\nno profile written: {refusal(late, m)}")
         return 0 if a.dry_run else 1
     if a.dry_run:
         return 0

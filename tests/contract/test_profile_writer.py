@@ -266,12 +266,18 @@ def test_a_refresh_keeps_the_accelerator_switch():
     assert "the switch stays off (off by default: the file holds none)" in decide(_measurements())[1]["accelerator"]
 
 
-def test_decide_never_starts_a_format_whose_unsplit_tile_has_no_row():
-    """A format with the pick's rows but no unsplit row at the chosen threadgroups per core (a record from before the
-    writer kept every geometry, say) gets the never-start, not a missing key that compiler.emit would read as T = 2."""
-    engine, notes = decide(dict(_measurements(), tile_geometry_ms={}), {"accelerator": "on"})
+@pytest.mark.parametrize("threadgroups, rows, mode", [
+    ({1: 0.324, 2: 0.330}, None, "crew"),                                   # a record from before the writer kept every geometry
+    ({1: 0.324, 2: 0.330}, {8: {"ksplit4": 0.5}}, "crew"),                  # rows without crew
+    ({1: 1.0, 2: 0.9}, {8: {"crew": 0.5}}, "crew2")])                       # two per core, rows without crew2
+def test_decide_never_starts_a_format_whose_unsplit_tile_has_no_row(threadgroups, rows, mode):
+    """A format with the pick's rows but no unsplit row at the chosen threadgroups per core gets the never-start, not a
+    missing key that compiler.emit would read as T = 2, and the note says so first."""
+    geometry = {} if rows is None else {"fp8_e4m3": rows, "nvfp4": rows}
+    engine, notes = decide(dict(_measurements(), threadgroups_ms=threadgroups, tile_geometry_ms=geometry), {"accelerator": "on"})
+    assert engine["threadgroups_per_core"] == (2 if mode == "crew2" else 1)
     assert engine["accelerator_min_t"] == {"fp8": NEVER, "nvfp4": NEVER} and "accelerator_fp8" in engine["cost_T"]
-    assert "no crew row for fp8, nvfp4: the tile never takes them" in notes["accelerator"]
+    assert notes["accelerator"].startswith(f"no {mode} row for fp8, nvfp4: the tile never takes them; the autotuner's pick would start")
     assert "plus the noise margin" in engine["note"]                                  # the start's rule, a tie to the tile
 
 
@@ -289,62 +295,19 @@ def _held_starts_file(monkeypatch, pw, tmp_path, held=None, accelerator="on"):
     return out
 
 
-def test_no_accelerator_refuses_a_file_that_holds_starts(monkeypatch, tmp_path):
-    """--no-accelerator over a file that holds tile starts writes nothing and exits 1: the run prices none of them."""
-    import tools.profile_writer as pw
-
-    out = _held_starts_file(monkeypatch, pw, tmp_path)
-    before = out.read_bytes()
-    monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_ms={}, tile_geometry_ms={}, tile_oracle_fail={}, oracle_fail=[]))
-    assert pw.main(["--no-accelerator", "--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
-
-
-def test_a_subset_refresh_refuses_a_file_that_holds_other_starts(monkeypatch, tmp_path, capsys):
-    """A --formats subset over a file that holds the other formats' starts writes nothing and exits 1, naming them;
-    --dry-run still measures and prints."""
-    import tools.profile_writer as pw
-
-    out = _held_starts_file(monkeypatch, pw, tmp_path)
-    before = out.read_bytes()
-    full = _measurements()
-    m = dict(full, **{key: {"fp8_e4m3": full[key]["fp8_e4m3"]} for key in ("shader_ms", "tile_ms", "tile_geometry_ms")},
-             tile_oracle_fail={}, oracle_fail=[])
-    monkeypatch.setattr(pw, "measure", lambda **kw: dict(m))
-    args = ["--formats", "fp8_e4m3", "--name", "x-20c", "--out", str(out)]
-    capsys.readouterr()
-    assert pw.main(args) == 1 and out.read_bytes() == before
-    assert "no tile rows for bf16, int4_affine, nvfp4" in capsys.readouterr().out
-    assert pw.main(args + ["--dry-run"]) == 0 and out.read_bytes() == before
-
-
-def test_a_refusal_refuses_a_file_that_holds_starts(monkeypatch, tmp_path):
-    """One format's unsplit refusal clears every format's rows: over a file that holds starts the writer writes nothing
-    and exits 1; over a new file it writes the profile with the accelerator off, as before."""
-    import tools.profile_writer as pw
-
-    out = _held_starts_file(monkeypatch, pw, tmp_path)
-    before = out.read_bytes()
-    m = dict(_measurements(), tile_ms={}, tile_geometry_ms={}, tile_oracle_fail={}, oracle_fail=[],
-             tile_error="nvfp4 TM=8 crew: gemm_tile: K must be a multiple of 1024 and of 128 for nvfp4 (K=2560)", tile_refused=True)
-    monkeypatch.setattr(pw, "measure", lambda **kw: dict(m))
-    assert pw.main(["--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
-    new = tmp_path / "new.json"
-    assert pw.main(["--name", "x-20c", "--out", str(new)]) == 0 and Profile.from_dict("x-20c", json.loads(new.read_text())).accelerator == "off"
-
-
-def test_a_full_refresh_over_held_starts_writes_and_a_partial_one_refuses(monkeypatch, tmp_path):
+def test_a_full_refresh_over_held_starts_writes_and_a_partial_one_refuses(monkeypatch, tmp_path, capsys):
     """Over a file whose starts are exactly the formats the run measures, a refresh that prices them all writes, keeping
-    the switch on and re-pricing the starts; a refusal or --no-accelerator over the same file writes nothing."""
+    the switch on and re-pricing the starts; one whose unsplit tile refused the shape writes nothing and says so."""
     import tools.profile_writer as pw
 
     out = _held_starts_file(monkeypatch, pw, tmp_path, held={"nvfp4": 2, "fp8": 4})
     before = out.read_bytes()
     base = dict(_measurements(), tile_oracle_fail={}, oracle_fail=[])
     refused = dict(base, tile_ms={}, tile_geometry_ms={}, tile_error="nvfp4 TM=8 crew: gemm_tile: K must be a multiple of 1024", tile_refused=True)
-    for args, m in ((["--name", "x-20c", "--out", str(out)], refused),
-                    (["--no-accelerator", "--name", "x-20c", "--out", str(out)], dict(base, tile_ms={}, tile_geometry_ms={}))):
-        monkeypatch.setattr(pw, "measure", lambda m=m, **kw: dict(m))
-        assert pw.main(args) == 1 and out.read_bytes() == before
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(refused))
+    capsys.readouterr()
+    assert pw.main(["--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
+    assert f"no tile start for fp8, nvfp4, whose start {out} holds: the tile refused the measured shape" in capsys.readouterr().out
     monkeypatch.setattr(pw, "measure", lambda **kw: dict(base))
     assert pw.main(["--name", "x-20c", "--out", str(out)]) == 0                            # every held start priced: it writes
     engine = json.loads(out.read_text())["engine"]
@@ -352,17 +315,19 @@ def test_a_full_refresh_over_held_starts_writes_and_a_partial_one_refuses(monkey
 
 
 def test_a_refusal_known_from_the_arguments_does_not_measure(monkeypatch, tmp_path, capsys):
-    """A --formats subset or --no-accelerator over a file that holds other starts is refused before the measurement
-    (exit 1, nothing written), naming the formats; --dry-run measures and warns that a write would be refused."""
+    """A --formats subset that leaves out a held start, or --no-accelerator over a file that holds starts, is refused
+    before the measurement (exit 1, nothing written), naming the formats and the cause; --dry-run measures and warns
+    that a write would be refused."""
     import tools.profile_writer as pw
 
     out = _held_starts_file(monkeypatch, pw, tmp_path)
     before = out.read_bytes()
     monkeypatch.setattr(pw, "measure", lambda **kw: pytest.fail("measured before refusing"))
     capsys.readouterr()
-    for extra in (["--formats", "fp8_e4m3"], ["--no-accelerator"]):
+    for extra, said in ((["--formats", "fp8_e4m3"], f"no tile start for bf16, int4_affine, nvfp4, whose start {out} holds: refresh every format"),
+                        (["--no-accelerator"], f"no tile start for bf16, fp8, int4_affine, nvfp4, whose start {out} holds: --no-accelerator prices none")):
         assert pw.main(extra + ["--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
-    assert "no tile rows for bf16, int4_affine, nvfp4" in capsys.readouterr().out
+        assert said in capsys.readouterr().out
     full = _measurements()
     m = dict(full, **{key: {"fp8_e4m3": full[key]["fp8_e4m3"]} for key in ("shader_ms", "tile_ms", "tile_geometry_ms")},
              tile_oracle_fail={}, oracle_fail=[])
@@ -373,15 +338,20 @@ def test_a_refusal_known_from_the_arguments_does_not_measure(monkeypatch, tmp_pa
 
 def test_the_carried_switch_refuses_implicit_starts(monkeypatch, tmp_path, capsys):
     """compiler.emit starts a format missing from accelerator_min_t at T = 2: over a file with the switch on and no
-    starts, a run that prices no format (--no-accelerator here) writes nothing; with the switch off it writes."""
+    starts, --no-accelerator is refused before measuring and a run whose tile refused the shape writes nothing; with
+    the switch off --no-accelerator writes."""
     import tools.profile_writer as pw
 
     out = _held_starts_file(monkeypatch, pw, tmp_path, held={})
     before = out.read_bytes()
-    monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_ms={}, tile_geometry_ms={}, tile_oracle_fail={}, oracle_fail=[]))
+    monkeypatch.setattr(pw, "measure", lambda **kw: pytest.fail("measured before refusing"))
     capsys.readouterr()
     assert pw.main(["--no-accelerator", "--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
-    assert "no tile start for fp8, nvfp4" in capsys.readouterr().out
+    assert f"no tile start for bf16, fp8, int4_affine, nvfp4, which the switch {out} holds on starts at T = 2: --no-accelerator" in capsys.readouterr().out
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_ms={}, tile_geometry_ms={}, tile_oracle_fail={}, oracle_fail=[],
+                                                         tile_error="nvfp4 TM=8 crew: gemm_tile: K must be a multiple of 1024", tile_refused=True))
+    assert pw.main(["--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
+    assert f"no tile start for fp8, nvfp4, which the switch {out} holds on starts at T = 2: the tile refused" in capsys.readouterr().out
     off = _held_starts_file(monkeypatch, pw, tmp_path, held={}, accelerator="off")
     monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_ms={}, tile_geometry_ms={}, tile_oracle_fail={}, oracle_fail=[]))
     assert pw.main(["--no-accelerator", "--name", "x-20c", "--out", str(off)]) == 0
@@ -397,6 +367,18 @@ def test_a_null_start_table_holds_no_starts(monkeypatch, tmp_path):
     out.write_text(json.dumps(doc, indent=2) + "\n")
     monkeypatch.setattr(pw, "measure", lambda **kw: dict(_measurements(), tile_oracle_fail={}, oracle_fail=[]))
     assert pw.main(["--name", "x-20c", "--out", str(out)]) == 0
+
+
+def test_a_start_no_measured_format_prices_is_named(monkeypatch, tmp_path, capsys):
+    """A held start under a key no format the writer measures maps to (fp8_e4m3 is a pack name; emit reads fp8) is
+    refused like any unpriced start, and the message says no argument prices it."""
+    import tools.profile_writer as pw
+
+    out = _held_starts_file(monkeypatch, pw, tmp_path, held={"fp8_e4m3": 2})
+    monkeypatch.setattr(pw, "measure", lambda **kw: pytest.fail("measured before refusing"))
+    capsys.readouterr()
+    assert pw.main(["--name", "x-20c", "--out", str(out)]) == 1
+    assert "no format the writer measures prices fp8_e4m3: edit it by hand" in capsys.readouterr().out
 
 
 def test_writer_tile_pick_crew2_unscaled_and_duplicate_formats(monkeypatch):
@@ -698,14 +680,15 @@ def test_cached_and_emitted_splits_stay_inside_tile_ksplits():
                                   ["--tms", "16", "--ts", "1,2,4,8,16"], ["--quick", "--ts", "1,2,4,8,16"],   # one compared T lacks it
                                   ["--tms", "8,"], ["--tms", ""], ["--ts", "1,x"], ["--ctx", "1024,"], ["--attn-ts", "1,"],  # not integer lists
                                   ["--ts", "1,2,4,8,32", "--tms", "8,16"], ["--ts", "1,64"],   # T = 32 needs TM 32; T = 64 is never compared
+                                  ["--ts", "1,2,64"], ["--no-accelerator", "--ts", "1,64"],   # nor a T above the largest tile row
                                   ["--formats", "q4_0"], ["--formats", "nvfp4,f16"],   # registered formats the harnesses cannot build
                                   ["--ts", "0,1,2"], ["--ts", "1,2,-4"]])              # token counts below 1
 def test_writer_rejects_bad_arguments_before_measuring(monkeypatch, args):
-    """A token-row count the tile has no variant for, a cost list without T = 1 (the costs' unit) or with a T below 1,
-    a format name the harnesses cannot build (an unregistered one or one monolith.bench.random_spec does not make), an
-    empty format list, a tile sweep that leaves a compared T (2 to 32) without its tile row (tile_rows, after --quick
-    keeps the first --tms value) or compares at no T, and a malformed integer list stop the writer at argument parsing
-    (exit 2), before the device is opened."""
+    """A token-row count the tile has no variant for, a cost list without T = 1 (the costs' unit) or with a T below 1 or
+    above the largest tile row, a format name the harnesses cannot build (an unregistered one or one
+    monolith.bench.random_spec does not make), an empty format list, a tile sweep that leaves a compared T (2 to 32)
+    without its tile row (tile_rows, after --quick keeps the first --tms value) or compares at no T, and a malformed
+    integer list stop the writer at argument parsing (exit 2), before the device is opened."""
     import tools.profile_writer as pw
 
     monkeypatch.setattr(pw, "nt", SimpleNamespace(Device=lambda: pytest.fail("the device opened before the arguments were checked")))

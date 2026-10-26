@@ -128,8 +128,10 @@ The writer preserves existing probe records, backend metadata and layer-fusion
 recipes. It saves the prior engine block and measurements under `writer`.
 A refresh carries the accelerator switch over: it also gates paths the writer does
 not time, so it changes only by a hand edit backed by an end-to-end A/B. A refresh
-must price every format whose tile start the file holds; a `--formats` subset,
-`--no-accelerator` or a shape one format's tile refuses writes nothing.
+must price every format whose tile start the file holds and, with the switch on, every
+format it measures (the compiler starts a format without a start at T = 2): a
+`--formats` subset that leaves out a held format, `--no-accelerator` over a file that
+holds starts or the switch on, or a shape one format's tile refuses writes nothing.
 Unregistered devices require `--out` (or `--dry-run`); measurements do not silently
 create a chip backend. Leaf calibration does not mark an untested layer recipe
 as validated. Store measurements and generated figures with the
