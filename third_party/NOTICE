@@ -321,6 +321,29 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   from `include/basalt/kernels/cpu/pool.hpp` and `src/kernels/cpu/pool.cpp` (MIT): the CPU expert pool's
   structure, its epoch-tagged claim protocol, its park and its phase barriers, with the memory orders as written.
   License: `third_party/BASALT-LICENSE`.
+- `runtime/src/basalt_ngram.h`, `runtime/src/basalt_ngram.cpp` and `tests/kernels/test_basalt_ngram.py` — adapted
+  from `include/basalt/kernels/ngram.hpp` and `src/kernels/ngram.cpp:52-87` (MIT): the PLE n-gram hash, its two
+  64-bit mixes, its bigram and trigram head split, its end-of-sequence cut and the `PleConsts` multipliers,
+  vocabulary sizes and offsets as the metadata carries them; the cases follow `src/kernels/ple_parity.cpp:302-316`,
+  `:324`. `tests/kernels/fixtures/ngram_oracle.txt` is transcribed from `src/kernels/ple_oracle_vectors.inc`.
+  License: `third_party/BASALT-LICENSE`.
+- `runtime/src/basalt_ple_table.h`, `runtime/src/basalt_ple_table.cpp` and `tests/kernels/test_basalt_ple_table.py` —
+  adapted from `include/basalt/kernels/ngram.hpp:43-49`, `:86-98`, `:170-173`,
+  `include/basalt/kernels/f16_bits.hpp:69-94` and `src/kernels/ngram.cpp:90-108`, `:456` (MIT): the IQ4_NL row
+  decode with its split-half nibbles and its codebook at that commit, the fp16 widening that keeps subnormals,
+  and the head-slowest flatten of sixteen rows into one embedding. License: `third_party/BASALT-LICENSE`.
+- `runtime/src/basalt_row_cache.h`, `runtime/src/basalt_row_cache.cpp` and `tests/kernels/test_basalt_row_cache.py` —
+  adapted from `src/ngram/ple_reader.cpp:30-71`, `:544-545` (MIT): the eight-way set-associative row cache, its
+  64-bit mix, its modulo set index and its round-robin replacement, which is the code's behaviour where that
+  file's own header says clock. License: `third_party/BASALT-LICENSE`.
+- `runtime/src/basalt_direct_file.h`, `runtime/src/basalt_direct_file.cpp` and
+  `tests/kernels/test_basalt_direct_file.py` — adapted from `include/basalt/platform/direct_file.hpp` and
+  `src/platform/direct_file.cpp` (MIT): the unbuffered reader, its thread pool, its tag-keyed completion
+  protocol, its alignment contract and its tolerance of a short read at the end of the file; the fixture's
+  deliberately misaligned header follows `src/ngram/ple_reader_test.cpp:46`. macOS has no `O_DIRECT`, so the port
+  substitutes `F_NOCACHE` with read-ahead off, which is advisory where `O_DIRECT` is structural; the
+  serialisation of its drivers and of `close` against them is this port's, not basalt's.
+  License: `third_party/BASALT-LICENSE`.
 - `tests/basalt_ple_ref.py`, `tests/contract/test_basalt_ple_refs.py`, `tests/kernels/test_basalt_ple.py` and
   `tests/kernels/test_basalt_ple_program.py` — adapted from `src/kernels/ple_parity.cpp` and
   `src/kernels/ple_win_parity.cpp` (MIT): their history regression, block, key and host-reference checks, fixtures,
