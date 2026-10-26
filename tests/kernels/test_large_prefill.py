@@ -227,6 +227,19 @@ def test_exact_128_row_sessions_give_v1_its_plain_bits(tmp_path):
     assert [k.macros.get('EXACT_SUB') for k in v1] == [None, None]
 
 
+def test_exact_requests_below_128_rows_run_plain_passes(tmp_path):
+    # serve's N-exact below 128 (serving.md, --prefill-chunk-size): a plain N-row session's programs and checkpoints
+    _checkpoint(tmp_path)
+    pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
+               PackLayout(rows=16))
+    exact, plain = (Session(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path / 'pack'),
+                            eos=-1, autotune=False, attention='auto', accelerator='off', prefill_chunk_size=64,
+                            prefill_exact=e, prefix_cache=True) for e in (True, False))
+    assert (exact.prefill_exact, exact.prefill_exact_attention) == (False, False)
+    assert exact.prefix_identity() == plain.prefix_identity()
+    assert {k.macros.get('EXACT_SUB') for k in exact.prefill_engine(None, 64).program.kernels.values()} == {None}
+
+
 def test_tie_rows_hold_the_scores_the_reference_chose_by(tmp_path):
     # greedy_ties.score_row, the scores agree reads: the prompt pass's row for token 0 and the decode step's row 0 for a
     # later token, with the steps queued past the last leaving that row alone
