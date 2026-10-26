@@ -6,7 +6,7 @@ GEMV variants: rows per activation-reuse group ``RG``, the geometry (the crew: 1
 threadgroups per core, or one block per SIMD-group in 64-thread threadgroups) and, for a norm-fed GEMV, whether
 the RMSNorm scaling is fused into the load (``NORM=1``, one dispatch fewer) or applied by ``norm_apply``. GDN
 variants: state-slice columns and slices per block. Timings are min-of-N after a warm-up; a variant must beat the
-default by more than the noise margin to replace it.
+default by at least the noise margin to replace it.
 """
 
 from __future__ import annotations
@@ -22,12 +22,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .. import kernels
+from ..backends.metal.calibration import NOISE as NOISE_MARGIN, TILE_KSPLITS   # a variant replaces the default only if faster by at least NOISE_MARGIN
 from ..bench import pack_spec, random_spec
 from ..formats import FORMATS, PackLayout
 from ..formats.blm import PackInfo
 from ..formats.fp import f32_to_bf16
-
-NOISE_MARGIN = 0.03           # a variant replaces the default only if faster by more than this fraction
 
 
 def gemv_key(info: PackInfo, t: int, epilogue: Optional[str], norm_fed: bool, stat_parts: int = 64) -> str:
@@ -217,7 +216,7 @@ class Autotuner:
     def tune_gemm(self, info: PackInfo, tm: int, epilogue: Optional[str], *, force: bool = False, permute: bool = False,
                   norm_fed: bool = False, stat_parts: int = 1) -> Choice:
         """The tile's geometry: one or two threadgroups per core (the sweep in decode-kernels.md §6 found either,
-        by format) or the K-split (one tile per threadgroup of 2 or 4 SIMD-groups, for the shapes whose tiles cannot
+        by format) or the K-split (one tile per threadgroup of TILE_KSPLITS SIMD-groups, for the shapes whose tiles cannot
         occupy the crew), timed on synthetic data like the GEMV variants. ``permute``: an ``x_permute`` dispatch per
         tile (the program's, when the producer does not write the input permuted; ``norm_fed`` = the norm applied on
         the way from ``stat_parts`` partials) — the tile-versus-shader decision must see the whole path, and a permute
@@ -243,7 +242,7 @@ class Autotuner:
         psos = {"crew": pso, "crew2": pso}
         # the K-splits, each with the scale cache where it fits and without it (the cache's registers cost more than the
         # reload on the 8B's shapes — measured, decode-kernels.md §9); a split finer than the lane groups needs it off
-        for s in (2, 4, 8, 16):
+        for s in TILE_KSPLITS:
             try:
                 km = kernels.gemm_macros(pinfo, tm=tm, out_bf16=True, epilogue=epilogue, ksplit=s)
             except ValueError:

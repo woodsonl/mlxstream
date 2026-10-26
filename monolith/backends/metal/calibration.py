@@ -1,9 +1,8 @@
 """The profile writer's decisions and merge (design §5.7: profiles are measured, never assumed; #49).
 
 ``tools/profile_writer.py`` runs the kernel harnesses on the machine and hands their numbers to these functions;
-they are pure (no Metal) so the contract tier tests them without a GPU. Every decision follows the autotuner's
-rule: a choice replaces the default only when it wins by more than the noise margin, and a tie keeps the profile's
-current value.
+they are pure (no Metal) so the contract tier tests them without a GPU. Each decision applies the noise margin
+``NOISE`` (the autotuner's ``NOISE_MARGIN``) under its own rule.
 """
 
 from __future__ import annotations
@@ -13,10 +12,13 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .config import COST_FORMAT
 
-NOISE = 0.03                    # the autotuner's margin (compiler.autotune.NOISE_MARGIN)
+NOISE = 0.03                    # the noise margin of these choices and of the autotuner (compiler.autotune.NOISE_MARGIN)
 COST_TS = (1, 2, 4, 8)          # the shader GEMV's measured T (the per-T variants of a speculative program)
 TILE_TMS = (8, 16, 32)          # the accelerator tile's token rows
-NEVER = 33                      # accelerator_min_t above the largest tile: the tile never takes this format's GEMVs
+TILE_KSPLITS = (2, 4, 8, 16)    # the tile's K-splits (SIMD-groups sharing a row tile's K): the autotuner tries them and the writer
+                                # times them; gemm_tile accepts only these and 1, so the splits the shipped kernel-choices files
+                                # cache and compiler.emit's small-BF16 splits must stay inside them
+NEVER = max(TILE_TMS) + 1       # the never-start, above every T a decode tile covers: the tile loses at every compared T, no T is compared, or no unsplit row prices it
 DEFAULT_LANE_ORDER = "interleaved16"
 
 
@@ -95,27 +97,30 @@ def accelerator_plan(shader: Mapping[str, Mapping[int, float]], tile: Mapping[st
     """``(accelerator, accelerator_min_t, why)`` from the shader's cost table and the tile's per format (both in
     units of the format's T = 1 shader pass): per format the smallest T > 1 at which the tile at ``tile_rows(T)``
     costs no more than the shader's T-pass plus the noise margin — a tie goes to the tile, whose one dispatch covers
-    the whole range the shader needs a variant per T for — ``NEVER`` when it never does; on when any format qualifies."""
+    the whole range the shader needs a variant per T for — ``NEVER`` when it loses at every T compared (a T whose tile row
+    was measured); on when any format qualifies (``decide`` writes the starts, not this switch, which carries over from
+    the file)."""
     min_t: Dict[str, int] = {}
     notes = []
     for key, rows in tile.items():
         sh = shader.get(key)
         if not sh or not rows:
             continue
-        chosen = NEVER
+        chosen, lost = NEVER, []
         for t in sorted(sh):
-            if t < 2 or t > 32:
-                continue
-            tm = tile_rows(t)
-            if tm in rows and rows[tm] <= sh[t] * (1 + NOISE):
+            if t < 2 or t > max(TILE_TMS) or tile_rows(t) not in rows:
+                continue                                            # no tile row for this T: not compared
+            if rows[tile_rows(t)] <= sh[t] * (1 + NOISE):
                 chosen = t
                 break
+            lost.append(t)
         min_t[key] = chosen
-        notes.append(f"{key}: {'the tile from T = %d' % chosen if chosen != NEVER else 'the shader everywhere'} "
-                     f"(tile {', '.join(f'TM{tm} {c:.2f}' for tm, c in sorted(rows.items()))} vs shader "
+        verdict = (f"the tile from T = {chosen}" if chosen != NEVER else
+                   f"the tile loses at T = {', '.join(map(str, lost))}" if lost else "no measured T has a tile row")
+        notes.append(f"{key}: {verdict} (tile {', '.join(f'TM{tm} {c:.2f}' for tm, c in sorted(rows.items()))} vs shader "
                      f"{', '.join(f'T{t} {c:.2f}' for t, c in sorted(sh.items()) if t > 1)})")
     on = any(v != NEVER for v in min_t.values())
-    return ("on" if on else "off"), min_t, ("; ".join(notes) if notes else "no tile measurement (the tensor ops did not compile or were skipped)")
+    return ("on" if on else "off"), min_t, ("; ".join(notes) if notes else "no tile measurement (the tile step was skipped)")
 
 
 def attention_choice(v1: Mapping[Any, float], v2: Mapping[Any, float], rep: int = 4, v3: Optional[Mapping[Any, float]] = None) -> Tuple[str, str]:
@@ -153,9 +158,15 @@ def _attention_choice_v12(v1: Mapping[Any, float], v2: Mapping[Any, float], rep:
 def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, str]]:
     """The ``engine`` block from the writer's measurements (``tools/profile_writer.py`` builds the mapping:
     ``family``, ``lane_order_gbps`` {order: GB/s}, ``threadgroups_ms`` {count: ms}, ``shader_ms`` {format: {T: ms}},
-    ``tile_ms`` {format: {TM: ms}} (the same T = 1 unit), ``attention_ms`` {"v1": {(ctx, T): ms}, "v2": …}) and the
-    current engine block (the values the measurement does not cover — sibling order, max_cb_ms, attention_rows —
-    carry over). Returns ``(engine, notes)``."""
+    ``tile_ms`` {format: {TM: ms}} (the geometry the autotuner picks, in the same T = 1 unit), ``tile_geometry_ms``
+    {format: {TM: {geometry: ms}}} (every geometry timed; the unsplit tile at the threadgroups per core chosen here prices
+    ``accelerator_min_t``), ``tile_error``,
+    ``tile_refused`` (the unsplit tile refused the shape: the error is that refusal),
+    ``attention_ms`` {"v1": {(ctx, T): ms}, "v2": …}) and the current engine block (the values the measurement does
+    not cover — the accelerator switch, sibling order, max_cb_ms, attention_rows — carry over; the switch is off without
+    one). A format with the pick's rows but no unsplit row gets ``NEVER``. On a profile with two threadgroups per core the
+    start is priced on crew2 while a crew pick's row was timed at one per core (compiler.emit dispatches a tuned crew at
+    two, crew2's geometry), so that row can exceed the shader pass at the start. Returns ``(engine, notes)``."""
     cur = dict(current or {})
     notes: Dict[str, str] = {}
     lane, notes["lane_order"] = choose_lane_order(measurements["lane_order_gbps"], cur.get("lane_order"))
@@ -164,7 +175,30 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
     shader = {cost_key(f): cost_table(ms) for f, ms in measurements["shader_ms"].items()}
     tile = {cost_key(f): {int(tm): round(ms / measurements["shader_ms"][f][1], 3) for tm, ms in rows.items()}
             for f, rows in measurements.get("tile_ms", {}).items() if f in measurements["shader_ms"] and rows}
-    accel, min_t, notes["accelerator"] = accelerator_plan(shader, tile)
+    unsplit_mode = "crew" if tgs == 1 else f"crew{tgs}"        # the unsplit tile at this profile's threadgroups per core: serve's tile
+    unsplit = {cost_key(f): {int(tm): round(g[unsplit_mode] / measurements["shader_ms"][f][1], 3) for tm, g in rows.items() if unsplit_mode in g}
+               for f, rows in measurements.get("tile_geometry_ms", {}).items() if f in measurements["shader_ms"] and rows}
+    _, min_t, why = accelerator_plan(shader, unsplit)
+    why = f"the unsplit tile ({unsplit_mode}): {why}" if min_t else ("" if tile else why)   # no unsplit row at all: the clause below
+    missing = sorted(set(tile) - set(min_t))                   # the pick's rows but no unsplit row: unpriced, so NEVER (emit reads a gap as 2)
+    if missing:
+        min_t.update(dict.fromkeys(missing, NEVER))
+        why += (f"{'; ' if why else ''}no {unsplit_mode} row for {', '.join(missing)}: no T up to {max(TILE_TMS)} starts the tile for "
+                f"{'them' if len(missing) > 1 else 'it'}")
+    notes["accelerator"] = why
+    _, pick_t, _ = accelerator_plan(shader, tile)
+    if pick_t:
+        notes["accelerator"] += "; the autotuner's pick would start the tile at " + ", ".join(
+            f"T = {t} for {k}" if t != NEVER else f"no T up to {max(TILE_TMS)} for {k}" for k, t in pick_t.items())
+    if "tile_error" in measurements:                            # main() writes a profile after a refusal only
+        notes["accelerator"] = (f"no tile rows for any format: one format's unsplit tile refused the measured shape, which ends the tile step: {measurements['tile_error']}"
+                                if measurements.get("tile_refused") else
+                                f"no tile measurement: the tile step ended on an error: {measurements['tile_error']}")
+    accel = cur.get("accelerator", "off")                       # never from the tile rows: the switch gates paths the writer does not time
+    notes["accelerator"] += (f"; the switch stays {accel} ({'carried over from the file' if 'accelerator' in cur else 'off by default: the file holds none'}): "
+                             "a refresh does not set it, because it also gates the T = 1 rows GEMVs, auto attention's MMA kernel at T >= 4, "
+                             "the drafter's MMA attention and the GDN prepared path (and m5_max_40c's attention, MLP and GDN-fusion "
+                             "recipes), which the writer does not time")
     att = measurements.get("attention_ms") or {}
     attention, notes["attention"] = attention_choice(att.get("v1", {}), att.get("v2", {}), rep=int(measurements.get("attention_rep", 4)), v3=att.get("v3"))
     cost_t: Dict[str, Dict[str, float]] = {k: {str(t): c for t, c in tbl.items()} for k, tbl in shader.items()}
@@ -175,8 +209,16 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
               "attention": attention, "attention_rows": int(cur.get("attention_rows", 4)), "attention_v2_threadgroups": int(cur.get("attention_v2_threadgroups", 2)),
               "accelerator": accel, "accelerator_min_t": min_t, "cost_T": cost_t,
               "note": "written by tools/profile_writer.py from the kernel harnesses (min-of-N over >= 2 GB streamed per point): cost_T = the "
-                      "pass cost relative to a T = 1 shader pass at the best geometry per T; accelerator_<fmt> = gemm_tile at TM rows in "
-                      "the same unit; sibling_order and max_cb_ms are the probes' (p11, p6/p6b) and attention_rows the file's: they carry over"}
+                      "pass cost relative to a T = 1 shader pass at the best geometry per T; accelerator_min_t = the smallest T at which the "
+                      "unsplit tile at threadgroups_per_core (crew at one per core, crew2 at two), the tile serve runs on the shapes the kernel "
+                      "choices do not list, costs no more than that shader pass plus the noise margin (a tie goes to the tile); "
+                      "accelerator_<fmt> = gemm_tile at TM rows in the geometry the "
+                      f"autotuner picks (crew and crew2 timed at one and two threadgroups per core, the K-splits {'/'.join(map(str, TILE_KSPLITS))} "
+                      "and their cacheless twins), in the same unit, which compiler.emit.verify_costs reads: a session without autotuning runs the "
+                      "unsplit tile, not the pick these rows price, and on two threadgroups per core a tuned crew or crew2 runs at twice the "
+                      "threadgroups its row was timed at, a geometry nothing times; the accelerator "
+                      "switch, which gates paths the writer does not time, is the file's (off in a new one), sibling_order and max_cb_ms are "
+                      "the probes' (p11, p6/p6b) and attention_rows the file's: they carry over"}
     if cur.get("gdn_mixer_fusion"):
         engine["gdn_mixer_fusion"] = dict(cur["gdn_mixer_fusion"])
         notes["gdn_mixer_fusion"] = "retained from the layer study; leaf measurements do not select mixer fusion"

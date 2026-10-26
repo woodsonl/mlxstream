@@ -53,6 +53,8 @@ class GemmBench:
         rng = np.random.default_rng(seed)
         spec = random_spec(fmt, n, k, rng)
         data, pinfo, row_scales = pack_spec(spec, PackLayout(rows=rows, lane_order=lane_order, scale_placement=placement))
+        macros = kernels.gemm_macros(pinfo, tm=tm, out_bf16=out_bf16, tn=tn, tk=tk, ksplit=ksplit, scale_cache=scale_cache)   # a refusal before the weight copies are allocated
+        tn, tk = int(macros["TN"].rstrip("u")), int(macros["TK"].rstrip("u"))
         f = FORMATS.get(fmt)
         useful = n * k * f.bytes_per_weight
         if copies is None:
@@ -68,8 +70,6 @@ class GemmBench:
         rsbuf = nt.Buffer(self.dev, row_scales.tobytes())
         ybuf = nt.Buffer(self.dev, tm * n * (2 if out_bf16 else 4))
         ybuf.fill(0)
-        macros = kernels.gemm_macros(pinfo, tm=tm, out_bf16=out_bf16, tn=tn, tk=tk, ksplit=ksplit, scale_cache=scale_cache)
-        tn, tk = int(macros["TN"].rstrip("u")), int(macros["TK"].rstrip("u"))
         macros.update(extra_macros or {})
         if check and macros.get("EXP_MODE", "0") != "0":
             check = False                                                   # experiments compute the wrong thing on purpose
@@ -111,12 +111,14 @@ class GemmBench:
         tiles_per_sg = n_tiles / n_sg
         return {"chip": self.info.name, "cores": cores, "kernel": "gemm_tile", "format": fmt, "n": n, "k": k, "rows": rows, "tm": tm, "tn": tn, "tk": tk,
                 "t_active": t_act, "lane_order": lane_order, "tg_per_core": tg_per_core, "tg": tg, "n_sg": n_sg, "n_tiles": n_tiles, "ksplit": ksplit,
-                "tiles_per_sg": round(tiles_per_sg, 2), "copies": copies, "ms": round(ms, 4), "scale_placement": pinfo.scale_placement,
+                "tiles_per_sg": round(tiles_per_sg, 2), "copies": copies, "ms": ms, "scale_placement": pinfo.scale_placement,
                 "gbps": round(useful / 1e9 / (ms / 1e3), 1),
                 "pct_nominal": round(100 * useful / 1e9 / (ms / 1e3) / self.profile.nominal_gbps, 1) if self.profile and self.profile.nominal_gbps > 0 else None,
                 "tflops": round(2 * tm * n * k / (ms / 1e3) / 1e12, 2),
                 "max_ulp_at_rms": round(chk.max_ulp_at_rms, 3) if chk else None, "max_ulp_elementwise": chk.max_ulp_elementwise if chk else None,
-                "max_rel_err": chk.max_rel_err if chk else None, "ok": chk.ok() if chk else None, "out_bf16": out_bf16, "macros": macros}
+                "max_ulp_at_scale": round(chk.max_ulp_at_scale, 3) if chk else None,
+                "max_rel_err": chk.max_rel_err if chk else None, "out_bf16": out_bf16, "macros": macros,
+                "ok": (chk.ok_rounded() if out_bf16 else chk.ok()) if chk else None}     # BF16 output: one rounding of the FP32 result
 
 
 def fmt_row(r: dict) -> str:

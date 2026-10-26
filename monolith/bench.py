@@ -13,6 +13,8 @@ from .formats import FORMATS, DequantSpec, PackLayout
 from .formats.blm import PackInfo
 from .formats.fp import E2M1_MAX, E4M3_MAX, bf16_to_f32, f32_to_bf16
 
+RANDOM_FORMATS = ("nvfp4", "fp8_e4m3", "bf16", "int8", "int4_affine")     # the formats random_spec makes (the harnesses' formats)
+
 
 def random_spec(fmt: str, n: int, k: int, rng: np.random.Generator) -> DequantSpec:
     """A random matrix *in the format's own codes* (no quantization pass), so large shapes are cheap to make."""

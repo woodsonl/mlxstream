@@ -403,14 +403,14 @@ def test_gemm_tile_ksplit_rejects_odd_splits():
     rng = np.random.default_rng(0)
     _, info, _ = pack_spec(random_spec("nvfp4", 256, 1024, rng), PackLayout(rows=16))     # 4 K tiles of 256, one word per lane
     kernels.gemm_macros(info, tm=8, ksplit=4)                                                # one K tile (one lane group) per slice
-    with pytest.raises(ValueError):
+    with pytest.raises(kernels.GemmRefused):
         kernels.gemm_macros(info, tm=8, ksplit=3)
     _, info, _ = pack_spec(random_spec("nvfp4", 256, 512, rng), PackLayout(rows=16))      # 2 K tiles: 4 does not divide them
-    with pytest.raises(ValueError):
+    with pytest.raises(kernels.GemmRefused):
         kernels.gemm_macros(info, tm=8, ksplit=4)
     _, info, _ = pack_spec(random_spec("nvfp4", 256, 4096, rng), PackLayout(rows=16))     # 16 K tiles, 4 words per lane: whole lane groups per slice
     assert kernels.gemm_macros(info, tm=8, ksplit=4)["KSPLIT"] == "4u"
-    with pytest.raises(ValueError, match="threadgroup memory"):                            # TM 32 × 16 slices: 60 KiB of partial tiles
+    with pytest.raises(kernels.GemmRefused, match="threadgroup memory"):                   # TM 32 × 16 slices: 60 KiB of partial tiles
         kernels.gemm_macros(info, tm=32, ksplit=16, scale_cache=False)
 
 
