@@ -53,7 +53,7 @@ class GemmBench:
         rng = np.random.default_rng(seed)
         spec = random_spec(fmt, n, k, rng)
         data, pinfo, row_scales = pack_spec(spec, PackLayout(rows=rows, lane_order=lane_order, scale_placement=placement))
-        macros = kernels.gemm_macros(pinfo, tm=tm, out_bf16=out_bf16, tn=tn, tk=tk, ksplit=ksplit, scale_cache=scale_cache)   # a refusal before any allocation
+        macros = kernels.gemm_macros(pinfo, tm=tm, out_bf16=out_bf16, tn=tn, tk=tk, ksplit=ksplit, scale_cache=scale_cache)   # a refusal before the weight copies are allocated
         tn, tk = int(macros["TN"].rstrip("u")), int(macros["TK"].rstrip("u"))
         f = FORMATS.get(fmt)
         useful = n * k * f.bytes_per_weight
