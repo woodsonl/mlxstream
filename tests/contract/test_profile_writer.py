@@ -261,7 +261,7 @@ def test_a_refresh_keeps_the_accelerator_switch():
     assert decide(_measurements(), {"accelerator": "off"})[0]["accelerator"] == "off"     # rows that start the tile at 2
     engine, notes = decide(lose, {"accelerator": "on"})
     assert engine["accelerator"] == "on" and engine["accelerator_min_t"] == {"nvfp4": NEVER}   # rows that lose at every T
-    assert "the autotuner's pick would start the tile at no T for nvfp4" in notes["accelerator"]
+    assert "the autotuner's pick would start the tile at no T up to 32 for nvfp4" in notes["accelerator"]
     assert decide(_measurements())[0]["accelerator"] == "off"                            # no file: off
     assert decide(_measurements(), {"sibling_order": "alu_first"})[0]["accelerator"] == "off"   # a file without the switch (m3_pro)
     assert all(path in notes["accelerator"] for path in ("rows GEMVs", "MMA kernel", "GDN prepared path", "does not time"))
@@ -280,7 +280,7 @@ def test_decide_never_starts_a_format_whose_unsplit_tile_has_no_row(threadgroups
     engine, notes = decide(dict(_measurements(), threadgroups_ms=threadgroups, tile_geometry_ms=geometry), {"accelerator": "on"})
     assert engine["threadgroups_per_core"] == (2 if mode == "crew2" else 1)
     assert engine["accelerator_min_t"] == {"fp8": NEVER, "nvfp4": NEVER} and "accelerator_fp8" in engine["cost_T"]
-    assert notes["accelerator"].startswith(f"no {mode} row for fp8, nvfp4: the tile never takes them; the autotuner's pick would start")
+    assert notes["accelerator"].startswith(f"no {mode} row for fp8, nvfp4: no T up to 32 starts the tile for them; the autotuner's pick would start")
     assert "plus the noise margin" in engine["note"]                                  # the start's rule, a tie to the tile
 
 
@@ -292,7 +292,7 @@ def test_the_never_start_note_keeps_the_priced_formats_verdicts():
     engine, notes = decide(m, {"accelerator": "on"})
     assert engine["accelerator_min_t"] == {"fp8": 2, "nvfp4": NEVER}
     assert notes["accelerator"].startswith("the unsplit tile (crew): fp8: the tile from T = 2 (")
-    assert "; no crew row for nvfp4: the tile never takes it; the autotuner's pick would start" in notes["accelerator"]
+    assert "; no crew row for nvfp4: no T up to 32 starts the tile for it; the autotuner's pick would start" in notes["accelerator"]
 
 
 def _held_starts_file(monkeypatch, pw, tmp_path, held=None, accelerator="on"):

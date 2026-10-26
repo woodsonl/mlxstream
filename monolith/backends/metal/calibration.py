@@ -98,7 +98,8 @@ def accelerator_plan(shader: Mapping[str, Mapping[int, float]], tile: Mapping[st
     units of the format's T = 1 shader pass): per format the smallest T > 1 at which the tile at ``tile_rows(T)``
     costs no more than the shader's T-pass plus the noise margin — a tie goes to the tile, whose one dispatch covers
     the whole range the shader needs a variant per T for — ``NEVER`` when it loses at every T compared (a T whose tile row
-    was measured); on when any format qualifies."""
+    was measured); on when any format qualifies (``decide`` writes the starts, not this switch, which carries over from
+    the file)."""
     min_t: Dict[str, int] = {}
     notes = []
     for key, rows in tile.items():
@@ -179,15 +180,16 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
                for f, rows in measurements.get("tile_geometry_ms", {}).items() if f in measurements["shader_ms"] and rows}
     _, min_t, why = accelerator_plan(shader, unsplit)
     why = f"the unsplit tile ({unsplit_mode}): {why}" if min_t else ("" if tile else why)   # no unsplit row at all: the clause below
-    missing = sorted(set(tile) - set(min_t))                   # the pick's rows but no unsplit row: unpriced, so never (emit reads a gap as 2)
+    missing = sorted(set(tile) - set(min_t))                   # the pick's rows but no unsplit row: unpriced, so NEVER (emit reads a gap as 2)
     if missing:
         min_t.update(dict.fromkeys(missing, NEVER))
-        why += f"{'; ' if why else ''}no {unsplit_mode} row for {', '.join(missing)}: the tile never takes {'them' if len(missing) > 1 else 'it'}"
+        why += (f"{'; ' if why else ''}no {unsplit_mode} row for {', '.join(missing)}: no T up to {max(TILE_TMS)} starts the tile for "
+                f"{'them' if len(missing) > 1 else 'it'}")
     notes["accelerator"] = why
     _, pick_t, _ = accelerator_plan(shader, tile)
     if pick_t:
         notes["accelerator"] += "; the autotuner's pick would start the tile at " + ", ".join(
-            f"T = {t} for {k}" if t != NEVER else f"no T for {k}" for k, t in pick_t.items())
+            f"T = {t} for {k}" if t != NEVER else f"no T up to {max(TILE_TMS)} for {k}" for k, t in pick_t.items())
     if "tile_error" in measurements:                            # main() writes a profile after a refusal only
         notes["accelerator"] = (f"no tile rows for any format: one format's unsplit tile refused the measured shape, which ends the tile step: {measurements['tile_error']}"
                                 if measurements.get("tile_refused") else
