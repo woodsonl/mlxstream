@@ -1,4 +1,5 @@
-"""tools/bench/gqa_bench.py's refusals: check_exact's EXACT_SUB row counts, and the command line's, before a device opens."""
+"""tools/bench/gqa_bench.py's refusals: check_exact's EXACT_SUB row counts, and run()'s and the command line's, before a
+device opens."""
 import pytest
 
 from tools.bench import gqa_bench
@@ -10,9 +11,12 @@ from tools.bench.gqa_bench import check_exact
     (128, [512], {"v2": True}, "v1 or v3"), (128, [512], {"steal": True}, "v1 or v3"),   # no exact form
     (128, [128], {}, "one sub-pass"), (128, [512, 4], {}, "one sub-pass"),    # v1's pass of T <= 128 rows: the plain kernel
 ])
-def test_check_exact_refuses(exact, ts, kw, reason):
+def test_check_exact_refuses(exact, ts, kw, reason, monkeypatch):
     with pytest.raises(ValueError, match=reason):
         check_exact(exact, ts, **kw)
+    monkeypatch.setattr(gqa_bench, "nt", None)   # run(), which callers reach without main(), refuses before a library builds
+    with pytest.raises(ValueError, match=reason):
+        gqa_bench.run(None, 8, 2, 32, 0, min(ts), 64, 4, 1, exact=exact, **kw)
 
 
 @pytest.mark.parametrize("exact,ts,kw", [
