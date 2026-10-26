@@ -12,7 +12,7 @@ if(NOT NB_RC EQUAL 0)
 endif()
 list(APPEND CMAKE_PREFIX_PATH "${NB_DIR}")
 find_package(nanobind CONFIG REQUIRED)
-nanobind_add_module(_native NB_STATIC src/native.mm src/metal_core.mm src/basalt_cpu.cpp src/basalt_cpu_expf.cpp src/basalt_pool.cpp src/basalt_cpu_experts.cpp)
+nanobind_add_module(_native NB_STATIC src/native.mm src/metal_core.mm src/basalt_cpu.cpp src/basalt_cpu_expf.cpp src/basalt_pool.cpp src/basalt_cpu_experts.cpp src/basalt_ngram.cpp src/basalt_ple_table.cpp src/basalt_row_cache.cpp src/basalt_direct_file.cpp)
 set_source_files_properties(src/native.mm src/metal_core.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 # basalt's CPU kernels transcribe two AVX-512 roundings (a vmulps then a vaddps) that a contracted fmla would
 # collapse into one, changing the activation codes. Measured, Apple clang keeps them apart at every contraction
@@ -26,7 +26,7 @@ set_source_files_properties(src/native.mm src/metal_core.mm PROPERTIES COMPILE_F
 # so that a build setting cannot silently choose a variant of the function, and the one site where the variants do
 # part is written as an explicit fma instead, immune to the flag (runtime/src/basalt_cpu_expf.cpp, WHICH VARIANT,
 # AND WHAT FUSES IN IT).
-set_source_files_properties(src/basalt_cpu.cpp src/basalt_cpu_expf.cpp src/basalt_cpu_experts.cpp PROPERTIES COMPILE_FLAGS "-ffp-contract=off")
+set_source_files_properties(src/basalt_cpu.cpp src/basalt_cpu_expf.cpp src/basalt_cpu_experts.cpp src/basalt_ngram.cpp src/basalt_ple_table.cpp PROPERTIES COMPILE_FLAGS "-ffp-contract=off")
 target_include_directories(_native PRIVATE src)
 target_link_libraries(_native PRIVATE "-framework Metal" "-framework Foundation" "-framework IOKit")
 set(LITHOS_METAL_NATIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/monolith/runtime" CACHE PATH "Python extension output directory")
