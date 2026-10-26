@@ -18,7 +18,7 @@ TILE_TMS = (8, 16, 32)          # the accelerator tile's token rows
 TILE_KSPLITS = (2, 4, 8, 16)    # the tile's K-splits (SIMD-groups sharing a row tile's K): the autotuner tries them and the writer
                                 # times them; gemm_tile accepts only these and 1, so the splits the shipped kernel-choices files
                                 # cache and compiler.emit's small-BF16 splits must stay inside them
-NEVER = max(TILE_TMS) + 1       # accelerator_min_t of a format the tile loses at every compared T: above every T a decode tile covers
+NEVER = max(TILE_TMS) + 1       # the never-start, above every T a decode tile covers: the tile loses at every compared T, no T is compared, or no unsplit row prices it
 DEFAULT_LANE_ORDER = "interleaved16"
 
 
@@ -212,8 +212,9 @@ def decide(measurements: Mapping[str, Any], current: Optional[Mapping[str, Any]]
                       "choices do not list, costs no more than that shader pass plus the noise margin (a tie goes to the tile); "
                       "accelerator_<fmt> = gemm_tile at TM rows in the geometry the "
                       f"autotuner picks (crew and crew2 timed at one and two threadgroups per core, the K-splits {'/'.join(map(str, TILE_KSPLITS))} "
-                      "and their cacheless twins), in the same unit, which compiler.emit.verify_costs reads: a session without autotuning, which "
-                      "runs the unsplit tile, and a tuned crew2 on two threadgroups per core cost more than these rows say; the accelerator "
+                      "and their cacheless twins), in the same unit, which compiler.emit.verify_costs reads: a session without autotuning runs the "
+                      "unsplit tile, not the pick these rows price, and on two threadgroups per core a tuned crew or crew2 runs at twice the "
+                      "threadgroups its row was timed at, a geometry nothing times; the accelerator "
                       "switch, which gates paths the writer does not time, is the file's (off in a new one), sibling_order and max_cb_ms are "
                       "the probes' (p11, p6/p6b) and attention_rows the file's: they carry over"}
     if cur.get("gdn_mixer_fusion"):

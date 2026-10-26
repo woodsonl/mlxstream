@@ -733,7 +733,7 @@
    },
    "accelerator_decision": "nvfp4: the tile from T = 2 (tile TM8 0.80, TM16 1.29, TM32 2.50 vs shader T2 1.14, T4 1.78, T8 5.11); fp8: the tile from T = 2 (tile TM8 0.91, TM16 0.99, TM32 1.89 vs shader T2 1.16, T4 1.69, T8 2.68); int4_affine: the tile from T = 2 (tile TM8 1.42, TM16 2.05, TM32 3.72 vs shader T2 1.46, T4 2.50, T8 6.80); bf16: the tile from T = 2 (tile TM8 1.02, TM16 1.07, TM32 1.27 vs shader T2 1.10, T4 1.20, T8 2.31)",
    "measured_s": 113,
-   "status_note": "overlapped another workspace's GPU tests for its whole run (its T = 1 shader passes ran 7-13 % slower)",
+   "status_note": "overlapped another workspace's GPU tests for its whole run (its NVFP4 and FP8 T = 1 shader passes ran 7-13 % slower)",
    "ended": "2026-10-25T07:25:39Z",
    "cost_T": {
     "nvfp4": {
