@@ -10,7 +10,7 @@ configuration or autotuning cache.
 | `m3_pro` | [18 cores](m3_pro/config.json) | Existing probe-derived settings preserved |
 | `m3_max_30c` | [30 cores](m3_max_30c/config.json) | Unmeasured native fallback. On the 36 GB machine, DSpark serving fits through 20480 context; 22528 does not |
 | `m3_max_40c` | [40 cores](m3_max_40c/config.json) | Measured (`profile_writer`, 48 GB): the Apple9 matrix tile from 2 rows for NVFP4 and BF16 (a paired DSpark-round A/B), 4 for FP8 and 8 for INT4; kernel choices for decode and the 32-row prompt-pass tiles. Prompt passes keep 128 rows: a 512-row exact pass with the DSpark drafter resident ran out of GPU memory on that machine |
-| `m3_ultra_60c` | [60 cores](m3_ultra_60c/config.json) | Measured (`profile_writer`, 256 GB): the Apple9 matrix tile from 4 rows |
+| `m3_ultra_60c` | [60 cores](m3_ultra_60c/config.json) | Measured (`profile_writer`, 256 GB): the Apple9 matrix tile from 4 rows (8 for BF16) |
 | `m4_pro` | [16 cores](m4_pro/config-16c.json), [20 cores](m4_pro/config-20c.json) | 20 cores measured (`profile_writer`, 48 GB): the Apple9 matrix tile from 2 rows (NVFP4); 16 cores an unmeasured native fallback |
 | `m4_max` | [32 cores](m4_max/config-32c.json), [40 cores](m4_max/config-40c.json) | Unmeasured native fallback |
 | `m5_pro` | [20 cores](m5_pro/config.json) | Existing measured settings preserved |
@@ -125,7 +125,13 @@ python tools/profile_writer.py            # refresh this device's registered con
 ```
 
 The writer preserves existing probe records, backend metadata and layer-fusion
-recipes. It saves the prior engine block and measurements under `writer`.
+recipes. It saves the prior engine block and this run's measurements under `writer`.
+A refresh carries the accelerator switch over (off in a new file): it also gates paths the writer does
+not time, so it changes only by a hand edit backed by an end-to-end A/B. A refresh
+must price every format whose tile start the file holds and, with the switch on, every
+format it measures (the compiler starts a format without a start at T = 2): a
+`--formats` subset that leaves out a held format, `--no-accelerator` over a file that
+holds starts or the switch on, or a shape one format's tile refuses writes nothing.
 Unregistered devices require `--out` (or `--dry-run`); measurements do not silently
 create a chip backend. Leaf calibration does not mark an untested layer recipe
 as validated. Store measurements and generated figures with the

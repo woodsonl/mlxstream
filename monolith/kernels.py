@@ -13,6 +13,7 @@ from .formats import FORMATS
 from .formats.blm import PackInfo
 from .formats.gguf import ggml_row_bytes
 from .backends.metal.context import current_backend
+from .backends.metal.calibration import TILE_KSPLITS
 
 from .resources import kernel_root
 
@@ -1034,6 +1035,10 @@ GEMM_PERM_SG = 16                 # SIMD-groups per row of x_permute (its grid i
 THREADGROUP_MEMORY_LIMIT = 32768  # bytes of threadgroup memory a dispatch may declare (Apple GPUs); a kernel needing more fails to build
 
 
+class GemmRefused(ValueError):
+    """gemm_tile cannot run this geometry for this pack, token rows or K: a refusal, not a defect."""
+
+
 def gemm_source(fmt: str) -> str:
     """The gemm_tile kernel (the M5 accelerator path for T > 1, #50) for storage format ``fmt``; compile it with
     ``language_version=MSL_TENSOR_OPS``."""
@@ -1077,31 +1082,31 @@ def gemm_macros(info: PackInfo, *, tm: int, out_bf16: bool = False, tn: Optional
         if a9 and tk // 8 < wpw // 2:                          # Apple9: a thread's TK/8 columns are whole words or a half-word
             tk = 4 * wpw if 4 * wpw <= 256 else tk
     if info.rows not in (8, 16):
-        raise ValueError(f"gemm_tile: R={info.rows} must be 8 or 16 (the epilogues index pack blocks)")
+        raise GemmRefused(f"gemm_tile: R={info.rows} must be 8 or 16 (the epilogues index pack blocks)")
     if info.lanes_per_word > 1:
-        raise ValueError(f"gemm_tile: sub-word units (K={info.k}) are the shader GEMV's; the tile reads whole-word units")
+        raise GemmRefused(f"gemm_tile: sub-word units (K={info.k}) are the shader GEMV's; the tile reads whole-word units")
     if epilogue not in EPILOGUES:
         raise ValueError(f"gemm_tile: unknown epilogue {epilogue!r}")
     if round_before_residual and epilogue != "residual":
         raise ValueError("gemm_tile: round_before_residual needs the residual epilogue")
     if (tn, tk) not in ((64, 64), (32, 128), (16, 256), (16, 128), (16, 64)):
-        raise ValueError(f"gemm_tile: tile {tn}x{tk} is not one of 64x64, 32x128, 16x256, 16x128, 16x64")
+        raise GemmRefused(f"gemm_tile: tile {tn}x{tk} is not one of 64x64, 32x128, 16x256, 16x128, 16x64")
     if info.k % (32 * wpw) or info.k % tk or tk % wpw:
-        raise ValueError(f"gemm_tile: K must be a multiple of {32 * wpw} and of {tk} for {info.format} (K={info.k})")
+        raise GemmRefused(f"gemm_tile: K must be a multiple of {32 * wpw} and of {tk} for {info.format} (K={info.k})")
     if tn % info.rows:
-        raise ValueError(f"gemm_tile: R={info.rows} must divide the {tn}-row tile")
+        raise GemmRefused(f"gemm_tile: R={info.rows} must divide the {tn}-row tile")
     if tm not in (8, 16, 32):
-        raise ValueError(f"gemm_tile: TM must be 8, 16 or 32 (got {tm})")
+        raise GemmRefused(f"gemm_tile: TM must be 8, 16 or 32 (got {tm})")
     if a9 and tk // 8 < wpw // 2:
-        raise ValueError(f"gemm_tile: on Apple9 a thread's TK/8 = {tk // 8} columns must be at least half a {wpw}-weight word")
+        raise GemmRefused(f"gemm_tile: on Apple9 a thread's TK/8 = {tk // 8} columns must be at least half a {wpw}-weight word")
     if a9 and f.scale_group and tk // 8 < 16:
-        raise ValueError(f"gemm_tile: on Apple9 a block-scaled format needs TK/8 >= 16 columns per thread (TK={tk})")
-    if ksplit not in (1, 2, 4, 8, 16) or (info.k // tk) % ksplit:
-        raise ValueError(f"gemm_tile: KSPLIT={ksplit} must be 1, 2, 4, 8 or 16 and divide the {info.k // tk} K tiles")
+        raise GemmRefused(f"gemm_tile: on Apple9 a block-scaled format needs TK/8 >= 16 columns per thread (TK={tk})")
+    if ksplit not in (1, *TILE_KSPLITS) or (info.k // tk) % ksplit:
+        raise GemmRefused(f"gemm_tile: KSPLIT={ksplit} must be one of {', '.join(map(str, (1, *TILE_KSPLITS)))} and divide the {info.k // tk} K tiles")
     c_cap = (tm // 8) * (tn // 4) if a9 else max(1, tm // 16) * tn // 2
     part_bytes = (ksplit - 1) * 32 * c_cap * 4                             # the slices' partial tiles (part[KSPLIT-1][32][C_CAP] floats)
     if part_bytes > THREADGROUP_MEMORY_LIMIT:
-        raise ValueError(f"gemm_tile: KSPLIT={ksplit} at TM={tm} needs {part_bytes} bytes of threadgroup memory for the partial tiles "
+        raise GemmRefused(f"gemm_tile: KSPLIT={ksplit} at TM={tm} needs {part_bytes} bytes of threadgroup memory for the partial tiles "
                          f"(the limit is {THREADGROUP_MEMORY_LIMIT})")
     macros = {"K": str(info.k), "R": str(info.rows), "TM": str(tm), "TN": f"{tn}u", "TK": f"{tk}u",
               "LANE_ORDER": "0" if info.lane_order == "contiguous" else "1",
@@ -1121,7 +1126,7 @@ def gemm_macros(info: PackInfo, *, tm: int, out_bf16: bool = False, tn: Optional
             nw = max(1, ct // wpw)                             #     in registers across the lane group's words (≤ 16 uints)
             if rows_t * nw * int(macros["SCALE_WORDS"]) * 4 <= 16:
                 if ksplit > 1 and ((info.k // tk) // ksplit) % int(macros["PAYLOAD_WORDS"]):     # the cache is filled at a lane group's first word
-                    raise ValueError(f"gemm_tile: KSPLIT={ksplit} must leave whole lane groups per slice ({32 // lpt} groups of {macros['PAYLOAD_WORDS']} words)")
+                    raise GemmRefused(f"gemm_tile: KSPLIT={ksplit} must leave whole lane groups per slice ({32 // lpt} groups of {macros['PAYLOAD_WORDS']} words)")
                 macros["SCALE_CACHE"] = "1"
     if ksplit > 1:
         macros["KSPLIT"] = f"{ksplit}u"
