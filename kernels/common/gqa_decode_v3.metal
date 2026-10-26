@@ -6,9 +6,10 @@
 // key normed + RoPE'd from the projection and, for the kv head's first row, appended to the caches — writer and
 // reader are the same SIMD-group), scores it (q·k by one simd_sum, bf16(bf16(q·k) · scaling), causal inside the
 // step), and folds it into its running online softmax (m, d, o) with exact FP32 rescaling, p̃ = bf16(exp(s − m))
-// rounded like the reference's P. Cached pairs share their maximum and the rescaling of prior accumulators;
-// an unpaired tail and new causal keys are folded individually. The NSG3 partials then meet in threadgroup memory
-// and every SIMD-group folds one
+// rounded like the reference's P. Cached pairs share their maximum and the rescaling of prior accumulators (with
+// EXACT_SUB, a row pairs the keys before the start of the EXACT_SUB-row pass from token 0 that holds it, cached or
+// appended by this pass, whatever this pass's start); an unpaired tail and new causal keys are folded individually.
+// The NSG3 partials then meet in threadgroup memory and every SIMD-group folds one
 // slice of D/NSG3 dims (lane ℓ = partial ℓ: one simd_max, one simd_sum per value) and writes it, normalized, rounded
 // to BF16 and times bf16(σ(gate)) when the projection carries the gate — no partial workspace, no second dispatch.
 //
@@ -19,7 +20,8 @@
 // plain decode and an LM drafter's chain step); v2 keeps T > 1 and v1 the 32-row passes (decode-kernels.md §11).
 //
 // Macros: D (head dim, multiple of 32), NSG3 (SIMD-groups per threadgroup, D / (4·NSG3) slices per SIMD-group in the
-// fold: 32 → 1024 threads), STEP_STATE, LM_MODE / CHAIN_I as v1, PERM_OUT (the consumer tile's order). Params as v1
+// fold: 32 → 1024 threads), STEP_STATE, LM_MODE / CHAIN_I as v1, PERM_OUT (the consumer tile's order), EXACT_SUB (a
+// prompt pass giving every row the bits of EXACT_SUB-row passes from token 0, wherever it starts). Params as v1
 // with n_sg = the threadgroups dispatched and pad1 = the gate rows' stride (0: out_stride). Buffers: 0 projection,
 // 1–2 caches, 3–4 RoPE tables, 5–6 norms, 7 out, 9 params, 10 the gate value [T, heads·D] (read when has_gate),
 // 15 StepState.
@@ -28,6 +30,27 @@
 #endif
 #ifndef SINGLE_BLOCK
 #define SINGLE_BLOCK 0
+#endif
+#if EXACT_SUB
+#if LM_MODE
+#error "EXACT_SUB: the target's prompt passes only"
+#endif
+// A key of an EXACT_SUB row's pairs that reach past this pass's start: k and v from the caches, or, for a key this pass
+// appends, from the projection with k normed and RoPE'd — the bits the caches get (norm_rope rounds to BF16, v is copied).
+// Never from the caches: the kv head's first row appends those keys in this dispatch, unordered with this read.
+static inline void exact_cached_kv(uint key, uint position, uint j, uint lane, device const ushort* qkvg, device const ushort* k_cache,
+                                   device const ushort* v_cache, device const ushort* cos_t, device const ushort* sin_t,
+                                   device const float* k_norm, constant GqaParams& p, thread float* kf, thread float* vf) {
+  if (key < position) {
+    load_dl(k_cache + (key * p.kv_heads + j) * D + lane * DL, kf);
+    load_dl(v_cache + (key * p.kv_heads + j) * D + lane * DL, vf);
+    return;
+  }
+  device const ushort* row = qkvg + (key - position) * p.in_stride + j * D + lane * DL;
+  load_dl(row + p.k_off, kf);
+  norm_rope(kf, k_norm, cos_t + key * D, sin_t + key * D, p.eps, lane);
+  load_dl(row + p.v_off, vf);
+}
 #endif
 #define MRG_STRIDE (D + 4u)          // floats per partial in the fold buffer: o[D], m, d, then padding to 16 bytes
 
@@ -84,10 +107,18 @@ kernel void gqa_decode_v3(device const ushort* qkvg [[buffer(0)]], device ushort
     float m_run = -INFINITY, d_run = 0.0f, o_run[DL];
     for (uint e = 0; e < DL; e++) o_run[e] = 0.0f;
     uint key = sgi;
+#if EXACT_SUB
+    // The row sums its keys as the EXACT_SUB-row pass from token 0 that holds it would (a run from scratch), wherever
+    // this pass starts (a prefix restore starts it anywhere): it pairs the keys before that pass's start, the cached
+    // ones here and the ones this pass appends in the loop below, and folds the rest one at a time.
+    const uint start = (position + t) / EXACT_SUB * EXACT_SUB, paired = min(start, position);
+#else
+    const uint paired = position;
+#endif
 
     // Two cached keys share one rescaling of the previous softmax state. Keep
     // score/probability BF16 boundaries; the tail and new causal keys follow below.
-    for (; key + NSG3 < position; key += 2u * NSG3) {
+    for (; key + NSG3 < paired; key += 2u * NSG3) {
       float scores[2u];
       float m_new = m_run;
 #pragma clang loop unroll(full)
@@ -113,7 +144,34 @@ kernel void gqa_decode_v3(device const ushort* qkvg [[buffer(0)]], device ushort
       }
       m_run = m_new;
     }
-    for (; key < position; key += NSG3) {
+#if EXACT_SUB
+    // Pairs reaching into keys this pass appends, up to the start of the row's pass from token 0: the same fold as above.
+    for (; key + NSG3 < start; key += 2u * NSG3) {
+      float scores[2u], vf[2u][DL];
+      float m_new = m_run;
+#pragma clang loop unroll(full)
+      for (uint pair = 0; pair < 2u; pair++) {
+        float kf[DL];
+        exact_cached_kv(key + pair * NSG3, position, j, lane, qkvg, k_cache, v_cache, cos_t, sin_t, k_norm, p, kf, vf[pair]);
+        float dot = 0.0f;
+        for (uint e = 0; e < DL; e++) dot = fma(q[e], kf[e], dot);
+        dot = simd_sum(dot);
+        scores[pair] = round_bf16(round_bf16(dot) * p.scaling);
+        m_new = max(m_new, scores[pair]);
+      }
+      const float a = m_run == -INFINITY ? 0.f : exp(m_run - m_new);
+      d_run *= a;
+      for (uint e = 0; e < DL; e++) o_run[e] *= a;
+#pragma clang loop unroll(full)
+      for (uint pair = 0; pair < 2u; pair++) {
+        const float pr = exp(scores[pair] - m_new), pb = round_bf16(pr);
+        d_run += pr;
+        for (uint e = 0; e < DL; e++) o_run[e] = fma(pb, vf[pair][e], o_run[e]);
+      }
+      m_run = m_new;
+    }
+#endif
+    for (; key < position; key += NSG3) {                        // (EXACT_SUB: an unpaired key this pass appends is the next loop's, the same fold)
       float kf[DL], vf[DL];
       load_dl(k_cache + (key * p.kv_heads + j) * D + lane * DL, kf);
       load_dl(v_cache + (key * p.kv_heads + j) * D + lane * DL, vf);

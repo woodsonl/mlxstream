@@ -58,13 +58,14 @@ uses sampled proposals with rejection correction. See [sampling semantics](specu
 
 ## Prefill policy
 
-`--prefill-chunk-size` accepts `N`, `N-exact`, or `auto-exact`. The default, `auto-exact`, selects the
-backend's qualified chunk size: 512 tokens on the 40-core M5 Max for the Qwen3.8-27B recipe and for the 27B
-in affine 4-bit groups, 512 on the 60-core M3 Ultra, and 128 elsewhere.
+`--prefill-chunk-size` accepts `N`, `N-exact` (N = 128 or a multiple of 128; a smaller N runs plain passes), or
+`auto-exact`. The default, `auto-exact`, selects the backend's qualified chunk size: 512 tokens on the 40-core M5
+Max for the Qwen3.8-27B recipe and for the 27B in affine 4-bit groups, 512 on the 60-core M3 Ultra, and 128
+elsewhere.
 Context and chunk sizes are separate controls: a larger chunk increases temporary work/storage without
 extending context capacity.
 
-Exact mode preserves the reduction orders of the 128-row reference graph. On the 40-core M5 Max, it uses
+Exact mode preserves the reduction orders of the exact 128-row graph. On the 40-core M5 Max, it uses
 32-key attention softmax and value blocks inside 128-key score tiles (the scores kept BF16-rounded, their
 first step, and overwritten by the probabilities in place), and projections that read the decoder's
 packed weights in the prefill kernel's arithmetic order. The MLP input projection decodes and multiplies each 128-column
@@ -72,8 +73,16 @@ weight tile in two 64-column halves, each FP8 projection's threadgroup decodes a
 threadgroup memory for four 32-token blocks, and the GDN recurrence sums four state columns in one transposed
 butterfly in `simd_sum`'s order; `matmul2d` accumulates K in order, so all of these keep every result bit for
 bit. Compatible prefill and decoder programs share those mappings and remain allocated together when they fit
-the Metal working set. Requests with a one-row reference chunk that needs the reference graph's projection path
-fall back to 128-row chunking. A plain `N` retains that chunk size's own reduction orders.
+the Metal working set. A request whose 128-row chunking leaves a one-row chunk, which needs the exact 128-row
+graph's one-row projection kernels, falls back to 128-row chunking. A plain `N` retains that chunk size's own
+reduction orders.
+
+In exact mode, `auto-exact`'s 128-row chunks included, the v3 attention gives every prompt row the bits of 128-row
+passes from the prompt's first token wherever its pass starts, so a request restored from a prefix checkpoint gets
+the attention results of the same request run cold. That does not cover v1, whose chunk size follows each pass's own
+context, prompt rows the resident decoder ingests, which run its kernels, or the projections: a chunk shorter than a
+format's accelerator threshold runs them on the shader instead of the tile. Exact and plain servers keep separate
+checkpoints on disk.
 
 With a compatible fixed-verification recipe, short prompts and cached tails can reuse the resident decoder.
 The limit is one chunk, capped at 128 tokens in exact mode. Longer prompts hand their final rows to the decoder

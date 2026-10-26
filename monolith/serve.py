@@ -751,7 +751,9 @@ def parse_args(argv=None):
     parser.add_argument("--served-model-name", default=None)
     parser.add_argument("--max-context", type=int, default=32768)
     parser.add_argument("--prefill-chunk-size", type=_prefill_chunk, default='auto-exact', metavar='N|N-exact|auto-exact',
-                        help="Prompt tokens per prefill pass. N-exact reproduces the results of 128-token passes bit for bit; "
+                        help="Prompt tokens per prefill pass. N-exact (N = 128 or a multiple of 128; a smaller N runs plain "
+                             "passes) reproduces the results of 128-token passes bit for bit; with the v3 attention its "
+                             "attention results also hold across prefix-cache restores (limits: docs/design/serving.md); "
                              "auto-exact (default) uses the chip's measured size for the model that way, else 128")
     parser.add_argument("--no-warmup", action='store_true', help="Skip startup compilation/warmup; the first request pays this cost")
     parser.add_argument("--model-ttl", type=float, default=None, metavar='SECONDS',

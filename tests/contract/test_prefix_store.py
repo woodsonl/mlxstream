@@ -474,6 +474,14 @@ def test_the_identity_changes_with_the_weights_and_the_configurations(tmp_path):
     assert s.prefix_identity(test=True) != before
     s.drafter.cfg.rms_norm_eps = 1e-6
     assert s.prefix_identity(test=True) == before
+    s.prefill_exact, s.prefill_chunk_size = False, 128          # plain 128-row passes, exact ones, exact 512-row ones
+    plain = s.prefix_identity(test=True)
+    s.prefill_exact_attention = True
+    exact128 = s.prefix_identity(test=True)
+    s.prefill_exact, s.prefill_chunk_size = True, 512
+    assert len({plain, exact128, s.prefix_identity(test=True)}) == 3
+    s.prefill_exact_attention = False
+    assert s.prefix_identity(test=True) == before
     (pack_dir / 'weights.pack').write_bytes(b'v' * 64)          # same size and manifest, other weights
     os.utime(pack_dir / 'weights.pack', ns=(1, 2))
     assert s.prefix_identity(test=True) != before

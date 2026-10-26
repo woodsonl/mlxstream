@@ -57,8 +57,10 @@ class Harness:
     def __init__(self, dev, cfg, qn, kn):
         self.dev, self.cfg = dev, cfg
         def library(source, macros, language_version=0):
-            return nt.Library(dev, source, dict(macros, QK_NORM=str(int(cfg.qk_norm)),
+            exact = {"EXACT_SUB": f"{cfg.exact_sub}u"} if getattr(cfg, "exact_sub", 0) else {}
+            return nt.Library(dev, source, dict(macros, **exact, **getattr(cfg, "extra_macros", {}), QK_NORM=str(int(cfg.qk_norm)),
                 MMA_PROB_FP16=str(int(getattr(cfg, 'prob_fp16', False)))), language_version)
+        self.library = library
         if cfg.mma:
             macros = dict(kernels.gqa_macros(cfg.d, chunk=cfg.chunk, rb_max=16, lm_mode=cfg.lm_mode, chain_i=2 if cfg.lm_mode == 2 else 0), FIXED_CHUNK="1", MMA_SG=str(kernels.gqa_mma_simdgroups(cfg.d, cfg.rep)))
             if cfg.direct:
@@ -84,8 +86,6 @@ class Harness:
             self.p_dec, self.p_merge = nt.Pipeline(lib, "gqa_decode_v2"), nt.Pipeline(lib, "gqa_merge_v2")
         else:
             macros = kernels.gqa_macros(cfg.d, chunk=cfg.chunk, rb_max=cfg.rb, steal=cfg.steal, steal_hits=cfg.steal)
-            if getattr(cfg, "exact_sub", 0):
-                macros = dict(macros, EXACT_SUB=f"{cfg.exact_sub}u")
             lib = library(kernels.gqa_source(steal=cfg.steal), macros)
             self.p_dec, self.p_merge = nt.Pipeline(lib, "gqa_decode"), nt.Pipeline(lib, "gqa_merge")
             if cfg.steal:
@@ -142,9 +142,11 @@ class Harness:
                 macros["STEP_STATE"] = "1"
                 source = source.replace(kernels.PRELUDE, kernels.PRELUDE + self.layout.to_msl(), 1)
             source, constants = kernels.specialize_params(source, "gqa", params)
-            lib = nt.Library(self.dev, source, dict(macros, **constants, QK_NORM=str(int(c.qk_norm))), kernels.MSL_TENSOR_OPS if c.mma else 0)
+            lib = self.library(source, dict(macros, **constants), kernels.MSL_TENSOR_OPS if c.mma else 0)
             name = "gqa_decode_mma" if c.mma else "gqa_decode_v3" if c.v3 else "gqa_decode_v2" if c.v2 else "gqa_decode"
             self.p_dec = nt.Pipeline(lib, name)
+            if c.v3:
+                assert self.p_dec.max_threads_per_threadgroup >= c.nsg3 * 32
             self.p_merge = None if c.v3 else nt.Pipeline(lib, "gqa_merge_v2" if c.v2 else "gqa_merge")
             if c.direct:
                 self.p_prepare = nt.Pipeline(lib, "gqa_prepare_mma")
@@ -573,6 +575,45 @@ def test_v3_is_bit_stable_and_t_active(dev, mma, heads):
     assert np.array_equal(c[:2], b[:2]) and np.all(c[2:] == 0)
     kc, _ = h3.caches()
     assert np.all(kc[pre + 2:] == 0)
+
+
+@pytest.mark.parametrize("emitted", [False, True])   # True: the emitter's form with the accelerator on (one block per threadgroup,
+                                                     # static geometry, o_proj's permute fused into the store)
+@pytest.mark.parametrize("d,heads,kv,qk_norm,gate,sub,position,t,nsg", [
+    (32, 8, 2, True, True, 128, 0, 300, None),        # the synthetic hybrid checkpoint's head (8 SIMD-groups), from token 0
+    (32, 8, 2, True, True, 128, 300, 400, None),      # restored at 300: rows in four 128-row passes, the first begun at 256
+    (32, 8, 2, True, True, 128, 600, 1, None),        # one row restored at 600 (the 128-row graph's one-token chunk)
+    (128, 32, 8, False, False, 96, 232, 250, None),   # no query or key norms (Llama), 32 SIMD-groups; grid starts 288, 480 32 mod 64
+    (256, 24, 4, True, True, 32, 90, 100, None),      # the 27B's head with the accelerator off (16 SIMD-groups, rep 6)
+    (64, 32, 8, False, False, 128, 150, 300, None),   # head dim 64 without query or key norms (16 SIMD-groups, 2 dims a lane)
+    (32, 8, 2, True, True, 36, 5, 100, 4),            # 4 SIMD-groups and S not a multiple of 2 · 4: grid start 36 is 4 mod 8
+], ids=["d32_from_token_0", "d32_restored_300", "d32_one_row", "d128_no_qk_norm", "d256_rep6", "d64_no_qk_norm", "nsg4_odd_sub"])
+def test_v3_exact_sub_gives_the_bits_of_passes_from_token_0(dev, d, heads, kv, qk_norm, gate, sub, position, t, nsg, emitted):
+    """EXACT_SUB = S on v3: a pass of T rows from any position gives every row the bits S-row passes from token 0 give it
+    (a run from scratch), outputs and appended caches. v3 pairs the keys cached before its pass and folds the rest one at
+    a time, so a plain pass's rows depend on where it starts, and a prefix restore starts it anywhere. The pass starts
+    off the S grid (its first rows' S-row pass began before it, at cached keys) and runs across grid lines (later rows
+    pair keys it appends); T is not a multiple of S; and the pass starts, and in the S = 96 and S = 36 cases every
+    other grid start past the pass start (288 and 480; 36), fall in the second half of a 2 · NSG3-key pair window, where
+    a pair loop bound off by one would pair a pass's first key."""
+    n = position + t
+    cfg = Cfg(heads, kv, d, d, n, max(t, sub), gate=gate, v3=True, nsg3=nsg, qk_norm=qk_norm, single_block=emitted)
+    ecfg = Cfg(heads, kv, d, d, n, max(t, sub), gate=gate, v3=True, nsg3=nsg, qk_norm=qk_norm, single_block=emitted)
+    ecfg.exact_sub = sub
+    cfg.specialize = ecfg.specialize = emitted
+    cfg.extra_macros = ecfg.extra_macros = kernels.perm_out_macros(heads * d, 8, 128) if emitted else {}
+    rng = np.random.default_rng(d + position)
+    qn, kn = _norms(rng, d)
+    scratch, restored = Harness(dev, cfg, qn, kn), Harness(dev, ecfg, qn, kn)
+    proj = _random_proj(rng, cfg, n)
+    ref = np.concatenate([scratch.step(proj[s0:s0 + sub], s0) for s0 in range(0, n, sub)])[position:]
+    k, v = scratch.caches()
+    k[position:], v[position:] = 0, 0                  # what a checkpoint at `position` restores
+    restored.set_caches(k, v)
+    got = restored.step(proj[position:], position)
+    assert np.array_equal(got.view(np.uint32), ref.view(np.uint32)), int((got != ref).sum())
+    for a, b in zip(restored.caches(), scratch.caches()):
+        assert np.array_equal(a.view(np.uint32), b.view(np.uint32))
 
 
 def test_v3_matches_layer_oracle(dev):

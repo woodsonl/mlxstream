@@ -54,7 +54,8 @@ def main():
             memory['unbound'] += spec.nbytes
     print('Memory GiB:', {k: round(v / 1024**3, 3) for k, v in memory.items()}, flush=True)
     result = dict(model=args.model, backend=program.backend_id, context_capacity=program.context_capacity,
-                  chunk=args.chunk, rows=args.rows or args.chunk, exact=session.prefill_exact, attention=args.attention,
+                  chunk=args.chunk, rows=args.rows or args.chunk, attention=args.attention,
+                  exact=session.prefill_exact or any('EXACT_SUB' in k.macros for k in program.kernels.values()),
                   memory_bytes=dict(memory),
                   largest_buffers=sorted([(n,s.nbytes,s.role) for n,s in program.buffers.items()],
                                          key=lambda x:x[1], reverse=True)[:20], points=[])

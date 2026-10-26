@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Decode attention (gqa_decode + gqa_merge) time vs context length: one layer, T new tokens over a filled KV cache,
-min-of-N over one command buffer holding both dispatches. GB/s counts the KV bytes read (K and V of the context).
+"""Attention time vs context length: one layer, T new tokens over a filled KV cache, min-of-N over one command buffer
+(v1 and v2: the core and the merge, the steal variant with its cursor reset; v3: one dispatch). GB/s counts the KV
+bytes read (K and V of the context). --exact ROWS times v1's or v3's EXACT_SUB form, the one exact prompt passes run.
 
     python tools/bench/gqa_bench.py [--heads 32 --kv 4 --d 256] [--ctx 1024,4096,8192,32768] [--t 1,4] [--chunk 64]
-        [--out tools/bench/results/<chip>_gqa.jsonl]
+        [--v2 | --v3 | --steal] [--exact 128] [--no-qk-norm] [--out tools/bench/results/<chip>_gqa.jsonl]
 """
 
 from __future__ import annotations
@@ -24,9 +25,24 @@ from monolith.nn.rope import rope_tables_permuted               # noqa: E402
 from monolith.runtime import _native as nt                     # noqa: E402
 
 
-def run(dev, heads, kv, d, ctx, t, chunk, rb, reps, v2=False, steal=False, v2_tg=1, v3=False, nsg3=None):
+def check_exact(exact, ts, v2=False, steal=False, v3=False):
+    """``exact`` 0 is off; else EXACT_SUB's row count: a uint, on v1 or v3 (v2 and the steal variant have no exact form),
+    for v1 below every pass's T (its pass of T <= EXACT_SUB rows is one sub-pass, the plain kernel's work; v3's rows
+    take the EXACT_SUB-row passes from token 0, so a shorter pass that starts off their grid differs from plain)."""
+    if not 0 <= exact < 2 ** 32:
+        raise ValueError(f"exact rows: 0 (off) or 1 to 2**32 - 1 (EXACT_SUB is a uint), not {exact}")
+    if exact and (v2 or steal):
+        raise ValueError("exact rows: v1 or v3 only (v2 and the steal variant have no exact form)")
+    if exact and not v3 and min(ts) <= exact:
+        raise ValueError(f"exact rows: v1's pass of T <= {exact} rows is one sub-pass, the plain kernel's work; give every T above it")
+
+
+def run(dev, heads, kv, d, ctx, t, chunk, rb, reps, v2=False, steal=False, v2_tg=1, v3=False, nsg3=None, exact=0, qk_norm=True):
     """``v2_tg``: v2's threadgroups per core (the profile's attention_v2_threadgroups); ``v3``: the one-dispatch kernel
-    (a threadgroup of ``nsg3`` SIMD-groups per query row, #113)."""
+    (a threadgroup of ``nsg3`` SIMD-groups per query row, #113, one block each as the emitter dispatches it);
+    ``exact``: EXACT_SUB, the pass reproducing passes of that many rows (v1 and v3: the exact prompt passes);
+    ``qk_norm`` False: no query and key norms (QK_NORM 0)."""
+    check_exact(exact, [t], v2, steal, v3)
     rng = np.random.default_rng(0)
     rep = heads // kv
     hd, kd = heads * d, kv * d
@@ -36,15 +52,18 @@ def run(dev, heads, kv, d, ctx, t, chunk, rb, reps, v2=False, steal=False, v2_tg
         chunk = kernels.GQA_V2_CHUNK_MIN
     n_chunks_max = -(-ctx_max // chunk)
     rows_max = rep * t
+    extra = dict({"EXACT_SUB": f"{exact}u"} if exact else {}, QK_NORM=str(int(qk_norm)))
     if v3:
         nsg3 = nsg3 or kernels.gqa_v3_simdgroups(d)
-        lib = nt.Library(dev, kernels.gqa_source(v3=True), kernels.gqa_v3_macros(d, nsg=nsg3))
+        lib = nt.Library(dev, kernels.gqa_source(v3=True), dict(kernels.gqa_v3_macros(d, nsg=nsg3), SINGLE_BLOCK="1", **extra))
         p_dec, p_merge = nt.Pipeline(lib, "gqa_decode_v3"), None
+        if p_dec.max_threads_per_threadgroup < nsg3 * 32:
+            raise RuntimeError(f"gqa_decode_v3: the pipeline takes {p_dec.max_threads_per_threadgroup} threads, not {nsg3 * 32}")
     elif v2:
-        lib = nt.Library(dev, kernels.gqa_source(True), kernels.gqa_v2_macros(d, rmax=rows_max, rg=rb))
+        lib = nt.Library(dev, kernels.gqa_source(True), dict(kernels.gqa_v2_macros(d, rmax=rows_max, rg=rb), **extra))
         p_dec, p_merge = nt.Pipeline(lib, "gqa_decode_v2"), nt.Pipeline(lib, "gqa_merge_v2")
     else:
-        lib = nt.Library(dev, kernels.gqa_source(steal=steal), kernels.gqa_macros(d, chunk=chunk, rb_max=rb, steal=steal))
+        lib = nt.Library(dev, kernels.gqa_source(steal=steal), dict(kernels.gqa_macros(d, chunk=chunk, rb_max=rb, steal=steal), **extra))
         p_dec, p_merge = nt.Pipeline(lib, "gqa_decode"), nt.Pipeline(lib, "gqa_merge")
     cos, sin = rope_tables_permuted(10000.0, d, d // 4, ctx_max)
     kc = nt.Buffer(dev, f32_to_bf16(rng.standard_normal((ctx_max, kv, d)).astype(np.float32) * 0.5).tobytes())
@@ -89,6 +108,7 @@ def run(dev, heads, kv, d, ctx, t, chunk, rb, reps, v2=False, steal=False, v2_tg
         best = r.gpu_ms if best is None else min(best, r.gpu_ms)
     kv_bytes = (ctx + t) * kv * d * 2 * 2
     return {"kernel": "v3" if v3 else ("v2" if v2 else ("v1-steal" if steal else "v1")), "heads": heads, "kv": kv, "d": d, "ctx": ctx, "t": t, "chunk": chunk, "rb": rb,
+            "exact": exact, "qk_norm": qk_norm,
             "n_blocks": (t * heads) if v3 else kv * (-(-(ctx + t) // chunk)) * (-(-rows_max // rb)),
             "ms": round(best, 4), "kv_gbps": round(kv_bytes / 1e9 / (best / 1e3), 1), "us_per_layer": round(best * 1e3, 1)}
 
@@ -103,18 +123,28 @@ def main(argv=None) -> int:
     ap.add_argument("--chunk", type=int, default=64)
     ap.add_argument("--rb", type=int, default=4)
     ap.add_argument("--reps", type=int, default=10)
-    ap.add_argument("--v2", action="store_true", help="the v2 kernel (design §5.6 v2, #34); --rb is then the rows per pass")
-    ap.add_argument("--v3", action="store_true", help="the v3 kernel: core and merge in one dispatch, a threadgroup per query row (#113)")
-    ap.add_argument("--steal", action="store_true", help="v1 with own-slice + steal block claiming (#44), the cursor reset included")
+    kernel = ap.add_mutually_exclusive_group()
+    kernel.add_argument("--v2", action="store_true", help="the v2 kernel (design §5.6 v2, #34); --rb is then the rows per pass")
+    kernel.add_argument("--v3", action="store_true", help="the v3 kernel: core and merge in one dispatch, a threadgroup per query row (#113)")
+    kernel.add_argument("--steal", action="store_true", help="v1 with own-slice + steal block claiming (#44), the cursor reset included")
+    ap.add_argument("--exact", type=int, default=0, metavar="ROWS",
+                    help="v1 or v3 reproducing passes of ROWS rows (EXACT_SUB; v3's from token 0: a --ctx off their grid times a restored pass)")
+    ap.add_argument("--no-qk-norm", action="store_true", help="no query and key norms (Llama)")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args(argv)
+    ts = [int(x) for x in a.t.split(",")]
+    try:
+        check_exact(a.exact, ts, a.v2, a.steal, a.v3)
+    except ValueError as e:
+        ap.error(str(e))
     dev = nt.Device()
     info = dev.info()
-    print(f"# {info.name}, {info.gpu_cores} cores; {time.strftime('%Y-%m-%d %H:%M')}; {'v2' if a.v2 else 'v1'} heads={a.heads} kv={a.kv} d={a.d} "
-          f"chunk={'dynamic' if a.v2 else a.chunk} rows/pass={a.rb}; min of {a.reps}")
+    print(f"# {info.name}, {info.gpu_cores} cores; {time.strftime('%Y-%m-%d %H:%M')}; {'v3' if a.v3 else 'v2' if a.v2 else 'v1-steal' if a.steal else 'v1'} heads={a.heads} kv={a.kv} d={a.d} "
+          f"chunk={'dynamic' if a.v2 else a.chunk} rows/pass={a.rb} exact={a.exact} qk_norm={not a.no_qk_norm}; min of {a.reps}")
     for ctx in (int(x) for x in a.ctx.split(",")):
-        for t in (int(x) for x in a.t.split(",")):
-            r = run(dev, a.heads, a.kv, a.d, ctx, t, a.chunk, a.rb, a.reps, v2=a.v2, steal=a.steal, v3=a.v3)
+        for t in ts:
+            r = run(dev, a.heads, a.kv, a.d, ctx, t, a.chunk, a.rb, a.reps, v2=a.v2, steal=a.steal, v3=a.v3, exact=a.exact,
+                    qk_norm=not a.no_qk_norm)
             r.update(chip=info.name, cores=info.gpu_cores)
             print(f"ctx {ctx:6d} T={t}: {r['us_per_layer']:8.1f} us/layer  {r['kv_gbps']:6.1f} GB/s of KV  ({r['n_blocks']} blocks)", flush=True)
             if a.out:

@@ -40,6 +40,24 @@ def test_exact_attention_marks_chunked_cores_and_their_folds():
         assert p.to_json() == before.to_json()
 
 
+def test_exact_attention_marks_v3_target_attention():
+    # v3 is core and fold in one dispatch, marked by itself; its output (slot 7) here in an arena a chunked core's
+    # workspace also uses, which leaves that core and its fold marked
+    def attention(v3_macros):
+        return Program({'v3': KernelSpec('', 'gqa_decode_v3', dict(v3_macros, STEP_STATE='1')),
+                        'core': KernelSpec('', 'gqa_decode', {'STEP_STATE': '1'}),
+                        'merge': KernelSpec('', 'gqa_merge', {'STEP_STATE': '1'})}, {},
+                       [OpSpec('v3', [(7, 'arena', 0)], (64, 1, 1), (256, 1, 1)),
+                        OpSpec('core', [(7, 'arena', 0), (8, 'part_md', 0)], (60, 1, 1), (384, 1, 1)),
+                        OpSpec('merge', [(0, 'arena', 0), (1, 'part_md', 0)], (64, 1, 1), (32, 1, 1))])
+    p = exact_attention(attention({}), 128)
+    assert [p.kernels[op.kernel].macros.get('EXACT_SUB') for op in p.ops] == ['128u'] * 3
+    p = exact_attention(attention({'LM_MODE': '1'}), 128)       # an LM drafter's ingest is not a target prompt pass
+    assert [p.kernels[op.kernel].macros.get('EXACT_SUB') for op in p.ops] == [None, '128u', '128u']
+    p = exact_attention(attention({}), 128, v1=False)           # passes of at most 128 rows: v1's exact form is plain v1
+    assert [p.kernels[op.kernel].macros.get('EXACT_SUB') for op in p.ops] == ['128u', None, None]
+
+
 def test_large_projection_policy_is_chip_and_shape_specific(monkeypatch):
     from monolith.backends.metal.m5_max_40c import prefill
     monkeypatch.setattr(prefill, 'packed_nvfp4_projection', lambda *args: None)

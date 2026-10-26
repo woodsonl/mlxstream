@@ -113,6 +113,133 @@ def test_large_prefill_shares_state_with_small_decode(tmp_path, draft_kind, acce
             _agree(reference, project_changed, reused.tokens, reference.generate(project_changed, 12).tokens, ties)
 
 
+@pytest.mark.parametrize('accelerator', ['off', 'on'])
+@pytest.mark.parametrize('attention', ['v1', 'auto'])
+def test_exact_prompt_passes_give_the_scores_of_128_row_passes(tmp_path, attention, accelerator):
+    # 512-row exact passes against 128-row passes, the last prompt row's scores bit for bit; the synthetic checkpoint's
+    # head dim is 32, so auto runs v3 in both programs, with the projections on the tile when the accelerator is on
+    _checkpoint(tmp_path)
+    pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
+               PackLayout(rows=16))
+
+    def session(**options):
+        return Session(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path / 'pack'), eos=-1,
+                       autotune=False, attention=attention, accelerator=accelerator, **options)
+    reference, exact = session(prefill_chunk_size=128), session(prefill_chunk_size=512, prefill_exact=True)
+    for count in (260, 300, 400, 700):                     # 700: a second 512-row pass, from position 512
+        ids = np.random.default_rng(count).integers(0, 50, count).tolist()
+        tokens = reference.generate(ids, 12).tokens
+        assert exact.generate(ids, 12).tokens == tokens, count
+        rows = [score_row(s, ids, 0) for s in (reference, exact)]
+        assert exact._last_engine is exact.engines['prefill.512']
+        assert rows[0][tokens[0]] == rows[0].max()
+        assert np.array_equal(rows[1].view(np.uint32), rows[0].view(np.uint32)), (count, int((rows[1] != rows[0]).sum()))
+    core = 'gqa_decode_v3' if attention == 'auto' else 'gqa_decode'
+    assert [k.macros.get('EXACT_SUB') for k in exact.engines['prefill.512'].program.kernels.values() if k.function == core] == ['128u']
+
+
+@pytest.mark.parametrize('accelerator', ['off', 'on'])
+@pytest.mark.parametrize('chunk', [512, 128])            # 128: serve's auto-exact where the chip measured no larger size
+def test_exact_requests_restored_off_the_grid_give_the_bits_of_cold_runs(tmp_path, chunk, accelerator):
+    # A request restored from a checkpoint off the 128-row grid gives the scores of its last pass's rows and its tokens
+    # as the same request run cold, bit for bit. auto runs v3 at the synthetic checkpoint's head dim 32, and v3 pairs the
+    # keys cached before a pass, so a row depends on where its pass starts unless the exact form anchors it at the
+    # 128-row passes from token 0. The checkpoint's one attention layer is its last, so only a row's own fold reaches its
+    # scores, and the rows compared must start their passes elsewhere warm than cold: turn 1 checkpoints its first 300
+    # tokens; turn 2 keeps a shorter message prefix (250, as serve keeps a system prompt's) and restores 300, where the
+    # cold run splits at 250. A pair and two single folds sum alike unless the running maximum moves between them, so the
+    # starts lie far apart: at 428 tokens the last row's 128-row pass, counted from each run's pass start, begins at 300
+    # warm and 378 cold (384 from token 0); at 429 the warm run's one-token chunk sends a 512-row session to its 128-row
+    # graph while the cold run stays on the large one, as does a cold run's one-token chunk from the default checkpoint
+    # at p - 1. A cold run whose passes all start on the grid gives what plain 128-row passes give, and only the exact
+    # session's prompt programs take the exact form.
+    _checkpoint(tmp_path)
+    pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
+               PackLayout(rows=16))
+
+    def session(**options):
+        return Session(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path / 'pack'), eos=-1,
+                       autotune=False, attention='auto', accelerator=accelerator, **options)
+    exact = session(prefill_chunk_size=chunk, prefill_exact=True, prefix_cache=True, prefix_cache_min_tokens=128)
+    plain = session(prefill_chunk_size=128)
+    ids = np.random.default_rng(81).integers(0, 50, 800).tolist()
+    exact.generate(ids[:300] + ids[700:], 1, cache_prefix_tokens=300)
+    turn1 = list(exact.prefix_cache.items)
+    assert [len(item.tokens) for item in turn1] == [300]
+
+    def last_pass(s, n, prefix, restore=False):
+        """The first position and the scores of the last pass's rows, and 12 greedy tokens, each from its own request
+        with the same cache."""
+        outputs = []
+        for steps in (1, 12):
+            if s.prefix_cache is not None:
+                s.prefix_cache.items = list(turn1) if restore else []
+            g = s.generate(ids[:n], steps, cache_prefix_tokens=prefix)
+            assert g.cached_prompt_tokens == g.prefill_timings[0]['position'] == (300 if restore else 0)
+            if steps > 1:
+                return outputs + [g.tokens]
+            last = g.prefill_timings[-1]
+            logits = np.frombuffer(s.read('logits'), dtype=np.uint16).reshape(-1, s.model.config.vocab_size)
+            outputs.append((last['position'], logits[:last['tokens']].copy()))
+
+    def agree(a, b, n, passes):
+        """Two requests' last passes (first position, rows) as expected, their tokens, and the scores of every row both
+        last passes hold."""
+        ((pa, rows_a), tokens_a), ((pb, rows_b), tokens_b) = a, b
+        assert [(pa, len(rows_a)), (pb, len(rows_b))] == passes, n
+        lo = max(pa, pb)
+        rows_a, rows_b = rows_a[lo - pa:n - pa], rows_b[lo - pb:n - pb]
+        assert tokens_a == tokens_b, n
+        assert np.array_equal(rows_a, rows_b), (n, lo, int((rows_a != rows_b).sum()))
+
+    big = chunk == 512
+    agree(last_pass(exact, 428, 250, restore=True), last_pass(exact, 428, 250), 428, [(300, 128), (250, 178) if big else (378, 50)])
+    agree(last_pass(exact, 429, 250, restore=True), last_pass(exact, 429, 250), 429, [(428, 1), (250, 179) if big else (378, 51)])
+    # the default checkpoint at p - 1 makes a one-token chunk; 100 is below the cache's minimum, no checkpoint
+    agree(last_pass(exact, 429, 0), last_pass(exact, 429, [100]), 429, [(428, 1), (0, 429) if big else (384, 45)])
+    agree(last_pass(exact, 700, 256), last_pass(plain, 700, 256), 700, [(256, 444) if big else (640, 60), (640, 60)])
+    assert 'prefill.128' in exact._programs
+    for s in (exact, plain):
+        for key, prog in s._programs.items():
+            forms = {k.macros.get('EXACT_SUB') for k in prog.kernels.values() if k.function == 'gqa_decode_v3'}
+            assert forms == ({'128u'} if s is exact and str(key).startswith('prefill.') else {None}), (s is exact, key)
+
+
+def test_exact_128_row_sessions_give_v1_its_plain_bits(tmp_path):
+    # An exact 128-row session compiles its prompt programs with exact_attention but leaves v1 plain: over at most 128
+    # rows v1's EXACT_SUB form is one sub-pass, the plain kernel's work, so the same request restored off the grid (a
+    # pass of 128 rows from 300) gives a plain and an exact session the same last prompt row's scores, bit for bit.
+    _checkpoint(tmp_path)
+    pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
+               PackLayout(rows=16))
+    ids = np.random.default_rng(81).integers(0, 50, 800).tolist()
+    rows = []
+    for exact in (False, True):
+        s = Session(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path / 'pack'), eos=-1,
+                    autotune=False, attention='v1', accelerator='off', prefill_chunk_size=128, prefill_exact=exact,
+                    prefix_cache=True, prefix_cache_min_tokens=128)
+        s.generate(ids[:300] + ids[700:], 1, cache_prefix_tokens=300)
+        g = s.generate(ids[:428], 1, cache_prefix_tokens=250)
+        assert g.cached_prompt_tokens == 300 and [t['tokens'] for t in g.prefill_timings] == [128]
+        rows.append(np.frombuffer(s.read('logits'), dtype=np.uint16).reshape(-1, s.model.config.vocab_size)[127].copy())
+    assert np.array_equal(*rows), int((rows[0] != rows[1]).sum())
+    v1 = [k for k in s._programs['prefill.128'].kernels.values() if k.function in ('gqa_decode', 'gqa_merge')]
+    assert [k.macros.get('EXACT_SUB') for k in v1] == [None, None]
+
+
+def test_exact_requests_below_128_rows_run_plain_passes(tmp_path):
+    # serve's N-exact below 128 (serving.md, --prefill-chunk-size): a plain N-row session's programs and checkpoints
+    _checkpoint(tmp_path)
+    pack_model(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path), str(tmp_path / 'pack'),
+               PackLayout(rows=16))
+    exact, plain = (Session(Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=1024), str(tmp_path / 'pack'),
+                            eos=-1, autotune=False, attention='auto', accelerator='off', prefill_chunk_size=64,
+                            prefill_exact=e, prefix_cache=True) for e in (True, False))
+    assert (exact.prefill_exact, exact.prefill_exact_attention) == (False, False)
+    assert exact.prefix_identity() == plain.prefix_identity()
+    assert {k.macros.get('EXACT_SUB') for k in exact.prefill_engine(None, 64).program.kernels.values()} == {None}
+
+
 def test_tie_rows_hold_the_scores_the_reference_chose_by(tmp_path):
     # greedy_ties.score_row, the scores agree reads: the prompt pass's row for token 0 and the decode step's row 0 for a
     # later token, with the steps queued past the last leaving that row alone

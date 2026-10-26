@@ -502,34 +502,41 @@ def device_attention_tiles(program, *, qm=32, kn=128, ks=None, score_bf16=False)
     return program
 
 
-def exact_attention(program, rows):
-    """Make a prompt program's attention reproduce passes of ``rows`` rows bit for bit: the run-time chunk rule
-    (``pick_chunk``) depends on the pass's context, so the cores and folds of the chunked attention take each row's
-    chunking from the ``rows``-row pass that row would be in (``EXACT_SUB``). Fixed-chunk kernels (v2, the matrix
-    attention) already sum every row the same way; a workspace shared with any other core is left alone."""
-    cores, merges = {}, {}
+def exact_attention(program, rows, v1=True):
+    """Make a prompt program's attention reproduce passes of ``rows`` rows bit for bit (``EXACT_SUB``): the run-time
+    chunk rule (``pick_chunk``) depends on the pass's context, so the cores and folds of the chunked attention take each
+    row's chunking from the ``rows``-row pass that row would be in, and v3 pairs the keys cached before a pass, so its
+    rows pair the keys before the ``rows``-row pass from token 0 that holds them, wherever the pass starts. Fixed-chunk
+    kernels (v2, the matrix attention) already sum every row the same way; a workspace shared with any other core is
+    left alone. ``v1`` False leaves the chunked attention plain, for a program whose passes hold at most ``rows`` rows:
+    such a pass is one sub-pass, the plain kernel's work."""
+    cores, merges, v3 = {}, {}, []
     for op in program.ops:
         k = program.kernels[op.kernel]
         if k.function == 'gqa_merge':
             merges.setdefault(dict((s, n) for s, n, _ in op.bindings).get(0), []).append(op)
+        elif k.function == 'gqa_decode_v3':
+            v3.append(op)                                         # core and fold in one dispatch: no workspace
         elif k.function.startswith('gqa_decode'):
             cores.setdefault(dict((s, n) for s, n, _ in op.bindings).get(7), []).append(op)
 
-    def chunked(op, function):
+    def has_exact_form(op, function):
         m = program.kernels[op.kernel].macros
         return (program.kernels[op.kernel].function == function and m.get('STEP_STATE') == '1'
                 and all(m.get(f, '0') == '0' for f in ('DRAFT', 'LM_MODE', 'STEAL', 'FIXED_CHUNK', 'ADAPTIVE_CHUNK')))
 
-    for workspace, ops in cores.items():
+    marked = [op for op in v3 if has_exact_form(op, 'gqa_decode_v3')]
+    for workspace, ops in cores.items() if v1 else ():
         folds = merges.get(workspace, [])
-        if not all(chunked(op, 'gqa_decode') for op in ops) or not all(chunked(op, 'gqa_merge') for op in folds):
+        if not all(has_exact_form(op, 'gqa_decode') for op in ops) or not all(has_exact_form(op, 'gqa_merge') for op in folds):
             continue
-        for op in ops + folds:
-            key = op.kernel+f'.exact{rows}'
-            if key not in program.kernels:
-                kernel = copy.deepcopy(program.kernels[op.kernel])
-                kernel.macros['EXACT_SUB'] = f'{rows}u'
-                program.kernels[key] = kernel
-            op.kernel = key
+        marked += ops + folds
+    for op in marked:
+        key = op.kernel + f'.exact{rows}'
+        if key not in program.kernels:
+            kernel = copy.deepcopy(program.kernels[op.kernel])
+            kernel.macros['EXACT_SUB'] = f'{rows}u'
+            program.kernels[key] = kernel
+        op.kernel = key
     program.kernels = {op.kernel: program.kernels[op.kernel] for op in program.ops}
     return program
