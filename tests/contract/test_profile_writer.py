@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from monolith import kernels
-from monolith.backends.metal.calibration import NOISE, TILE_KSPLITS
+from monolith.backends.metal.calibration import NOISE, TILE_KSPLITS, TILE_TMS
 from monolith.bench import RANDOM_FORMATS
 from monolith.core.profile import Profile, load_profiles
 from monolith.core.profile_writer import (NEVER, accelerator_plan, attention_choice, choose_lane_order, choose_threadgroups, cost_table, decide,
@@ -53,6 +53,8 @@ def test_accelerator_plan_reproduces_the_m5_pro_decision():
     assert accelerator_plan({"bf16": {1: 1.0, 2: 1.1}}, {"bf16": {16: 1.0}})[2].startswith("bf16: no measured T has a tile row (")
     assert accelerator_plan({"bf16": {1: 1.0, 2: 1.1, 4: 1.3, 8: 3.0}}, {"bf16": {8: 1.3, 16: 1.5, 32: 2.5}})[:2] == ("on", {"bf16": 4})   # 1.3 > 1.1 × 1.03, ≤ 1.3 × 1.03
     assert accelerator_plan(shader, {}) == ("off", {}, "no tile measurement (the tile step was skipped)")
+    assert accelerator_plan({"bf16": {1: 1.0, 2: 2.0}}, {"bf16": {8: 2.06}})[1] == {"bf16": 2}   # exactly 2.0 × 1.03: a tie goes to the tile
+    assert NEVER > max(TILE_TMS)                                            # the never-start lies above every T a decode tile covers
 
 
 def test_attention_choice():
@@ -155,7 +157,7 @@ def test_writer_records_the_autotuners_tile_pick(monkeypatch):
     geometry is no candidate; one that fails either check is recorded (through a later error too) and is no candidate
     either; a TM whose unsplit tile fails is still swept and gets no row; an unsplit refusal ends the tile step and clears
     every tile row, and so does any other error, a ValueError that is no refusal included; the tile error names the
-    geometry, and the note then states that error alone."""
+    geometry, and the note then states that error in place of the rows' verdict, before the switch clause."""
     import tools.profile_writer as pw
 
     # ms per TM and geometry: absent or None = refused for the shape, negative = fails the oracle, an exception = raised;
@@ -280,6 +282,17 @@ def test_decide_never_starts_a_format_whose_unsplit_tile_has_no_row(threadgroups
     assert engine["accelerator_min_t"] == {"fp8": NEVER, "nvfp4": NEVER} and "accelerator_fp8" in engine["cost_T"]
     assert notes["accelerator"].startswith(f"no {mode} row for fp8, nvfp4: the tile never takes them; the autotuner's pick would start")
     assert "plus the noise margin" in engine["note"]                                  # the start's rule, a tie to the tile
+
+
+def test_the_never_start_note_keeps_the_priced_formats_verdicts():
+    """In a record where one format has an unsplit row and another only the pick's rows, the note gives the priced
+    format's verdict first and then the other's never-start."""
+    m = _measurements()
+    m["tile_geometry_ms"] = {"fp8_e4m3": m["tile_geometry_ms"]["fp8_e4m3"], "nvfp4": {8: {"ksplit4": 0.2}}}
+    engine, notes = decide(m, {"accelerator": "on"})
+    assert engine["accelerator_min_t"] == {"fp8": 2, "nvfp4": NEVER}
+    assert notes["accelerator"].startswith("the unsplit tile (crew): fp8: the tile from T = 2 (")
+    assert "; no crew row for nvfp4: the tile never takes it; the autotuner's pick would start" in notes["accelerator"]
 
 
 def _held_starts_file(monkeypatch, pw, tmp_path, held=None, accelerator="on"):
@@ -749,6 +762,19 @@ def test_writer_sweeps_each_listed_value_once():
     assert pw.int_list("8,8,16") == [8, 16] and pw.int_list("1,2,2,1") == [1, 2]
 
 
+def test_main_sweeps_each_listed_value_once(monkeypatch, tmp_path):
+    """main() parses every integer list through int_list: measure() gets each repeated value once, in the given order."""
+    import tools.profile_writer as pw
+
+    _fake_device(monkeypatch, pw)
+    calls = []
+    monkeypatch.setattr(pw, "measure", lambda **kw: calls.append(kw) or dict(_measurements(), tile_oracle_fail={}, oracle_fail=[]))
+    assert pw.main(["--ts", "1,2,2,4,8", "--tms", "8,8,16,32", "--ctx", "1024,1024,4096", "--attn-ts", "1,4,1", "--dry-run",
+                    "--name", "x-20c", "--out", str(tmp_path / "p.json")]) == 0
+    kw = calls[-1]
+    assert (kw["ts"], kw["tms"], kw["ctxs"], kw["attn_ts"]) == ([1, 2, 4, 8], [8, 16, 32], [1024, 4096], [1, 4])
+
+
 @pytest.mark.parametrize("formats", [["nvfp4", "q4_0"], ["q4_0"], []])
 def test_measure_refuses_formats_the_harnesses_cannot_build(monkeypatch, formats):
     """measure() refuses a format outside monolith.bench.RANDOM_FORMATS, or none, before it builds a harness, as main()
@@ -1015,8 +1041,8 @@ def test_writer_times_on_the_lane_order_it_writes(monkeypatch, gbps, current, ti
 @pytest.mark.parametrize("at_scale, rel, bf16_ok", [(1.0, 5e-3, True), (2.5, 5e-3, False), (1.0, 2e-2, False)])
 def test_gemm_bench_judges_each_output_by_its_rule(monkeypatch, at_scale, rel, bf16_ok):
     """GemmBench.run judges 32-bit output by OracleCheck.ok (the writer's strict check) and BF16 output by
-    ok_rounded (one rounding of the FP32 result, the timed run), which fails past 2.5 ulp at scale or a relative
-    error of 2e-2, and reports the metric each rule reads."""
+    ok_rounded (one rounding of the FP32 result, the timed run), which passes up to 2 ulp at scale and below a relative
+    error of 1e-2 (the failing points here are 2.5 ulp and 2e-2), and reports the metric each rule reads."""
     import tools.profile_writer as pw                                        # puts tools/bench on sys.path
     from monolith.bench import OracleCheck
 
