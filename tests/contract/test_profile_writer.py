@@ -310,8 +310,9 @@ def _held_starts_file(monkeypatch, pw, tmp_path, held=None, accelerator="on"):
 
 
 def test_a_full_refresh_over_held_starts_writes_and_a_partial_one_refuses(monkeypatch, tmp_path, capsys):
-    """Over a file whose starts are exactly the formats the run measures, a refresh that prices them all writes, keeping
-    the switch on and re-pricing the starts; one whose unsplit tile refused the shape writes nothing and says so."""
+    """Over a file whose starts are exactly the formats the run measures, a refresh that prices them all writes (so does a
+    --formats subset naming exactly those formats), keeping the switch on and re-pricing the starts; one whose unsplit
+    tile refused the shape writes nothing and says so."""
     import tools.profile_writer as pw
 
     out = _held_starts_file(monkeypatch, pw, tmp_path, held={"nvfp4": 2, "fp8": 4})
@@ -324,6 +325,11 @@ def test_a_full_refresh_over_held_starts_writes_and_a_partial_one_refuses(monkey
     assert f"no tile start for fp8, nvfp4, whose start {out} holds: the tile refused the measured shape" in capsys.readouterr().out
     monkeypatch.setattr(pw, "measure", lambda **kw: dict(base))
     assert pw.main(["--name", "x-20c", "--out", str(out)]) == 0                            # every held start priced: it writes
+    engine = json.loads(out.read_text())["engine"]
+    assert engine["accelerator"] == "on" and engine["accelerator_min_t"] == {"fp8": 2, "nvfp4": 2}
+    capsys.readouterr()
+    assert pw.main(["--formats", "fp8_e4m3,nvfp4", "--name", "x-20c", "--out", str(out)]) == 0   # the subset names every held start
+    assert f"wrote {out}" in capsys.readouterr().out
     engine = json.loads(out.read_text())["engine"]
     assert engine["accelerator"] == "on" and engine["accelerator_min_t"] == {"fp8": 2, "nvfp4": 2}
 
@@ -763,7 +769,8 @@ def test_writer_sweeps_each_listed_value_once():
 
 
 def test_main_sweeps_each_listed_value_once(monkeypatch, tmp_path):
-    """main() parses every integer list through int_list: measure() gets each repeated value once, in the given order."""
+    """main() parses every integer list through int_list: measure() gets each repeated value once, in the given order;
+    --quick alone passes the argument checks with its short sweep, and --ts takes T up to the largest tile row."""
     import tools.profile_writer as pw
 
     _fake_device(monkeypatch, pw)
@@ -773,6 +780,12 @@ def test_main_sweeps_each_listed_value_once(monkeypatch, tmp_path):
                     "--name", "x-20c", "--out", str(tmp_path / "p.json")]) == 0
     kw = calls[-1]
     assert (kw["ts"], kw["tms"], kw["ctxs"], kw["attn_ts"]) == ([1, 2, 4, 8], [8, 16, 32], [1024, 4096], [1, 4])
+    out = str(tmp_path / "p.json")
+    assert pw.main(["--quick", "--dry-run", "--name", "x-20c", "--out", out]) == 0          # TM 8, the first --tms value, covers T = 2, 4, 8
+    kw = calls[-1]
+    assert (kw["ts"], kw["tms"], kw["ctxs"], kw["copies"], kw["reps"]) == ([1, 2, 4, 8], [8], [1024], 4, 2)
+    assert pw.main(["--ts", "1,2,4,8,16,32", "--dry-run", "--name", "x-20c", "--out", out]) == 0   # T up to the largest tile row
+    assert calls[-1]["ts"] == [1, 2, 4, 8, 16, 32]
 
 
 @pytest.mark.parametrize("formats", [["nvfp4", "q4_0"], ["q4_0"], []])
