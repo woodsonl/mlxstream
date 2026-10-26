@@ -320,19 +320,24 @@ def main(argv=None) -> int:
     def unpriced(priced, measured):
         return sorted((set(held) | ({cost_key(f) for f in measured} if switch_on else set())) - set(priced))
 
-    def refusal(starts, m=None):
-        kept, implicit = [k for k in starts if k in held], [k for k in starts if k not in held]
-        whose = "; ".join(([f"{', '.join(kept)}, whose start {src} holds"] if kept else []) +
-                          ([f"{', '.join(implicit)}, which the switch {src} holds on starts at T = 2"] if implicit else []))
-        cause = ("--no-accelerator prices none" if a.no_accelerator else
-                 "the tile refused the measured shape: measure one every format's tile takes" if m and m.get("tile_refused") else
-                 "refresh every format with the tile")
-        odd = [k for k in starts if k not in {cost_key(f) for f in RANDOM_FORMATS}]
-        return f"no tile start for {whose}: {cause}" + (f"; no format the writer measures prices {', '.join(odd)}: edit it by hand" if odd else "")
+    def refusal(starts, measured):                                  # the starts by cause, each with its remedy
+        def whose(keys):
+            kept, implicit = [k for k in keys if k in held], [k for k in keys if k not in held]
+            return "; ".join(([f"{', '.join(kept)}, whose start {src} holds"] if kept else []) +
+                             ([f"{', '.join(implicit)}, which the switch {src} holds on starts at T = 2"] if implicit else []))
+        known, ran = {cost_key(f) for f in RANDOM_FORMATS}, {cost_key(f) for f in measured}
+        odd = [k for k in starts if k not in known]
+        left_out = [k for k in starts if k in known and k not in ran]
+        unpriced_run = [k for k in starts if k in ran]
+        return "no tile start for " + "; and for ".join(
+            ([f"{whose(odd)}: no format the writer measures prices it; edit it by hand"] if odd else []) +
+            ([f"{whose(left_out)}: --formats leaves them out; refresh every format with the tile"] if left_out else []) +
+            ([f"{whose(unpriced_run)}: " + ("--no-accelerator prices none" if a.no_accelerator else   # else only a refusal clears rows
+                                             "the tile refused the measured shape; measure one every format's tile takes")] if unpriced_run else []))
 
     early = unpriced(set() if a.no_accelerator else {cost_key(f) for f in formats}, formats)
     if early and not a.dry_run:                                     # decided by the arguments: refuse before measuring
-        print(f"no profile written: {refusal(early)}, or measure with --dry-run", flush=True)
+        print(f"no profile written: {refusal(early, formats)}, or measure with --dry-run", flush=True)
         return 1
     t0 = time.time()
     m = measure(shape=(n, k), formats=formats, ts=ts, tms=tms, copies=copies, reps=reps, accelerator=not a.no_accelerator,
@@ -358,7 +363,8 @@ def main(argv=None) -> int:
         print(f"  {key}: {why}")
     late = unpriced(engine["accelerator_min_t"], m["shader_ms"])   # a refusal or no tile leaves them unpriced
     if late:
-        print(f"\na write would be refused: {refusal(late, m)}" if a.dry_run else f"\nno profile written: {refusal(late, m)}")
+        why = refusal(late, m["shader_ms"])
+        print(f"\na write would be refused: {why}" if a.dry_run else f"\nno profile written: {why}")
         return 0 if a.dry_run else 1
     if a.dry_run:
         return 0

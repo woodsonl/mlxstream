@@ -325,10 +325,13 @@ def test_a_refusal_known_from_the_arguments_does_not_measure(monkeypatch, tmp_pa
     before = out.read_bytes()
     monkeypatch.setattr(pw, "measure", lambda **kw: pytest.fail("measured before refusing"))
     capsys.readouterr()
-    for extra, said in ((["--formats", "fp8_e4m3"], f"no tile start for bf16, int4_affine, nvfp4, whose start {out} holds: refresh every format"),
-                        (["--no-accelerator"], f"no tile start for bf16, fp8, int4_affine, nvfp4, whose start {out} holds: --no-accelerator prices none")):
+    for extra, said in ((["--formats", "fp8_e4m3"], f"no tile start for bf16, int4_affine, nvfp4, whose start {out} holds: --formats leaves them "
+                                                    "out; refresh every format with the tile, or measure with --dry-run"),
+                        (["--no-accelerator"], f"no tile start for bf16, fp8, int4_affine, nvfp4, whose start {out} holds: --no-accelerator "
+                                               "prices none, or measure with --dry-run")):
         assert pw.main(extra + ["--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
-        assert said in capsys.readouterr().out
+        printed = capsys.readouterr().out
+        assert printed.rstrip().endswith(said) and "edit it by hand" not in printed
     full = _measurements()
     m = dict(full, **{key: {"fp8_e4m3": full[key]["fp8_e4m3"]} for key in ("shader_ms", "tile_ms", "tile_geometry_ms")},
              tile_oracle_fail={}, oracle_fail=[])
@@ -379,7 +382,47 @@ def test_a_start_no_measured_format_prices_is_named(monkeypatch, tmp_path, capsy
     monkeypatch.setattr(pw, "measure", lambda **kw: pytest.fail("measured before refusing"))
     capsys.readouterr()
     assert pw.main(["--name", "x-20c", "--out", str(out)]) == 1
-    assert "no format the writer measures prices fp8_e4m3: edit it by hand" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert f"no tile start for fp8_e4m3, whose start {out} holds: no format the writer measures prices it; edit it by hand" in printed
+    assert "refresh every format" not in printed                           # a full refresh: no argument prices it
+
+
+def test_a_refusal_names_each_cause_with_its_starts(monkeypatch, tmp_path, capsys):
+    """Starts unpriced for different reasons are listed apart, each with its remedy: a --formats subset's left-out starts
+    and a measured format the tile's refusal left unpriced; held and implicit (the switch's T = 2) starts are named
+    apart too."""
+    import tools.profile_writer as pw
+
+    out = _held_starts_file(monkeypatch, pw, tmp_path)
+    full = _measurements()
+    m = dict(full, **{key: {"fp8_e4m3": full[key]["fp8_e4m3"]} for key in ("shader_ms",)}, tile_ms={}, tile_geometry_ms={},
+             tile_oracle_fail={}, oracle_fail=[], tile_error="fp8_e4m3 TM=8 crew: refused", tile_refused=True)
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(m))
+    capsys.readouterr()
+    assert pw.main(["--formats", "fp8_e4m3", "--dry-run", "--name", "x-20c", "--out", str(out)]) == 0
+    assert (f"a write would be refused: no tile start for bf16, int4_affine, nvfp4, whose start {out} holds: --formats leaves them out; "
+            f"refresh every format with the tile; and for fp8, whose start {out} holds: the tile refused the measured shape") in capsys.readouterr().out
+    (tmp_path / "b").mkdir()
+    out = _held_starts_file(monkeypatch, pw, tmp_path / "b", held={"nvfp4": 2})          # one held start, one implicit (switch on)
+    monkeypatch.setattr(pw, "measure", lambda **kw: dict(full, tile_ms={}, tile_geometry_ms={}, tile_oracle_fail={}, oracle_fail=[],
+                                                         tile_error="nvfp4 TM=8 crew: refused", tile_refused=True))
+    capsys.readouterr()
+    assert pw.main(["--name", "x-20c", "--out", str(out)]) == 1
+    assert f"no tile start for nvfp4, whose start {out} holds; fp8, which the switch {out} holds on starts at T = 2: the tile refused" in capsys.readouterr().out
+
+
+def test_a_switch_off_file_still_refuses_to_drop_held_starts(monkeypatch, tmp_path, capsys):
+    """Held starts bind with the switch off too (generate.py --accelerator on and MONOLITH_ACCELERATOR=on read them): a
+    --formats subset or --no-accelerator over such a file is refused before measuring and writes nothing."""
+    import tools.profile_writer as pw
+
+    out = _held_starts_file(monkeypatch, pw, tmp_path, accelerator="off")
+    before = out.read_bytes()
+    monkeypatch.setattr(pw, "measure", lambda **kw: pytest.fail("measured before refusing"))
+    capsys.readouterr()
+    for extra in (["--formats", "fp8_e4m3"], ["--no-accelerator"]):
+        assert pw.main(extra + ["--name", "x-20c", "--out", str(out)]) == 1 and out.read_bytes() == before
+        assert f"whose start {out} holds" in capsys.readouterr().out
 
 
 def test_writer_tile_pick_crew2_unscaled_and_duplicate_formats(monkeypatch):
