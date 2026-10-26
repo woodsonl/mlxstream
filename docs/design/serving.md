@@ -73,8 +73,9 @@ weight tile in two 64-column halves, each FP8 projection's threadgroup decodes a
 threadgroup memory for four 32-token blocks, and the GDN recurrence sums four state columns in one transposed
 butterfly in `simd_sum`'s order; `matmul2d` accumulates K in order, so all of these keep every result bit for
 bit. Compatible prefill and decoder programs share those mappings and remain allocated together when they fit
-the Metal working set. Requests with a one-row reference chunk that needs the reference graph's projection path
-fall back to 128-row chunking. A plain `N` retains that chunk size's own reduction orders.
+the Metal working set. A request whose 128-row chunking leaves a one-row chunk, which needs the exact 128-row
+graph's one-row projection kernels, falls back to 128-row chunking. A plain `N` retains that chunk size's own
+reduction orders.
 
 In exact mode, `auto-exact`'s 128-row chunks included, the v3 attention gives every prompt row the bits of 128-row
 passes from the prompt's first token wherever its pass starts, so a request restored from a prefix checkpoint gets
