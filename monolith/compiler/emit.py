@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 
 from ..backends.metal.context import dispatch, current_backend
 
@@ -33,13 +34,14 @@ from ..core.shapes import N_CHAIN, N_FIRST, N_INJ, Sym, T, bind, numel, step_bin
 from ..core.step_state import StepStateLayout
 from ..formats import FORMATS
 from ..formats.blm import PackInfo
+from ..formats.gguf import ggml_row_bytes
 from ..nn.module import Model
 from ..packs.basalt import BasaltSource
 from ..packs.packer import ALIGN, PackFile
 from ..runtime.program import BufferSpec, KernelSpec, OpSpec, Program
 from .barriers import place_barriers
 from .coverage import check_coverage
-from .emit_basalt import BASALT_HANDLERS
+from .emit_basalt import BASALT_HANDLERS, GGML_IDS
 from .emit_basalt_prompt import BASALT_PROMPT_HANDLERS
 from .passes import DEFAULT_PASSES
 
@@ -87,8 +89,26 @@ class _Ctx:
     post_norm_inputs: Set[str] = field(default_factory=set)
     preconvolved: Set[str] = field(default_factory=set)
     gdn_pending: Dict[str, Tuple[List[Tuple[int, str, int]], Dict[str, str]]] = field(default_factory=dict)
+    host: Dict[str, Tuple[BufferSpec, str, str]] = field(default_factory=dict)  # the session's buffer -> (its own spec, what names it, why)
 
     # ---- helpers -----------------------------------------------------------------------------------------------
+    def host_buffer(self, name: str, nbytes: int, what: str, why: str) -> None:
+        """Declare ``name`` a buffer the session allocates and passes in (role "host", at least ``nbytes``), which the
+        program binds by name: a host input's, or one an op reaches through GPU addresses (basalt's expert cache).
+        ``what`` names the declaration and ``why`` says why it is the session's buffer, in the refusals: here, of a
+        name the program's own buffers hold (StepState, the token ring, a weights window, a params record, a scratch
+        arena, a log); at the end of emit_program, of one a buffer created later takes. A name declared again keeps
+        its spec, at the larger size."""
+        p, held = self.program, self.host.get(name)
+        if held is not None:
+            held[0].nbytes = max(held[0].nbytes, nbytes)
+            return
+        if name in (p.step_state, p.ring) or name in p.buffers:      # the input loop runs before StepState and the ring
+            raise ValueError(f"emit_program: the {what} {name!r} is named after the program's {_own_buffer(p, name)}; "
+                             f"{why}")
+        p.buffers[name] = spec = BufferSpec(nbytes, None, "host")
+        self.host[name] = (spec, what, why)
+
     def slab_info(self, name: str) -> PackInfo:
         for pk in self.packs:
             if name in pk.slabs:
@@ -210,6 +230,26 @@ class _Ctx:
 
 def _value_bytes(v: Value, t: int) -> int:
     return numel(v.shape, step_bindings(t)) * v.dtype.itemsize
+
+
+def _own_buffer(program: Program, name: str) -> str:
+    """What the program's own buffer ``name`` is: StepState, the token ring and the logs by name (the input loop runs
+    before StepState and the ring exist), any other by its role."""
+    by_name = {program.step_state: "StepState", program.ring: "token ring", ACCEPT_LOG: "accept log",
+               CONF_LOG: "confidence log"}
+    if name in by_name:
+        return by_name[name]
+    role = program.buffers[name].role
+    return {"params": "params record", "arena": "scratch arena", "weights": "weights window"}.get(role, f"{role} buffer")
+
+
+def _stored_bytes(v: Value) -> Optional[int]:
+    """The bytes of a weight held as stored, counted by its format: a value a byte for u8 (a section's bytes), whole
+    rows of a ggml type's blocks; None for any other format, which only its pack lays out."""
+    if v.format == "u8":
+        return math.prod(v.shape)
+    tid = GGML_IDS.get(v.format)
+    return None if tid is None or not v.shape else math.prod(v.shape[:-1]) * ggml_row_bytes(tid, v.shape[-1])
 
 
 def _size_stat(ctx: _Ctx, name: str) -> None:
@@ -1535,7 +1575,6 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
     ctx.ctx_cap_target, ctx.ctx_cap = _context_capacity(ctx, g)
     program.context_capacity = ctx.ctx_cap
     hoisted = {op.attrs["stat_value"]: ctx.slab_info(op.inputs[1].name).n_blocks for op in g.ops if op.kind == "gemv" and op.attrs.get("stat_value")}
-    host: Dict[str, BufferSpec] = {}                                  # host input -> its own spec (checked after the tail)
     for v in g.values.values():
         if v.is_view:
             continue                                                  # rows of its base's buffer
@@ -1546,12 +1585,9 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
             if v.is_host and fld in layout.offsets:                   # _Ctx.buf would bind the field, not the session's
                 raise ValueError(f"emit_program: the host input {v.name!r} is named after StepState's {fld!r}; a host "
                                  "input binds the session's buffer of its name")
-            if v.is_host and (v.name in (program.step_state, program.ring) or v.name in program.buffers):  # the windows so far
-                own = {program.step_state: "StepState", program.ring: "token ring"}.get(v.name, "weights window")
-                raise ValueError(f"emit_program: the host input {v.name!r} is named after the program's {own}; a host "
-                                 "input binds the session's buffer of its name")
             if v.is_host:                                             # the session's buffer: the value's bytes exactly
-                program.buffers[v.name] = host[v.name] = BufferSpec(_value_bytes(v, t), None, "host")
+                ctx.host_buffer(v.name, _value_bytes(v, t), "host input", "a host input binds the session's buffer of "
+                                "its name")
             elif fld not in layout.offsets:                           # not StepState-backed: a host-written arena buffer
                 program.buffers[v.name] = BufferSpec(max(_value_bytes(v, t), 16), None, "arena")
         elif not v.is_source:
@@ -1562,14 +1598,22 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
         elif v.is_weight or v.is_const:
             if v.name not in ctx.windows:
                 raise KeyError(f"emit_program: the pack has no entry for {v.name!r}")
+            aux = next((pk.aux[v.name] for pk in packs if v.name in pk.aux), None)
             if v.is_const:
-                aux = next((pk.aux[v.name] for pk in packs if v.name in pk.aux), None)
                 if aux is not None and _value_bytes(v, t) > int(aux["nbytes"]):
                     raise ValueError(
                         f"emit_program: constant {v.name!r} needs {_value_bytes(v, t)} bytes "
                         f"for shape {v.shape}, but its pack entry has only {aux['nbytes']} bytes "
                         f"(shape {aux['shape']}); repack with the requested context capacity"
                     )
+            elif v.format == "u8" and any(v.name in pk.slabs for pk in packs):    # as _weight refuses a ggml type's
+                raise ValueError(f"emit_program: the weight {v.name!r} (u8) is a block-lane-major pack slab, not bytes "
+                                 "as stored")
+            elif aux is not None and (need := _stored_bytes(v)) is not None and need != int(aux["nbytes"]):
+                # the kernels read every byte a weight declares (the routed experts' blobs, the drafter plan's base, u8
+                # rows), so its entry holds exactly those, as a .basalt entry does (BasaltSource.bind)
+                raise ValueError(f"emit_program: the weight {v.name!r} is {need} bytes of {v.format} {list(v.shape)}, "
+                                 f"but its pack entry holds {aux['nbytes']}")
     program.buffers[program.step_state] = BufferSpec(layout.size, layout.pack({"t_this_step": t}), "step_state")
     program.buffers[program.ring] = BufferSpec(ring_capacity * 8, None, "ring")
     order = list(g.ops)
@@ -1589,20 +1633,17 @@ def emit_program(g: Graph, *, pack: Union[PackFile, BasaltSource, Sequence[Union
                 writes=[1, 2])
     elif tail is not None:
         raise ValueError(f"emit_program: unknown tail {tail!r}")
-    # a buffer added after the input loop under a host input's name (a params record, a scratch arena, a log, StepState,
-    # the ring) replaced its spec, and the ops bind that buffer in place of the session's
-    for name, own in host.items():
-        spec = program.buffers[name]
-        if spec is not own:
-            what = {ACCEPT_LOG: "accept log", CONF_LOG: "confidence log"}.get(name) or {
-                "params": "params record", "arena": "scratch arena", "weights": "weights window", "step_state": "StepState",
-                "ring": "token ring"}.get(spec.role, f"{spec.role} buffer")
-            raise ValueError(f"emit_program: the program's {what} took the name of the host input {name!r}; a host input "
-                             "binds the session's buffer of its name")
+    # a buffer added after a host declaration under its name (a params record, a scratch arena, a log) replaced its
+    # spec, and the ops bind that buffer in place of the session's
+    for name, (own, what, why) in ctx.host.items():
+        if program.buffers[name] is not own:
+            raise ValueError(f"emit_program: the program's {_own_buffer(program, name)} took the name of the {what} "
+                             f"{name!r}; {why}")
     # an arena value no dispatch binds is not allocated: the graph allots the attention's partial workspaces for the
     # two-dispatch kernels, and with v3 (core and merge in one) nothing reads or writes them — the 8B's part_o alone
-    # is 8 MiB per layer at a 32K context
-    bound = {name for op in program.ops for _, name, _ in op.bindings}
+    # is 8 MiB per layer at a 32K context. A value a dispatch reaches only through GPU addresses (its indirect reads
+    # and writes: basalt's expert blobs) is used.
+    bound = {name for op in program.ops for names in op.access() for name in names}
     for name in [n for n, spec in program.buffers.items() if spec.role == "arena" and n not in bound]:
         del program.buffers[name]
     place_barriers(program, barriers)

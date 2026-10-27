@@ -292,11 +292,11 @@ def _k16(g, src, bad, tmp):
 
 
 def _f16_blocks(g, src, bad, tmp):
-    """Gemm::native of a pack's 4 GGUF rows over K 64 at byte 16: Q8_0 (valid), or F16, a ggml type outside the ten
-    (basalt's dequant_f16 exits on it: dequant_bf16.cu:203, :210-213)."""
+    """Gemm::native of a pack's 4 GGUF rows over K 64 at byte 16, the entry holding its type's bytes: Q8_0 (valid), or
+    F16, a ggml type outside the ten (basalt's dequant_f16 exits on it: dequant_bf16.cu:203, :210-213)."""
     w = g.weight("p", (4, 64), "f16" if bad else "q8_0")
     op(g, "basalt_prompt_gemm", [g.input("x", (T, 64), F16), w], [g.value("y", (T, 4), F32)], entry="native")
-    return {"packs": [pack(tmp, {"p": (16, 4 * ggml_row_bytes(8, 64))})]}
+    return {"packs": [pack(tmp, {"p": (16, 4 * ggml_row_bytes(1 if bad else 8, 64))})]}
 
 
 TEN = r"of ggml type \['iq4_nl', 'iq4_xs', 'q2_0', 'q3_k', 'q4_0', 'q4_k', 'q5_0', 'q5_k', 'q6_k', 'q8_0'\]"
