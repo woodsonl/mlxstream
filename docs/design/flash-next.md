@@ -97,6 +97,10 @@ ones this pack runs.
   not basalt code, so invariant 5's subnormal emulation does not apply (decided 2026-10-19 for the partial sums; for
   the operands, 2026-10-20). Widened FP16 operands, their fp32 products and the partial sums are never subnormal in
   fp32: nonzero operands are multiples of 2^-24, nonzero products and partial sums multiples of 2^-48.
+- `Gemm::bf16_w`'s BF16 image of an int8 hyper-connection copy (`src/kernels/cuda/hc_fused.cu:1229-1244`) needs no IEEE
+  emulation: each product of a code and a finite fp16 scale is exact and never subnormal, and a group whose scale
+  overflowed to infinity has only zero codes, whose NaN products are stored through `cuda_nan`
+  (`docs/research/basalt-nvcc/hc_fused.md`).
 
 ### Exactness invariants
 

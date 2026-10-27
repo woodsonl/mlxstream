@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Jesús Gulfo
-# adapted from basalt (jesdga95/basalt) src/prefill/prefill.cpp:1188-1199 @ b4c63b55754637f4c72ad53a0f791d425f71eb36
-# (MIT; third_party/NOTICE).
+# adapted from basalt (jesdga95/basalt) src/prefill/prefill.cpp:1188-1199 and src/prefill/gemm.cu:134-156 @
+# b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
 """The emitter's handlers for basalt's prompt path (``monolith/ops/basalt_prompt.py``), merged into ``emit.HANDLERS``.
 Every dispatch binds StepState at slot 15 and reads the chunk's rows only through ``prompt_rows(st)``
-(``kernels.PROMPT_ROWS``; ``Gemm::native``'s dequantization reads none), in the dynamic-T prompt program and in a
-static one. Its sources, params and the GEMM's slices come from ``monolith/kernels.py``'s builders, as do the
-dequantization's ``DQ_TYPE``, ``DQ_OUT``, grid and threadgroup; the row macros come from ``prompt_rows``, and
-``GEMM_BF16``, ``CV_BF16`` and the products' and conversions' grids and threadgroups from the handlers. A params
-record holds geometry, never a row count, a position or a pointer (invariant 4). The weight checks are
-``native_proj``'s and ``bf16_proj``'s (``prefill.cpp:1188-1199``): the entry must agree with the weight."""
+(``kernels.PROMPT_ROWS``; ``Gemm::native``'s dequantization and ``Gemm::bf16_w``'s copy image read none), in the
+dynamic-T prompt program and in a static one. Its sources, params and the GEMM's slices come from
+``monolith/kernels.py``'s builders, as do the dequantization's ``DQ_TYPE``, ``DQ_OUT``, grid and threadgroup and the
+copy image's grid and threadgroup; the row macros come from ``prompt_rows``, and ``GEMM_BF16``, ``CV_BF16`` and the
+products' and conversions' grids and threadgroups from the handlers. A params record holds geometry, never a row
+count, a position or a pointer (invariant 4). The weight checks are ``native_proj``'s and ``bf16_proj``'s
+(``prefill.cpp:1188-1199``): the entry must agree with the weight; and ``Gemm::bf16_w``'s
+(``src/prefill/gemm.cu:137-141``): a copy must be the product's N x K."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple
 
@@ -25,7 +28,7 @@ from .emit_basalt import GGML_IDS, _bind, _expect, _weight
 if TYPE_CHECKING:
     from .emit import _Ctx
 
-GEMM_ENTRIES = ("bf16", "native")      # hc8 adds "bf16_w"
+GEMM_ENTRIES = ("bf16", "native", "bf16_w")
 
 
 def prompt_rows(ctx: _Ctx, op: Op, rows_from: Optional[Value] = None,
@@ -60,10 +63,17 @@ def _gemm(ctx: _Ctx, op: Op) -> None:
     scratch, grown to its largest image (basalt slices only a matrix past its 32M-value scratch, none on this pack;
     each output reads only its own image row, so the bits are the same), then ``Gemm::f16``'s product on that image.
     The dequantization lists the scratch in ``writes``: the barrier pass orders it after the products that read the
-    previous op's image and before its own, and ``reuse_arenas`` may pack the scratch."""
+    previous op's image and before its own, and ``reuse_arenas`` may pack the scratch. ``Gemm::bf16_w`` on an int8
+    copy: ``_gemm_copy``. Each entry's input count is checked before its inputs are unpacked."""
     entry = op.attrs.get("entry")
     if entry not in GEMM_ENTRIES:
         raise ValueError(f"basalt_prompt_gemm: attr entry must be one of {GEMM_ENTRIES}, got {entry!r}")
+    n_in = 3 if entry == "bf16_w" else 2
+    if len(op.inputs) != n_in:
+        raise ValueError(f"basalt_prompt_gemm: entry {entry!r} takes {n_in} inputs, "
+                         f"{'(x, wq, ws)' if n_in == 3 else '(x, w)'}, got {len(op.inputs)}")
+    if entry == "bf16_w":
+        return _gemm_copy(ctx, op)
     (x, w), (y,) = op.inputs, op.outputs
     rows, macros = prompt_rows(ctx, op, same_rows=(x,))
     native = entry == "native"
@@ -84,6 +94,54 @@ def _gemm(ctx: _Ctx, op: Op) -> None:
     ctx.add(kern, [_bind(ctx, op, 0, w, 1), img, (2, prm, 0), (15, ctx.program.step_state, 0)], (grid, 1, 1),
             (threads, 1, 1), f"{op.kind}:dequant_f16:{w.name}", writes=[1])
     _product(ctx, op, img, False, rows, n, k, macros)
+
+
+def _gemm_copy(ctx: _Ctx, op: Op) -> None:
+    """``Gemm::bf16_w`` on an int8 hyper-connection copy (``gemm.cu:134-154``): ``hc8_dequant_bf16``
+    (``hc_fused.cu:1328-1333``; ``basalt_hc8_dequant_bf16``) of the whole copy, codes ``wq`` and scales ``ws``, into the
+    program's shared GEMM scratch, then ``Gemm::bf16``'s product on that BF16 image, every slice reading the one image.
+    basalt's row-slice loop (``:143``, ``:148-152``) runs once on this pack (every copy fits its scratch) and is not
+    ported. The image is rebuilt on every call, as basalt's is, and lists the scratch in ``writes``, so the barrier
+    pass orders it behind the previous op's products and ahead of its own. N and K are the product's (y's columns,
+    x's), as ``bf16_w`` takes them; a copy of another shape is refused with basalt's message (``:137-141``, where it
+    exits). The image reads every byte of the codes and the scales, so each must be a constant held as rows (not a
+    weight, not a pack slab) whose pack row, if a pack holds it, is exactly its bytes, as ``_weight`` requires of a
+    weight's rows; basalt's reads stay inside the copy it allocated at its size (``hc_fused.cu:1212-1217``). The codes
+    and the scales must be one copy's, ``hc8/<name>/q`` and ``hc8/<name>/s`` of one pack, as basalt's are: it finds
+    the copy by the matrix's pointer (``hc8_view``, ``gemm.cu:136``) and reads both from it."""
+    (x, wq, ws), (y,) = op.inputs, op.outputs
+    rows, macros = prompt_rows(ctx, op, same_rows=(x,))
+    n, k = ctx.shape(y)[-1], ctx.shape(x)[-1]
+    _expect(ctx, op, x, (rows, k), DType.BF16, "Gemm::bf16_w's BF16 rows")
+    _expect(ctx, op, y, (rows, n), DType.F32, "the product's rows")
+    if ctx.shape(wq) != (n, k):
+        raise ValueError(f"{op.kind}: {wq.name!r}: prefill gemm: an 8-bit copy is "
+                         f"{' x '.join(map(str, ctx.shape(wq)))}, the product wants {n} x {k}")
+    _expect(ctx, op, wq, (n, k), DType.U8, "the copy's int8 codes")
+    _expect(ctx, op, ws, (n, (k // 32 + 7) & ~7), DType.F16, "the copy's fp16 scales, (K / 32 + 7) & ~7 a row")
+    if not (wq.name.startswith("hc8/") and wq.name.endswith("/q") and ws.name == wq.name[:-2] + "/s"):
+        raise ValueError(f"{op.kind}: the codes {wq.name!r} and the scales {ws.name!r} are not one copy's "
+                         "hc8/<name>/q and hc8/<name>/s")
+    for v in (wq, ws):
+        if not v.is_const or any(v.name in pk.slabs for pk in ctx.packs):
+            raise ValueError(f"{op.kind}: {v.name!r} is {'a pack slab' if v.is_const else 'not a constant'}; a copy's "
+                             "codes and scales are the constants hc8/<name>/q and /s, rows as stored")
+        aux = next((pk.aux[v.name] for pk in ctx.packs if v.name in pk.aux), None)
+        if aux is not None and int(aux["nbytes"]) != (need := math.prod(ctx.shape(v)) * v.dtype.itemsize):
+            raise ValueError(f"{op.kind}: the copy's {v.name!r} is {need} bytes of {v.dtype.short} "
+                             f"{list(ctx.shape(v))}, but its pack entry holds {aux['nbytes']}")
+    homes = [next((i for i, pk in enumerate(ctx.packs) if v.name in pk.aux), None) for v in (wq, ws)]
+    if homes[0] != homes[1]:
+        raise ValueError(f"{op.kind}: the codes {wq.name!r} and the scales {ws.name!r} are in two packs; a copy's "
+                         "codes and scales are one pack's rows")
+    img = ctx.scratch("prompt_gemm_f16", 2 * n * k, shared=True)
+    kern = ctx.kernel("basalt_hc8_dequant_bf16", kernels.basalt_prompt_hc8_source(), "basalt_hc8_dequant_bf16", {})
+    prm = ctx.params("hc8_image", kernels.basalt_hc8_image_params(n, k))
+    grid, threads = kernels.basalt_hc8_image_grid(n, k)
+    ctx.add(kern, [_bind(ctx, op, 0, wq, 1), _bind(ctx, op, 1, ws, 2), (2, img, 0), (3, prm, 0),
+                   (15, ctx.program.step_state, 0)], (grid, 1, 1), (threads, 1, 1),
+            f"{op.kind}:hc8_dequant_bf16:{wq.name}", writes=[2])
+    _product(ctx, op, (1, img, 0), True, rows, n, k, macros)
 
 
 def _product(ctx: _Ctx, op: Op, w: Tuple[int, str, int], bf16: bool, rows: int, n: int, k: int,

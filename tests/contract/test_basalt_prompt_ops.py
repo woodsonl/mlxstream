@@ -3,7 +3,8 @@ synthetic .basalt file of test_basalt_ops.py: both kinds registered and covered;
 builders and the handlers' rules (function, macros, source, grid, threadgroup, params, written slot), with StepState at
 slot 15 and the row macros of the program's form (prompt_rows); no per-step value in a params record (invariant 4);
 the GEMM's static slices tiling every product once; Gemm::native's dequantization into the program's one FP16 scratch
-ordered ahead of its products and behind the previous op's; and each refusal, a valid input with exactly one defect
+ordered ahead of its products and behind the previous op's; Gemm::bf16_w's BF16 image of an int8 copy (its pack rows
+hc8/<name>/q and /s) the same way, into the same scratch; and each refusal, a valid input with exactly one defect
 refused by that defect's own check (its message). The GPU side is tests/kernels/test_basalt_prompt_program.py."""
 
 import struct
@@ -299,9 +300,48 @@ def _f16_blocks(g, src, bad, tmp):
     return {"packs": [pack(tmp, {"p": (16, 4 * ggml_row_bytes(8, 64))})]}
 
 
+def copy_op(g, name, n, k, rows=T, entry="bf16_w", x_dtype=BF16, q_dtype=DType.U8, s_dtype=F16, s_width=None,
+            copy_rows=None, q_format=None, x_rows=None, s_name=None):
+    """``basalt_prompt_gemm`` entry ``bf16_w`` (Gemm::bf16_w) of x.<name> [x_rows (default rows), k] BF16 by the int8
+    copy ``name``, its codes ``hc8/<name>/q`` U8 [n, k] and scales ``hc8/<name>/s`` F16 [n, (k / 32 + 7) & ~7] (the
+    pack rows packs/basalt_hc8.py writes), into y.<name> [rows, n] F32; the other arguments replace one valid part
+    (``q_format``: the codes a weight of that format, U8 as every weight is; ``s_name``: the scales under another
+    name). Returns the codes and the scales."""
+    copy_rows = n if copy_rows is None else copy_rows
+    q = (g.weight(f"hc8/{name}/q", (copy_rows, k), q_format) if q_format else
+         g.const(f"hc8/{name}/q", (copy_rows, k), q_dtype))
+    s = g.const(s_name or f"hc8/{name}/s", (copy_rows, (k // 32 + 7) & ~7 if s_width is None else s_width), s_dtype)
+    op(g, "basalt_prompt_gemm", [g.input(f"x.{name}", (rows if x_rows is None else x_rows, k), x_dtype), q, s],
+       [g.value(f"y.{name}", (rows, n), F32)], entry=entry)
+    return q, s
+
+
+def nbytes(v):
+    return int(np.prod(v.shape)) * v.dtype.itemsize
+
+
+def _copy(q_extra=0, s_pack=None, **defect):
+    """A valid Gemm::bf16_w on the 4 x 64 copy c (srow 8), and the same with ``defect``. The pack holds exactly the
+    graph's bytes of each constant, laid out as write_pack lays a copy (the codes at byte 256, the scales right after),
+    so emit_program's size check passes every case and the handler's own check meets the defect. Or the rows are held
+    wrongly, which that check (a constant's aux row too short) does not see: the codes' row ``q_extra`` bytes longer
+    (a wider copy's), or the scales in a second pack (``s_pack``): a block-lane-major slab ("slab") or an aux row
+    ("aux")."""
+    def build(g, src, bad, tmp):
+        q, s = copy_op(g, "c", 4, 64, **(defect if bad else {}))
+        nq = nbytes(q) + (q_extra if bad else 0)
+        if bad and s_pack:
+            return {"packs": [pack(tmp, {q.name: (256, nq)}),
+                              pack(tmp.parent / f"{tmp.name}.{s_pack}", {s.name: (256, nbytes(s))},
+                                   slab=s_pack == "slab")]}
+        return {"packs": [pack(tmp, {q.name: (256, nq), s.name: (256 + nq, nbytes(s))})]}
+    return build
+
+
 TEN = r"of ggml type \['iq4_nl', 'iq4_xs', 'q2_0', 'q3_k', 'q4_0', 'q4_k', 'q5_0', 'q5_k', 'q6_k', 'q8_0'\]"
 REFUSALS = [
-    ("entry outside bf16 and native", _gemm(entry="f16"), r"attr entry must be one of \('bf16', 'native'\), got 'f16'"),
+    ("entry outside bf16, native and bf16_w", _gemm(entry="f16"),
+     r"attr entry must be one of \('bf16', 'native', 'bf16_w'\), got 'f16'"),
     ("bf16 entry on GGUF blocks", _gemm(w="gguf/mmvq.12"), r"is not a weight or constant .* of ggml type \['bf16'\]"),
     ("native entry on a BF16 matrix", _gemm(entry="native"), r"'dense/mmvf.q' \(bf16 \[128, 2560\]\) is not .* " + TEN),
     ("native on F16 blocks", _f16_blocks, r"'p' \(f16 \[4, 64\]\) is not .* " + TEN),
@@ -312,6 +352,25 @@ REFUSALS = [
     ("K not a multiple of 16", _k16, "k must be a positive multiple of 16, got 40"),
     ("rows from n_inject", _gemm(rows=N_INJ), r"'y' has the rows n_inject \(T_SRC 1\)"),
     ("product rows from two sources", _gemm(rows=2, x_rows=T), r"'x' has the rows T and 'y' 2; a prompt kernel reads"),
+    # Gemm::bf16_w: the entry agrees with its inputs; a BF16 matrix without a copy is entry "bf16" (gemm.cu:155)
+    ("bf16_w entry on a BF16 matrix", _gemm(entry="bf16_w"), r"entry 'bf16_w' takes 3 inputs, \(x, wq, ws\), got 2"),
+    ("bf16 entry on a copy", _copy(entry="bf16"), r"entry 'bf16' takes 2 inputs, \(x, w\), got 3"),
+    ("copy of F16 rows", _copy(x_dtype=F16), r"'x.c' is f16 \[2, 64\], not bf16 \[2, 64\]"),
+    ("copy codes not U8", _copy(q_dtype=BF16), r"'hc8/c/q' is bf16 \[4, 64\], not u8 \[4, 64\]"),
+    ("copy scales not F16", _copy(s_dtype=BF16), r"'hc8/c/s' is bf16 \[4, 8\], not f16 \[4, 8\]"),
+    ("copy scale rows not srow wide", _copy(s_width=2), r"'hc8/c/s' is f16 \[4, 2\], not f16 \[4, 8\]"),
+    ("copy not the product's N x K", _copy(copy_rows=5),
+     "prefill gemm: an 8-bit copy is 5 x 64, the product wants 4 x 64"),
+    ("copy rows from two sources", _copy(rows=2, x_rows=T), r"'x.c' has the rows T and 'y.c' 2; a prompt kernel reads"),
+    # a copy's rows are pack constants of exactly their bytes: the image reads all of them (hc_fused.cu:1212-1217)
+    ("copy codes a weight", _copy(q_format="q8_0"), r"'hc8/c/q' is not a constant; a copy's codes and scales are"),
+    ("copy scales a pack slab", _copy(s_pack="slab"), r"'hc8/c/s' is a pack slab; a copy's codes and scales are"),
+    ("copy codes and scales in two packs", _copy(s_pack="aux"),
+     r"the codes 'hc8/c/q' and the scales 'hc8/c/s' are in two packs; a copy's codes and scales are one pack's rows"),
+    ("copy codes and scales of two copies", _copy(s_name="hc8/d/s"),
+     r"the codes 'hc8/c/q' and the scales 'hc8/d/s' are not one copy's hc8/<name>/q and hc8/<name>/s"),
+    ("copy codes' pack row longer than the codes", _copy(q_extra=256),
+     r"the copy's 'hc8/c/q' is 256 bytes of u8 \[4, 64\], but its pack entry holds 512"),
     ("convert to F32", _convert(y_dtype=F32), r"'y' is f32; the output is F16 \(to_f16\) or BF16 \(to_bf16\)"),
     ("convert of F16 rows", _convert(x_dtype=F16), r"'x' is f16 \[2, 64\], not f32 \[2, 64\]"),
     ("convert output of another width", _convert(y_extra=1), r"'y' is f16 \[2, 65\], not f16 \[2, 64\]"),
@@ -330,3 +389,123 @@ def test_refusals(src, tmp_path, build, why):
             continue
         with pytest.raises(ValueError, match=why):
             emit(g, src, 2, packs, **kw)
+
+
+def test_missing_copy_is_refused(src, tmp_path):
+    """A copy the packs do not hold, here its scales, is refused by emit_program's missing-entry check before any
+    handler runs; the same graph emits beside the whole copy."""
+    g = Graph("step")
+    q, s = copy_op(g, "c", 4, 64)
+    emit(g, src, 2, [pack(tmp_path / "whole", {q.name: (256, nbytes(q)), s.name: (256 + nbytes(q), nbytes(s))})])
+    with pytest.raises(KeyError, match="emit_program: the pack has no entry for 'hc8/c/s'"):
+        emit(g, src, 2, [pack(tmp_path / "codes", {q.name: (256, nbytes(q))})])
+
+
+def test_image_builders():
+    """basalt_hc8_image_params' record (cols, srow, row0, n), srow = (cols / 32 + 7) & ~7 (hc_fused.cu:1212), and
+    basalt_hc8_image_grid's launch (:1330-1331) for the down and up copies; then each of the record's four refusals
+    by its message (the handler always passes row0 0 and n N, so only these direct calls reach the middle two)."""
+    assert kernels.basalt_hc8_image_params(320, 10240) == struct.pack("<4I", 10240, 320, 0, 320)
+    assert kernels.basalt_hc8_image_params(10240, 320, 9828) == struct.pack("<4I", 320, 16, 9828, 412)
+    assert kernels.basalt_hc8_image_grid(320, 10240) == kernels.basalt_hc8_image_grid(10240, 320) == (1600, 256)
+    for args, why in [((4, 48), "cols must be a positive multiple of 32, got 48"),
+                      ((4, 0), "cols must be a positive multiple of 32, got 0"),
+                      ((4, -32), "cols must be a positive multiple of 32, got -32"),
+                      ((4, 64, 0, 0), "need at least one row, got n 0"),
+                      ((4, 64, 0, -1), "need at least one row, got n -1"),
+                      ((4, 64, -1, 2), r"rows \[-1, 1\) outside the copy's 4"),
+                      ((4, 64, 2, 3), r"rows \[2, 5\) outside the copy's 4"),
+                      ((65536, 32768), r"a 65536 x 32768 copy has 2\^31 values or more")]:
+        with pytest.raises(ValueError, match=why):
+            kernels.basalt_hc8_image_params(*args)
+
+
+# ---- Gemm::bf16_w on the down copy (hc8_parity.cpp's wd, 320 x 10240: the pack's largest image) --------------------
+
+DOWN = (320, 10240)
+B_SLICED = 64 * (kernels.PROMPT_GEMM_MACS // (64 * DOWN[0] * DOWN[1]) + 1)     # the first bound whose product slices
+
+
+@pytest.fixture(scope="module")
+def copies(tmp_path_factory):
+    """A pack of zeros holding the down copy's rows hc8/down/q and hc8/down/s, the codes at byte 256 and the scales
+    right after them, as write_pack lays a copy out (the contract tier reads no byte of it)."""
+    n, k = DOWN
+    return pack(tmp_path_factory.mktemp("copies") / "pack",
+                {"hc8/down/q": (256, n * k), "hc8/down/s": (256 + n * k, n * ((k // 32 + 7) & ~7) * 2)})
+
+
+@pytest.mark.parametrize("b", [64, B_SLICED], ids=["B64", "sliced"])
+@pytest.mark.parametrize("dynamic", [True, False], ids=["dynamic", "static"])
+def test_copy_images_then_multiplies(src, copies, dynamic, b):
+    """Gemm::bf16_w (gemm.cu:134-154): basalt_hc8_dequant_bf16 of the whole copy (row0 0, n N: basalt's slice loop
+    runs once) into the program's one ws.T{B}.prompt_gemm_f16.shared, then exactly len(basalt_prompt_gemm_slices(B, N,
+    K)) products (GEMM_BF16 1) reading it at slot 1, at B 64 (one slice) and at the first B whose product slices. Every
+    dispatch is the builders' and binds (15, step_state, 0); the image's macros are its builder's ({}, STEP_STATE 1
+    from _Ctx.kernel in a dynamic-T program), the products' the program form's row macros. Each writes only slot 2:
+    the image the scratch, each product y, so the scratch is the products' read. Two emissions give byte-identical
+    records and macros, and every record is its builder's geometry: no row count (invariant 4)."""
+    n, k = DOWN
+    slices = kernels.basalt_prompt_gemm_slices(b, n, k)
+    assert b <= LAYOUT.t_max and (len(slices) > 1 if b == B_SLICED else len(slices) == 1), (b, slices)
+    progs = []
+    for _ in range(2):
+        g = Graph("step")
+        copy_op(g, "down", n, k)
+        progs.append(emit(g, src, b, [copies], dynamic_t=dynamic, layout=LAYOUT))
+    prog = progs[0]
+    a, again = ([(record(p, o), p.kernels[o.kernel].macros) for o in p.ops] for p in progs)
+    assert a == again
+    scratch = f"ws.T{b}.prompt_gemm_f16.shared"
+    hc8_source, gemm_source = (s.replace(kernels.PRELUDE, kernels.PRELUDE + LAYOUT.to_msl() + "\n", 1)
+                               for s in (kernels.basalt_prompt_hc8_source(), kernels.basalt_prompt_gemm_source()))
+    grid, threads = kernels.basalt_hc8_image_grid(n, k)
+    # per dispatch: (function, macros, source, the value slots, params, grid, threadgroup, label)
+    want = [("basalt_hc8_dequant_bf16", {"STEP_STATE": "1"} if dynamic else {}, hc8_source,
+             [(0, "pack.0", 256), (1, "pack.0", 256 + n * k), (2, scratch, 0)], kernels.basalt_hc8_image_params(n, k),
+             (grid, 1, 1), (threads, 1, 1), "basalt_prompt_gemm:hc8_dequant_bf16:hc8/down/q")]
+    want += [("basalt_prompt_gemm", {**row_macros(b, not dynamic), "GEMM_BF16": "1"}, gemm_source,
+              [(0, "x.down", 0), (1, scratch, 0), (2, "y.down", 0)],
+              kernels.basalt_prompt_gemm_params(n, k, row0, col0), (-(-ncols // 64), nrows // 64, 1), (256, 1, 1),
+              "basalt_prompt_gemm:bf16_w:hc8/down/q")
+             for row0, nrows, col0, ncols in slices]
+    assert len(prog.ops) == len(want) == 1 + len(slices)
+    for o, (fn, macros, source, values, params, grid, threads, label) in zip(prog.ops, want):
+        spec = prog.kernels[o.kernel]
+        assert (spec.function, spec.macros, spec.source) == (fn, macros, source), label
+        assert (o.name, o.grid, o.threadgroup, o.threadgroup_memory, o.meta["writes"]) == (
+            label, grid, threads, [], [2])
+        slot, prm, off = o.bindings[len(values)]
+        assert o.bindings == values + [(slot, prm, off), (15, prog.step_state, 0)], label
+        assert (slot, off, prog.buffers[prm].role, prog.buffers[prm].init) == (3, 0, "params", params), label
+    assert prog.ops[0].access()[1] == {scratch}
+    assert all(scratch in o.access()[0] and o.access()[1] == {"y.down"} for o in prog.ops[1:])
+    assert [name for name in prog.buffers if "prompt_gemm_f16" in name] == [scratch]
+    assert (prog.buffers[scratch].nbytes, prog.buffers[scratch].role) == (2 * n * k, "arena")
+    assert prog.buffers["pack.0"].file == str(copies.dir / "weights.pack")
+
+
+@pytest.mark.parametrize("b", [64, B_SLICED], ids=["B64", "sliced"])
+def test_copy_after_native_shares_the_scratch(src, copies, b):
+    """A native op (Q4_K 70 x 2560: a 358,400-byte FP16 image) then the copy op (the down copy: a 6,553,600-byte BF16
+    image) in one dynamic-T program: one ws.T{B}.prompt_gemm_f16.shared, sized to the larger image. The barrier pass
+    (compiler/barriers.py's conflict rule, emit_program's default "minimal") puts the copy's image behind the native
+    products (its write of the scratch after their reads) and the copy's first product behind its image (read after
+    write), which orders every later slice behind it too."""
+    g = Graph("step")
+    w = weight(g, "gguf/mmvq.12", src)
+    op(g, "basalt_prompt_gemm", [g.input("x16", (T, 2560), F16), w], [g.value("y.native", (T, 70), F32)],
+       entry="native")
+    copy_op(g, "down", *DOWN)
+    prog = emit(g, src, b, [copies], dynamic_t=True, layout=LAYOUT)
+    labels = [o.name for o in prog.ops]
+    image = labels.index("basalt_prompt_gemm:hc8_dequant_bf16:hc8/down/q")
+    assert labels == (["basalt_prompt_gemm:dequant_f16:gguf/mmvq.12"]
+                      + ["basalt_prompt_gemm:native:gguf/mmvq.12"] * len(kernels.basalt_prompt_gemm_slices(b, 70, 2560))
+                      + [labels[image]]
+                      + ["basalt_prompt_gemm:bf16_w:hc8/down/q"] * len(kernels.basalt_prompt_gemm_slices(b, *DOWN)))
+    scratch = f"ws.T{b}.prompt_gemm_f16.shared"
+    assert [name for name in prog.buffers if "prompt_gemm_f16" in name] == [scratch]
+    assert prog.buffers[scratch].nbytes == 2 * DOWN[0] * DOWN[1] > 2 * 70 * 2560
+    assert prog.ops[image].barrier_before, "the copy's image waits for the native products (write after read)"
+    assert prog.ops[image + 1].barrier_before, "the copy's products wait for its image (read after write)"

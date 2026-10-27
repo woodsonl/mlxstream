@@ -404,7 +404,9 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   three output conversions (`put`), `kv_iq4nl` and `scale_min_k4`, in the arithmetic nvcc compiles for them
   (`docs/research/basalt-nvcc/dequant_bf16.md`). License: `third_party/BASALT-LICENSE`.
 - `monolith/kernels.py` — adapted from `src/kernels/cuda/dequant_bf16.cu:190-240` (MIT): `geometry` and `launch`'s
-  refusals and grid, as `basalt_dequant16_params` and `basalt_dequant16_grid`. License: `third_party/BASALT-LICENSE`.
+  refusals and grid, as `basalt_dequant16_params` and `basalt_dequant16_grid`; and from
+  `src/kernels/cuda/hc_fused.cu:1212` and `:1328-1333` (MIT): `hc8_make`'s scale row and `hc8_dequant_bf16`'s launch,
+  as `basalt_hc8_image_params` and `basalt_hc8_image_grid`. License: `third_party/BASALT-LICENSE`.
 - `tests/kernels/test_basalt_prompt_dequant.py`, `tests/contract/test_basalt_dequant16_builders.py` — adapted from
   `src/kernels/dequant_f16_parity.cpp:35-106`, `src/kernels/dequant_bf16_test.cpp:56-107` and
   `src/kernels/elementwise_parity.cpp:438-472` (MIT): their fixtures (the `std::mt19937(7)` blocks with pinned
@@ -418,12 +420,19 @@ Format: `<path in this repo>` — adapted from / copied from `<repo>` `<path>` @
   fixed-order fma chain per output (the order is this port's: cuBLAS fixes none,
   `docs/research/basalt-nvcc/prefill_kernels.md`), and `to_f16` and `to_bf16` with `hf` and `bf`. License:
   `third_party/BASALT-LICENSE`.
-- `monolith/compiler/emit_basalt_prompt.py` — adapted from `src/prefill/prefill.cpp:1188-1199` (MIT): `native_proj`'s
-  and `bf16_proj`'s weight checks, as the refusals at emit time of an `entry` its weight contradicts. License:
+- `monolith/compiler/emit_basalt_prompt.py` — adapted from `src/prefill/prefill.cpp:1188-1199` and
+  `src/prefill/gemm.cu:134-156` (MIT): `native_proj`'s and `bf16_proj`'s weight checks, as the refusals at emit time of
+  an `entry` its weight contradicts; and `Gemm::bf16_w` on an int8 hyper-connection copy, its N x K check with basalt's
+  message and its two stages, the copy's BF16 image into the GEMM scratch, then `Gemm::bf16`'s product on it. License:
   `third_party/BASALT-LICENSE`.
-- `tests/kernels/test_basalt_prompt_gemm.py` — adapted from `src/kernels/hc8_parity.cpp:253-262` and `:269` (MIT): the
-  GEMM gate's bound, `expect(ex.rel() < 5e-3, "the product against the copy in double");`, and its use of `Err`
-  over the product against double. License: `third_party/BASALT-LICENSE`.
+- `tests/kernels/test_basalt_prompt_gemm.py` (with `tests/kernels/basalt_prompt_gpu.py` for the copies) — adapted from
+  `src/kernels/hc8_parity.cpp:209-275` (MIT): the GEMM gate's bound, `expect(ex.rel() < 5e-3, "the product against the
+  copy in double");` (`:269`), and its use of `Err` over the product against double (`:253-262`); and the product checks
+  of `Gemm::bf16_w` on the copies, their shapes, slices and bounds. License: `third_party/BASALT-LICENSE`.
+- `kernels/common/basalt_prompt_hc8.metal` — adapted from `src/kernels/cuda/hc_fused.cu:1229-1244`
+  (`hc8_dequant_bf16_kernel`) and its launch at `:1328-1333` (MIT): the BF16 image of an int8 hyper-connection copy,
+  which `Gemm::bf16_w` (`src/prefill/gemm.cu:134-156`) multiplies by, in the arithmetic nvcc compiles for it
+  (`docs/research/basalt-nvcc/hc_fused.md`). License: `third_party/BASALT-LICENSE`.
 
 ## NVIDIA libdevice (CUDA Toolkit 13.0, NVIDIA Corporation)
 

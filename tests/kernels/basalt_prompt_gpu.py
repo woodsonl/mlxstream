@@ -1,8 +1,14 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jesús Gulfo
+# adapted from basalt (jesdga95/basalt) src/kernels/hc8_parity.cpp @ b4c63b55754637f4c72ad53a0f791d425f71eb36
+# (MIT; third_party/NOTICE): part 2's runs of Gemm::bf16_w on the copies, whole and in row slices (:209-275).
 """Single-kernel runs of basalt's prompt path (kernels/common/basalt_prompt_*.metal) for the GPU tests. Every prompt
 kernel reads its rows from StepState at slot 15 (monolith/kernels.py's PROMPT_ROWS), so ``run_rows`` is
 basalt_gpu.run with a StepState record bound there. A source compiles as the emitter registers it (the StepState
 struct spliced in after the prelude) with the dynamic-T program's row macros: STEP_STATE 1, T_SRC 0 and ROWS_MAX the
-compiled bound B; the static form (T_SRC 2) is the contract and program tiers' concern."""
+compiled bound B; the static form (T_SRC 2) is the contract and program tiers' concern. The copy image
+(basalt_prompt_hc8.metal) reads no rows, so ``hc8_image`` is basalt_gpu.run alone; ``prompt_gemm_copy`` runs it and
+then the product in one queue run, as the program does."""
 
 import numpy as np
 
@@ -87,3 +93,56 @@ def convert(x, *, bf16, B, rows, fill=0xFF):
     y = run_rows(pso, [x.tobytes(), 2 * B * n], kernels.basalt_prompt_convert_params(n), 2, (-(-B * n // 256), 1, 1),
                  (256, 1, 1), rows, 0, fill=fill)[1]
     return np.frombuffer(y, np.uint16).reshape(B, n)
+
+
+def hc8_image(q, s, rows, cols, row0=0, n=None, guard=0):
+    """basalt_hc8_dequant_bf16: hc8_dequant_bf16's BF16 image (hc_fused.cu:1229-1244, launched as :1328-1333) of rows
+    [row0, row0 + n) (n None: every row from row0) of the ``rows`` x ``cols`` copy with codes ``q`` (int8 bit
+    patterns, [rows, cols]) and scales ``s`` (fp16 bits, uint16 [rows, srow]), each bound as exactly its bytes. One
+    dispatch, compiled as the emitter registers the source, into a buffer of n * cols values and ``guard`` more, every
+    byte 0xFF: with ``guard`` 0 the binding is exactly the image, so shader validation reports any store past it.
+    Returns the buffer's bits, uint16 [n * cols + guard]. The image reads no StepState."""
+    n = rows - row0 if n is None else n
+    q, s = np.ascontiguousarray(q), np.ascontiguousarray(s)
+    assert (q.dtype.itemsize == 1 and q.shape == (rows, cols) and s.dtype == np.uint16
+            and s.shape == (rows, (cols // 32 + 7) & ~7)), \
+        f"q {q.dtype} {q.shape} and s {s.dtype} {s.shape}: not a {rows} x {cols} copy"
+    pso = pipeline(spliced(kernels.basalt_prompt_hc8_source()), "basalt_hc8_dequant_bf16")
+    grid, threads = kernels.basalt_hc8_image_grid(n, cols)
+    out = run(pso, [q.tobytes(), s.tobytes(), 2 * (n * cols + guard)],
+              kernels.basalt_hc8_image_params(rows, cols, row0, n), 3, grid, threads, fill=0xFF)[2]
+    return np.frombuffer(out, np.uint16)
+
+
+def prompt_gemm_copy(x, q, s, *, rows=None, slices=None, out_fill=0xFF):
+    """``Gemm::bf16_w`` on an int8 hyper-connection copy (gemm.cu:134-154) as the handler runs it: hc8_image's dispatch
+    over the whole copy (codes ``q`` [N, K] and scales ``s`` as hc8_image takes them; row0 0, n N, the one slice) into
+    a scratch of exactly N * K BF16 values, then prompt_gemm's BF16 product of the BF16 bits ``x`` [B, K] by that
+    image, compiled at bound B = len(x) and run with ``rows`` (default B) in StepState, one dispatch per slice
+    (``slices`` as prompt_gemm's), every dispatch in one queue run, in order. The scratch's bytes and y's (exactly
+    B * N floats) start as ``out_fill``. Returns (y's bits uint32 [B, N], the image's bits uint16 [N, K])."""
+    x, q, s = (np.ascontiguousarray(a) for a in (x, q, s))
+    (B, k), (n, kq) = x.shape, q.shape
+    assert (x.dtype == np.uint16 and q.dtype.itemsize == 1 and kq == k and s.dtype == np.uint16
+            and s.shape == (n, (k // 32 + 7) & ~7)), \
+        f"x {x.dtype} {x.shape}, q {q.dtype} {q.shape} and s {s.dtype} {s.shape}: not x [B, K] by an N x K copy"
+    dev = device()
+    image_pso = pipeline(spliced(kernels.basalt_prompt_hc8_source()), "basalt_hc8_dequant_bf16")
+    product_pso = prompt_pipeline(kernels.basalt_prompt_gemm_source(), "basalt_prompt_gemm", B, {"GEMM_BF16": "1"})
+    bx, bq, bs = (nt.Buffer(dev, a.tobytes()) for a in (x, q, s))
+    image, y = nt.Buffer(dev, 2 * n * k), nt.Buffer(dev, 4 * B * n)
+    image.fill(out_fill)
+    y.fill(out_fill)
+    state = nt.Buffer(dev, StepStateLayout().pack({"t_this_step": B if rows is None else rows, "position": 0,
+                                                   "done": 0}))
+    grid, threads = kernels.basalt_hc8_image_grid(n, k)
+    ds = [nt.Dispatch().pipeline(image_pso).buffer(0, bq).buffer(1, bs).buffer(2, image)
+          .bytes(3, kernels.basalt_hc8_image_params(n, k)).grid(grid).threadgroup(threads)]
+    for row0, nrows, col0, ncols in kernels.basalt_prompt_gemm_slices(B, n, k) if slices is None else slices:
+        ds.append(nt.Dispatch().pipeline(product_pso).buffer(0, bx).buffer(1, image).buffer(2, y).buffer(15, state)
+                  .bytes(3, kernels.basalt_prompt_gemm_params(n, k, row0, col0))
+                  .grid(-(-ncols // 64), -(-nrows // 64), 1).threadgroup(256, 1, 1))
+    r = nt.Queue(dev).run(ds)
+    assert not r.error, r.error
+    return (np.frombuffer(y.read(0, 4 * B * n), np.uint32).reshape(B, n),
+            np.frombuffer(image.read(0, 2 * n * k), np.uint16).reshape(n, k))

@@ -21,12 +21,21 @@ through it) and static programs (the tests') are both accepted; every dispatch b
 
 * ``basalt_prompt_gemm``, attr ``entry`` (``Gemm::<entry>``, ``src/prefill/gemm.cu:122-185``): ``"bf16"``: ``(x [T, K]
   BF16, w [N, K] BF16)`` → ``y [T, N] F32``; ``"native"``: ``(x [T, K] F16, w [N, K]`` GGUF blocks of one of the ten
-  ggml types ``Gemm::native`` meets on this pack ``)`` → ``y [T, N] F32``, through one FP16 image of ``w`` per op.
-  ``hc8`` adds ``"bf16_w"``. The entry must agree with ``w`` (a BF16 tensor for ``bf16``, GGUF blocks for
-  ``native``, as ``native_proj`` and ``bf16_proj`` require, ``src/prefill/prefill.cpp:1188-1199``); a mismatch is
-  refused. K is a multiple of 16. Each output is one fp32 ``fma`` chain from +0 in increasing k, so its bits depend
-  only on its x row, its w row and K: never on the chunk's rows, the row's place in the chunk or the static slice
-  that computes it (basalt's cuBLAS call promises none of these).
+  ggml types ``Gemm::native`` meets on this pack ``)`` → ``y [T, N] F32``, through one FP16 image of ``w`` per op;
+  ``"bf16_w"``: ``(x [T, K] BF16, wq [N, K] U8, ws [N, srow] F16)`` → ``y [T, N] F32``, the codes and scales of an
+  int8 hyper-connection copy (the constants ``hc8/<name>/q`` and ``hc8/<name>/s`` of ``packs/basalt_hc8.py``'s pack,
+  ``srow = (K / 32 + 7) & ~7``): as basalt does (``gemm.cu:134-154``), the copy's BF16 image into the GEMM scratch,
+  then ``Gemm::bf16``'s product on it; the image is rebuilt on every call, in the scratch the entries share, as
+  basalt's is. A copy whose rows or columns differ from the product's N x K is refused (basalt exits,
+  ``gemm.cu:137-141``), as are codes and scales of two copies or of two packs (basalt reads both from the one copy
+  it finds, ``gemm.cu:136``). The entry must agree with ``w`` (a BF16 tensor for ``bf16``, GGUF blocks for ``native``,
+  as ``native_proj`` and ``bf16_proj`` require, ``src/prefill/prefill.cpp:1188-1199``) and with the inputs (``bf16``
+  and ``native`` take ``(x, w)``, ``bf16_w`` ``(x, wq, ws)``); a mismatch is refused: so are ``entry="bf16_w"`` on a
+  BF16 ``w``, two inputs (basalt's fall-through for a matrix without a copy, ``gemm.cu:155``, is written
+  ``entry="bf16"``), and ``entry="bf16"`` with three. K is a multiple of 16 (of 32 for a copy). Each output is one
+  fp32 ``fma`` chain from +0 in increasing k, so its bits depend only on its x row, its w row and K: never on the
+  chunk's rows, the row's place in the chunk or the static slice that computes it (basalt's cuBLAS call promises none
+  of these).
 * ``basalt_prompt_convert`` (``to_f16`` / ``to_bf16``, ``src/prefill/kernels.cu:818-833``): ``(x [T, n] F32)`` →
   ``y [T, n]`` F16 (``to_f16``) or BF16 (``to_bf16``); the output dtype picks the kernel. Element-local, so a row's
   bits never depend on the chunk.

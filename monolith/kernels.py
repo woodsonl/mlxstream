@@ -1026,6 +1026,41 @@ def basalt_prompt_convert_params(n: int) -> bytes:
     return struct.pack("<I", n)
 
 
+# ---- basalt's prompt path: Gemm::bf16_w's copy image (kernels/common/basalt_prompt_hc8.metal; docs/research/basalt-nvcc/hc_fused.md) ----
+# The scale row and launch below are basalt's (jesdga95/basalt) src/kernels/cuda/hc_fused.cu:1212 and :1328-1333
+# @ b4c63b55754637f4c72ad53a0f791d425f71eb36 (MIT; third_party/NOTICE).
+
+def basalt_prompt_hc8_source() -> str:
+    """basalt's ``hc8_dequant_bf16_kernel`` (hc_fused.cu:1229-1244) as ``basalt_hc8_dequant_bf16``: the BF16 image of
+    an int8 hyper-connection copy's rows, ``Gemm::bf16_w``'s first stage (gemm.cu:150). Bindings: 0 the codes (int8
+    [rows, cols]), 1 the scales (fp16 bits [rows, srow]), 2 the image (n * cols BF16 values), 3 the
+    ``basalt_hc8_image_params`` record; grid ``basalt_hc8_image_grid``. It reads no per-step value."""
+    return PRELUDE + template("basalt_fp.metal") + template("basalt_prompt_hc8.metal")
+
+
+def basalt_hc8_image_params(rows: int, cols: int, row0: int = 0, n: Optional[int] = None) -> bytes:
+    """``Hc8ImageParams`` (cols, srow, row0, n) for rows [row0, row0 + n) of a ``rows`` x ``cols`` copy (n None: every
+    row from row0), srow = (cols / 32 + 7) & ~7 (hc_fused.cu:1212). Refused, each with its own message: cols not a
+    positive multiple of 32 (a scale group would straddle a row); n < 1 (basalt launches nothing, :1329); rows outside
+    the copy; a copy of 2^31 values or more (the kernel's indices are 32-bit; the largest on the pack has 3,276,800)."""
+    n = rows - row0 if n is None else n
+    if cols < 32 or cols % 32:
+        raise ValueError(f"basalt_hc8_image: cols must be a positive multiple of 32, got {cols}")
+    if n < 1:
+        raise ValueError(f"basalt_hc8_image: need at least one row, got n {n}")
+    if row0 < 0 or row0 + n > rows:
+        raise ValueError(f"basalt_hc8_image: rows [{row0}, {row0 + n}) outside the copy's {rows}")
+    if rows * cols >= 2 ** 31:
+        raise ValueError(f"basalt_hc8_image: a {rows} x {cols} copy has 2^31 values or more (32-bit indices)")
+    return struct.pack("<4I", cols, (cols // 32 + 7) & ~7, row0, n)
+
+
+def basalt_hc8_image_grid(n: int, cols: int) -> Tuple[int, int]:
+    """(threadgroups, threads per threadgroup): hc8_dequant_bf16's launch, one thread per 8 codes, (n * cols / 8 + 255)
+    / 256 blocks of 256 (hc_fused.cu:1330-1331)."""
+    return -(-(n * cols // 8) // 256), 256
+
+
 # ---- the other decode kernels -------------------------------------------------------------------------------
 
 MSL_TENSOR_OPS = 4 << 16          # the language version the tensor-ops kernels need (MSL 4.0: <metal_tensor>, MPP)
